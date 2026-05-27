@@ -1,0 +1,33 @@
+[package]
+name        = "zhive-bridge-stdio"
+description = "Transparent stdio <-> UDS forwarder (D-005). Lets stdio-only hosts spawn zhive."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+homepage.workspace     = true
+authors.workspace      = true
+
+[lints]
+workspace = true
+
+[features]
+default = []
+
+[dependencies]
+zhive-proto = { workspace = true }
+
+# `io-std` enables tokio::io::stdin/stdout async wrappers used by the
+# bridge's runtime; the rest are inherited from the workspace defaults.
+tokio      = { workspace = true, features = ["io-std"] }
+tokio-util = { workspace = true }
+anyhow     = { workspace = true }
+thiserror  = { workspace = true }
+tracing    = { workspace = true }
+bytes      = { workspace = true }
+
+[dev-dependencies]
+tempfile   = { workspace = true }
+tokio      = { workspace = true, features = ["macros", "rt", "io-util", "net"] }
+serde_json = { workspace = true }

@@ -1,0 +1,40 @@
+[package]
+name        = "zhive-core"
+description = "Agent runtime engine: threads, turns, items, tool dispatch, LLM glue."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+homepage.workspace     = true
+authors.workspace      = true
+
+[lints]
+workspace = true
+
+# Feature topology (per D-009 build-optimization plan):
+#   * `default`     -> minimal usable engine
+#   * `sandbox`     -> Landlock / Seatbelt / Job Object adapters (Phase 3)
+#   * `persistence` -> session storage backend (Phase 3)
+[features]
+default     = []
+sandbox     = []
+persistence = []
+
+[dependencies]
+zhive-proto = { workspace = true }
+
+tokio       = { workspace = true }
+async-trait = { workspace = true }
+futures     = { workspace = true }
+anyhow      = { workspace = true }
+thiserror   = { workspace = true }
+tracing     = { workspace = true }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+
+# LLM provider abstraction (D-010 Phase 1 dependency).
+llmsdk = { workspace = true }
+
+[dev-dependencies]
+tokio       = { workspace = true, features = ["test-util"] }

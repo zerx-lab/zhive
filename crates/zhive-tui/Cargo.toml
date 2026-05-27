@@ -1,0 +1,32 @@
+[package]
+name        = "zhive-tui"
+description = "Ratatui terminal UI for zhive. Talks to the engine via zhive-client-native (D-002)."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+homepage.workspace     = true
+authors.workspace      = true
+
+[lints]
+workspace = true
+
+[features]
+default = []
+
+[dependencies]
+# D-002: TUI MUST NOT depend on zhive-core. Only on zhive-proto and the
+# native client. If you ever feel the urge to add `zhive-core` here, stop
+# and re-read research/99-decisions/D-002.
+zhive-proto         = { workspace = true }
+zhive-client-native = { workspace = true }
+
+tokio       = { workspace = true }
+futures     = { workspace = true }
+anyhow      = { workspace = true }
+thiserror   = { workspace = true }
+tracing     = { workspace = true }
+
+ratatui    = { workspace = true }
+crossterm  = { workspace = true }

@@ -1,0 +1,18 @@
+/target
+**/*.rs.bk
+
+# Local Cargo overrides (linker, sccache, llmsdk paths). Each dev keeps
+# their own copy; the committed `.cargo/config.toml.example` is the template.
+/.cargo/config.toml
+
+# Generated protobuf artifacts live under each crate's src/generated/ and
+# are committed (M-OOBE), but the OUT_DIR copies should not be.
+**/target/
+*.swp
+*.swo
+
+# Editor metadata
+/.idea/
+/.vscode/
+.DS_Store
+/.claude

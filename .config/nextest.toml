@@ -1,0 +1,26 @@
+# nextest profile config
+#
+# 用法：
+#   cargo nextest run -p <crate> <filter>      # 默认 profile（本地开发）
+#   cargo nextest run --profile ci             # CI 场景（如未来接入再启用）
+#
+# 配置参考：https://nexte.st/docs/configuration/reference/
+# CLAUDE.md 强制规则：测试一律使用 nextest，不要 `cargo test --workspace`。
+
+[profile.default]
+# 本地反复调试时，慢测试只警告不中断；阈值之后 ×3 仍未完成视为卡死并杀掉。
+slow-timeout = { period = "30s", terminate-after = 3 }
+
+# 任何 test binary 在结束后 200ms 内仍有子进程视为泄漏。
+leak-timeout = "200ms"
+
+# 单测失败立刻中断，节省本地反馈时间；CI 场景需要换 ci profile。
+fail-fast = true
+
+# 仅在最终汇总里强调失败 / 不稳定 / 慢测试，不要刷屏。
+status-level = "pass"
+final-status-level = "flaky"
+
+# 失败输出立刻贴出来，成功输出默认隐藏。
+failure-output = "immediate"
+success-output = "never"

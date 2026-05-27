@@ -1,0 +1,49 @@
+# Local developer overrides for the zhive workspace.
+#
+# Copy to `.cargo/config.toml` (gitignored) and adjust paths to taste.
+# 三件事：
+#   1. 关闭 incremental，让全局 sccache rustc-wrapper 命中率上去
+#   2. 链接器换成 clang + mold（Linux）/ rust-lld（Windows）
+#   3. llmsdk 本地路径覆盖（可选）
+
+# 重要：cargo config 的 `paths` 是顶层 key，必须出现在所有 `[xxx]` 表头之前。
+
+# --- llmsdk 本地路径覆盖（可选） -----------------------------------------
+# 指向 llmsdk workspace 根目录后，所有 member crate（llmsdk / llmsdk-openai /
+# llmsdk-anthropic ...）会按 name+version 匹配并覆盖 git 源。版本不匹配
+# 会静默回退到 git，不会硬报错。
+paths = ["/absolute/path/to/your/llmsdk"]
+
+# --- 关键：必须关闭 incremental ----------------------------------------
+# 全局 ~/.cargo/config.toml 已设 rustc-wrapper="sccache"。rustc 的
+# incremental artifact 不能被 sccache 缓存，二者共存时 cache miss 会暴涨。
+[env]
+CARGO_INCREMENTAL = "0"
+
+# --- 链接器加速 -----------------------------------------------------------
+# Linux：mold 通常比 lld 快 2-3 倍。需先 `pacman -S mold` / `apt install mold`。
+[target.x86_64-unknown-linux-gnu]
+linker = "clang"
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+
+[target.aarch64-unknown-linux-gnu]
+linker = "clang"
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+
+# macOS (Apple Silicon) -- 需要 `brew install llvm`。
+[target.aarch64-apple-darwin]
+linker = "clang"
+rustflags = ["-C", "link-arg=-fuse-ld=/opt/homebrew/opt/llvm/bin/ld64.lld"]
+
+# macOS (Intel) -- 需要 `brew install llvm`。
+[target.x86_64-apple-darwin]
+linker = "clang"
+rustflags = ["-C", "link-arg=-fuse-ld=/usr/local/opt/llvm/bin/ld64.lld"]
+
+# Windows 用 rust-lld（随 rustup 自带）。
+[target.x86_64-pc-windows-msvc]
+linker = "rust-lld.exe"
+
+# --- workspace 别名 -------------------------------------------------------
+[alias]
+xtask = "run --package xtask --release --"

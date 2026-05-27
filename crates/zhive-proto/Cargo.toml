@@ -1,0 +1,31 @@
+[package]
+name        = "zhive-proto"
+description = "JSON-RPC 2.0 wire schema and length-delimited framing for zhive (D-003 / D-006)."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+homepage.workspace     = true
+authors.workspace      = true
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# JSON Schema export (consumed by xtask / docs).
+schema  = ["dep:schemars"]
+
+[dependencies]
+# `std + derive` needed because we use `#[serde(flatten)]` and `untagged`,
+# both of which require ContentDeserializer (std/alloc gated upstream).
+serde      = { workspace = true, features = ["derive", "std"] }
+serde_json = { workspace = true }
+thiserror  = { workspace = true }
+tokio      = { workspace = true, features = ["io-util"] }
+bytes      = { workspace = true }
+schemars   = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "io-util"] }

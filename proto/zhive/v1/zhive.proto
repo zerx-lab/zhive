@@ -1,0 +1,212 @@
+// zhive v1 protocol schema.
+//
+// Single source of truth for ConnectRPC service surface (D-003).
+// Generated Rust bindings live in `crates/zhive-proto` (messages) and
+// `crates/zhive-service` (service traits + clients).
+//
+// Design notes:
+//   * Three-layer primitives: Thread / Turn / Item (D-006).
+//   * First RPC MUST be `Initialize`; subsequent calls fail otherwise (D-007).
+//   * Approval flows use server -> client bidi requests (D-008).
+//   * Schema is versioned via the `zhive.v1` package; future revisions live
+//     under `zhive.v2` so v1 clients keep working.
+
+syntax = "proto3";
+
+package zhive.v1;
+
+// ---------------------------------------------------------------------------
+// Top-level entities
+// ---------------------------------------------------------------------------
+
+// A persistent conversation. Survives across processes and reconnects.
+message Thread {
+  string id           = 1;
+  string title        = 2;
+  string workspace_id = 3;
+  int64  created_at   = 4;  // unix millis
+  int64  updated_at   = 5;
+}
+
+// One user input -> all agent work -> final message.
+message Turn {
+  string id          = 1;
+  string thread_id   = 2;
+  TurnStatus status  = 3;
+  int64  created_at  = 4;
+  int64  completed_at = 5;
+}
+
+enum TurnStatus {
+  TURN_STATUS_UNSPECIFIED = 0;
+  TURN_STATUS_PENDING     = 1;
+  TURN_STATUS_RUNNING     = 2;
+  TURN_STATUS_COMPLETED   = 3;
+  TURN_STATUS_FAILED      = 4;
+  TURN_STATUS_CANCELED    = 5;
+}
+
+// One observable artifact produced inside a Turn.
+message Item {
+  string id      = 1;
+  string turn_id = 2;
+  oneof payload {
+    AgentReasoning    reasoning      = 10;
+    AgentMessage      agent_message  = 11;
+    ToolCall          tool_call      = 12;
+    ExecCommand       exec_command   = 13;
+    FileEdit          file_edit      = 14;
+    UserMessage       user_message   = 15;
+  }
+}
+
+message AgentReasoning { string text = 1; }
+message AgentMessage   { string text = 1; }
+message UserMessage    { string text = 1; }
+message ToolCall {
+  string name      = 1;
+  string arguments = 2; // JSON-encoded for now
+  string result    = 3;
+}
+message ExecCommand {
+  repeated string argv      = 1;
+  string          stdout    = 2;
+  string          stderr    = 3;
+  int32           exit_code = 4;
+}
+message FileEdit {
+  string path       = 1;
+  string unified_diff = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Handshake (D-007)
+// ---------------------------------------------------------------------------
+
+message InitializeRequest {
+  ClientInfo client_info             = 1;
+  ClientCapabilities capabilities    = 2;
+  string protocol_version            = 3; // "v1"
+}
+
+message InitializeResponse {
+  ServerInfo server_info             = 1;
+  ServerCapabilities capabilities    = 2;
+  string protocol_version            = 3;
+  string session_token               = 4; // opaque, used as Authorization
+}
+
+message ClientInfo {
+  string name    = 1;  // logged for compliance (D-007 reference)
+  string version = 2;
+  string platform = 3;
+}
+message ServerInfo {
+  string name    = 1;
+  string version = 2;
+  string platform = 3;
+  string home_dir = 4; // resolved $ZHIVE_HOME
+}
+message ClientCapabilities {
+  bool supports_approvals = 1;
+  bool supports_streaming = 2;
+  repeated string opt_out_event_kinds = 3;
+}
+message ServerCapabilities {
+  bool supports_tools     = 1;
+  bool supports_sandbox   = 2;
+  repeated string available_models = 3;
+}
+
+// ---------------------------------------------------------------------------
+// Thread / Turn RPC payloads
+// ---------------------------------------------------------------------------
+
+message ThreadStartRequest  { string workspace_id = 1; string title = 2; }
+message ThreadStartResponse { Thread thread = 1; }
+
+message ThreadResumeRequest  { string thread_id = 1; }
+message ThreadResumeResponse { Thread thread = 1; repeated Turn turns = 2; }
+
+message TurnStartRequest {
+  string thread_id        = 1;
+  UserMessage user_input  = 2;
+  TurnOptions options     = 3;
+}
+message TurnOptions {
+  string model            = 1;
+  bool   auto_approve     = 2;
+  repeated string enabled_tools = 3;
+}
+
+// Server -> client streaming envelope.
+message TurnEvent {
+  string turn_id = 1;
+  oneof event {
+    TurnStarted   started   = 10;
+    Item          item      = 11;
+    TurnDelta     delta     = 12;
+    TurnCompleted completed = 13;
+    TurnFailed    failed    = 14;
+  }
+}
+message TurnStarted   { Turn turn = 1; }
+message TurnDelta     { string item_id = 1; string text_delta = 2; }
+message TurnCompleted { Turn turn = 1; }
+message TurnFailed    { Turn turn = 1; string message = 2; }
+
+message TurnInterruptRequest  { string turn_id = 1; }
+message TurnInterruptResponse {}
+
+// ---------------------------------------------------------------------------
+// Approval channel (D-008): server -> client bidi requests
+// ---------------------------------------------------------------------------
+
+message ApprovalSubscribeRequest  {}
+
+message ApprovalEvent {
+  string approval_id = 1;
+  oneof request {
+    ExecCommand exec_command = 10;
+    FileEdit    apply_patch  = 11;
+    ToolCall    tool_call    = 12;
+  }
+}
+
+message ApprovalDecision {
+  string approval_id = 1;
+  ApprovalOutcome outcome = 2;
+  string reason = 3;
+}
+
+enum ApprovalOutcome {
+  APPROVAL_OUTCOME_UNSPECIFIED = 0;
+  APPROVAL_OUTCOME_ALLOW       = 1;
+  APPROVAL_OUTCOME_DENY        = 2;
+  APPROVAL_OUTCOME_ALLOW_ONCE  = 3;
+}
+
+// ---------------------------------------------------------------------------
+// Services
+// ---------------------------------------------------------------------------
+
+service SessionService {
+  // Mandatory first call.
+  rpc Initialize(InitializeRequest) returns (InitializeResponse);
+}
+
+service ThreadService {
+  rpc StartThread (ThreadStartRequest)  returns (ThreadStartResponse);
+  rpc ResumeThread(ThreadResumeRequest) returns (ThreadResumeResponse);
+}
+
+service TurnService {
+  // Streaming events for one Turn.
+  rpc StartTurn(TurnStartRequest) returns (stream TurnEvent);
+  rpc InterruptTurn(TurnInterruptRequest) returns (TurnInterruptResponse);
+}
+
+service ApprovalService {
+  // Bidi stream: server pushes ApprovalEvent, client returns ApprovalDecision.
+  rpc Approvals(stream ApprovalDecision) returns (stream ApprovalEvent);
+}

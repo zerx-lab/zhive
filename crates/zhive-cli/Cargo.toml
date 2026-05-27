@@ -1,0 +1,41 @@
+[package]
+name        = "zhive-cli"
+description = "The `zhive` binary: unified dispatcher for tui / serve / bridge subcommands."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+homepage.workspace     = true
+authors.workspace      = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "zhive"
+path = "src/main.rs"
+
+# Bin crates are leaf nodes: no other crate may depend on `zhive-cli`.
+# Subcommands turn on via Cargo features so non-default ones do not pay
+# the compile cost. Phase 1 ships `tui + serve + bridge-stdio`; exec /
+# bridge-mcp / bridge-acp land in Phase 2 alongside their crates.
+[features]
+default      = ["tui", "serve", "bridge-stdio"]
+tui          = ["dep:zhive-tui"]
+serve        = ["dep:zhive-core"]
+bridge-stdio = ["dep:zhive-bridge-stdio"]
+full         = ["tui", "serve", "bridge-stdio"]
+
+[dependencies]
+zhive-tui           = { workspace = true, optional = true }
+zhive-core          = { workspace = true, optional = true }
+zhive-bridge-stdio  = { workspace = true, optional = true }
+zhive-client-native = { workspace = true }
+zhive-proto         = { workspace = true }
+
+tokio              = { workspace = true }
+anyhow             = { workspace = true }
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap               = { workspace = true }

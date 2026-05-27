@@ -1,0 +1,565 @@
+<style>
+    * {
+        box-sizing: border-box;
+        margin: 0;
+        padding: 0;
+    }
+    .wrap {
+        display: flex;
+        flex-direction: column;
+        gap: 1px;
+        border-radius: 12px;
+        overflow: hidden;
+        border: 1px solid var(--color-border-tertiary);
+    }
+    .panel {
+        padding: 44px 48px;
+        display: flex;
+        justify-content: center;
+        align-items: center;
+    }
+    .pl {
+        background: #f5f4ee;
+    }
+    .pd {
+        background: #131311;
+    }
+    .sep {
+        height: 1px;
+        background: var(--color-border-tertiary);
+    }
+    .marks {
+        display: flex;
+        gap: 12px;
+        justify-content: center;
+        align-items: center;
+        margin-top: 20px;
+        flex-wrap: wrap;
+    }
+    .mc {
+        border-radius: 10px;
+        padding: 12px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+    }
+    .mcl {
+        background: #f5f4ee;
+    }
+    .mcd {
+        background: #131311;
+    }
+    .label {
+        text-align: center;
+        font-size: 11px;
+        color: var(--color-text-secondary);
+        margin-top: 8px;
+        letter-spacing: 0.06em;
+    }
+</style>
+
+<div class="wrap">
+    <!-- Light -->
+    <div class="panel pl">
+        <svg
+            width="360"
+            viewBox="0 0 460 140"
+            xmlns="http://www.w3.org/2000/svg"
+        >
+            <!-- center hex: solid amber -->
+            <polygon
+                points="75,55 92.32,65 92.32,85 75,95 57.68,85 57.68,65"
+                fill="#EF9F27"
+                stroke="#BA7517"
+                stroke-width="0.75"
+            />
+            <text
+                x="75"
+                y="75"
+                text-anchor="middle"
+                dominant-baseline="central"
+                font-family="monospace"
+                font-size="21"
+                font-weight="700"
+                fill="#412402"
+            >
+                z
+            </text>
+            <!-- upper-right: medium -->
+            <polygon
+                points="92.32,25 109.64,35 109.64,55 92.32,65 75,55 75,35"
+                fill="#FAC775"
+                stroke="#EF9F27"
+                stroke-width="0.5"
+            />
+            <!-- right: ghost -->
+            <polygon
+                points="109.64,55 126.96,65 126.96,85 109.64,95 92.32,85 92.32,65"
+                fill="#EF9F27"
+                fill-opacity="0.06"
+                stroke="#EF9F27"
+                stroke-width="0.75"
+                stroke-opacity="0.45"
+            />
+            <!-- upper-left: ghost -->
+            <polygon
+                points="57.68,25 75,35 75,55 57.68,65 40.36,55 40.36,35"
+                fill="#EF9F27"
+                fill-opacity="0.06"
+                stroke="#EF9F27"
+                stroke-width="0.75"
+                stroke-opacity="0.45"
+            />
+            <!-- left: medium -->
+            <polygon
+                points="40.36,55 57.68,65 57.68,85 40.36,95 23.04,85 23.04,65"
+                fill="#FAC775"
+                stroke="#EF9F27"
+                stroke-width="0.5"
+            />
+            <!-- lower-right: medium -->
+            <polygon
+                points="92.32,85 109.64,95 109.64,115 92.32,125 75,115 75,95"
+                fill="#FAC775"
+                stroke="#EF9F27"
+                stroke-width="0.5"
+            />
+            <!-- lower-left: ghost -->
+            <polygon
+                points="57.68,85 75,95 75,115 57.68,125 40.36,115 40.36,95"
+                fill="#EF9F27"
+                fill-opacity="0.06"
+                stroke="#EF9F27"
+                stroke-width="0.75"
+                stroke-opacity="0.45"
+            />
+
+            <!-- wordmark -->
+            <text
+                x="148"
+                y="97"
+                font-family="var(--font-mono,monospace)"
+                font-size="64"
+                font-weight="700"
+            >
+                <tspan fill="#EF9F27">z</tspan>
+                <tspan fill="#1C1C1A">hive</tspan>
+            </text>
+            <!-- tagline -->
+            <text
+                x="150"
+                y="118"
+                font-family="var(--font-sans,sans-serif)"
+                font-size="11"
+                fill="#88887A"
+                letter-spacing="0.18em"
+            >
+                AGENT HARNESS
+            </text>
+        </svg>
+    </div>
+
+    <div class="sep"></div>
+
+    <!-- Dark -->
+    <div class="panel pd">
+        <svg
+            width="360"
+            viewBox="0 0 460 140"
+            xmlns="http://www.w3.org/2000/svg"
+        >
+            <polygon
+                points="75,55 92.32,65 92.32,85 75,95 57.68,85 57.68,65"
+                fill="#EF9F27"
+                stroke="#BA7517"
+                stroke-width="0.75"
+            />
+            <text
+                x="75"
+                y="75"
+                text-anchor="middle"
+                dominant-baseline="central"
+                font-family="monospace"
+                font-size="21"
+                font-weight="700"
+                fill="#FAEEDA"
+            >
+                z
+            </text>
+            <polygon
+                points="92.32,25 109.64,35 109.64,55 92.32,65 75,55 75,35"
+                fill="#854F0B"
+                stroke="#BA7517"
+                stroke-width="0.5"
+            />
+            <polygon
+                points="109.64,55 126.96,65 126.96,85 109.64,95 92.32,85 92.32,65"
+                fill="#EF9F27"
+                fill-opacity="0.08"
+                stroke="#633806"
+                stroke-width="0.75"
+            />
+            <polygon
+                points="57.68,25 75,35 75,55 57.68,65 40.36,55 40.36,35"
+                fill="#EF9F27"
+                fill-opacity="0.08"
+                stroke="#633806"
+                stroke-width="0.75"
+            />
+            <polygon
+                points="40.36,55 57.68,65 57.68,85 40.36,95 23.04,85 23.04,65"
+                fill="#854F0B"
+                stroke="#BA7517"
+                stroke-width="0.5"
+            />
+            <polygon
+                points="92.32,85 109.64,95 109.64,115 92.32,125 75,115 75,95"
+                fill="#854F0B"
+                stroke="#BA7517"
+                stroke-width="0.5"
+            />
+            <polygon
+                points="57.68,85 75,95 75,115 57.68,125 40.36,115 40.36,95"
+                fill="#EF9F27"
+                fill-opacity="0.08"
+                stroke="#633806"
+                stroke-width="0.75"
+            />
+
+            <text
+                x="148"
+                y="97"
+                font-family="var(--font-mono,monospace)"
+                font-size="64"
+                font-weight="700"
+            >
+                <tspan fill="#EF9F27">z</tspan>
+                <tspan fill="#EFEFE8">hive</tspan>
+            </text>
+            <text
+                x="150"
+                y="118"
+                font-family="var(--font-sans,sans-serif)"
+                font-size="11"
+                fill="#6A6A62"
+                letter-spacing="0.18em"
+            >
+                AGENT HARNESS
+            </text>
+        </svg>
+    </div>
+</div>
+
+<!-- Icon marks row -->
+<div class="marks">
+    <div>
+        <div class="mc mcl">
+            <svg
+                width="36"
+                viewBox="18 20 115 115"
+                xmlns="http://www.w3.org/2000/svg"
+            >
+                <polygon
+                    points="75,55 92.32,65 92.32,85 75,95 57.68,85 57.68,65"
+                    fill="#EF9F27"
+                    stroke="#BA7517"
+                    stroke-width="0.75"
+                />
+                <polygon
+                    points="92.32,25 109.64,35 109.64,55 92.32,65 75,55 75,35"
+                    fill="#FAC775"
+                    stroke="#EF9F27"
+                    stroke-width="0.5"
+                />
+                <polygon
+                    points="109.64,55 126.96,65 126.96,85 109.64,95 92.32,85 92.32,65"
+                    fill="none"
+                    stroke="#EF9F27"
+                    stroke-width="0.75"
+                    stroke-opacity="0.45"
+                />
+                <polygon
+                    points="57.68,25 75,35 75,55 57.68,65 40.36,55 40.36,35"
+                    fill="none"
+                    stroke="#EF9F27"
+                    stroke-width="0.75"
+                    stroke-opacity="0.45"
+                />
+                <polygon
+                    points="40.36,55 57.68,65 57.68,85 40.36,95 23.04,85 23.04,65"
+                    fill="#FAC775"
+                    stroke="#EF9F27"
+                    stroke-width="0.5"
+                />
+                <polygon
+                    points="92.32,85 109.64,95 109.64,115 92.32,125 75,115 75,95"
+                    fill="#FAC775"
+                    stroke="#EF9F27"
+                    stroke-width="0.5"
+                />
+                <polygon
+                    points="57.68,85 75,95 75,115 57.68,125 40.36,115 40.36,95"
+                    fill="none"
+                    stroke="#EF9F27"
+                    stroke-width="0.75"
+                    stroke-opacity="0.45"
+                />
+            </svg>
+        </div>
+        <div class="label">36px</div>
+    </div>
+    <div>
+        <div class="mc mcd">
+            <svg
+                width="36"
+                viewBox="18 20 115 115"
+                xmlns="http://www.w3.org/2000/svg"
+            >
+                <polygon
+                    points="75,55 92.32,65 92.32,85 75,95 57.68,85 57.68,65"
+                    fill="#EF9F27"
+                    stroke="#BA7517"
+                    stroke-width="0.75"
+                />
+                <polygon
+                    points="92.32,25 109.64,35 109.64,55 92.32,65 75,55 75,35"
+                    fill="#854F0B"
+                    stroke="#BA7517"
+                    stroke-width="0.5"
+                />
+                <polygon
+                    points="109.64,55 126.96,65 126.96,85 109.64,95 92.32,85 92.32,65"
+                    fill="none"
+                    stroke="#633806"
+                    stroke-width="0.75"
+                />
+                <polygon
+                    points="57.68,25 75,35 75,55 57.68,65 40.36,55 40.36,35"
+                    fill="none"
+                    stroke="#633806"
+                    stroke-width="0.75"
+                />
+                <polygon
+                    points="40.36,55 57.68,65 57.68,85 40.36,95 23.04,85 23.04,65"
+                    fill="#854F0B"
+                    stroke="#BA7517"
+                    stroke-width="0.5"
+                />
+                <polygon
+                    points="92.32,85 109.64,95 109.64,115 92.32,125 75,115 75,95"
+                    fill="#854F0B"
+                    stroke="#BA7517"
+                    stroke-width="0.5"
+                />
+                <polygon
+                    points="57.68,85 75,95 75,115 57.68,125 40.36,115 40.36,95"
+                    fill="none"
+                    stroke="#633806"
+                    stroke-width="0.75"
+                />
+            </svg>
+        </div>
+        <div class="label">dark</div>
+    </div>
+    <div>
+        <div class="mc mcl">
+            <svg
+                width="56"
+                viewBox="18 20 115 115"
+                xmlns="http://www.w3.org/2000/svg"
+            >
+                <polygon
+                    points="75,55 92.32,65 92.32,85 75,95 57.68,85 57.68,65"
+                    fill="#EF9F27"
+                    stroke="#BA7517"
+                    stroke-width="0.75"
+                />
+                <text
+                    x="75"
+                    y="75"
+                    text-anchor="middle"
+                    dominant-baseline="central"
+                    font-family="monospace"
+                    font-size="21"
+                    font-weight="700"
+                    fill="#412402"
+                >
+                    z
+                </text>
+                <polygon
+                    points="92.32,25 109.64,35 109.64,55 92.32,65 75,55 75,35"
+                    fill="#FAC775"
+                    stroke="#EF9F27"
+                    stroke-width="0.5"
+                />
+                <polygon
+                    points="109.64,55 126.96,65 126.96,85 109.64,95 92.32,85 92.32,65"
+                    fill="none"
+                    stroke="#EF9F27"
+                    stroke-width="0.75"
+                    stroke-opacity="0.45"
+                />
+                <polygon
+                    points="57.68,25 75,35 75,55 57.68,65 40.36,55 40.36,35"
+                    fill="none"
+                    stroke="#EF9F27"
+                    stroke-width="0.75"
+                    stroke-opacity="0.45"
+                />
+                <polygon
+                    points="40.36,55 57.68,65 57.68,85 40.36,95 23.04,85 23.04,65"
+                    fill="#FAC775"
+                    stroke="#EF9F27"
+                    stroke-width="0.5"
+                />
+                <polygon
+                    points="92.32,85 109.64,95 109.64,115 92.32,125 75,115 75,95"
+                    fill="#FAC775"
+                    stroke="#EF9F27"
+                    stroke-width="0.5"
+                />
+                <polygon
+                    points="57.68,85 75,95 75,115 57.68,125 40.36,115 40.36,95"
+                    fill="none"
+                    stroke="#EF9F27"
+                    stroke-width="0.75"
+                    stroke-opacity="0.45"
+                />
+            </svg>
+        </div>
+        <div class="label">56px</div>
+    </div>
+    <div>
+        <div class="mc mcd">
+            <svg
+                width="56"
+                viewBox="18 20 115 115"
+                xmlns="http://www.w3.org/2000/svg"
+            >
+                <polygon
+                    points="75,55 92.32,65 92.32,85 75,95 57.68,85 57.68,65"
+                    fill="#EF9F27"
+                    stroke="#BA7517"
+                    stroke-width="0.75"
+                />
+                <text
+                    x="75"
+                    y="75"
+                    text-anchor="middle"
+                    dominant-baseline="central"
+                    font-family="monospace"
+                    font-size="21"
+                    font-weight="700"
+                    fill="#FAEEDA"
+                >
+                    z
+                </text>
+                <polygon
+                    points="92.32,25 109.64,35 109.64,55 92.32,65 75,55 75,35"
+                    fill="#854F0B"
+                    stroke="#BA7517"
+                    stroke-width="0.5"
+                />
+                <polygon
+                    points="109.64,55 126.96,65 126.96,85 109.64,95 92.32,85 92.32,65"
+                    fill="none"
+                    stroke="#633806"
+                    stroke-width="0.75"
+                />
+                <polygon
+                    points="57.68,25 75,35 75,55 57.68,65 40.36,55 40.36,35"
+                    fill="none"
+                    stroke="#633806"
+                    stroke-width="0.75"
+                />
+                <polygon
+                    points="40.36,55 57.68,65 57.68,85 40.36,95 23.04,85 23.04,65"
+                    fill="#854F0B"
+                    stroke="#BA7517"
+                    stroke-width="0.5"
+                />
+                <polygon
+                    points="92.32,85 109.64,95 109.64,115 92.32,125 75,115 75,95"
+                    fill="#854F0B"
+                    stroke="#BA7517"
+                    stroke-width="0.5"
+                />
+                <polygon
+                    points="57.68,85 75,95 75,115 57.68,125 40.36,115 40.36,95"
+                    fill="none"
+                    stroke="#633806"
+                    stroke-width="0.75"
+                />
+            </svg>
+        </div>
+        <div class="label">dark</div>
+    </div>
+    <div>
+        <div class="mc mcl">
+            <svg
+                width="80"
+                viewBox="18 20 115 115"
+                xmlns="http://www.w3.org/2000/svg"
+            >
+                <polygon
+                    points="75,55 92.32,65 92.32,85 75,95 57.68,85 57.68,65"
+                    fill="#EF9F27"
+                    stroke="#BA7517"
+                    stroke-width="0.75"
+                />
+                <text
+                    x="75"
+                    y="75"
+                    text-anchor="middle"
+                    dominant-baseline="central"
+                    font-family="monospace"
+                    font-size="21"
+                    font-weight="700"
+                    fill="#412402"
+                >
+                    z
+                </text>
+                <polygon
+                    points="92.32,25 109.64,35 109.64,55 92.32,65 75,55 75,35"
+                    fill="#FAC775"
+                    stroke="#EF9F27"
+                    stroke-width="0.5"
+                />
+                <polygon
+                    points="109.64,55 126.96,65 126.96,85 109.64,95 92.32,85 92.32,65"
+                    fill="none"
+                    stroke="#EF9F27"
+                    stroke-width="0.75"
+                    stroke-opacity="0.45"
+                />
+                <polygon
+                    points="57.68,25 75,35 75,55 57.68,65 40.36,55 40.36,35"
+                    fill="none"
+                    stroke="#EF9F27"
+                    stroke-width="0.75"
+                    stroke-opacity="0.45"
+                />
+                <polygon
+                    points="40.36,55 57.68,65 57.68,85 40.36,95 23.04,85 23.04,65"
+                    fill="#FAC775"
+                    stroke="#EF9F27"
+                    stroke-width="0.5"
+                />
+                <polygon
+                    points="92.32,85 109.64,95 109.64,115 92.32,125 75,115 75,95"
+                    fill="#FAC775"
+                    stroke="#EF9F27"
+                    stroke-width="0.5"
+                />
+                <polygon
+                    points="57.68,85 75,95 75,115 57.68,125 40.36,115 40.36,95"
+                    fill="none"
+                    stroke="#EF9F27"
+                    stroke-width="0.75"
+                    stroke-opacity="0.45"
+                />
+            </svg>
+        </div>
+        <div class="label">80px</div>
+    </div>
+</div>

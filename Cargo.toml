@@ -1,0 +1,143 @@
+# zhive workspace root.
+#
+# Architecture decisions live in `research/99-decisions/README.md`.
+# Build performance combo is documented in `research/06-build-optimization/README.md`.
+
+[workspace]
+resolver = "3"
+members = [
+  "crates/zhive-proto",
+  "crates/zhive-core",
+  "crates/zhive-client-native",
+  "crates/zhive-tui",
+  "crates/zhive-cli",
+  "crates/zhive-bridge-stdio",
+  "xtask",
+]
+default-members = [
+  "crates/zhive-cli",
+]
+
+[workspace.package]
+version       = "0.1.0"
+edition       = "2024"
+rust-version  = "1.88"
+license       = "Apache-2.0"
+repository    = "https://github.com/zerx-lab/zhive"
+homepage      = "https://github.com/zerx-lab/zhive"
+authors       = ["zhive contributors"]
+readme        = "README.md"
+
+# Shared dependency declarations. Per D-009, every crate consumes
+# dependencies via `dep = { workspace = true }` so versions stay aligned and
+# Cargo can dedupe the compile graph aggressively.
+[workspace.dependencies]
+# ---- internal crates ----
+zhive-proto         = { path = "crates/zhive-proto",         version = "0.1.0" }
+zhive-core          = { path = "crates/zhive-core",          version = "0.1.0" }
+zhive-client-native = { path = "crates/zhive-client-native", version = "0.1.0" }
+zhive-tui           = { path = "crates/zhive-tui",           version = "0.1.0" }
+zhive-bridge-stdio  = { path = "crates/zhive-bridge-stdio",  version = "0.1.0" }
+
+# ---- async runtime ----
+tokio       = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "sync", "io-util", "net", "time", "signal", "fs"] }
+tokio-util  = { version = "0.7", default-features = false }
+async-trait = "0.1"
+futures     = { version = "0.3", default-features = false, features = ["std"] }
+bytes       = "1"
+
+# ---- error / log / serialization ----
+anyhow             = "1"
+thiserror          = "2"
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt"] }
+serde              = { version = "1", default-features = false, features = ["derive"] }
+serde_json         = "1"
+
+# ---- CLI ----
+clap = { version = "4", default-features = false, features = ["derive", "std", "help", "usage", "error-context"] }
+
+# ---- TUI ----
+ratatui    = { version = "0.30", default-features = false, features = ["crossterm"] }
+crossterm  = "0.29"
+
+# ---- JSON-RPC 2.0 schema (D-003 R3+R4 终版) ----
+# Phase 1 RPC = JSON-RPC 2.0 over stdio + UDS with hand-rolled
+# Content-Length framing in `zhive-proto::framing`. ConnectRPC and the
+# prost ecosystem were removed wholesale; see research/99-decisions/D-003.
+schemars = { version = "0.8", default-features = false, features = ["derive"] }
+
+# ---- LLM SDK (consumed by zhive-core) ----
+llmsdk = { git = "https://github.com/zerx-lab/llmsdk", branch = "main" }
+
+# ---- dev / test ----
+tempfile = "3"
+
+# Build profiles per research/06-build-optimization.
+#
+# * `dev`: business code stays unoptimized for fast incremental builds,
+#   dependencies get `opt-level = 1` to make hot paths bearable to step through.
+# * `release`: thin LTO + symbol strip for a small binary.
+# * `dist`: fat LTO release used by the publish workflow.
+[profile.dev]
+opt-level         = 0
+debug             = "line-tables-only"
+split-debuginfo   = "unpacked"
+incremental       = true
+codegen-units     = 256
+
+[profile.dev.package."*"]
+opt-level = 1
+
+# Proc macros and build scripts should always be optimized so codegen
+# does not dominate cold compile times.
+[profile.dev.build-override]
+opt-level = 3
+
+[profile.release]
+opt-level     = 3
+lto           = "thin"
+codegen-units = 1
+strip         = "symbols"
+panic         = "abort"
+
+[profile.bench]
+inherits = "release"
+
+[profile.dist]
+inherits = "release"
+lto      = "fat"
+
+# Workspace-wide lint configuration (subset of M-STATIC-VERIFICATION).
+# Crates inherit via `[lints] workspace = true`.
+[workspace.lints.rust]
+ambiguous_negative_literals     = "warn"
+missing_debug_implementations   = "warn"
+redundant_imports               = "warn"
+redundant_lifetimes             = "warn"
+trivial_numeric_casts           = "warn"
+unsafe_op_in_unsafe_fn          = "warn"
+unused_lifetimes                = "warn"
+
+[workspace.lints.clippy]
+correctness = { level = "warn", priority = -1 }
+suspicious  = { level = "warn", priority = -1 }
+perf        = { level = "warn", priority = -1 }
+style       = { level = "warn", priority = -1 }
+complexity  = { level = "warn", priority = -1 }
+pedantic    = { level = "warn", priority = -1 }
+# Selected restriction lints (see M-STATIC-VERIFICATION).
+allow_attributes_without_reason  = "warn"
+clone_on_ref_ptr                 = "warn"
+empty_drop                       = "warn"
+empty_enum_variants_with_brackets = "warn"
+empty_structs_with_brackets      = "warn"
+map_err_ignore                   = "warn"
+semicolon_outside_block          = "warn"
+undocumented_unsafe_blocks       = "warn"
+# Logging templates use literal `{{placeholder}}` text.
+literal_string_with_formatting_args = "allow"
+# Common pedantic warts in early-stage code; revisit per crate before 1.0.
+module_name_repetitions          = "allow"
+missing_errors_doc               = "allow"
+missing_panics_doc               = "allow"
