@@ -25,6 +25,10 @@
 
 pub mod domain;
 pub mod framing;
+pub mod hook;
+pub mod initialize;
+pub mod manifest;
+pub mod permission;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

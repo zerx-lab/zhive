@@ -15,11 +15,9 @@ workspace = true
 # Feature topology (per D-009 build-optimization plan):
 #   * `default`     -> minimal usable engine
 #   * `sandbox`     -> Landlock / Seatbelt / Job Object adapters (Phase 3)
-#   * `persistence` -> session storage backend (Phase 3)
 [features]
-default     = []
-sandbox     = []
-persistence = []
+default = []
+sandbox = []
 
 [dependencies]
 zhive-proto = { workspace = true }
@@ -33,8 +31,24 @@ tracing     = { workspace = true }
 serde       = { workspace = true }
 serde_json  = { workspace = true }
 
+# Persistence: sqlx replaces rusqlite per the 2026-05-28 user decision.
+# The `macros` feature is enabled at the workspace level only to embed
+# migrations via `sqlx::migrate!`; the `query!` / `query_as!` macros are
+# avoided so that `cargo check -p <crate>` does not need `DATABASE_URL`.
+sqlx = { workspace = true }
+
+# Hook input re-validation after PreToolUse mutation (red line 11).
+jsonschema = { workspace = true }
+
 # LLM provider abstraction (D-010 Phase 1 dependency).
 llmsdk = { workspace = true }
 
+# Safe syscall wrappers; only the UDS fallback path uses
+# `rustix::process::getuid` to compose `/tmp/zhive-<uid>.sock` without
+# resorting to unsafe libc bindings (red line 2).
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true }
+
 [dev-dependencies]
-tokio       = { workspace = true, features = ["test-util"] }
+tokio    = { workspace = true, features = ["test-util"] }
+tempfile = { workspace = true }

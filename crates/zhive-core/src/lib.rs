@@ -9,6 +9,7 @@
 #![forbid(unsafe_code)]
 
 pub mod engine;
+pub mod persistence;
 pub mod state;
 
 /// Reports this crate's package version.

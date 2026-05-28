@@ -70,6 +70,20 @@ schemars = { version = "0.8", default-features = false, features = ["derive"] }
 # ---- LLM SDK (consumed by zhive-core) ----
 llmsdk = { git = "https://github.com/zerx-lab/llmsdk", branch = "main" }
 
+# ---- persistence (D-011 revised 2026-05-28: sqlx replaces rusqlite per
+#      user decision). The `macros` feature is enabled solely so the
+#      `sqlx::migrate!("./migrations/...")` macro can embed SQL files at
+#      compile time; the `query!` / `query_as!` macros that would
+#      require a live `DATABASE_URL` are intentionally not used,
+#      preserving the `cargo check -p <crate>` workflow. ----
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros", "json"] }
+
+# ---- hook schema re-validation (red line 11: PreToolUse mutate -> re-validate) ----
+jsonschema = { version = "0.46", default-features = false }
+
+# ---- safe syscall wrappers (B4: UDS fallback path avoids unsafe libc::getuid) ----
+rustix = { version = "1", default-features = false, features = ["process", "std"] }
+
 # ---- dev / test ----
 tempfile = "3"
 
