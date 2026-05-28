@@ -22,7 +22,10 @@ sandbox = []
 [dependencies]
 zhive-proto = { workspace = true }
 
-tokio       = { workspace = true }
+# `io-std` adds tokio::io::{stdin, stdout} for the stdio transport in
+# `crate::server::transport`; the rest stays at the workspace defaults.
+tokio       = { workspace = true, features = ["io-std"] }
+tokio-util  = { workspace = true }
 async-trait = { workspace = true }
 futures     = { workspace = true }
 anyhow      = { workspace = true }
@@ -42,6 +45,11 @@ jsonschema = { workspace = true }
 
 # LLM provider abstraction (D-010 Phase 1 dependency).
 llmsdk = { workspace = true }
+
+# OpenTelemetry layer for `tracing` (D-014 revised).
+tracing-opentelemetry = { workspace = true }
+opentelemetry         = { workspace = true }
+opentelemetry_sdk     = { workspace = true }
 
 # Safe syscall wrappers; only the UDS fallback path uses
 # `rustix::process::getuid` to compose `/tmp/zhive-<uid>.sock` without

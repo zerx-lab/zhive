@@ -8,9 +8,17 @@
 
 #![forbid(unsafe_code)]
 
+pub mod cancel;
 pub mod engine;
+pub mod hooks;
+pub mod observability;
+pub mod permission;
 pub mod persistence;
+pub mod provider;
+pub mod queues;
+pub mod server;
 pub mod state;
+pub mod subagent;
 
 /// Reports this crate's package version.
 #[must_use]

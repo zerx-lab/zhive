@@ -84,6 +84,14 @@ jsonschema = { version = "0.46", default-features = false }
 # ---- safe syscall wrappers (B4: UDS fallback path avoids unsafe libc::getuid) ----
 rustix = { version = "1", default-features = false, features = ["process", "std"] }
 
+# ---- tracing + OpenTelemetry (D-014 revised 2026-05-28: OTel ships in
+#      Phase 1 per user decision). Field names follow OTel semantic
+#      conventions (thread.id, turn.id, tool.name, …) so attaching an
+#      OTLP exporter later does not require a rename. ----
+tracing-opentelemetry = { version = "0.33", default-features = false }
+opentelemetry         = { version = "0.32", default-features = false, features = ["trace"] }
+opentelemetry_sdk     = { version = "0.32", default-features = false, features = ["trace", "rt-tokio"] }
+
 # ---- dev / test ----
 tempfile = "3"
 
