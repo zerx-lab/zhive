@@ -23,7 +23,7 @@ supersedes: 99-decisions/README.md (D-001~D-010 第一版)
 | D-008 | 反向 RPC 走 JSON-RPC server-initiated request + steer/followUp + subagent permission inheritance | 实质改（去 ConnectRPC bidi） |
 | D-009 | 编译速度组合拳（无 hakari） | 保留 |
 | D-010 | 三阶段路径 + Phase 1 必含 bridge-stdio + ACP minimal harness | 实质改 |
-| D-011 | rusqlite + JSONL rollout + Storage trait 留 domain 拆分口 | 新增 |
+| D-011 | rusqlite **多库**（state / logs / memories / goals）+ JSONL+Leaf rollout + Storage trait 聚合 4 子接口 | **2026-05-28 修订**（用户决策推翻单库起步） |
 | D-012 | Hooks JSON schema 至少 14 事件 + `#[non_exhaustive]` | 新增 |
 | D-013 | Extension manifest 统一发现，Skills/SlashCommand 是并列 namespace | 新增 |
 | D-014 | tracing 进核心，OTel exporter feature gated | 新增 |
@@ -270,22 +270,47 @@ D-003 去 ConnectRPC 全家桶后，cold build 估算从 90-140s 降至 ~25-40s�
 
 ---
 
-## D-011 Session 持久化 = rusqlite + JSONL rollout
+## D-011 Session 持久化 = rusqlite 多库 + JSONL rollout
+
+> **2026-05-28 修订**：上一版"Phase 1 单库起步，Storage trait 留口"已废。直接采用 codex 当前演进的多库结构，理由见 § 修订理由。
 
 **决策**：
-- `rusqlite =0.40 + bundled`（精确锁版本）
-- JSONL rollout 作 source-of-truth（codex 模式起点）
-- SQLite 作索引（按 ts / parent / thread）
-- `Storage` trait 抽象 —— 支持后续按 domain 拆库（codex 当前演进），但 **Phase 1 单库起步**
+- `rusqlite =0.40 + bundled`（精确锁版本，不切 sqlx —— codex 用 sqlx 是其工程偏好，与 D-011 拒绝 sqlx-sqlite 的"破坏 cargo check -p 工作流"理由不冲突，结构借鉴 ≠ 实现照抄）
+- JSONL rollout 作 source-of-truth（独立 `zhive-rollout` 子 module 或同 core 内 module，参考 codex `rollout/` crate）
+- **SQLite 从 Phase 1 起就 4 库分离**，结构对齐 codex `codex-rs/state/`：
 
-**拒绝的候选**（同上一版）：sled / diesel / sqlx-sqlite / sea-orm / redb / 纯 JSONL
+  | DB 文件 | 用途 | migrations 目录（zhive） | 对照 codex |
+  |---|---|---|---|
+  | `state.db`    | threads / sessions / agent_jobs / 主索引 | `crates/zhive-core/migrations/state/` | `codex-rs/state/migrations/` |
+  | `logs.db`     | 结构化日志（tool exec / error / event 流） | `crates/zhive-core/migrations/logs/` | `codex-rs/state/logs_migrations/` |
+  | `memories.db` | 跨 session 长期记忆（per Pi+Claude Code 模式） | `crates/zhive-core/migrations/memories/` | `codex-rs/state/memory_migrations/` |
+  | `goals.db`    | thread-level goals / TODO | `crates/zhive-core/migrations/goals/` | `codex-rs/state/goals_migrations/` |
 
-**理由**：
-- codex / Warp / opencode 三家殊途同归到 SQLite
-- codex PR #24591 拆出 memories_1.sqlite 是 codex 自身演进，不是 zhive 起点：zhive 从 codex 起点起步、保留拆分接口
-- 纯 JSONL（Pi 模型）在 session 数多时 list/filter 体验崩坏，codex 踩过坑才加 SQLite
+- `Storage` trait 不是"留口"，而是**Phase 1 必交付的 4 库聚合接口**：
+  ```rust
+  trait Storage {
+      fn state(&self) -> &StateDb;
+      fn logs(&self) -> &LogsDb;
+      fn memories(&self) -> &MemoriesDb;
+      fn goals(&self) -> &GoalsDb;
+  }
+  ```
+- 每个 DB 独立 connection pool（rusqlite + `r2d2-sqlite` 或 `deadpool-sqlite`，本任务调研定）
+- **Leaf 指针**采纳 Pi 模型：JSONL 不只 append，最后一条可写 `leaf` entry 指向当前分支头，支持 fork（[B3 deliverable 落地](../../plans/phase1-core-native-research/phase1-core-native-research.md#b3--persistencerusqlite--jsonl-rollout)）
 
-**依据**：[91 § 二 Session 持久化 + § 七 Critic A-1](../91-architecture-review-2026-05-27/README.md)
+**修订理由**（2026-05-28，用户决策）：
+
+- "Phase 1 单库 → Phase 2 拆多库"是上一版基于"codex 多库是演进中段"的论证。但**早晚要拆 = 一开始就拆代价更小**：
+  - schema 跨库 migration 是高成本工程（外键失效、事务边界变化、备份策略变化）
+  - 4 库并行从 0 写 vs 1 库写完再拆，前者多写 ~200 行 ddl，后者要做 data migration 工具 + 测试 + 灰度
+  - codex 自己的 PR #24591 ~3000 行 diff 就是这个学费
+- 上一版引用的"红线 8（不得因 codex 拆多 SQLite 就在 Phase 1 拆多库）"同步废除（见 § 红线）
+
+**拒绝的候选**（保留）：sled / diesel / sqlx-sqlite / sea-orm / redb / 纯 JSONL —— 理由同上一版
+
+**与 91 § 二 Critic A-1 的关系**：A-1 反对"拆多 DB"，本次修订是用户基于工程总成本的反向决策；A-1 的论据未被否定（"codex 演进中段"是事实），但权衡换了一把尺。
+
+**依据**：[91 § 二 Session 持久化](../91-architecture-review-2026-05-27/README.md)（论据轨迹保留）；2026-05-28 用户决策；codex `state/` 当前结构（35+1+2+1 migrations，4 库分离）
 
 ---
 
@@ -400,9 +425,13 @@ CLAUDE.md 原有：
 3. 禁止 `unwrap()` / `expect()` 非测试代码
 4. 公开 API 必须 doc comment + doctest/example
 
-本次 review 新增（R4 defender 给的 5 条红线）：
+本次 review 新增（R4 defender 给的 5 条红线 → 现存 4 条）：
 5. 不得新增 prost / ConnectRPC runtime / a2a-rs 进 Phase 1 核心依赖
 6. 不得让 Phase 1 出现"bridge crate 不存在但要求依赖只在 bridge crate 内"的字面矛盾
 7. 不得用双标尺评估第三方 crate（sled 与 a2a-rs 同尺）
-8. 不得因"codex 在拆多 SQLite"就在 Phase 1 拆多库
+8. ~~不得因"codex 在拆多 SQLite"就在 Phase 1 拆多库~~ —— **2026-05-28 废除**：D-011 已修订为多库起步，理由见 D-011
 9. 不得保留任何"为 Phase 3 抵押 Phase 1 复杂度"的 feature gate
+
+本次新增（2026-05-28 Pi 调研后）：
+10. 公开 hook event base 字段必含 `registered_by: ExtensionRef`（Pi 反例：missing source metadata 导致后续无法定位 hook 注册者）
+11. tool_call hook 允许 mutate input 时，**必须重新过 schema 验证**（Pi 反例：mutate 后不验证 → 工具崩溃来源）

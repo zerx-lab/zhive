@@ -20,7 +20,9 @@ schema  = ["dep:schemars"]
 [dependencies]
 # `std + derive` needed because we use `#[serde(flatten)]` and `untagged`,
 # both of which require ContentDeserializer (std/alloc gated upstream).
-serde      = { workspace = true, features = ["derive", "std"] }
+# `rc` enables Serialize/Deserialize for `Arc<str>` (matches ACP schema
+# `agent-client-protocol-schema 0.12.0`).
+serde      = { workspace = true, features = ["derive", "std", "rc"] }
 serde_json = { workspace = true }
 thiserror  = { workspace = true }
 tokio      = { workspace = true, features = ["io-util"] }

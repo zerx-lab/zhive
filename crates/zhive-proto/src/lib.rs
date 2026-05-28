@@ -23,6 +23,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod domain;
 pub mod framing;
 
 use serde::{Deserialize, Serialize};
