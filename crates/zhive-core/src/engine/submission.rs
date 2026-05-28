@@ -5,10 +5,23 @@
 //! permission) lands here. The actor consumes the stream serially so
 //! ordering inside a thread is deterministic; concurrency lives at the
 //! cross-thread layer.
+//!
+//! ## Reply pattern
+//!
+//! Each submission is wrapped in a [`SubmissionEnvelope`] that carries
+//! an optional [`tokio::sync::oneshot::Sender`]. The engine actor
+//! always tries to discharge the sender exactly once with a typed
+//! reply (see [`StartTurnReply`] / [`CancelTurnReply`] / etc.). When
+//! the caller did not supply a reply channel the envelope is fire-and-
+//! forget; subscribers can still observe outcomes via the broadcast
+//! [`crate::engine::event::EngineEvent`] stream.
 
 use std::sync::Arc;
 
-use zhive_proto::domain::{Item, ThreadId};
+use serde::{Deserialize, Serialize};
+use tokio::sync::oneshot;
+use zhive_proto::domain::{Item, ThreadId, TurnId};
+use zhive_proto::hook::EnginePhase;
 use zhive_proto::permission::{
     PermissionOutcome, PermissionScope, StreamingBehavior, SubagentDefinition,
 };
@@ -17,12 +30,63 @@ use zhive_proto::permission::{
 ///
 /// Allocated by [`crate::permission`] when the engine emits a permission
 /// prompt; the matching [`Submission::ResumePermission`] echoes the same
-/// value to discharge the wait.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// value to discharge the wait. Serialises as a JSON string on the wire
+/// (e.g. `"perm:42"`) so the JSON-RPC envelope stays compact.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct PermissionRequestId(pub Arc<str>);
 
+/// Successful outcome of a `StartTurn` dispatch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartTurnReply {
+    /// Newly issued turn id.
+    pub turn_id: TurnId,
+}
+
+/// Reasons a `StartTurn` submission failed inside the actor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum StartTurnError {
+    /// Engine phase was not `Idle` at dispatch time.
+    EngineBusy {
+        /// Observed phase.
+        current: EnginePhase,
+    },
+}
+
+/// Outcome of a `CancelTurn` dispatch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CancelTurnReply {
+    /// The target thread had an active turn; it was cancelled.
+    Cancelled {
+        /// Id of the turn that was cancelled.
+        turn_id: TurnId,
+    },
+    /// Target thread had no active turn; cancel was a no-op.
+    NoActiveTurn,
+}
+
+/// Outcome of a `ResumePermission` dispatch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ResumePermissionReply {
+    /// The pending request was resolved.
+    Resolved,
+    /// The request id was unknown to the reducer (stale or duplicate).
+    UnknownRequest,
+    /// The request id did not parse as `perm:<n>`.
+    InvalidRequestId,
+    /// The awaiter was dropped before the resume arrived.
+    Abandoned,
+}
+
 /// One inbound command for the engine actor.
-#[derive(Debug, Clone)]
+///
+/// `Clone` is intentionally NOT derived: a submission can carry a
+/// `oneshot::Sender` (via [`SubmissionEnvelope`]) which is single-shot
+/// by construction. Callers that need to fan a payload out should
+/// construct multiple envelopes.
+#[derive(Debug)]
 #[non_exhaustive]
 pub enum Submission {
     /// Start a new turn on an existing or freshly-allocated thread.
@@ -72,6 +136,58 @@ pub enum Submission {
     },
     /// Gracefully stop the engine actor.
     Shutdown,
+}
+
+/// Typed reply discharged on a [`SubmissionEnvelope::reply`] sender.
+///
+/// One variant per submission kind that has a synchronous reply. A
+/// fire-and-forget envelope (no reply channel attached) never produces
+/// a `SubmissionReply`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SubmissionReply {
+    /// Reply to a [`Submission::StartTurn`].
+    StartTurn(Result<StartTurnReply, StartTurnError>),
+    /// Reply to a [`Submission::CancelTurn`].
+    CancelTurn(CancelTurnReply),
+    /// Reply to a [`Submission::ResumePermission`].
+    ResumePermission(ResumePermissionReply),
+    /// Reply to a [`Submission::Shutdown`].
+    Shutdown,
+}
+
+/// Wraps a [`Submission`] with an optional reply oneshot.
+#[derive(Debug)]
+pub struct SubmissionEnvelope {
+    /// The command itself.
+    pub submission: Submission,
+    /// When `Some`, the actor sends a typed [`SubmissionReply`] on
+    /// completion; when `None`, the submission is fire-and-forget.
+    pub reply: Option<oneshot::Sender<SubmissionReply>>,
+}
+
+impl SubmissionEnvelope {
+    /// Builds a fire-and-forget envelope.
+    #[must_use]
+    pub fn fire_and_forget(submission: Submission) -> Self {
+        Self {
+            submission,
+            reply: None,
+        }
+    }
+
+    /// Builds an envelope plus the matching receiver.
+    #[must_use]
+    pub fn with_reply(submission: Submission) -> (Self, oneshot::Receiver<SubmissionReply>) {
+        let (tx, rx) = oneshot::channel();
+        (
+            Self {
+                submission,
+                reply: Some(tx),
+            },
+            rx,
+        )
+    }
 }
 
 // Rust guideline compliant 2026-02-21

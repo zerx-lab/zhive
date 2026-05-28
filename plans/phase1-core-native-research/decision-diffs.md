@@ -1,14 +1,13 @@
 ---
 plan: phase1-core-native-research
 date: 2026-05-28
-status: 待用户决策
+status: 已定稿（2026-05-28 终审）
 scope: A1-A5 / B1-B10 / C1-C4 调研收尾（19 个 deliverable 汇总）
 purpose: 集中回流调研期间发现的「决策修订建议 / 决策冲突警告 / 风险触发 / 待用户决策 / wire schema 新增 / Phase 1 占接口不实装项」，由用户决定是否更新 research/99-decisions/README.md
 rule: |
-  用户审阅后选择 (a) 直接采纳更新 research/99-decisions/README.md；
-  (b) 拒绝并在对应 deliverable 顶部追加拒绝理由；
-  (c) 部分采纳。
-  本文件不直接修改决策原文，所有「⏳」表示待用户决策。
+  2026-05-28 终审：所有 ⏳ 决策项基于 deliverable 一手源码调研结论 + 推荐方向定稿。
+  采纳的修订需后续手动同步 research/99-decisions/README.md（落地 PR 序列启动前完成）。
+  本文件不直接修改决策原文，决策结果以 § 0 表 + § 1-§ 4 各节"决策点"字段为准。
 references:
   - plan §7.4 退出条件（"能不能给一个没看过 5 个 repo 的工程师直接派活写 Engine::run_turn()"）
   - plan §10 决策回流
@@ -19,31 +18,42 @@ references:
 
 ## 0. 一目了然（决策表）
 
-| 类别 | 锚 | 修订建议 | 来源 deliverable | 用户决策 |
+| 类别 | 锚 | 修订建议 | 来源 deliverable | 终审结论 (2026-05-28) |
 |---|---|---|---|---|
-| 决策修订 | D-006 | Item enum case 数 8 → 14（补 UserMessage / Plan / AvailableCommands / ModeChange / ContextCompaction / SystemNotice） | A1 §2 / §8 OP-1 | ⏳ |
-| 决策修订 | D-006 | discriminator 选 `kind`（避开 ACP `sessionUpdate` 与 codex `type`） | A1 §2.1 决策冲突警告 | ⏳ |
-| 决策修订 | D-007 | "双命名空间共存" 重定义为「源码模块层 v1/v2 + wire 层无前缀 + capability flag」三件套；method 字符串保持裸 `initialize`，不出现 `v1/` 前缀 | A2 §6.Q3 / TODO A2.1 / A2.6 | ⏳ |
-| 决策修订 | D-007 | 是否纳入 `initialized` notification（codex 有，ACP 无）—— 建议纳入 | A2 TODO A2.3 | ⏳ |
-| 决策修订 | D-008 | 二元 `StreamingBehavior` → **三队列模型**（Steer / FollowUp / NextTurn），每队列独立 QueueMode，NextTurn 跨 abort 保留；新增 `Cancelled` outcome 硬约束 | A3 顶警告 + §11 词条草案 | ⏳ |
-| 决策修订 | D-008 | Subagent 继承靠 `SubagentDefinition` 字段缺省，**不存在** wire `inherited_permissions` 字段 | A3 §7.3 / §9 Q5 | ⏳ |
-| 决策修订 | D-012 | reserved 5 个调整：`WorktreeCreate / WorktreeRemove` 下沉 Phase 3；新增 `PostCompact` / `PreProviderRequest` / `PostProviderResponse`（候选）/ `PreBranchSummary` / `PostBranchSummary`（B9 提议） | A4 顶警告 + §8 TODO A4-D1 / B9 TODO B9-2 | ⏳ |
-| 决策修订 | D-012 | `ToolApprovalChange` 在 Claude Code 19 事件无对应；是否真的是 14 必含之一，或换为 `MessageDisplay` | A4 顶警告 + TODO A4-D2 | ⏳ |
-| 决策修订 | D-012 | `Setup` 是 Claude Code TS-only；Phase 1 不实装则建议改 reserved | A4 顶警告 + TODO A4-D3 | ⏳ |
-| 决策修订 | D-012 | 新增第 15 事件 `PhaseTransition { from, to, thread_id }`（B1 提议；与 `#[non_exhaustive]` 兼容） | B1 §6.7 / B1-3 / B5 TODO B5-8 | ⏳ |
-| 决策修订 | D-013 | `kind: skill \| slash_command \| hook` → **`kind: extension \| prompt \| skill`**；hook / slash_command / tool / shortcut / flag 全部作为 `extension` 的 sub-section（R-D013） | A5 顶警告 + §10 R-D013 | ⏳ |
-| 决策修订 | D-013 | "hook 必须挂 extension manifest，不允许 settings 顶层裸注册"（联动红线 10）（R-D013-2） | A5 §10 R-D013-2 | ⏳ |
-| 决策修订 | D-013 | `entrypoint` 字段 Phase 1 仅承认 `"builtin"`，第三方 entrypoint 推 Phase 2（R-D013-3 隐含） | A5 §2 表 + TODO A5-1 | ⏳ |
-| 决策修订 | D-014 | 6 个 span 之外新增 `zhive.compaction` 容器 span + `zhive.branch_summary` 容器 span（覆盖 EnginePhase::Compaction / BranchSummary 期间） | B9 TODO B9-1 / B9-2 | ⏳ |
+| 决策修订 | D-006 | Item enum case 数 8 → 14（补 UserMessage / Plan / AvailableCommands / ModeChange / ContextCompaction / SystemNotice） | A1 §2 / §8 OP-1 | ✅ 采纳 |
+| 决策修订 | D-006 | discriminator 选 `itemKind`（避开 ACP `sessionUpdate` / codex `type` / `ToolCall.kind` 字段冲突） | A1 §2.1 决策冲突警告 | ✅ 采纳（代码已实装） |
+| 决策修订 | D-007 | "双命名空间共存" 重定义为「源码模块层 v1/v2 + wire 层无前缀 + capability flag」三件套；method 字符串保持裸 `initialize`，不出现 `v1/` 前缀 | A2 §6.Q3 / TODO A2.1 / A2.6 | ✅ 采纳 |
+| 决策修订 | D-007 | 纳入 `initialized` notification（codex 有，ACP 无） | A2 TODO A2.3 | ✅ 采纳 |
+| 决策修订 | D-008 | 二元 `StreamingBehavior` → **三队列模型**（Steer / FollowUp / NextTurn），每队列独立 QueueMode，NextTurn 跨 abort 保留；新增 `Cancelled` outcome 硬约束 | A3 顶警告 + §11 词条草案 | ✅ 采纳 |
+| 决策修订 | D-008 | Subagent 继承靠 `SubagentDefinition` 字段缺省，**不存在** wire `inherited_permissions` 字段 | A3 §7.3 / §9 Q5 | ✅ 采纳 |
+| 决策修订 | D-012 | reserved 5 个调整：`WorktreeCreate / WorktreeRemove` 下沉 Phase 3；新增 `PostCompact` / `PreProviderRequest` / `PostProviderResponse` / `PreBranchSummary` / `PostBranchSummary` | A4 顶警告 + §8 TODO A4-D1 / B9 TODO B9-2 | ✅ 采纳 |
+| 决策修订 | D-012 | `ToolApprovalChange` 保留为 zhive 自有事件（permission_mode 切换审计，A4 §3 已验证场景真实） | A4 顶警告 + TODO A4-D2 | ✅ 保留方案 (a) |
+| 决策修订 | D-012 | `Setup` 是 Claude Code TS-only；Phase 1 不实装，改 reserved | A4 顶警告 + TODO A4-D3 | ✅ 改 reserved |
+| 决策修订 | D-012 | 新增第 15 事件 `PhaseTransition { from, to, thread_id }`（B1 提议；与 `#[non_exhaustive]` 兼容） | B1 §6.7 / B1-3 / B5 TODO B5-8 | ✅ 采纳 |
+| 决策修订 | D-013 | `kind: skill \| slash_command \| hook` → **`kind: extension \| prompt \| skill`**；hook / slash_command / tool / shortcut / flag 全部作为 `extension` 的 sub-section（R-D013） | A5 顶警告 + §10 R-D013 | ✅ 采纳 |
+| 决策修订 | D-013 | "hook 必须挂 extension manifest，不允许 settings 顶层裸注册"（联动红线 10）（R-D013-2） | A5 §10 R-D013-2 | ✅ 采纳 |
+| 决策修订 | D-013 | `entrypoint` 字段 Phase 1 仅承认 `"builtin"`，第三方 entrypoint 推 Phase 2（R-D013-3 隐含） | A5 §2 表 + TODO A5-1 | ✅ 采纳 |
+| 决策修订 | D-014 | 6 个 span 之外新增 `zhive.compaction` 容器 span + `zhive.branch_summary` 容器 span（覆盖 EnginePhase::Compaction / BranchSummary 期间） | B9 TODO B9-1 / B9-2 | ✅ 采纳 |
 | 风险触发 | R-2 | rusqlite =0.40 + bundled cold release build **实测 78-80s**（>60s 阈值，未达 >2min 极端值）；是否接受 release 慢路径 | B3 §8 / TODO B3-4 | ✅ 接受 (2026-05-28) |
-| 风险待拍 | R-7 | rusqlite connection pool 选型：**未自决，等用户拍板**。推荐起步方案 d（`Arc<Mutex<Connection>>` × 4 库，0 新依赖）；中期演进方案 c（自写 mini pool）或方案 b（deadpool-sqlite，触发红线 1） | B3 §6 / TODO B3-2 | ⏳ |
+| 风险触发 | R-7 | rusqlite connection pool 选型：方案 **d**（`Arc<Mutex<Connection>>` × 4 库，0 新依赖）起步；中期演进方案 c（自写 mini pool） | B3 §6 / TODO B3-2 | ✅ 方案 d (2026-05-28) |
 | 风险触发 | R-8 | 跨库一致性：4 库无原子事务。采纳 D-011 "JSONL source of truth"，state.db 是衍生索引；崩溃恢复伪码已落地（B3 §7.3） | B3 §7 / B2 TODO B2-7 | ✅ 方案已选 |
 | 风险未触发 | R-3 | tower-lsp **不再作为蓝本**，已切换至 `async-lsp` 设计 + `codex` 工程双蓝本；不引 async-lsp 作 dep（仅 design reference） | B4 §2 / §10 | ✅ 已落槌 |
 | 风险未触发 | R-4 | llmsdk trait 4 个必需能力（completion / stream / tool_call / reasoning）全覆盖；适配纯在 fold 逻辑 | B10 §0 / §5 | ✅ 已落槌 |
-| 风险触发 | R-6 | Phase 1 不装 `tracing-opentelemetry` 但字段名按 OTel semconv 预先对齐；feature gate 代码用 stub trait + 文档注释占位，等 Phase 2 装时再加 dep（避免触发红线 1） | B9 §3 / TODO B9-6 | ⏳ |
-| 待用户决策 | 红线 1 | B5 TODO B5-2：`jsonschema = "0.18"`（红线 11 重验证必需）—— 是否走 cargo add | B5 TODO B5-2 | ⏳ |
-| 待用户决策 | 红线 1 | B5 TODO B5-3：`futures` crate 是否在 workspace（`catch_unwind` 异步支持） | B5 TODO B5-3 | ⏳ |
-| 待用户决策 | 红线 2 | B4 `libc::getuid()` 是 unsafe（违反红线 2）；Phase 1 推荐改强制要求 `XDG_RUNTIME_DIR`、无则报错 | B4 TODO B4-2 | ⏳ |
+| 风险触发 | R-6 | Phase 1 不装 `tracing-opentelemetry`，走方案 **b**（stub trait + 文档占位 + 字段命名预对齐 OTel semconv）；Phase 2 再加 dep | B9 §3 / TODO B9-6 | ✅ 方案 b (2026-05-28) |
+| 红线 1 | jsonschema | `jsonschema = "0.18"`（红线 11 mutate 后重验证必需）——走 cargo add | B5 TODO B5-2 | ✅ 同意 cargo add (2026-05-28) |
+| 红线 1 | futures | `futures = "0.3"` **已在 workspace**（`Cargo.toml:46`）；core/native-client/tui 三 crate 均已 `{ workspace = true }` 引用，**不触红线 1** | B5 TODO B5-3 | ✅ 用现有 workspace dep (2026-05-28) |
+| 红线 2 | XDG_RUNTIME_DIR | 取消 `libc::getuid()` unsafe fallback；改强制要求 `XDG_RUNTIME_DIR`，无则启动报错 | B4 TODO B4-2 | ✅ 方案 b (2026-05-28) |
+
+### Phase 1 占接口不实装的 6 项（全部 ✅ 保留接口位，2026-05-28）
+
+| # | 项 | 决定 |
+|---|---|---|
+| 3.1 | Windows lockfile + 127.0.0.1 transport | ✅ 保留 CLI flag + 运行时 `TransportNotImplementedInPhase1` |
+| 3.2 | client 自动重连 | ✅ 保留 `Disconnected` 终态，caller 走 `connect_*()` 重建 |
+| 3.3 | ACP 0.12 reserved 7 个反向 method（`fs/*`, `terminal/*`） | ✅ 默认 `-32601 method_not_found`，bridge crate 挂 handler |
+| 3.4 | tracing-opentelemetry layer | ✅ 保留 `#[cfg(feature = "otel")]` gate + stub trait |
+| 3.5 | Subprocess hook executor | ✅ 保留 `HookExecutor::Subprocess(...)` enum variant |
+| 3.6 | Extension 热重载 trigger | ✅ 保留 scope token + `unregister_scope`，不暴露 `/reload` CLI |
 
 ---
 
@@ -323,7 +333,7 @@ A4 实装 `HookEvent` 时补这一 case。
 - **短期 Phase 1 起步**：方案 d（`Arc<Mutex<Connection>>` × 4 库，每库独立锁）
 - **中期演进**：方案 c（自写 mini pool）或方案 b（走红线 1 审批）
 
-**决策点**：⏳ 方案 a / b / c / **d**（B3 推荐起步）
+**决策点**：✅ **方案 d** 落定 (2026-05-28)。Phase 1 单用户写入低频，串行可接受；如未来出现 SQLITE_BUSY 瓶颈再切方案 c 自写 mini pool。方案 b/c 触红线 1 不进 Phase 1。
 
 ---
 
@@ -379,15 +389,15 @@ A4 实装 `HookEvent` 时补这一 case。
 
 **B9 推荐**：(b)，更严守红线 1。
 
-**决策点**：⏳ 走 (a) 红线 1 审批 / ✅ 走 (b) stub trait
+**决策点**：✅ **方案 b** 落定 (2026-05-28)。Phase 1 无部署 OTel 需求；字段命名按 OTel semconv 预对齐确保 Phase 2 装 dep 时零 wire 改动。
 
 ---
 
 ### 2.7 红线 1 触发待审：新增 dependency
 
-**B5 TODO B5-2**：`jsonschema = "0.18"` —— 红线 11 重验证（PreToolUse mutate `tool_input` 后强制重过 schema）必需。⏳ 走 cargo add 流程。
+**B5 TODO B5-2**：`jsonschema = "0.18"` —— 红线 11 重验证（PreToolUse mutate `tool_input` 后强制重过 schema）必需。✅ **同意走 cargo add** (2026-05-28)。自写校验器风险高，jsonschema 0.18 社区主流。
 
-**B5 TODO B5-3**：`futures` crate —— `catch_unwind` 对 async closure 支持；workspace 是否已有需 grep；备选手写 `AssertUnwindSafe` wrap。⏳ 实装期决定。
+**B5 TODO B5-3**：`futures` crate —— `catch_unwind` 对 async closure 支持。✅ **workspace 已有** (2026-05-28)：root `Cargo.toml:46` 已声明 `futures = { version = "0.3", default-features = false, features = ["std"] }`；zhive-core/zhive-client-native/zhive-tui 均 `{ workspace = true }` 引用。**不触红线 1**。
 
 **B9 TODO B9-6**：见 §2.6。
 
@@ -401,7 +411,7 @@ A4 实装 `HookEvent` 时补这一 case。
 - (a) `rustix` crate（成熟 safe wrapper，但属新增依赖触红线 1）
 - (b) **仅依赖 `XDG_RUNTIME_DIR`，无则报错让用户配置**（B4 推荐）
 
-**决策点**：⏳ (a) / **✅ (b)** B4 推荐
+**决策点**：✅ **方案 b** 落定 (2026-05-28)。强制 `XDG_RUNTIME_DIR` 存在，缺失时启动报错让用户配置；避免 unsafe 调用与新增依赖。
 
 ---
 
@@ -509,37 +519,41 @@ A4 实装 `HookEvent` 时补这一 case。
 5. ✅ 读 B10 → 调 `provider.do_stream(CallOptions) -> StreamResult`，fold 到 Item
 6. ✅ 读 B3 §7 + B2 §4 → 写入 JSONL（source of truth）+ state.db 异步索引
 
-**partial 缺口（需要用户决策才能完全跑通）**：
-1. ✅ R-2：rusqlite cold release 78-80s 已接受（2026-05-28）
-2. ⏳ R-7：connection pool 选型（推荐 d 起步）
-3. ⏳ D-006 8→14 case 是否采纳（影响 wire 兼容性）
-4. ⏳ D-008 三队列修订是否采纳（影响 A3/B6/B7 全链路）
-5. ⏳ D-012 第 15 事件 PhaseTransition 是否采纳
-6. ⏳ D-013 三 namespace 修订（R-D013）是否采纳
-7. ⏳ 红线 1 / 红线 2 触发的几个待审 dep（jsonschema / futures / rustix / opentelemetry）
+**partial 缺口（已全部消除，2026-05-28 终审）**：
+1. ✅ R-2：rusqlite cold release 78-80s 已接受
+2. ✅ R-7：connection pool **方案 d**（`Arc<Mutex<Connection>>` × 4 库）落定
+3. ✅ D-006 8→14 case 采纳
+4. ✅ D-008 三队列修订采纳
+5. ✅ D-012 第 15 事件 PhaseTransition 采纳
+6. ✅ D-013 三 namespace 修订（R-D013）采纳
+7. ✅ 红线 1 / 红线 2：jsonschema 走 cargo add；futures 用现有 workspace dep；rustix 不引入；opentelemetry 走 stub trait（Phase 2 再装）
 
-**结论**：Phase 1 调研产出 ✅ **足以派活**。但建议用户先就 §0 决策表中 14 条 ⏳ 修订项做一次集中拍板，再启动 Phase 1 落地 PR；否则落地者会反复回头改 wire schema / Cargo.toml dep / decision 原文。
+**结论**：Phase 1 调研产出 ✅ **足以派活，且决策已全部定稿**。可以直接启动 Phase 1 落地 PR 序列。落地者只需按 §1-§4 各节"决策点"字段对应实装即可，无需回头改 wire schema / Cargo.toml dep / decision 原文（同步 `research/99-decisions/README.md` 在落地 PR 序列启动前一次完成）。
 
 ---
 
-## 7. 用户审阅工作流建议
+## 7. 终审完成情况（2026-05-28）
 
 1. **第一轮 - 决策修订**（§1 共 14 条 D-XXX 修订）：
-   - 逐条选 ✅ 采纳 / ❌ 拒绝 / 🔄 部分采纳
-   - 采纳的修订 → 用户手动更新 `research/99-decisions/README.md`
-   - 拒绝的修订 → 用户在对应 deliverable 顶部追加拒绝理由
+   - ✅ **全部 14 条采纳**（含 D-012 `ToolApprovalChange` 保留方案 (a) / `Setup` 改 reserved）
+   - 待办：把采纳的修订一次性同步到 `research/99-decisions/README.md`（落地 PR 序列启动前完成）
 
-2. **第二轮 - 风险触发**（§2 共 7 项 R-N / 红线触发）：
-   - R-2（cold release 78-80s）/ R-7（pool 选型）/ R-6（OTel red line）/ 红线 1 几个 dep / 红线 2 unsafe 拍板
-   - 决策结果回写 plan §9 风险表
+2. **第二轮 - 风险触发 & 红线触发**（§2 共 7 项）：
+   - ✅ R-2：rusqlite cold release 78-80s 接受
+   - ✅ R-7：connection pool 走方案 d（`Arc<Mutex<Connection>>` × 4 库，0 新 dep）
+   - ✅ R-8：JSONL source of truth 已选
+   - ✅ R-3 / R-4：已落槌（tower-lsp 不作蓝本 / llmsdk 全覆盖）
+   - ✅ R-6：tracing-opentelemetry 走方案 b（stub trait + 文档占位）
+   - ✅ 红线 1：jsonschema 走 cargo add；futures 用现有 workspace dep
+   - ✅ 红线 2：B4 强制 `XDG_RUNTIME_DIR`，取消 `libc::getuid()` fallback
 
 3. **第三轮 - wire schema + Phase 1 占位**（§3 / §4）：
    - §3 wire 新增项随 zhive-proto crate 落地 PR 实装（无需单独决策）
-   - §4 6 项 Phase 1 不实装 → 用户确认是否同意保留接口位
+   - §4 6 项 Phase 1 不实装 → ✅ 全部确认保留接口位
 
 4. **第四轮 - 启动 Phase 1 落地**：
    - 调研已通过 §6 反向检验
-   - 决策修订采纳后，按 plan §10 启动落地 PR 序列
+   - **所有决策已定稿**，可按 plan §10 启动落地 PR 序列
 
 ---
 

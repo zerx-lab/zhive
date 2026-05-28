@@ -11,6 +11,25 @@ use zhive_proto::permission::{RequestPermissionRequest, SessionAbortedNotificati
 
 use super::submission::PermissionRequestId;
 
+/// Reasons a [`crate::engine::submission::Submission::StartTurn`] submission
+/// can be refused before a [`TurnId`] is allocated.
+///
+/// Emitted as [`EngineEvent::TurnRejected`] so subscribed clients can
+/// surface a meaningful diagnostic instead of timing out waiting for
+/// `TurnStarted`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TurnRejectionReason {
+    /// The engine is already in a non-`Idle` phase (another turn,
+    /// compaction, branch summary, retry, …). The engine refuses to
+    /// queue further turns to keep the global phase machine consistent
+    /// with the Pi / codex single-active-turn invariant.
+    EngineBusy {
+        /// Phase the engine was in when the submission arrived.
+        current: EnginePhase,
+    },
+}
+
 /// One outbound event surfaced by the engine.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -21,6 +40,16 @@ pub enum EngineEvent {
         thread_id: ThreadId,
         /// Newly issued turn id.
         turn_id: TurnId,
+    },
+    /// A [`crate::engine::submission::Submission::StartTurn`] was refused
+    /// before a [`TurnId`] could be allocated. The engine attaches a
+    /// machine-readable reason so subscribers do not have to guess why
+    /// they will not see a matching `TurnStarted`.
+    TurnRejected {
+        /// Thread the submission targeted.
+        thread_id: ThreadId,
+        /// Why the engine refused to start the turn.
+        reason: TurnRejectionReason,
     },
     /// An item was appended to the active turn.
     ItemAppended {
@@ -50,7 +79,11 @@ pub enum EngineEvent {
     },
     /// A session was aborted; payload is the wire notification.
     SessionAborted(Box<SessionAbortedNotification>),
-    /// Engine phase changed; thread is `None` for global transitions.
+    /// Engine phase changed.
+    ///
+    /// `thread_id` is `Some` for transitions driven by a specific
+    /// thread (turn start / completion / cancel) and `None` for
+    /// engine-global transitions (compaction, branch summary).
     PhaseChanged {
         /// Optional thread the transition belongs to.
         thread_id: Option<ThreadId>,

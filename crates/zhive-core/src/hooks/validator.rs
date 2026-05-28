@@ -43,6 +43,12 @@ pub enum ValidatorError {
         /// Offending tool name.
         tool: String,
     },
+
+    /// The shared schema map was poisoned (a previous panic left it
+    /// inconsistent). The host surfaces this rather than silently
+    /// proceeding with possibly-stale state.
+    #[error("schema cache lock is poisoned")]
+    RegistryPoisoned,
 }
 
 /// Compiles tool schemas once and reuses the result for every
@@ -54,8 +60,12 @@ pub struct SchemaCache {
 
 impl std::fmt::Debug for SchemaCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let count = match self.schemas.read() {
+            Ok(g) => g.len(),
+            Err(poisoned) => poisoned.get_ref().len(),
+        };
         f.debug_struct("SchemaCache")
-            .field("count", &self.schemas.read().map_or(0, |m| m.len()))
+            .field("count", &count)
             .finish()
     }
 }
@@ -73,14 +83,18 @@ impl SchemaCache {
     /// # Errors
     ///
     /// Returns [`ValidatorError::InvalidSchema`] when the schema does
-    /// not compile.
+    /// not compile, or [`ValidatorError::RegistryPoisoned`] when the
+    /// internal lock is in a poisoned state.
     pub fn register(&self, tool: &str, schema: &Value) -> Result<(), ValidatorError> {
         let compiled =
             jsonschema::validator_for(schema).map_err(|e| ValidatorError::InvalidSchema {
                 tool: tool.to_string(),
                 reason: e.to_string(),
             })?;
-        let mut guard = self.schemas.write().expect("schema cache lock poisoned");
+        let mut guard = self
+            .schemas
+            .write()
+            .map_err(|_poisoned| ValidatorError::RegistryPoisoned)?;
         guard.insert(tool.to_string(), compiled);
         Ok(())
     }
@@ -93,8 +107,13 @@ impl SchemaCache {
     /// * [`ValidatorError::RevalidationFailed`] when `input` does not
     ///   satisfy the schema; the message contains every reported
     ///   error.
+    /// * [`ValidatorError::RegistryPoisoned`] when the internal lock
+    ///   is in a poisoned state.
     pub fn revalidate(&self, tool: &str, input: &Value) -> Result<(), ValidatorError> {
-        let guard = self.schemas.read().expect("schema cache lock poisoned");
+        let guard = self
+            .schemas
+            .read()
+            .map_err(|_poisoned| ValidatorError::RegistryPoisoned)?;
         let Some(validator) = guard.get(tool) else {
             return Err(ValidatorError::UnknownTool {
                 tool: tool.to_string(),
@@ -117,7 +136,10 @@ impl SchemaCache {
     /// Number of registered tool schemas.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.schemas.read().map_or(0, |m| m.len())
+        match self.schemas.read() {
+            Ok(g) => g.len(),
+            Err(poisoned) => poisoned.get_ref().len(),
+        }
     }
 
     /// `true` when no schemas have been registered yet.

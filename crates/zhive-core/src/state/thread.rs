@@ -53,11 +53,14 @@ impl ThreadHandle {
         }
     }
 
-    /// Appends an item to the tail, evicting the oldest entry once the
-    /// capacity is reached.
+    /// Appends an item to the tail, evicting older entries when over capacity.
+    ///
+    /// The loop tolerates the tail already exceeding `items_tail_capacity`
+    /// (e.g. after a future API lowers the cap at runtime); the strict `==`
+    /// guard previously used would have stopped evicting in that case.
     pub async fn push_item(&self, item: Item) {
         let mut tail = self.items_tail.write().await;
-        if tail.len() == self.items_tail_capacity {
+        while tail.len() >= self.items_tail_capacity {
             tail.pop_front();
         }
         tail.push_back(item);

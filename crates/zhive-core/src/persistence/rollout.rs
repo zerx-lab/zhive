@@ -70,12 +70,20 @@ impl RolloutWriter {
     /// Opens (or creates) the rollout file at `path`.
     ///
     /// The file is opened in append mode; existing content is left
-    /// untouched.
+    /// untouched. The parent directory is created when missing so the
+    /// writer is usable outside the canonical
+    /// [`super::Storage::open`] bootstrap path.
     ///
     /// # Errors
     ///
-    /// Returns [`StorageError::Io`] when the file cannot be opened.
+    /// Returns [`StorageError::Io`] when the parent directory cannot be
+    /// created or the file cannot be opened.
     pub async fn open(path: PathBuf) -> StorageResult<Self> {
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            tokio::fs::create_dir_all(parent).await?;
+        }
         let file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -179,6 +187,18 @@ mod tests {
         let entries = read_all(&path).await.unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0], session);
+    }
+
+    #[tokio::test]
+    async fn open_creates_missing_parent_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested/subdir/rollout.jsonl");
+        let mut w = RolloutWriter::open(path.clone()).await.unwrap();
+        w.append(&RolloutEntry::Leaf { target_id: None })
+            .await
+            .unwrap();
+        assert!(path.exists());
+        assert!(path.parent().unwrap().is_dir());
     }
 
     #[tokio::test]

@@ -40,13 +40,23 @@ pub trait HookFn: Send + Sync {
 #[non_exhaustive]
 pub enum HookHostError {
     /// `registered_by.id` was empty (red line 10).
-    #[error("hook registration must carry an ExtensionRef id (red line 10)")]
-    MissingProvenance,
+    #[error("hook registration must carry a non-empty ExtensionRef id (red line 10)")]
+    MissingProvenanceId,
+
+    /// `registered_by.version` was empty (red line 10).
+    #[error("hook registration must carry a non-empty ExtensionRef version (red line 10)")]
+    MissingProvenanceVersion,
 
     /// A hook returned a mutated `tool_input` that does not satisfy
     /// the tool schema (red line 11).
     #[error("schema re-validation failed: {0}")]
     Revalidation(#[from] ValidatorError),
+
+    /// The shared registration list was poisoned (a previous holder of
+    /// the lock panicked). The host surfaces the failure instead of
+    /// continuing with a possibly-inconsistent registry.
+    #[error("hook registration list is poisoned")]
+    RegistryPoisoned,
 
     /// A callback panicked. The host catches the panic and turns it
     /// into this error so the engine can fail the turn cleanly.
@@ -119,11 +129,12 @@ pub struct HookHost {
 
 impl std::fmt::Debug for HookHost {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let count = match self.registrations.read() {
+            Ok(v) => v.len(),
+            Err(poisoned) => poisoned.get_ref().len(),
+        };
         f.debug_struct("HookHost")
-            .field(
-                "registration_count",
-                &self.registrations.read().map_or(0, |v| v.len()),
-            )
+            .field("registration_count", &count)
             .field("schema_count", &self.schemas.len())
             .finish_non_exhaustive()
     }
@@ -145,10 +156,15 @@ impl HookHost {
 
     /// Registers a hook callback.
     ///
+    /// Registrations are sorted by descending priority so dispatch
+    /// always invokes the highest-priority callback first.
+    ///
     /// # Errors
     ///
-    /// Returns [`HookHostError::MissingProvenance`] when
-    /// `registered_by.id` is empty (red line 10).
+    /// * [`HookHostError::MissingProvenanceId`] / [`HookHostError::MissingProvenanceVersion`]
+    ///   when `registered_by` is incomplete (red line 10).
+    /// * [`HookHostError::RegistryPoisoned`] when a previous panic left
+    ///   the internal registration lock in a poisoned state.
     pub fn register(
         self: &Arc<Self>,
         registered_by: ExtensionRef,
@@ -157,7 +173,10 @@ impl HookHost {
         callback: Arc<dyn HookFn>,
     ) -> Result<ExtensionScope, HookHostError> {
         if registered_by.id.trim().is_empty() {
-            return Err(HookHostError::MissingProvenance);
+            return Err(HookHostError::MissingProvenanceId);
+        }
+        if registered_by.version.trim().is_empty() {
+            return Err(HookHostError::MissingProvenanceVersion);
         }
         let id = self.ids.next();
         let reg = HookRegistration {
@@ -170,9 +189,12 @@ impl HookHost {
         let mut guard = self
             .registrations
             .write()
-            .expect("registration lock poisoned");
-        guard.push(reg);
-        guard.sort_by_key(|r| std::cmp::Reverse(r.priority));
+            .map_err(|_poisoned| HookHostError::RegistryPoisoned)?;
+        // Insert sorted by descending priority: locate the first entry with
+        // a strictly lower priority and splice in there. Stable order keeps
+        // ties resolved by registration sequence.
+        let insert_at = guard.partition_point(|r| r.priority >= reg.priority);
+        guard.insert(insert_at, reg);
         drop(guard);
 
         let host = Arc::clone(self);
@@ -182,47 +204,56 @@ impl HookHost {
     }
 
     /// Explicitly removes a registration by id.
+    ///
+    /// Silently no-ops when the registry is poisoned; callers that need
+    /// the failure surface should call [`Self::register`] which returns
+    /// [`HookHostError::RegistryPoisoned`] in the same situation.
     pub fn unregister(&self, id: RegistrationId) {
-        let mut guard = self
-            .registrations
-            .write()
-            .expect("registration lock poisoned");
+        let registration_id = id.0;
+        let Ok(mut guard) = self.registrations.write() else {
+            tracing::warn!(
+                name: "zhive.hooks.unregister.poisoned",
+                registration_id,
+                "hook registry lock poisoned during unregister; entry retained"
+            );
+            return;
+        };
         guard.retain(|r| r.id != id);
     }
 
     /// Dispatches `event` to every matching registration **serially**.
     ///
+    /// Snapshot only captures the `(RegistrationId, Arc<dyn HookFn>)`
+    /// pair per matching registration so the dispatch path avoids
+    /// cloning the surrounding `ExtensionRef` / `HookFilter` payloads on
+    /// every call. The lock is released before any callback is
+    /// awaited.
+    ///
     /// Panics inside callbacks are caught and reported as
-    /// [`HookHostError::CallbackPanic`]; the remaining hooks still run
-    /// (later hooks see the unmodified event because dispatch is
-    /// effectively read-only here — mutations to `tool_input` flow
-    /// through the returned [`HookOutput`]).
+    /// [`HookHostError::CallbackPanic`]; later hooks still see the
+    /// unmodified event because dispatch is effectively read-only here
+    /// — mutations to `tool_input` flow through the returned
+    /// [`HookOutput`].
     ///
     /// # Errors
     ///
     /// See [`HookHostError`].
     pub async fn dispatch(&self, event: &HookEvent) -> Result<Vec<HookOutput>, HookHostError> {
-        let snapshot: Vec<HookRegistration> = {
+        let snapshot: Vec<(RegistrationId, Arc<dyn HookFn>)> = {
             let guard = self
                 .registrations
                 .read()
-                .expect("registration lock poisoned");
+                .map_err(|_poisoned| HookHostError::RegistryPoisoned)?;
             guard
                 .iter()
                 .filter(|r| r.filter.matches(event))
-                .map(|r| HookRegistration {
-                    id: r.id,
-                    registered_by: r.registered_by.clone(),
-                    filter: r.filter.clone(),
-                    priority: r.priority,
-                    callback: Arc::clone(&r.callback),
-                })
+                .map(|r| (r.id, Arc::clone(&r.callback)))
                 .collect()
         };
 
         let mut outputs = Vec::with_capacity(snapshot.len());
-        for reg in snapshot {
-            let fut = std::panic::AssertUnwindSafe(reg.callback.call(event));
+        for (_id, callback) in snapshot {
+            let fut = std::panic::AssertUnwindSafe(callback.call(event));
             match fut.catch_unwind().await {
                 Ok(Some(output)) => outputs.push(output),
                 Ok(None) => {}
@@ -294,7 +325,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn registration_missing_provenance_rejected() {
+    async fn registration_missing_provenance_id_rejected() {
         let host = Arc::new(HookHost::new());
         let err = host
             .register(
@@ -306,7 +337,89 @@ mod tests {
                 }),
             )
             .unwrap_err();
-        assert!(matches!(err, HookHostError::MissingProvenance));
+        assert!(matches!(err, HookHostError::MissingProvenanceId));
+    }
+
+    #[tokio::test]
+    async fn registration_missing_provenance_version_rejected() {
+        let host = Arc::new(HookHost::new());
+        // Build an ExtensionRef whose `version` is empty; `id` is fine.
+        let bad: ExtensionRef = serde_json::from_value(serde_json::json!({
+            "id": "ext",
+            "version": "",
+            "source": "builtin",
+        }))
+        .expect("fixture");
+        let err = host
+            .register(
+                bad,
+                HookFilter::default(),
+                0,
+                Arc::new(Counting {
+                    inner: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                }),
+            )
+            .unwrap_err();
+        assert!(matches!(err, HookHostError::MissingProvenanceVersion));
+    }
+
+    struct Probe {
+        tag: i32,
+        sink: Arc<std::sync::Mutex<Vec<i32>>>,
+    }
+    #[async_trait]
+    impl HookFn for Probe {
+        async fn call(&self, _event: &HookEvent) -> Option<HookOutput> {
+            self.sink.lock().unwrap().push(self.tag);
+            None
+        }
+    }
+
+    #[tokio::test]
+    async fn registrations_are_inserted_sorted_by_priority() {
+        let host = Arc::new(HookHost::new());
+        let order = Arc::new(std::sync::Mutex::new(Vec::<i32>::new()));
+
+        // Register out of order; higher priority should dispatch first.
+        let _s1 = host
+            .register(
+                provenance("low"),
+                HookFilter::default(),
+                -1,
+                Arc::new(Probe {
+                    tag: -1,
+                    sink: Arc::clone(&order),
+                }),
+            )
+            .unwrap();
+        let _s2 = host
+            .register(
+                provenance("high"),
+                HookFilter::default(),
+                5,
+                Arc::new(Probe {
+                    tag: 5,
+                    sink: Arc::clone(&order),
+                }),
+            )
+            .unwrap();
+        let _s3 = host
+            .register(
+                provenance("mid"),
+                HookFilter::default(),
+                0,
+                Arc::new(Probe {
+                    tag: 0,
+                    sink: Arc::clone(&order),
+                }),
+            )
+            .unwrap();
+
+        host.dispatch(&stop_event(&provenance("any")))
+            .await
+            .unwrap();
+        let recorded = order.lock().unwrap().clone();
+        assert_eq!(recorded, vec![5, 0, -1]);
     }
 
     #[tokio::test]

@@ -20,7 +20,7 @@ default = []
 [dependencies]
 zhive-proto = { workspace = true }
 
-tokio       = { workspace = true }
+tokio       = { workspace = true, features = ["io-std"] }
 async-trait = { workspace = true }
 futures     = { workspace = true }
 anyhow      = { workspace = true }
@@ -28,3 +28,4 @@ thiserror   = { workspace = true }
 tracing     = { workspace = true }
 bytes       = { workspace = true }
 serde_json  = { workspace = true }
+tokio-util.workspace = true

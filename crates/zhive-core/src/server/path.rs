@@ -47,17 +47,17 @@ mod tests {
     #[test]
     fn fallback_is_not_empty() {
         let p = fallback_tmp_path();
-        assert!(p.as_os_str().is_empty().not_if_macos());
+        assert!(!p.as_os_str().is_empty());
     }
 
-    // Tiny helper so the assertion above reads naturally regardless of OS.
-    trait BoolExt {
-        fn not_if_macos(self) -> bool;
-    }
-    impl BoolExt for bool {
-        fn not_if_macos(self) -> bool {
-            !self
-        }
+    #[cfg(unix)]
+    #[test]
+    fn fallback_includes_uid() {
+        let p = fallback_tmp_path();
+        let uid = rustix::process::getuid().as_raw();
+        let s = p.to_string_lossy();
+        assert!(s.contains(&uid.to_string()));
+        assert!(s.ends_with(".sock"));
     }
 }
 

@@ -25,8 +25,13 @@ use zhive_proto::permission::{PermissionMode, PermissionScope, ScopeError, Subag
 #[non_exhaustive]
 pub enum SubagentError {
     /// Parent thread is itself a subagent and tried to spawn one.
-    #[error("subagent recursion forbidden (Claude Code hard constraint)")]
-    RecursionForbidden,
+    #[error("parent thread is already a subagent; recursion forbidden")]
+    ParentIsSubagent,
+
+    /// The subagent definition opted into spawning further subagents,
+    /// which Claude Code's hard constraint forbids.
+    #[error("subagent definition requested allow_subagent_spawn=true; recursion forbidden")]
+    ChildSpawnRequested,
 
     /// The proposed child scope does not narrow the parent scope.
     #[error("child scope widens parent: {0}")]
@@ -55,7 +60,11 @@ pub struct ChildScope {
 ///
 /// # Errors
 ///
-/// * [`SubagentError::RecursionForbidden`] when `parent_is_subagent`.
+/// * [`SubagentError::ParentIsSubagent`] when `parent_is_subagent`
+///   (Claude Code forbids subagent → subagent recursion).
+/// * [`SubagentError::ChildSpawnRequested`] when the supplied
+///   `definition.allow_subagent_spawn` is `true`; a freshly spawned
+///   child must never opt back into the recursion path.
 /// * [`SubagentError::InvalidNarrowing`] when the child scope widens
 ///   the parent scope.
 pub fn prepare_child_scope(
@@ -64,8 +73,11 @@ pub fn prepare_child_scope(
     definition: &SubagentDefinition,
     child_thread_id: ThreadId,
 ) -> Result<ChildScope, SubagentError> {
-    if parent_is_subagent || definition.allow_subagent_spawn {
-        return Err(SubagentError::RecursionForbidden);
+    if parent_is_subagent {
+        return Err(SubagentError::ParentIsSubagent);
+    }
+    if definition.allow_subagent_spawn {
+        return Err(SubagentError::ChildSpawnRequested);
     }
 
     // Resolve inheritance per D-008: `None` fields take the parent's
@@ -169,7 +181,7 @@ mod tests {
             tid("thread:native/child"),
         )
         .unwrap_err();
-        assert!(matches!(err, SubagentError::RecursionForbidden));
+        assert!(matches!(err, SubagentError::ParentIsSubagent));
     }
 
     #[test]
@@ -182,7 +194,7 @@ mod tests {
             tid("thread:native/child"),
         )
         .unwrap_err();
-        assert!(matches!(err, SubagentError::RecursionForbidden));
+        assert!(matches!(err, SubagentError::ChildSpawnRequested));
     }
 
     #[test]
