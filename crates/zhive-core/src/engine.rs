@@ -34,6 +34,7 @@ pub mod event;
 mod inner;
 pub mod phase;
 pub mod submission;
+mod tool_dispatch;
 mod turn;
 
 use std::sync::Arc;
@@ -47,7 +48,9 @@ use zhive_proto::permission::{PermissionOutcome, PermissionScope};
 
 use inner::EngineInner;
 
+use crate::hooks::HookHost;
 use crate::provider::DynLanguageModel;
+use crate::tools::ToolRegistry;
 
 #[doc(inline)]
 pub use event::{EngineEvent, TurnRejectionReason};
@@ -75,6 +78,42 @@ const EVENT_CHANNEL_CAP: usize = 1024;
 /// a slow boundary, so this is a safety net rather than a feature —
 /// most calls return in microseconds.
 const DEFAULT_REPLY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Configuration bundle for [`Engine::spawn_with_config`].
+///
+/// Groups all injectable dependencies so callers do not need to chain many
+/// builder calls.  [`Default`] supplies an empty-stream provider, empty tool
+/// registry, and an empty hook host — the same defaults used by
+/// [`Engine::spawn`].
+///
+/// # Examples
+///
+/// ```
+/// use std::sync::Arc;
+/// use zhive_core::engine::EngineConfig;
+/// let cfg = EngineConfig::default();
+/// assert!(cfg.tools.is_empty());
+/// ```
+#[derive(Debug)]
+pub struct EngineConfig {
+    /// LLM provider used for every turn.
+    pub provider: DynLanguageModel,
+    /// Tool registry made available to the inner dispatch loop.
+    pub tools: Arc<ToolRegistry>,
+    /// Hook host dispatched on `PreToolUse` / `PostToolUse` events.
+    pub hook_host: Arc<HookHost>,
+}
+
+impl Default for EngineConfig {
+    fn default() -> Self {
+        use crate::provider::ScriptedModel;
+        Self {
+            provider: ScriptedModel::new("noop", "noop", vec![]).into_dyn(),
+            tools: Arc::new(ToolRegistry::new()),
+            hook_host: Arc::new(HookHost::new()),
+        }
+    }
+}
 
 /// Top-level [`Engine`] failure surface.
 ///
@@ -196,6 +235,56 @@ impl Engine {
         let (submission_tx, submission_rx) = mpsc::channel(SUBMISSION_CHANNEL_CAP);
         let (events_tx, _) = broadcast::channel(EVENT_CHANNEL_CAP);
         let inner = Arc::new(EngineInner::new(events_tx.clone(), provider));
+        let threads = Arc::clone(inner.threads());
+        let permission = inner.permission_reducer();
+        tokio::spawn(inner.run(submission_rx));
+        Self {
+            submission_tx,
+            events_tx,
+            threads,
+            permission,
+            reply_timeout: DEFAULT_REPLY_TIMEOUT,
+        }
+    }
+
+    /// Spawns a fresh engine actor using the full [`EngineConfig`].
+    ///
+    /// Allows injecting a provider, hook host, and tool registry in one
+    /// call.  [`Engine::spawn`] and [`Engine::spawn_with_provider`] remain
+    /// as thin wrappers (empty tools / hooks) for backward compatibility.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::sync::Arc;
+    /// use zhive_core::engine::{Engine, EngineConfig};
+    /// use zhive_core::hooks::HookHost;
+    /// use zhive_core::tools::{ToolRegistry, EchoTool};
+    /// use zhive_core::provider::ScriptedModel;
+    ///
+    /// # async fn demo() {
+    /// let mut tools = ToolRegistry::new();
+    /// tools.register(Arc::new(EchoTool));
+    ///
+    /// let cfg = EngineConfig {
+    ///     provider: ScriptedModel::new("p", "m", vec![]).into_dyn(),
+    ///     tools: Arc::new(tools),
+    ///     hook_host: Arc::new(HookHost::new()),
+    /// };
+    /// let engine = Engine::spawn_with_config(cfg);
+    /// engine.shutdown().await.unwrap();
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn spawn_with_config(config: EngineConfig) -> Self {
+        let (submission_tx, submission_rx) = mpsc::channel(SUBMISSION_CHANNEL_CAP);
+        let (events_tx, _) = broadcast::channel(EVENT_CHANNEL_CAP);
+        let inner = Arc::new(inner::EngineInner::new_with_hooks_tools(
+            events_tx.clone(),
+            config.provider,
+            config.hook_host,
+            config.tools,
+        ));
         let threads = Arc::clone(inner.threads());
         let permission = inner.permission_reducer();
         tokio::spawn(inner.run(submission_rx));
@@ -872,6 +961,814 @@ mod tests {
         assert!(
             !saw_completed,
             "TurnCompleted must NOT follow TurnFailed for the same turn"
+        );
+        engine.shutdown().await.unwrap();
+    }
+}
+
+// ============================================================
+// Increment-3 tool-dispatch tests
+// ============================================================
+
+#[cfg(test)]
+mod inc3_tests {
+    //! Integration tests for the inner tool-call loop introduced in increment 3.
+    //!
+    //! Each test exercises a specific aspect of the dispatch pipeline:
+    //!  - `tool_call_executes_echo_and_completes` — happy-path end-to-end.
+    //!  - `pre_tool_use_deny_blocks_execution` — hook returning Deny.
+    //!  - `red_line_11_invalid_updated_input_blocks_tool` — schema failure.
+    //!  - `ask_flow_allow_resolves_tool` — permission Ask → user allows.
+    //!  - `max_iteration_cap_terminates_turn` — runaway loop terminates.
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use async_trait::async_trait;
+    use futures::stream;
+    use llmsdk::language_model::{
+        BoxStream, CallOptions, GenerateResult, StreamPart, StreamResult,
+    };
+    use llmsdk::{LanguageModel, ProviderError};
+
+    use super::*;
+    use crate::hooks::{HookFilter, HookFn};
+    use crate::tools::{EchoTool, Tool, ToolContext, ToolError, ToolKind, ToolOutput};
+    use zhive_proto::hook::HookEvent;
+    use zhive_proto::permission::{HookOutput, PermissionDecision};
+
+    fn tid(s: &str) -> ThreadId {
+        ThreadId(Arc::from(s))
+    }
+
+    /// Waits for up to `limit` events, returns `true` if `pred` matched one.
+    async fn collect_until(
+        rx: &mut broadcast::Receiver<EngineEvent>,
+        limit: usize,
+        mut pred: impl FnMut(&EngineEvent) -> bool,
+    ) -> bool {
+        for _ in 0..limit {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await {
+                Ok(Ok(ev)) if pred(&ev) => return true,
+                Ok(Ok(_)) => {}
+                _ => return false,
+            }
+        }
+        false
+    }
+
+    // ---- MultiScriptedModel -----------------------------------------------
+
+    /// A scripted model that returns a different set of [`StreamPart`]s on
+    /// each successive call to `do_stream`.
+    ///
+    /// The call counter is shared so tests can clone the model handle.
+    #[derive(Debug, Clone)]
+    struct MultiScriptedModel {
+        call_count: Arc<AtomicUsize>,
+        scripts: Arc<Vec<Vec<StreamPart>>>,
+    }
+
+    impl MultiScriptedModel {
+        fn new(scripts: Vec<Vec<StreamPart>>) -> Self {
+            Self {
+                call_count: Arc::new(AtomicUsize::new(0)),
+                scripts: Arc::new(scripts),
+            }
+        }
+
+        fn into_dyn(self) -> DynLanguageModel {
+            DynLanguageModel::new(self)
+        }
+    }
+
+    #[async_trait]
+    impl LanguageModel for MultiScriptedModel {
+        fn provider(&self) -> &'static str {
+            "test"
+        }
+
+        fn model_id(&self) -> &'static str {
+            "multi-scripted"
+        }
+
+        async fn do_generate(&self, _opts: CallOptions) -> llmsdk::error::Result<GenerateResult> {
+            use llmsdk::language_model::{FinishReason, FinishReasonKind};
+            Ok(GenerateResult {
+                content: vec![],
+                finish_reason: FinishReason::new(FinishReasonKind::Stop),
+                usage: llmsdk::language_model::Usage::default(),
+                provider_metadata: None,
+                request: None,
+                response: None,
+                warnings: vec![],
+            })
+        }
+
+        async fn do_stream(&self, _opts: CallOptions) -> llmsdk::error::Result<StreamResult> {
+            let idx = self.call_count.fetch_add(1, Ordering::SeqCst);
+            let parts = self.scripts.get(idx).cloned().unwrap_or_default();
+            let iter = parts.into_iter().map(Ok::<_, ProviderError>);
+            let s: BoxStream<llmsdk::error::Result<StreamPart>> = Box::pin(stream::iter(iter));
+            Ok(StreamResult {
+                stream: s,
+                request: None,
+                response: None,
+            })
+        }
+    }
+
+    // ---- Always-tool-call model (for max-iteration test) ------------------
+
+    /// A model that always emits a `ToolCall` for "echo" so the loop
+    /// never terminates on its own (used for the max-iteration cap test).
+    #[derive(Debug, Clone)]
+    struct AlwaysToolCallModel;
+
+    #[async_trait]
+    impl LanguageModel for AlwaysToolCallModel {
+        fn provider(&self) -> &'static str {
+            "test"
+        }
+
+        fn model_id(&self) -> &'static str {
+            "always-tool-call"
+        }
+
+        async fn do_generate(&self, _opts: CallOptions) -> llmsdk::error::Result<GenerateResult> {
+            use llmsdk::language_model::{FinishReason, FinishReasonKind};
+            Ok(GenerateResult {
+                content: vec![],
+                finish_reason: FinishReason::new(FinishReasonKind::Stop),
+                usage: llmsdk::language_model::Usage::default(),
+                provider_metadata: None,
+                request: None,
+                response: None,
+                warnings: vec![],
+            })
+        }
+
+        async fn do_stream(&self, _opts: CallOptions) -> llmsdk::error::Result<StreamResult> {
+            use llmsdk::ToolCallPart;
+            let call = ToolCallPart {
+                tool_call_id: "tc-always".into(),
+                tool_name: "echo".into(),
+                input: serde_json::json!({"msg": "loop"}),
+                provider_executed: None,
+                dynamic: None,
+                provider_options: None,
+            };
+            let iter = vec![Ok(StreamPart::ToolCall(call))].into_iter();
+            let s: BoxStream<llmsdk::error::Result<StreamPart>> = Box::pin(stream::iter(iter));
+            Ok(StreamResult {
+                stream: s,
+                request: None,
+                response: None,
+            })
+        }
+    }
+
+    // ---- Hook helpers -------------------------------------------------------
+
+    /// A hook that unconditionally returns a specified `PermissionDecision`.
+    struct FixedDecisionHook {
+        decision: PermissionDecision,
+        updated_input: Option<serde_json::Value>,
+    }
+
+    #[async_trait]
+    impl HookFn for FixedDecisionHook {
+        async fn call(&self, _event: &HookEvent) -> Option<HookOutput> {
+            Some(
+                serde_json::from_value(serde_json::json!({
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": self.decision,
+                        "updatedInput": self.updated_input,
+                    }
+                }))
+                .expect("fixture"),
+            )
+        }
+    }
+
+    fn ext_ref(id: &str) -> zhive_proto::hook::ExtensionRef {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "version": "0.1.0",
+            "source": "builtin"
+        }))
+        .expect("fixture")
+    }
+
+    /// A tool whose body blocks until the turn cancel token fires.
+    ///
+    /// Lets the cancel-during-execute test deterministically hold the
+    /// dispatch loop inside `tool.execute` until `cancel_turn` is issued. It
+    /// then returns a (would-be) success result, proving the dispatch
+    /// `select!` — not the tool — is what races and wins on cancel.
+    #[derive(Debug, Clone, Copy)]
+    struct BlockUntilCancelledTool;
+
+    #[async_trait]
+    impl Tool for BlockUntilCancelledTool {
+        fn name(&self) -> &'static str {
+            "block_until_cancelled"
+        }
+
+        fn kind(&self) -> ToolKind {
+            ToolKind::Other
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+            ctx: &ToolContext,
+        ) -> Result<ToolOutput, ToolError> {
+            // Wait for the turn to be cancelled, then (try to) return a
+            // success result. The dispatch select! should have already
+            // returned Blocked by the time this resolves.
+            ctx.cancel.cancelled().await;
+            Ok(ToolOutput::text("late result that must be discarded"))
+        }
+    }
+
+    // =========================================================================
+    // Test 1: happy path — model emits tool_call(echo) then a text answer
+    // =========================================================================
+
+    /// A turn where the scripted model emits a `ToolCall(echo)` then (on the
+    /// 2nd iteration) a text answer: asserts the tool executed, a
+    /// `ToolCall Completed` item + the final `AgentMessage` are appended, and
+    /// `TurnCompleted` fires.
+    #[tokio::test]
+    async fn tool_call_executes_echo_and_completes() {
+        use llmsdk::ToolCallPart;
+
+        // First call: one tool call.
+        let script0 = vec![StreamPart::ToolCall(ToolCallPart {
+            tool_call_id: "tc-0".into(),
+            tool_name: "echo".into(),
+            input: serde_json::json!({"msg": "hello"}),
+            provider_executed: None,
+            dynamic: None,
+            provider_options: None,
+        })];
+        // Second call: a text response (no tool calls → loop ends).
+        let script1 = vec![
+            StreamPart::TextStart {
+                id: "b0".into(),
+                provider_metadata: None,
+            },
+            StreamPart::TextDelta {
+                id: "b0".into(),
+                delta: "done".into(),
+                provider_metadata: None,
+            },
+            StreamPart::TextEnd {
+                id: "b0".into(),
+                provider_metadata: None,
+            },
+        ];
+
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(EchoTool));
+
+        let model = MultiScriptedModel::new(vec![script0, script1]);
+        let cfg = EngineConfig {
+            provider: model.into_dyn(),
+            tools: Arc::new(tools),
+            hook_host: Arc::new(HookHost::new()),
+        };
+        let engine =
+            Engine::spawn_with_config(cfg).with_reply_timeout(std::time::Duration::from_secs(5));
+        let mut events = engine.subscribe();
+
+        engine
+            .start_turn(tid("thread:native/echo"), Vec::new(), None)
+            .await
+            .unwrap();
+
+        let mut saw_tool_completed = false;
+        let mut saw_agent_msg = false;
+        let mut saw_turn_completed = false;
+
+        for _ in 0..64 {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
+                .await
+                .expect("timeout")
+                .expect("broadcast")
+            {
+                EngineEvent::ItemAppended { item, .. } => match *item {
+                    zhive_proto::domain::Item::ToolCall {
+                        status: zhive_proto::domain::ToolCallStatus::Completed,
+                        ..
+                    } => {
+                        saw_tool_completed = true;
+                    }
+                    zhive_proto::domain::Item::AgentMessage { text, .. } if text == "done" => {
+                        saw_agent_msg = true;
+                    }
+                    _ => {}
+                },
+                EngineEvent::TurnCompleted { .. } => saw_turn_completed = true,
+                _ => {}
+            }
+            if saw_tool_completed && saw_agent_msg && saw_turn_completed {
+                break;
+            }
+        }
+
+        assert!(saw_tool_completed, "expected ToolCall Completed item");
+        assert!(saw_agent_msg, "expected AgentMessage 'done'");
+        assert!(saw_turn_completed, "expected TurnCompleted");
+        engine.shutdown().await.unwrap();
+    }
+
+    // =========================================================================
+    // Test 2: PreToolUse hook returning Deny blocks execution
+    // =========================================================================
+
+    /// A `PreToolUse` hook returning `Deny`: asserts the tool did NOT
+    /// execute and a denial result was appended (`ToolCall { status: Failed }`).
+    #[tokio::test]
+    async fn pre_tool_use_deny_blocks_execution() {
+        use llmsdk::ToolCallPart;
+
+        let script0 = vec![StreamPart::ToolCall(ToolCallPart {
+            tool_call_id: "tc-deny".into(),
+            tool_name: "echo".into(),
+            input: serde_json::json!({"msg": "blocked"}),
+            provider_executed: None,
+            dynamic: None,
+            provider_options: None,
+        })];
+        // Second call: text answer to end the turn.
+        let script1 = vec![
+            StreamPart::TextStart {
+                id: "b0".into(),
+                provider_metadata: None,
+            },
+            StreamPart::TextEnd {
+                id: "b0".into(),
+                provider_metadata: None,
+            },
+        ];
+
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(EchoTool));
+
+        let hook_host = Arc::new(HookHost::new());
+        let _scope = hook_host
+            .register(
+                ext_ref("deny-hook"),
+                HookFilter::default(),
+                0,
+                Arc::new(FixedDecisionHook {
+                    decision: PermissionDecision::Deny,
+                    updated_input: None,
+                }),
+            )
+            .unwrap();
+
+        let cfg = EngineConfig {
+            provider: MultiScriptedModel::new(vec![script0, script1]).into_dyn(),
+            tools: Arc::new(tools),
+            hook_host,
+        };
+        let engine =
+            Engine::spawn_with_config(cfg).with_reply_timeout(std::time::Duration::from_secs(5));
+        let mut events = engine.subscribe();
+
+        engine
+            .start_turn(tid("thread:native/deny"), Vec::new(), None)
+            .await
+            .unwrap();
+
+        let mut saw_tool_failed = false;
+        let saw_completed = collect_until(&mut events, 64, |ev| {
+            if let EngineEvent::ItemAppended { item, .. } = ev
+                && let zhive_proto::domain::Item::ToolCall { status, .. } = item.as_ref()
+                && *status == zhive_proto::domain::ToolCallStatus::Failed
+            {
+                saw_tool_failed = true;
+            }
+            matches!(ev, EngineEvent::TurnCompleted { .. })
+        })
+        .await;
+
+        assert!(
+            saw_tool_failed,
+            "denied tool must emit ToolCall Failed item"
+        );
+        assert!(saw_completed, "TurnCompleted must still fire after denial");
+        engine.shutdown().await.unwrap();
+    }
+
+    // =========================================================================
+    // Test 3: Red line 11 — updated_input fails schema revalidation → blocked
+    // =========================================================================
+
+    /// A `PreToolUse` hook returning an `updated_input` that fails schema
+    /// re-validation: asserts the tool was blocked (`ToolCall { status: Failed }`).
+    #[tokio::test]
+    async fn red_line_11_invalid_updated_input_blocks_tool() {
+        use llmsdk::ToolCallPart;
+
+        let script0 = vec![StreamPart::ToolCall(ToolCallPart {
+            tool_call_id: "tc-rl11".into(),
+            tool_name: "echo".into(),
+            input: serde_json::json!({"msg": "original"}),
+            provider_executed: None,
+            dynamic: None,
+            provider_options: None,
+        })];
+        let script1 = vec![
+            StreamPart::TextStart {
+                id: "b0".into(),
+                provider_metadata: None,
+            },
+            StreamPart::TextEnd {
+                id: "b0".into(),
+                provider_metadata: None,
+            },
+        ];
+
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(EchoTool));
+
+        // Register a strict schema for "echo" that requires a "msg" string.
+        let hook_host = Arc::new(HookHost::new());
+        hook_host
+            .schemas()
+            .register(
+                "echo",
+                &serde_json::json!({
+                    "type": "object",
+                    "required": ["msg"],
+                    "properties": {"msg": {"type": "string"}},
+                    "additionalProperties": false
+                }),
+            )
+            .unwrap();
+
+        // Hook returns an updated_input that violates the schema (extra field).
+        let _scope = hook_host
+            .register(
+                ext_ref("rl11-hook"),
+                HookFilter::default(),
+                0,
+                Arc::new(FixedDecisionHook {
+                    decision: PermissionDecision::Allow,
+                    updated_input: Some(serde_json::json!({"msg": "ok", "bad_field": 42})),
+                }),
+            )
+            .unwrap();
+
+        let cfg = EngineConfig {
+            provider: MultiScriptedModel::new(vec![script0, script1]).into_dyn(),
+            tools: Arc::new(tools),
+            hook_host,
+        };
+        let engine =
+            Engine::spawn_with_config(cfg).with_reply_timeout(std::time::Duration::from_secs(5));
+        let mut events = engine.subscribe();
+
+        engine
+            .start_turn(tid("thread:native/rl11"), Vec::new(), None)
+            .await
+            .unwrap();
+
+        let mut saw_tool_failed = false;
+        collect_until(&mut events, 64, |ev| {
+            if let EngineEvent::ItemAppended { item, .. } = ev
+                && let zhive_proto::domain::Item::ToolCall { status, .. } = item.as_ref()
+                && *status == zhive_proto::domain::ToolCallStatus::Failed
+            {
+                saw_tool_failed = true;
+            }
+            matches!(ev, EngineEvent::TurnCompleted { .. })
+        })
+        .await;
+
+        assert!(
+            saw_tool_failed,
+            "schema-invalid updated_input must block tool (ToolCall Failed)"
+        );
+        engine.shutdown().await.unwrap();
+    }
+
+    // =========================================================================
+    // Test 4: Ask flow — permission resolved via ResumePermission
+    // =========================================================================
+
+    /// A hook returning `Ask`; the test drives `ResumePermission` (Selected
+    /// allow) and asserts the tool then executed.
+    #[tokio::test]
+    async fn ask_flow_allow_resolves_tool() {
+        use llmsdk::ToolCallPart;
+
+        let script0 = vec![StreamPart::ToolCall(ToolCallPart {
+            tool_call_id: "tc-ask".into(),
+            tool_name: "echo".into(),
+            input: serde_json::json!({"msg": "ask"}),
+            provider_executed: None,
+            dynamic: None,
+            provider_options: None,
+        })];
+        let script1 = vec![
+            StreamPart::TextStart {
+                id: "b0".into(),
+                provider_metadata: None,
+            },
+            StreamPart::TextEnd {
+                id: "b0".into(),
+                provider_metadata: None,
+            },
+        ];
+
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(EchoTool));
+
+        let hook_host = Arc::new(HookHost::new());
+        let _scope = hook_host
+            .register(
+                ext_ref("ask-hook"),
+                HookFilter::default(),
+                0,
+                Arc::new(FixedDecisionHook {
+                    decision: PermissionDecision::Ask,
+                    updated_input: None,
+                }),
+            )
+            .unwrap();
+
+        let cfg = EngineConfig {
+            provider: MultiScriptedModel::new(vec![script0, script1]).into_dyn(),
+            tools: Arc::new(tools),
+            hook_host,
+        };
+        let engine =
+            Engine::spawn_with_config(cfg).with_reply_timeout(std::time::Duration::from_secs(10));
+        let mut events = engine.subscribe();
+
+        engine
+            .start_turn(tid("thread:native/ask"), Vec::new(), None)
+            .await
+            .unwrap();
+
+        // Wait for PermissionRequested and answer it.
+        let mut request_id_opt: Option<PermissionRequestId> = None;
+        for _ in 0..32 {
+            if let EngineEvent::PermissionRequested { request_id, .. } =
+                tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
+                    .await
+                    .expect("timeout")
+                    .expect("broadcast")
+            {
+                request_id_opt = Some(request_id);
+                break;
+            }
+        }
+        let request_id = request_id_opt.expect("PermissionRequested must fire");
+
+        engine
+            .resume_permission(
+                request_id,
+                PermissionOutcome::Selected {
+                    option_id: "allow_once".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        // Now wait for ToolCall Completed + TurnCompleted.
+        let mut saw_tool_completed = false;
+        let saw_turn_completed = collect_until(&mut events, 64, |ev| {
+            if let EngineEvent::ItemAppended { item, .. } = ev
+                && let zhive_proto::domain::Item::ToolCall { status, .. } = item.as_ref()
+                && *status == zhive_proto::domain::ToolCallStatus::Completed
+            {
+                saw_tool_completed = true;
+            }
+            matches!(ev, EngineEvent::TurnCompleted { .. })
+        })
+        .await;
+
+        assert!(saw_tool_completed, "tool must have executed after Allow");
+        assert!(saw_turn_completed, "TurnCompleted must fire");
+        engine.shutdown().await.unwrap();
+    }
+
+    // =========================================================================
+    // Test 5: Max-iteration cap terminates the turn
+    // =========================================================================
+
+    /// A scripted model that ALWAYS emits a `ToolCall`: asserts the turn
+    /// terminates (does not hang) at the iteration cap.
+    #[tokio::test]
+    async fn max_iteration_cap_terminates_turn() {
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(EchoTool));
+
+        let cfg = EngineConfig {
+            provider: DynLanguageModel::new(AlwaysToolCallModel),
+            tools: Arc::new(tools),
+            hook_host: Arc::new(HookHost::new()),
+        };
+        let engine =
+            Engine::spawn_with_config(cfg).with_reply_timeout(std::time::Duration::from_secs(60));
+        let mut events = engine.subscribe();
+
+        engine
+            .start_turn(tid("thread:native/maxiter"), Vec::new(), None)
+            .await
+            .unwrap();
+
+        // The turn must complete within a reasonable bound even though the
+        // model never stops emitting tool calls.
+        let saw_completed = collect_until(&mut events, 256, |ev| {
+            matches!(ev, EngineEvent::TurnCompleted { .. })
+        })
+        .await;
+
+        assert!(
+            saw_completed,
+            "TurnCompleted must fire even when model always emits tool calls"
+        );
+        engine.shutdown().await.unwrap();
+    }
+
+    // =========================================================================
+    // Test 6: the finalized ToolCall item carries provider_tool_call_id
+    // =========================================================================
+
+    /// After a tool executes, the broadcast `ToolCall { Completed }` item must
+    /// carry the provider's original `provider_tool_call_id` (the same id the
+    /// model used in its `ToolCall` stream part), not `None`.
+    #[tokio::test]
+    async fn completed_tool_call_item_carries_provider_tool_call_id() {
+        use llmsdk::ToolCallPart;
+
+        let script0 = vec![StreamPart::ToolCall(ToolCallPart {
+            tool_call_id: "toolu_keepme".into(),
+            tool_name: "echo".into(),
+            input: serde_json::json!({"msg": "hi"}),
+            provider_executed: None,
+            dynamic: None,
+            provider_options: None,
+        })];
+        let script1 = vec![
+            StreamPart::TextStart {
+                id: "b0".into(),
+                provider_metadata: None,
+            },
+            StreamPart::TextEnd {
+                id: "b0".into(),
+                provider_metadata: None,
+            },
+        ];
+
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(EchoTool));
+
+        let cfg = EngineConfig {
+            provider: MultiScriptedModel::new(vec![script0, script1]).into_dyn(),
+            tools: Arc::new(tools),
+            hook_host: Arc::new(HookHost::new()),
+        };
+        let engine =
+            Engine::spawn_with_config(cfg).with_reply_timeout(std::time::Duration::from_secs(5));
+        let mut events = engine.subscribe();
+
+        engine
+            .start_turn(tid("thread:native/keepid"), Vec::new(), None)
+            .await
+            .unwrap();
+
+        let mut found_id: Option<Option<String>> = None;
+        for _ in 0..64 {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
+                .await
+                .expect("timeout")
+                .expect("broadcast")
+            {
+                EngineEvent::ItemAppended { item, .. } => {
+                    if let zhive_proto::domain::Item::ToolCall {
+                        status: zhive_proto::domain::ToolCallStatus::Completed,
+                        provider_tool_call_id,
+                        ..
+                    } = *item
+                    {
+                        found_id = Some(provider_tool_call_id);
+                        break;
+                    }
+                }
+                EngineEvent::TurnCompleted { .. } => break,
+                _ => {}
+            }
+        }
+
+        let id = found_id.expect("expected a Completed ToolCall item");
+        assert_eq!(
+            id.as_deref(),
+            Some("toolu_keepme"),
+            "finalized ToolCall item must carry the provider tool_call_id"
+        );
+        engine.shutdown().await.unwrap();
+    }
+
+    // =========================================================================
+    // Test 7: cancel during tool execution emits no result item
+    // =========================================================================
+
+    /// When the turn is cancelled while a tool is executing, the dispatch
+    /// `select!` wins the race and **no** `ToolCall { Completed }` item is
+    /// appended/broadcast for the abandoned result. `SessionAborted` fires and
+    /// `TurnCompleted` does not.
+    #[tokio::test]
+    async fn cancel_during_tool_execute_emits_no_result_item() {
+        use llmsdk::ToolCallPart;
+
+        // The model emits one tool call for the blocking tool, then (on a
+        // hypothetical 2nd call) nothing — the turn is cancelled before that.
+        let script0 = vec![StreamPart::ToolCall(ToolCallPart {
+            tool_call_id: "toolu_block".into(),
+            tool_name: "block_until_cancelled".into(),
+            input: serde_json::json!({}),
+            provider_executed: None,
+            dynamic: None,
+            provider_options: None,
+        })];
+
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(BlockUntilCancelledTool));
+
+        let cfg = EngineConfig {
+            provider: MultiScriptedModel::new(vec![script0, vec![]]).into_dyn(),
+            tools: Arc::new(tools),
+            hook_host: Arc::new(HookHost::new()),
+        };
+        let engine =
+            Engine::spawn_with_config(cfg).with_reply_timeout(std::time::Duration::from_secs(10));
+        let mut events = engine.subscribe();
+
+        let thread_id = tid("thread:native/cancel-exec");
+        engine
+            .start_turn(thread_id.clone(), Vec::new(), None)
+            .await
+            .unwrap();
+
+        // Wait for TurnStarted so the turn task is in-flight, then give the
+        // stream a brief moment to drain and the dispatch loop to reach the
+        // blocking tool body.
+        let saw_started = collect_until(&mut events, 16, |ev| {
+            matches!(ev, EngineEvent::TurnStarted { .. })
+        })
+        .await;
+        assert!(saw_started, "expected TurnStarted");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Cancel while the tool body is blocking in execute().
+        let cancelled = engine.cancel_turn(thread_id).await.unwrap();
+        assert!(cancelled.is_some(), "expected a turn id to be cancelled");
+
+        // Drain events: SessionAborted must appear; no Completed ToolCall item
+        // and no TurnCompleted may appear.
+        let mut saw_aborted = false;
+        let mut saw_completed_item = false;
+        let mut saw_turn_completed = false;
+        for _ in 0..32 {
+            match tokio::time::timeout(std::time::Duration::from_millis(300), events.recv()).await {
+                Ok(Ok(EngineEvent::SessionAborted(_))) => saw_aborted = true,
+                Ok(Ok(EngineEvent::TurnCompleted { .. })) => saw_turn_completed = true,
+                Ok(Ok(EngineEvent::ItemAppended { item, .. })) => {
+                    if matches!(
+                        *item,
+                        zhive_proto::domain::Item::ToolCall {
+                            status: zhive_proto::domain::ToolCallStatus::Completed,
+                            ..
+                        }
+                    ) {
+                        saw_completed_item = true;
+                    }
+                }
+                Ok(Ok(_)) => {}
+                _ => {
+                    if saw_aborted {
+                        break;
+                    }
+                }
+            }
+        }
+
+        assert!(saw_aborted, "expected SessionAborted after cancel");
+        assert!(
+            !saw_completed_item,
+            "no Completed ToolCall item may be emitted after cancel during execute"
+        );
+        assert!(
+            !saw_turn_completed,
+            "TurnCompleted must NOT fire for a cancelled turn"
         );
         engine.shutdown().await.unwrap();
     }

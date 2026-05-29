@@ -58,8 +58,11 @@ pub enum HookHostError {
     #[error("hook registration list is poisoned")]
     RegistryPoisoned,
 
-    /// A callback panicked. The host catches the panic and turns it
-    /// into this error so the engine can fail the turn cleanly.
+    /// A callback panicked.
+    ///
+    /// Retained for external callers that construct or match this
+    /// variant.  [`HookHost::dispatch`] no longer returns this error;
+    /// panicking hooks are isolated and dispatch continues (B5 §3.4).
     #[error("hook callback panicked: {reason}")]
     CallbackPanic {
         /// Human-readable description; the original panic payload is
@@ -229,8 +232,10 @@ impl HookHost {
     /// every call. The lock is released before any callback is
     /// awaited.
     ///
-    /// Panics inside callbacks are caught and reported as
-    /// [`HookHostError::CallbackPanic`]; later hooks still see the
+    /// Panics inside callbacks are caught, logged at `WARN` level
+    /// (`zhive.hooks.callback_panic`), and **isolated**: the panicking
+    /// hook is skipped and dispatch continues with the remaining hooks
+    /// (B5 §3.4 error-isolation contract).  Later hooks still see the
     /// unmodified event because dispatch is effectively read-only here
     /// — mutations to `tool_input` flow through the returned
     /// [`HookOutput`].
@@ -258,6 +263,10 @@ impl HookHost {
                 Ok(Some(output)) => outputs.push(output),
                 Ok(None) => {}
                 Err(payload) => {
+                    // B5 §3.4 panic-isolation: a panicking hook must not
+                    // abort the entire dispatch chain.  Log the failure and
+                    // continue with the remaining hooks so higher-or-equal-
+                    // priority hooks are not silently suppressed.
                     let reason = if let Some(s) = payload.downcast_ref::<&'static str>() {
                         (*s).to_string()
                     } else if let Some(s) = payload.downcast_ref::<String>() {
@@ -265,7 +274,11 @@ impl HookHost {
                     } else {
                         "(non-string panic payload)".to_string()
                     };
-                    return Err(HookHostError::CallbackPanic { reason });
+                    tracing::warn!(
+                        name: "zhive.hooks.callback_panic",
+                        reason,
+                        "hook callback panicked; isolating and continuing"
+                    );
                 }
             }
         }
@@ -464,22 +477,44 @@ mod tests {
         assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
+    /// A panicking hook is isolated: dispatch succeeds and returns an
+    /// empty output list (the panicking hook contributes no decision),
+    /// while subsequent hooks in the chain are still executed.
     #[tokio::test]
-    async fn callback_panic_surfaces_as_callback_panic() {
+    async fn callback_panic_is_isolated_and_dispatch_continues() {
         let host = Arc::new(HookHost::new());
-        let _scope = host
+        let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        // Register: panic hook (priority 1) runs before the counting hook
+        // (priority 0).  After the fix the counting hook must still fire.
+        let _p = host
             .register(
-                provenance("test"),
+                provenance("panic-hook"),
                 HookFilter::default(),
-                0,
+                1,
                 Arc::new(Panicking),
             )
             .unwrap();
-        let err = host
-            .dispatch(&stop_event(&provenance("test")))
+        let _c = host
+            .register(
+                provenance("count-hook"),
+                HookFilter::default(),
+                0,
+                Arc::new(Counting {
+                    inner: Arc::clone(&counter),
+                }),
+            )
+            .unwrap();
+
+        // Dispatch must succeed (Ok) even though one hook panicked.
+        let outputs = host
+            .dispatch(&stop_event(&provenance("any")))
             .await
-            .unwrap_err();
-        assert!(matches!(err, HookHostError::CallbackPanic { .. }));
+            .unwrap();
+        // Panicking hook contributes no HookOutput.
+        assert!(outputs.is_empty());
+        // Subsequent counting hook must have run.
+        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }
 

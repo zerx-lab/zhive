@@ -224,6 +224,30 @@ pub enum ScopeError {
 }
 
 impl PermissionScope {
+    /// Returns a conservative default scope suitable for engine-internal turns.
+    ///
+    /// All tool access is allowed (no allowlist or denylist), no specific
+    /// permission mode is set, and subagent spawning is disabled.
+    /// Used by the engine when the client does not supply an explicit scope.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use zhive_proto::permission::PermissionScope;
+    /// let scope = PermissionScope::default_turn_scope();
+    /// assert!(scope.allowed_tools.is_none());
+    /// assert!(!scope.allow_subagent_spawn);
+    /// ```
+    #[must_use]
+    pub fn default_turn_scope() -> Self {
+        Self {
+            allowed_tools: None,
+            disallowed_tools: vec![],
+            permission_mode: None,
+            allow_subagent_spawn: false,
+        }
+    }
+
     /// Returns `Ok` when `child` is a legal narrowing of `self`.
     ///
     /// # Errors

@@ -292,6 +292,10 @@ impl StreamFold {
                             // Malformed JSON: surface as raw string, never panic.
                             serde_json::Value::String(buf.text.clone())
                         });
+                    // Preserve the provider block id as `provider_tool_call_id`
+                    // so the engine can round-trip it in Message::Tool without
+                    // minting a synthetic replacement.
+                    let provider_tool_call_id = Some(id);
                     vec![Item::ToolCall {
                         id: buf.item_id,
                         name: buf.tool_name.unwrap_or_default(),
@@ -301,6 +305,7 @@ impl StreamFold {
                         locations: vec![],
                         raw_input: Some(raw_input),
                         raw_output: None,
+                        provider_tool_call_id,
                     }]
                 } else {
                     vec![]
@@ -321,6 +326,9 @@ impl StreamFold {
                     .remove(&call_part.tool_call_id)
                     .map(|buf| buf.item_id)
                     .unwrap_or_else(|| self.next_item_id());
+                // Preserve the provider-assigned tool_call_id so the engine
+                // can return it verbatim in Message::Tool.tool_call_id.
+                let provider_tool_call_id = Some(call_part.tool_call_id.clone());
                 vec![Item::ToolCall {
                     id: item_id,
                     name: call_part.tool_name,
@@ -330,6 +338,7 @@ impl StreamFold {
                     locations: vec![],
                     raw_input: Some(call_part.input),
                     raw_output: None,
+                    provider_tool_call_id,
                 }]
             }
 
@@ -410,9 +419,11 @@ impl StreamFold {
         }
 
         // Flush open tool-input blocks with parsed-so-far arguments.
-        for (_id, buf) in self.tool_bufs.drain() {
+        for (block_id, buf) in self.tool_bufs.drain() {
             let raw_input = serde_json::from_str::<serde_json::Value>(&buf.text)
                 .unwrap_or_else(|_| serde_json::Value::String(buf.text.clone()));
+            // Preserve the provider block id as `provider_tool_call_id` so
+            // the engine can use it when building the tool-result prompt.
             items.push(Item::ToolCall {
                 id: buf.item_id,
                 name: buf.tool_name.unwrap_or_default(),
@@ -422,6 +433,7 @@ impl StreamFold {
                 locations: vec![],
                 raw_input: Some(raw_input),
                 raw_output: None,
+                provider_tool_call_id: Some(block_id),
             });
         }
 

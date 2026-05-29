@@ -19,6 +19,7 @@ pub mod queues;
 pub mod server;
 pub mod state;
 pub mod subagent;
+pub mod tools;
 
 /// Reports this crate's package version.
 #[must_use]

@@ -38,9 +38,11 @@ use tokio::sync::{broadcast, mpsc};
 use zhive_proto::domain::{ThreadId, ThreadStatus, TurnId};
 use zhive_proto::hook::EnginePhase;
 
+use crate::hooks::HookHost;
 use crate::permission::{PermissionReducer, ReducerError};
 use crate::provider::DynLanguageModel;
 use crate::state::{ActiveTurn, ThreadStore};
+use crate::tools::ToolRegistry;
 
 use super::event::{EngineEvent, TurnRejectionReason};
 use super::phase::allows_transition;
@@ -77,12 +79,31 @@ pub(crate) struct EngineInner {
     /// compatibility; real providers are injected via
     /// [`super::Engine::spawn_with_provider`].
     provider: DynLanguageModel,
+    /// Hook host shared across all turn tasks spawned by this engine.
+    pub(in crate::engine) hook_host: Arc<HookHost>,
+    /// Tool registry shared across all turn tasks spawned by this engine.
+    pub(in crate::engine) tools: Arc<ToolRegistry>,
 }
 
 impl EngineInner {
     pub(crate) fn new(
         events_tx: broadcast::Sender<EngineEvent>,
         provider: DynLanguageModel,
+    ) -> Self {
+        Self::new_with_hooks_tools(
+            events_tx,
+            provider,
+            Arc::new(HookHost::new()),
+            Arc::new(ToolRegistry::new()),
+        )
+    }
+
+    /// Low-level constructor used by [`super::Engine::spawn_with_config`].
+    pub(crate) fn new_with_hooks_tools(
+        events_tx: broadcast::Sender<EngineEvent>,
+        provider: DynLanguageModel,
+        hook_host: Arc<HookHost>,
+        tools: Arc<ToolRegistry>,
     ) -> Self {
         Self {
             threads: Arc::new(ThreadStore::new()),
@@ -91,6 +112,8 @@ impl EngineInner {
             turn_counter: AtomicU64::new(0),
             permission: PermissionReducer::new(),
             provider,
+            hook_host,
+            tools,
         }
     }
 
@@ -108,6 +131,16 @@ impl EngineInner {
     /// the `engine` module (e.g. [`super::turn`]).
     pub(in crate::engine) fn provider(&self) -> &DynLanguageModel {
         &self.provider
+    }
+
+    /// Returns the hook host for sibling modules.
+    pub(in crate::engine) fn hook_host(&self) -> &Arc<HookHost> {
+        &self.hook_host
+    }
+
+    /// Returns the tool registry for sibling modules.
+    pub(in crate::engine) fn tools(&self) -> &Arc<ToolRegistry> {
+        &self.tools
     }
 
     /// Runs the actor loop, consuming submissions until `Shutdown`.

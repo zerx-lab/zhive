@@ -355,6 +355,16 @@ pub enum Item {
         /// Raw JSON output returned by the tool.
         #[serde(skip_serializing_if = "Option::is_none")]
         raw_output: Option<Value>,
+        /// Provider-assigned tool call id (e.g. `toolu_01...` from Anthropic).
+        ///
+        /// Preserved from the [`StreamPart::ToolCall`] or `ToolInputStart`
+        /// frame so the engine can round-trip it back in `Message::Tool`
+        /// `tool_call_id` without minting a synthetic replacement.
+        ///
+        /// `None` for items that pre-date this field or originate outside
+        /// the provider stream (e.g. synthetic items in tests).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_tool_call_id: Option<String>,
     },
     /// Shell command execution.
     CommandExecution {
