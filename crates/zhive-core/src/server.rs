@@ -47,9 +47,11 @@
 
 pub mod events;
 pub mod handlers;
+pub mod initialize;
 pub mod path;
 pub mod reverse_rpc;
 pub mod router;
+pub mod serve_loop;
 pub mod transport;
 
 #[doc(inline)]
@@ -57,9 +59,13 @@ pub use events::{engine_event_to_notification, spawn_event_forwarder};
 #[doc(inline)]
 pub use handlers::{ENGINE_ERROR_CODE, register_engine_handlers};
 #[doc(inline)]
+pub use initialize::{server_capabilities, server_identity};
+#[doc(inline)]
 pub use reverse_rpc::{ResolveOutcome, ReverseRpcError, ReverseRpcResult, ReverseRpcTracker};
 #[doc(inline)]
 pub use router::{Handler, JsonRpcCode, Router, error_object};
+#[doc(inline)]
+pub use serve_loop::{serve_loop, serve_loop_with_outbound, serve_loop_with_reverse};
 #[doc(inline)]
 pub use transport::{StdioTransport, Transport, TransportError};
 
@@ -73,7 +79,7 @@ use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::{Semaphore, mpsc};
 use tokio_util::sync::CancellationToken;
-use zhive_proto::{Message, Response};
+use zhive_proto::Message;
 
 /// Default capacity for the per-connection outbound queue used by
 /// [`serve_loop_with_outbound`]. Sized to absorb burst notification
@@ -127,184 +133,6 @@ pub enum ServerError {
     /// `max_connections` was `0`, which would deadlock the semaphore.
     #[error("max_connections must be >= 1")]
     InvalidMaxConnections,
-}
-
-/// Runs the server loop on `transport` until the peer closes the
-/// stream or `shutdown` fires.
-///
-/// Every inbound request is dispatched to `router`. Notifications go
-/// to the router too but no response is sent. Inbound [`Response`]s
-/// are routed to `reverse_rpc` when supplied; a stray response (no
-/// pending entry) is logged and discarded.
-///
-/// The shutdown token is checked between messages and against the
-/// blocking read on `transport.next_message`. An in-flight dispatch is
-/// allowed to complete before the loop returns so the matching
-/// response is not lost mid-flight.
-///
-/// # Errors
-///
-/// Returns [`ServerError::Transport`] for unrecoverable read / write
-/// failures.
-pub async fn serve_loop<T>(
-    transport: &mut T,
-    router: Arc<Router>,
-    shutdown: CancellationToken,
-) -> Result<(), ServerError>
-where
-    T: Transport + ?Sized,
-{
-    serve_loop_with_reverse(transport, router, None, shutdown).await
-}
-
-/// Variant of [`serve_loop`] that also routes responses to a
-/// [`ReverseRpcTracker`].
-///
-/// Use this entry point when the engine drives server-initiated
-/// requests (typically `permission/request`); the tracker is shared
-/// with the engine actor so a matching reply discharges the awaiting
-/// `oneshot`.
-///
-/// # Errors
-///
-/// Same surface as [`serve_loop`].
-pub async fn serve_loop_with_reverse<T>(
-    transport: &mut T,
-    router: Arc<Router>,
-    reverse_rpc: Option<Arc<ReverseRpcTracker>>,
-    shutdown: CancellationToken,
-) -> Result<(), ServerError>
-where
-    T: Transport + ?Sized,
-{
-    serve_loop_with_outbound(transport, router, reverse_rpc, None, shutdown).await
-}
-
-/// Variant of [`serve_loop`] that drains an outbound message queue.
-///
-/// `outbound_rx` is `Some` when the caller has wired a side channel
-/// for engine-driven traffic (events, reverse RPC) — every value it
-/// receives is shipped through the transport's `send` half along with
-/// inbound request responses.
-///
-/// When `outbound_rx` is `None` the function behaves exactly like
-/// [`serve_loop_with_reverse`].
-///
-/// # Errors
-///
-/// Same surface as [`serve_loop`].
-pub async fn serve_loop_with_outbound<T>(
-    transport: &mut T,
-    router: Arc<Router>,
-    reverse_rpc: Option<Arc<ReverseRpcTracker>>,
-    mut outbound_rx: Option<mpsc::Receiver<Message>>,
-    shutdown: CancellationToken,
-) -> Result<(), ServerError>
-where
-    T: Transport + ?Sized,
-{
-    loop {
-        // The select! arms cover (in priority order):
-        //   1. shutdown signal — leave the loop without losing data,
-        //   2. outbound queue ready — drain server-pushed messages
-        //      (events, reverse RPC) before reading more inbound,
-        //   3. transport read — pull the next inbound message.
-        //
-        // The outbound arm is gated on `outbound_rx.is_some()` so the
-        // `serve_loop` entry point that supplied `None` keeps its old
-        // behaviour exactly.
-        enum Branch {
-            Inbound(Option<Message>),
-            Outbound(Message),
-            Shutdown,
-            OutboundClosed,
-        }
-        let branch = tokio::select! {
-            biased;
-            () = shutdown.cancelled() => Branch::Shutdown,
-            out = async {
-                match outbound_rx.as_mut() {
-                    Some(rx) => rx.recv().await,
-                    None => std::future::pending::<Option<Message>>().await,
-                }
-            } => match out {
-                Some(m) => Branch::Outbound(m),
-                None => Branch::OutboundClosed,
-            },
-            res = transport.next_message() => Branch::Inbound(res?),
-        };
-        let msg = match branch {
-            // Both Shutdown and graceful Inbound EOF close the loop;
-            // the explicit fall-through keeps the intent obvious to a
-            // future reader.
-            Branch::Shutdown | Branch::Inbound(None) => return Ok(()),
-            Branch::OutboundClosed => {
-                // Outbound producer hung up: stop trying to read it but
-                // keep serving inbound traffic.
-                outbound_rx = None;
-                continue;
-            }
-            Branch::Outbound(m) => {
-                transport.send(&m).await?;
-                continue;
-            }
-            Branch::Inbound(Some(m)) => m,
-        };
-
-        match msg {
-            Message::Request(req) => {
-                let id = req.id.clone();
-                let outcome = router.dispatch(&req.method, req.params).await;
-                let response = match outcome {
-                    Ok(value) => Response::ok(id, value),
-                    Err(err) => Response::err(id, err),
-                };
-                transport.send(&Message::Response(response)).await?;
-            }
-            Message::Notification(n) => {
-                // Notifications never produce a response per JSON-RPC
-                // 2.0 § 4.1, but a dispatch failure is useful diagnostic
-                // signal — log it at debug level rather than discarding
-                // it outright.
-                let method = n.method.clone();
-                if let Err(err) = router.dispatch(&n.method, n.params).await {
-                    let code = err.code;
-                    tracing::debug!(
-                        name: "zhive.rpc.notification.dispatch_failed",
-                        rpc_method = %method,
-                        rpc_jsonrpc_error_code = code,
-                        "notification dispatch returned error (no response sent)"
-                    );
-                }
-            }
-            Message::Response(resp) => {
-                // No tracker wired up yet in Phase 1's default
-                // `serve_loop`; the stray-response branches only fire
-                // when a caller supplies a tracker via
-                // [`serve_loop_with_reverse`].
-                if let Some(tracker) = reverse_rpc.as_ref() {
-                    let response_id = format!("{:?}", resp.id);
-                    match tracker.resolve(resp) {
-                        ResolveOutcome::Delivered => {}
-                        ResolveOutcome::AwaiterDropped => {
-                            tracing::debug!(
-                                name: "zhive.rpc.response.awaiter_dropped",
-                                response_id = %response_id,
-                                "reverse-RPC awaiter was dropped before response arrived"
-                            );
-                        }
-                        ResolveOutcome::NoMatch => {
-                            tracing::warn!(
-                                name: "zhive.rpc.response.no_match",
-                                response_id = %response_id,
-                                "response did not match any pending reverse-RPC id"
-                            );
-                        }
-                    }
-                }
-            }
-        }
-    }
 }
 
 /// Owns the process stdin/stdout and runs [`serve_loop`] on them.
@@ -542,6 +370,36 @@ mod tests {
         }
     }
 
+    /// Sends the initialize handshake over a raw [`Transport`] and
+    /// asserts it succeeds. Returns when the server responds with an
+    /// `InitializeResponse`.
+    #[cfg(unix)]
+    async fn raw_handshake(client: &mut UdsTransport) {
+        use zhive_proto::{Id, Request};
+
+        // Use JSON construction to avoid `#[non_exhaustive]` struct
+        // literal restrictions on `InitializeRequest`.
+        let params = serde_json::json!({
+            "protocolVersion": 1,
+            "clientInfo": {
+                "name": "test-client",
+                "version": "0.0.0",
+            },
+        });
+        let req = Request::new(Id::Number(0), "initialize", Some(params));
+        client.send(&Message::Request(req)).await.unwrap();
+        let reply = client.next_message().await.unwrap().unwrap();
+        match reply {
+            Message::Response(resp) => match resp.outcome {
+                zhive_proto::ResponseOutcome::Result(_) => {}
+                zhive_proto::ResponseOutcome::Error(e) => {
+                    panic!("initialize handshake failed: {e:?}")
+                }
+            },
+            other => panic!("expected Response to initialize, got {other:?}"),
+        }
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn end_to_end_uds_round_trip() {
@@ -566,6 +424,8 @@ mod tests {
         });
 
         let mut client = UdsTransport::connect(&socket).await.unwrap();
+        // Must handshake before dispatching any other method.
+        raw_handshake(&mut client).await;
         let req = Request::new(Id::Number(1), "ping", None);
         client.send(&Message::Request(req)).await.unwrap();
         let reply = client.next_message().await.unwrap().unwrap();
@@ -643,80 +503,6 @@ mod tests {
             .expect("server must exit Ok on cancel");
     }
 
-    #[tokio::test]
-    async fn serve_loop_with_reverse_routes_response_to_tracker() {
-        use zhive_proto::{Id, Response};
-
-        // Channel-backed transport: serve_loop reads Messages from
-        // `incoming` and writes them to `outgoing`. We push a Response
-        // and verify the tracker resolves the matching awaiter.
-        struct ChannelTransport {
-            incoming: tokio::sync::mpsc::Receiver<Message>,
-            outgoing: tokio::sync::mpsc::UnboundedSender<Message>,
-        }
-        #[async_trait]
-        impl Transport for ChannelTransport {
-            async fn next_message(&mut self) -> Result<Option<Message>, TransportError> {
-                Ok(self.incoming.recv().await)
-            }
-            async fn send(&mut self, msg: &Message) -> Result<(), TransportError> {
-                let _ = self.outgoing.send(msg.clone());
-                Ok(())
-            }
-        }
-
-        let (in_tx, in_rx) = tokio::sync::mpsc::channel::<Message>(4);
-        let (out_tx, _out_rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
-        let mut transport = ChannelTransport {
-            incoming: in_rx,
-            outgoing: out_tx,
-        };
-
-        let router = Arc::new(Router::new());
-        let tracker = Arc::new(ReverseRpcTracker::new());
-        let (req, rx) = tracker.issue("permission/request", None);
-        let id_for_response = req.id.clone();
-        let token = CancellationToken::new();
-
-        let tracker_for_loop = Arc::clone(&tracker);
-        let cancel = token.clone();
-        let loop_handle = tokio::spawn(async move {
-            serve_loop_with_reverse(&mut transport, router, Some(tracker_for_loop), cancel)
-                .await
-                .unwrap();
-        });
-
-        // Feed the response that matches our issued request.
-        in_tx
-            .send(Message::Response(Response::ok(
-                id_for_response,
-                serde_json::json!({"outcome": "selected"}),
-            )))
-            .await
-            .unwrap();
-
-        let outcome = tokio::time::timeout(std::time::Duration::from_secs(2), rx)
-            .await
-            .expect("tracker must resolve quickly")
-            .expect("oneshot")
-            .expect("ok value");
-        assert_eq!(outcome, serde_json::json!({"outcome": "selected"}));
-
-        // Sending an extra Response with an unknown id should be a
-        // `NoMatch` (logged at warn but not crashing the loop).
-        in_tx
-            .send(Message::Response(Response::ok(
-                Id::String("rev:999".into()),
-                serde_json::Value::Null,
-            )))
-            .await
-            .unwrap();
-
-        token.cancel();
-        drop(in_tx);
-        loop_handle.await.unwrap();
-    }
-
     #[cfg(unix)]
     #[tokio::test]
     async fn serve_uds_round_trip_then_shutdown() {
@@ -753,6 +539,8 @@ mod tests {
             }
         };
 
+        // Must handshake before sending any other request.
+        raw_handshake(&mut client).await;
         let req = Request::new(Id::Number(7), "ping", None);
         client.send(&Message::Request(req)).await.unwrap();
         let reply = client.next_message().await.unwrap().unwrap();

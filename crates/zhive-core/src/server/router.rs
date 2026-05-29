@@ -16,9 +16,12 @@ use async_trait::async_trait;
 use serde_json::Value;
 use zhive_proto::ErrorObject;
 
-/// JSON-RPC 2.0 reserved error codes used by the router.
+/// JSON-RPC 2.0 reserved error codes used by the router and the
+/// per-connection handshake gate.
 ///
-/// Numeric values are spec-mandated; do not change.
+/// Spec-mandated numeric values (parse/request/method/params/internal)
+/// must not change. Application-level codes in the `-32000..=-32099`
+/// server-error band are documented in the zhive wire spec (D-007).
 #[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
 pub enum JsonRpcCode {
@@ -32,10 +35,30 @@ pub enum JsonRpcCode {
     InvalidParams,
     /// Internal JSON-RPC error (-32603).
     InternalError,
+    /// Handshake: the requested protocol version is outside the supported
+    /// range `[V0, LATEST]` (-32001). The error `data` field carries a
+    /// `{ "supported": [0,1], "requested": <n> }` object.
+    ProtocolVersionUnsupported,
+    /// Handshake: a non-`initialize` request arrived before the
+    /// handshake completed (-32002).
+    ServerNotInitialized,
+    /// Handshake: a second `initialize` request arrived on a connection
+    /// that is already initialized (-32003).
+    AlreadyInitialized,
 }
 
 impl JsonRpcCode {
-    /// Numeric value as required by the JSON-RPC 2.0 spec.
+    /// Numeric value as required by the JSON-RPC 2.0 spec or zhive wire
+    /// spec (D-007).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use zhive_core::server::router::JsonRpcCode;
+    /// assert_eq!(JsonRpcCode::MethodNotFound.as_i64(), -32601);
+    /// assert_eq!(JsonRpcCode::ProtocolVersionUnsupported.as_i64(), -32001);
+    /// assert_eq!(JsonRpcCode::ServerNotInitialized.as_i64(), -32002);
+    /// ```
     #[must_use]
     pub const fn as_i64(self) -> i64 {
         match self {
@@ -44,10 +67,21 @@ impl JsonRpcCode {
             Self::MethodNotFound => -32601,
             Self::InvalidParams => -32602,
             Self::InternalError => -32603,
+            // Server-error band: zhive handshake codes (D-007).
+            Self::ProtocolVersionUnsupported => -32001,
+            Self::ServerNotInitialized => -32002,
+            Self::AlreadyInitialized => -32003,
         }
     }
 
     /// Default message string for the code.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use zhive_core::server::router::JsonRpcCode;
+    /// assert_eq!(JsonRpcCode::ServerNotInitialized.message(), "Server not initialized");
+    /// ```
     #[must_use]
     pub const fn message(self) -> &'static str {
         match self {
@@ -56,6 +90,9 @@ impl JsonRpcCode {
             Self::MethodNotFound => "Method not found",
             Self::InvalidParams => "Invalid params",
             Self::InternalError => "Internal error",
+            Self::ProtocolVersionUnsupported => "Unsupported protocol version",
+            Self::ServerNotInitialized => "Server not initialized",
+            Self::AlreadyInitialized => "Already initialized",
         }
     }
 }
@@ -170,6 +207,13 @@ mod tests {
         let r = Router::new();
         let err = r.dispatch("missing", None).await.unwrap_err();
         assert_eq!(err.code, JsonRpcCode::MethodNotFound.as_i64());
+    }
+
+    #[test]
+    fn handshake_error_codes_match_spec() {
+        assert_eq!(JsonRpcCode::ProtocolVersionUnsupported.as_i64(), -32001);
+        assert_eq!(JsonRpcCode::ServerNotInitialized.as_i64(), -32002);
+        assert_eq!(JsonRpcCode::AlreadyInitialized.as_i64(), -32003);
     }
 }
 

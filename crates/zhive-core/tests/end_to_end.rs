@@ -55,6 +55,38 @@ async fn spawn_server() -> (
     (token, socket, dir, engine)
 }
 
+/// The `connect_uds` handshake must negotiate V1 and surface the
+/// server's capabilities (hooks=true because `register_engine_handlers`
+/// is wired, and the server is a Phase 1 zhive instance).
+#[tokio::test]
+async fn connect_uds_handshake_populates_negotiated_metadata() {
+    use zhive_proto::initialize::ProtocolVersion;
+
+    let (token, socket, _dir, engine) = spawn_server().await;
+    let client = Client::connect_uds(&socket).await.expect("connect");
+
+    // Negotiated version must be V1 (current LATEST).
+    assert_eq!(
+        client.negotiated_version(),
+        ProtocolVersion::V1,
+        "negotiated version must be V1"
+    );
+
+    // Server must claim hooks and cancellation.
+    let caps = client.server_capabilities();
+    assert!(caps.hooks, "server must advertise hooks capability");
+    assert!(caps.cancellation, "server must advertise cancellation");
+    assert!(caps.subagents, "server must advertise subagents");
+
+    // Server identity must be "zhive".
+    assert_eq!(client.server_info().name, "zhive");
+    assert!(!client.server_info().version.is_empty());
+
+    client.shutdown();
+    token.cancel();
+    let _ = engine.shutdown().await;
+}
+
 #[tokio::test]
 async fn start_turn_round_trip_via_client() {
     let (token, socket, _dir, engine) = spawn_server().await;
