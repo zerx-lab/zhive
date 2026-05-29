@@ -131,6 +131,11 @@ impl EngineInner {
         // transient and always correct in memory; on DB round-trip the flags
         // field is restored as an empty vec (see thread_status_from_str).
         // DELIBERATE: active_flags detail is not persisted to state.db.
+        //
+        // Derive the source from the live handle so that subagent (child)
+        // threads are persisted with `ThreadSource::Subagent` rather than
+        // being silently overwritten to `ThreadSource::User`.
+        let source = thread_source_for_handle(&handle);
         let thread_snapshot = Thread {
             id: thread_id.clone(),
             session_id: None,
@@ -144,7 +149,7 @@ impl EngineInner {
                 active_flags: vec![zhive_proto::domain::ThreadActiveFlag::TurnInProgress],
             },
             cwd: PathBuf::from("."),
-            source: ThreadSource::User,
+            source,
             name: None,
             turns: vec![],
         };
@@ -229,26 +234,39 @@ impl EngineInner {
         let mut status = handle.status.write().await;
         *status = ThreadStatus::Idle;
         drop(status);
-        if let Err(err) = self.try_set_phase_atomic(EnginePhase::Turn, EnginePhase::Idle) {
-            // We've already verified `we_owned_the_turn` above, so the
-            // per-thread state was self-consistent — reaching this
-            // branch means the global engine phase fell out of sync,
-            // which is a true state-machine drift bug (not a benign
-            // race) and warrants an error-level log.
-            let actual = err.actual();
-            tracing::error!(
-                name: "zhive.engine.phase.rollback_failed",
-                expected = ?EnginePhase::Turn,
-                actual = ?actual,
-                "engine phase was not Turn when finishing a turn; state machine drift"
-            );
-        } else {
-            let _ = self.events_tx().send(EngineEvent::PhaseChanged {
-                thread_id: Some(thread_id.clone()),
-                from: EnginePhase::Turn,
-                to: EnginePhase::Idle,
-            });
+
+        // Subagent (child) threads do NOT own a slot in the global
+        // EnginePhase machine. The parent turn raised the phase to Turn
+        // and will lower it when it finishes. Calling try_set_phase_atomic
+        // here for a child thread would either (a) prematurely roll the
+        // phase back to Idle while the parent turn is still running, or
+        // (b) fire a PreconditionMismatch error when the engine is already
+        // Idle (the test case where spawn is called after the parent
+        // completes). Either outcome is wrong, so we skip the phase
+        // rollback entirely for child threads.
+        if handle.parent_thread_id.is_none() {
+            if let Err(err) = self.try_set_phase_atomic(EnginePhase::Turn, EnginePhase::Idle) {
+                // We've already verified `we_owned_the_turn` above, so the
+                // per-thread state was self-consistent — reaching this
+                // branch means the global engine phase fell out of sync,
+                // which is a true state-machine drift bug (not a benign
+                // race) and warrants an error-level log.
+                let actual = err.actual();
+                tracing::error!(
+                    name: "zhive.engine.phase.rollback_failed",
+                    expected = ?EnginePhase::Turn,
+                    actual = ?actual,
+                    "engine phase was not Turn when finishing a turn; state machine drift"
+                );
+            } else {
+                let _ = self.events_tx().send(EngineEvent::PhaseChanged {
+                    thread_id: Some(thread_id.clone()),
+                    from: EnginePhase::Turn,
+                    to: EnginePhase::Idle,
+                });
+            }
         }
+
         // Only emit TurnCompleted when the turn did not fail. A turn that
         // already broadcast TurnFailed must not also emit TurnCompleted —
         // each turn has exactly one terminal event.
@@ -277,6 +295,9 @@ impl EngineInner {
             duration_ms,
         });
         // Update the persisted thread status to Idle now that the turn has ended.
+        // Preserve the thread source so that subagent threads remain
+        // `ThreadSource::Subagent` after their turn ends.
+        let idle_source = thread_source_for_handle(handle);
         let idle_snapshot = Thread {
             id: thread_id.clone(),
             session_id: None,
@@ -288,7 +309,7 @@ impl EngineInner {
             updated_at: completed_at,
             status: ThreadStatus::Idle,
             cwd: PathBuf::from("."),
-            source: ThreadSource::User,
+            source: idle_source,
             name: None,
             turns: vec![],
         };
@@ -370,6 +391,9 @@ impl EngineInner {
             duration_ms,
         });
         // Flip the thread row back to Idle in the persistence index.
+        // Preserve the thread source so that cancelled subagent turns remain
+        // `ThreadSource::Subagent` rather than being overwritten to User.
+        let cancel_idle_source = thread_source_for_handle(&handle);
         let idle_snapshot = Thread {
             id: thread_id.clone(),
             session_id: None,
@@ -381,31 +405,42 @@ impl EngineInner {
             updated_at: cancel_at,
             status: ThreadStatus::Idle,
             cwd: PathBuf::from("."),
-            source: ThreadSource::User,
+            source: cancel_idle_source,
             name: None,
             turns: vec![],
         };
         self.enqueue_storage_op(StorageWriteOp::ThreadUpserted(Box::new(idle_snapshot)));
 
-        // Roll the global phase back to Idle. With `finish_turn` now
-        // gated by `we_owned_the_turn`, the only way to land in the
-        // error arm here is genuine state-machine drift — same as the
-        // finish_turn error path. Log at `error` to keep the asymmetry
-        // gone.
-        if let Err(err) = self.try_set_phase_atomic(EnginePhase::Turn, EnginePhase::Idle) {
-            let actual = err.actual();
-            tracing::error!(
-                name: "zhive.engine.phase.cancel_rollback_failed",
-                expected = ?EnginePhase::Turn,
-                actual = ?actual,
-                "cancel_turn observed phase != Turn; state machine drift"
-            );
-        } else {
-            let _ = self.events_tx().send(EngineEvent::PhaseChanged {
-                thread_id: Some(thread_id),
-                from: EnginePhase::Turn,
-                to: EnginePhase::Idle,
-            });
+        // Subagent (child) threads do NOT own a slot in the global
+        // EnginePhase machine — the parent turn raised the phase to Turn
+        // and will lower it when it finishes. Calling try_set_phase_atomic
+        // here for a child thread would prematurely set the phase to Idle
+        // while the parent turn is still running, causing the parent's
+        // eventual finish_turn to log a spurious 'state machine drift' error
+        // and allowing a new start_turn to succeed while the engine is
+        // actually still mid-turn (breaking the single-active-turn invariant).
+        // Mirror the identical guard added to finish_turn at line 242.
+        if handle.parent_thread_id.is_none() {
+            // Roll the global phase back to Idle. With `finish_turn` now
+            // gated by `we_owned_the_turn`, the only way to land in the
+            // error arm here is genuine state-machine drift — same as the
+            // finish_turn error path. Log at `error` to keep the asymmetry
+            // gone.
+            if let Err(err) = self.try_set_phase_atomic(EnginePhase::Turn, EnginePhase::Idle) {
+                let actual = err.actual();
+                tracing::error!(
+                    name: "zhive.engine.phase.cancel_rollback_failed",
+                    expected = ?EnginePhase::Turn,
+                    actual = ?actual,
+                    "cancel_turn observed phase != Turn; state machine drift"
+                );
+            } else {
+                let _ = self.events_tx().send(EngineEvent::PhaseChanged {
+                    thread_id: Some(thread_id),
+                    from: EnginePhase::Turn,
+                    to: EnginePhase::Idle,
+                });
+            }
         }
         CancelTurnReply::Cancelled {
             turn_id: cancelled_turn_id,
@@ -423,6 +458,34 @@ impl EngineInner {
 // Helpers (used only by this module)
 // ============================================================
 
+/// Derives the [`ThreadSource`] from a [`ThreadHandle`] without copying data.
+///
+/// A handle whose `parent_thread_id` is `Some(_)` was spawned as a subagent
+/// and must be persisted as [`ThreadSource::Subagent`]. Top-level threads
+/// (no parent) are [`ThreadSource::User`].
+///
+/// This helper is called at every persistence snapshot site to ensure
+/// subagent child threads are never silently downgraded to `User` on upsert.
+///
+/// # Examples
+///
+/// ```
+/// use std::sync::Arc;
+/// use zhive_proto::domain::{ThreadId, ThreadSource};
+/// use zhive_core::state::ThreadHandle;
+///
+/// let top_level = ThreadHandle::new_idle(ThreadId(Arc::from("thread:native/x")));
+/// // thread_source_for_handle is pub(in crate::engine), not accessible here,
+/// // but the logic is tested via the inc6b integration tests.
+/// ```
+fn thread_source_for_handle(handle: &crate::state::ThreadHandle) -> ThreadSource {
+    if handle.parent_thread_id.is_some() {
+        ThreadSource::Subagent
+    } else {
+        ThreadSource::User
+    }
+}
+
 /// Returns the current time as seconds since the Unix epoch.
 ///
 /// Saturates to `0` on clock errors and to [`i64::MAX`] on overflow.
@@ -430,6 +493,14 @@ fn unix_now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs().try_into().unwrap_or(i64::MAX))
+}
+
+/// Public re-export of [`unix_now`] for use in sibling modules.
+///
+/// The inner `unix_now` is private to this module; callers outside the
+/// module (e.g. [`super::inner`]) use this thin wrapper.
+pub(in crate::engine) fn unix_now_pub() -> i64 {
+    unix_now()
 }
 
 // ============================================================
@@ -546,6 +617,85 @@ mod tests {
         assert!(
             saw_phase_back_to_idle,
             "cancel_turn must broadcast a Turn→Idle PhaseChanged"
+        );
+    }
+
+    /// Regression guard: `cancel_turn` on a **child** (subagent) thread must
+    /// NOT roll the global engine phase back to `Idle`, because the parent
+    /// turn is still running and owns the `Turn` phase slot.
+    ///
+    /// Before the fix, the CAS at the end of `cancel_turn` would succeed and
+    /// set the global phase to `Idle`, causing the parent's eventual
+    /// `finish_turn` to log a spurious "state machine drift" error and allowing
+    /// a new `start_turn` to succeed while the engine was still mid-turn.
+    #[tokio::test]
+    async fn cancel_child_turn_does_not_roll_back_global_phase() {
+        let (events_tx, mut events_rx) = tokio::sync::broadcast::channel::<EngineEvent>(16);
+        let inner = Arc::new(EngineInner::new(events_tx, noop_provider()));
+
+        let parent_id = tid("thread:native/parent");
+        let child_id = tid("thread:subagent/parent/0");
+
+        // Register a *child* handle — it has parent_thread_id set.
+        // `new_child` returns `(handle, rx)`; the receiver is unused in
+        // this unit test (we only care about the phase-rollback behaviour).
+        let (child_handle_inner, _rx) =
+            crate::state::ThreadHandle::new_child(child_id.clone(), parent_id.clone());
+        let child_handle = Arc::new(child_handle_inner);
+        {
+            let mut guard = inner.threads().write_guard().await;
+            guard.insert(child_id.clone(), Arc::clone(&child_handle));
+        };
+
+        // Seed an active turn on the child.
+        let child_turn_id = inner.allocate_turn_id(&child_id);
+        {
+            let mut active = child_handle.active_turn.lock().await;
+            *active = Some(crate::state::ActiveTurn::new(
+                child_turn_id.clone(),
+                unix_now(),
+            ));
+        };
+
+        // Simulate the parent turn: engine phase is Turn.
+        inner
+            .try_set_phase_atomic(EnginePhase::Idle, EnginePhase::Turn)
+            .expect("seed phase to Turn");
+
+        // Drain setup events.
+        while events_rx.try_recv().is_ok() {}
+
+        // Cancel the child turn — this must NOT affect the global phase.
+        let reply = inner.cancel_turn(child_id.clone()).await;
+        assert!(
+            matches!(
+                reply,
+                crate::engine::submission::CancelTurnReply::Cancelled { .. }
+            ),
+            "cancel_turn should report Cancelled for the child"
+        );
+
+        // Global phase must still be Turn (parent is still running).
+        assert_eq!(
+            *inner.phase_lock(),
+            EnginePhase::Turn,
+            "cancel_turn on a child thread must not roll the global phase back to Idle"
+        );
+
+        // No Turn→Idle PhaseChanged event should have been emitted.
+        let had_phase_idle = events_rx.try_recv().is_ok_and(|ev| {
+            matches!(
+                ev,
+                EngineEvent::PhaseChanged {
+                    from: EnginePhase::Turn,
+                    to: EnginePhase::Idle,
+                    ..
+                }
+            )
+        });
+        assert!(
+            !had_phase_idle,
+            "cancel_turn on a child thread must not emit a Turn→Idle PhaseChanged event"
         );
     }
 

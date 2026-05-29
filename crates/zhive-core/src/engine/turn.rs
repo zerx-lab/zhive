@@ -67,6 +67,12 @@ const MAX_TURN_ITERATIONS: u32 = 32;
 /// Runs in a dedicated `tokio::spawn` task; holds no lock across await
 /// points so `cancel_turn` can take the `active_turn` slot at any time.
 ///
+/// Returns `true` when the turn ended in a failure state (`TurnFailed` was
+/// broadcast), `false` on a clean completion or cancellation. Callers that
+/// need to distinguish outcomes — notably [`super::inner::EngineInner::run_child_turn_and_deliver`]
+/// — use the return value to decide which payload to include in
+/// [`crate::engine::event::EngineEvent::SubagentCompleted`].
+///
 /// ## Steps (per iteration, up to [`MAX_TURN_ITERATIONS`])
 ///
 /// 1. Build `CallOptions` from the thread history.
@@ -91,10 +97,21 @@ pub(super) async fn run_turn(
     thread_id: ThreadId,
     turn_id: TurnId,
     cancel: CancellationToken,
-) {
-    // Scope used for permission evaluation when none is supplied externally.
-    // Phase 1: turns do not yet carry an explicit scope from the client.
-    let scope = PermissionScope::default_turn_scope();
+) -> bool {
+    // Read the turn scope from the active turn record.
+    //
+    // Top-level turns store `PermissionScope::default_turn_scope()` (set by
+    // `start_turn` via `ActiveTurn::new_with_cancel`). Child (subagent) turns
+    // carry a computed narrowed scope that `prepare_child_scope` produced and
+    // `start_child_turn` stored via `ActiveTurn::new_with_cancel_and_scope`.
+    // In either case the authoritative value is in `handle.active_turn.scope`,
+    // so we always read it from there to honour the narrowing guarantee.
+    let scope: PermissionScope = {
+        let guard = handle.active_turn.lock().await;
+        guard
+            .as_ref()
+            .map_or_else(PermissionScope::default_turn_scope, |a| a.scope.clone())
+    };
 
     // Per-turn item sequence counter for persistence.  Monotonically
     // incremented on every ItemAppended enqueue so the writer can order
@@ -160,7 +177,7 @@ pub(super) async fn run_turn(
             biased;
             () = cancel.cancelled() => {
                 inner.finish_turn(&handle, thread_id, turn_id, false).await;
-                return;
+                return false;
             }
             r = inner.provider().do_stream(call_options) => r,
         };
@@ -178,7 +195,7 @@ pub(super) async fn run_turn(
                     error: turn_error,
                 });
                 inner.finish_turn(&handle, thread_id, turn_id, true).await;
-                return;
+                return true;
             }
         };
 
@@ -269,7 +286,7 @@ pub(super) async fn run_turn(
             inner
                 .finish_turn(&handle, thread_id, turn_id, stream_failed)
                 .await;
-            return;
+            return stream_failed;
         }
 
         // 4. Tool dispatch for all tool-call items produced this iteration.
@@ -391,7 +408,7 @@ pub(super) async fn run_turn(
             // be an orphan event. Just finish and exit.
             if cancel.is_cancelled() {
                 inner.finish_turn(&handle, thread_id, turn_id, false).await;
-                return;
+                return false;
             }
 
             // The finalized item already carries `provider_tool_call_id`
@@ -449,6 +466,7 @@ pub(super) async fn run_turn(
     // 5. finish_turn handles the Turn→Idle rollback and TurnCompleted
     //    emission. Pass failed=false (normal completion).
     inner.finish_turn(&handle, thread_id, turn_id, false).await;
+    false
 }
 
 // Rust guideline compliant 2026-02-21

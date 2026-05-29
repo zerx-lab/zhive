@@ -319,6 +319,15 @@ impl EngineInner {
                 self.enqueue_next_turn(thread_id, items).await;
                 drop(reply);
             }
+            Submission::SpawnSubagent {
+                parent_thread_id,
+                definition,
+            } => {
+                let outcome = self.spawn_subagent(parent_thread_id, definition).await;
+                if let Some(tx) = reply {
+                    let _ = tx.send(SubmissionReply::SpawnSubagent(outcome));
+                }
+            }
             other => {
                 tracing::debug!(
                     name: "zhive.engine.submission.unhandled",

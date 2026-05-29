@@ -5,6 +5,8 @@
 //! cares about. The events are not request/response — discrete RPC
 //! roundtrips ride on the [`crate::engine::submission`] path instead.
 
+use std::sync::Arc;
+
 use zhive_proto::domain::{Item, ThreadId, TurnError, TurnId};
 use zhive_proto::hook::EnginePhase;
 use zhive_proto::permission::{RequestPermissionRequest, SessionAbortedNotification};
@@ -99,6 +101,25 @@ pub enum EngineEvent {
         request_id: PermissionRequestId,
         /// Wire payload for the reverse RPC.
         request: Box<RequestPermissionRequest>,
+    },
+    /// A subagent turn finished (completed or failed).
+    ///
+    /// External observers see exactly one `SubagentCompleted` per spawned
+    /// subagent. Intermediate items produced by the child turn are scoped
+    /// to the child thread and do not appear here.
+    ///
+    /// `final_message` is `None` when the child transcript contained no
+    /// [`Item::AgentMessage`] or [`Item::SystemNotice`], or when the child
+    /// turn failed — both are treated the same way by external subscribers
+    /// because the precise failure detail is already on [`EngineEvent::TurnFailed`]
+    /// for the child thread.
+    SubagentCompleted {
+        /// Thread id of the parent that spawned the subagent.
+        parent_thread_id: ThreadId,
+        /// Thread id of the subagent that just finished.
+        child_thread_id: ThreadId,
+        /// The single item delivered back to the parent, or `None`.
+        final_message: Option<Arc<Item>>,
     },
 }
 

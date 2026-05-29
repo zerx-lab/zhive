@@ -16,6 +16,7 @@
 //! forget; subscribers can still observe outcomes via the broadcast
 //! [`crate::engine::event::EngineEvent`] stream.
 
+use std::fmt;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -138,6 +139,43 @@ pub enum Submission {
     Shutdown,
 }
 
+/// Reasons a [`Submission::SpawnSubagent`] dispatch failed.
+///
+/// Distinct from [`StartTurnError`] because spawning a subagent has
+/// additional preconditions (recursion ban, scope narrowing) that do not
+/// apply to ordinary turn starts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SubagentSpawnError {
+    /// The parent thread was not found in the thread store.
+    ParentNotFound,
+    /// The parent thread is itself a subagent; recursion is forbidden.
+    RecursionForbidden,
+    /// The subagent definition requested `allow_subagent_spawn = true`.
+    ChildSpawnRequested,
+    /// The proposed child scope is wider than the parent scope.
+    ScopeWideningRejected,
+}
+
+impl fmt::Display for SubagentSpawnError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ParentNotFound => f.write_str("parent thread not found"),
+            Self::RecursionForbidden => {
+                f.write_str("subagent recursion forbidden (parent is already a subagent)")
+            }
+            Self::ChildSpawnRequested => f.write_str(
+                "subagent definition requested allow_subagent_spawn=true; recursion forbidden",
+            ),
+            Self::ScopeWideningRejected => {
+                f.write_str("child scope widens the parent scope; narrowing required")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SubagentSpawnError {}
+
 /// Typed reply discharged on a [`SubmissionEnvelope::reply`] sender.
 ///
 /// One variant per submission kind that has a synchronous reply. A
@@ -152,6 +190,8 @@ pub enum SubmissionReply {
     CancelTurn(CancelTurnReply),
     /// Reply to a [`Submission::ResumePermission`].
     ResumePermission(ResumePermissionReply),
+    /// Reply to a [`Submission::SpawnSubagent`].
+    SpawnSubagent(Result<ThreadId, SubagentSpawnError>),
     /// Reply to a [`Submission::Shutdown`].
     Shutdown,
 }

@@ -244,6 +244,10 @@ fn engine_error(err: &EngineError) -> ErrorObject {
             "kind": "reply_timed_out",
             "timeoutSecs": d.as_secs(),
         })),
+        EngineError::SubagentSpawnFailed(reason) => Some(serde_json::json!({
+            "kind": "subagent_spawn_failed",
+            "reason": reason.to_string(),
+        })),
     };
     ErrorObject {
         code: ENGINE_ERROR_CODE,

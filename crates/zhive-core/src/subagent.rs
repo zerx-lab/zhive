@@ -17,8 +17,71 @@
 use std::sync::Arc;
 
 use thiserror::Error;
-use zhive_proto::domain::{Item, ThreadId};
+use zhive_proto::domain::{Item, ThreadId, TurnError};
 use zhive_proto::permission::{PermissionMode, PermissionScope, ScopeError, SubagentDefinition};
+
+/// Outcome variants for a finished subagent turn.
+///
+/// ## Delivery
+///
+/// Subagent outcomes are delivered via two paths:
+///
+/// 1. **In-process channel**: `ThreadHandle::subagent_final_tx` holds a
+///    `Sender<SubagentFinalEvent>`.  The matching `Receiver` is returned by
+///    [`crate::state::ThreadHandle::new_child`] to the spawn site so the
+///    spawner can `await` the child result directly (e.g. from within a
+///    parent Agent-tool handler), without subscribing to the broadcast bus.
+///
+/// 2. **Broadcast bus**: [`crate::engine::event::EngineEvent::SubagentCompleted`]
+///    is always emitted for external observers regardless of whether the
+///    in-process channel receiver was retained.
+///
+/// `Suspended` is intentionally omitted from Phase 1 — the Defer /
+/// parent-suspended path is tracked as TODO B8-O6 and will land in a
+/// later increment.
+///
+/// # Examples
+///
+/// ```
+/// use std::sync::Arc;
+/// use zhive_proto::domain::{ItemId, ThreadId};
+/// use zhive_core::subagent::{SubagentFinalEvent, extract_final_message};
+/// use zhive_proto::domain::Item;
+///
+/// let tid = ThreadId(Arc::from("thread:subagent/child/0"));
+/// let items = vec![Item::AgentMessage { id: ItemId(Arc::from("a1")), text: "done".into() }];
+/// let final_msg = extract_final_message(&items);
+/// let event = SubagentFinalEvent::Completed { child_thread_id: tid, final_message: final_msg };
+/// assert!(matches!(event, SubagentFinalEvent::Completed { .. }));
+/// ```
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum SubagentFinalEvent {
+    /// The subagent turn completed normally.
+    ///
+    /// `final_message` is the single [`Item::AgentMessage`] (or
+    /// [`Item::SystemNotice`] fallback) extracted by
+    /// [`extract_final_message`]; it is `None` when the child transcript
+    /// contained neither.
+    Completed {
+        /// Stable id of the child thread.
+        child_thread_id: ThreadId,
+        /// The one item delivered back to the parent context, or `None`.
+        final_message: Option<Arc<Item>>,
+    },
+    /// The subagent turn failed (provider error, stream error, etc.).
+    ///
+    /// On failure the engine emits `SubagentCompleted` with
+    /// `final_message = None` rather than surfacing a hard error to the
+    /// parent, matching the Claude Code "child error = tool result error"
+    /// contract.
+    Errored {
+        /// Stable id of the child thread.
+        child_thread_id: ThreadId,
+        /// Failure detail from the turn.
+        error: TurnError,
+    },
+}
 
 /// Reasons a subagent cannot be spawned.
 #[derive(Debug, Error)]
@@ -36,6 +99,14 @@ pub enum SubagentError {
     /// The proposed child scope does not narrow the parent scope.
     #[error("child scope widens parent: {0}")]
     InvalidNarrowing(#[from] ScopeError),
+
+    /// Building the child [`PermissionScope`] from JSON failed.
+    ///
+    /// This indicates that `PermissionScope`'s serde schema changed in a
+    /// way that is incompatible with the JSON literal used to construct the
+    /// candidate scope in [`prepare_child_scope`].
+    #[error("failed to construct child PermissionScope: {0}")]
+    ScopeConstruction(#[from] serde_json::Error),
 }
 
 /// Snapshot returned by [`prepare_child_scope`].
@@ -105,14 +176,17 @@ pub fn prepare_child_scope(
     };
 
     // Build the candidate child scope through JSON because
-    // `PermissionScope` is `#[non_exhaustive]`.
+    // `PermissionScope` is `#[non_exhaustive]` and has no constructor that
+    // accepts all fields at once. A serde round-trip is the only stable way
+    // to construct it without depending on private fields. If the schema
+    // changes, this returns `SubagentError::ScopeConstruction` so the
+    // engine can surface it as a tool-call failure rather than panicking.
     let candidate: PermissionScope = serde_json::from_value(serde_json::json!({
         "allowedTools": allowed_tools,
         "disallowedTools": disallowed_tools,
         "permissionMode": permission_mode,
         "allowSubagentSpawn": false,
-    }))
-    .expect("scope fixture");
+    }))?;
 
     parent.narrowed_into(&candidate)?;
 

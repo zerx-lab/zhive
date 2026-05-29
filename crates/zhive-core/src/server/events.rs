@@ -190,6 +190,12 @@ pub fn engine_event_to_notification(event: &EngineEvent) -> Option<Notification>
             })
             .ok()?,
         ),
+        // SubagentCompleted is an internal engine event. It is
+        // suppressed from the wire notification stream in Phase 1 —
+        // external clients observe subagent outcomes via ItemAppended
+        // events on the child thread rather than a dedicated wire type.
+        // Returning `None` causes the forwarder to silently skip it.
+        EngineEvent::SubagentCompleted { .. } => return None,
     };
     Some(Notification::new(method, Some(params)))
 }

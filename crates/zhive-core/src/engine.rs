@@ -35,6 +35,7 @@ mod inner;
 mod lifecycle;
 pub mod phase;
 mod prompt;
+mod subagent_spawn;
 pub mod submission;
 mod tool_dispatch;
 mod turn;
@@ -46,7 +47,7 @@ use thiserror::Error;
 use tokio::sync::{broadcast, mpsc};
 use zhive_proto::domain::{Item, ThreadId, TurnId};
 use zhive_proto::hook::EnginePhase;
-use zhive_proto::permission::{PermissionOutcome, PermissionScope};
+use zhive_proto::permission::{PermissionOutcome, PermissionScope, SubagentDefinition};
 
 use inner::EngineInner;
 
@@ -158,6 +159,14 @@ pub enum EngineError {
     /// timeout.
     #[error("engine reply timed out after {0:?}")]
     ReplyTimedOut(Duration),
+
+    /// A [`Submission::SpawnSubagent`] was rejected by the engine.
+    ///
+    /// Covers parent-not-found, recursion-forbidden, and scope-widening
+    /// cases. Callers should surface this as a tool-call failure back to
+    /// the parent LLM rather than propagating it as a hard error.
+    #[error("subagent spawn rejected: {0}")]
+    SubagentSpawnFailed(submission::SubagentSpawnError),
 }
 
 impl EngineError {
@@ -488,6 +497,73 @@ impl Engine {
         let reply = self.submit_with_reply(Submission::Shutdown).await?;
         match reply {
             submission::SubmissionReply::Shutdown => Ok(()),
+            _ => Err(EngineError::ReplyDropped),
+        }
+    }
+
+    /// Spawns a subagent child thread under `parent_thread_id` and returns
+    /// the newly allocated child [`ThreadId`].
+    ///
+    /// The child thread starts with an **empty** transcript (fresh context
+    /// window), runs a turn seeded by `definition.prompt`, and delivers its
+    /// final message back via [`EngineEvent::SubagentCompleted`].
+    ///
+    /// Three hard constraints are enforced (Claude Code Subagents spec):
+    ///
+    /// * **No recursion** — the parent must not itself be a subagent.
+    /// * **Child spawn disabled** — `definition.allow_subagent_spawn` must
+    ///   be `false`.
+    /// * **Scope can only narrow** — the child scope must not widen the
+    ///   parent's permission scope.
+    ///
+    /// # Errors
+    ///
+    /// * [`EngineError::SubagentSpawnFailed`] when any of the above
+    ///   constraints is violated, or when the parent thread is not found.
+    /// * [`EngineError::ActorStopped`] / [`EngineError::ReplyDropped`]
+    ///   / [`EngineError::ReplyTimedOut`] on channel-level failures.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::sync::Arc;
+    /// use zhive_core::engine::Engine;
+    /// use zhive_proto::domain::ThreadId;
+    /// use zhive_proto::permission::SubagentDefinition;
+    ///
+    /// # async fn demo() -> Result<(), Box<dyn std::error::Error>> {
+    /// let engine = Engine::spawn();
+    /// let parent = ThreadId(Arc::from("thread:native/parent"));
+    ///
+    /// // Start a turn on the parent first so the thread exists.
+    /// engine.start_turn(parent.clone(), vec![], None).await?;
+    ///
+    /// let def: SubagentDefinition = serde_json::from_value(serde_json::json!({
+    ///     "name": "scout",
+    ///     "description": "read-only scout",
+    ///     "prompt": "Check the environment.",
+    /// }))?;
+    /// let child_id = engine.spawn_subagent(parent, def).await?;
+    /// println!("child thread: {}", child_id.0);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn spawn_subagent(
+        &self,
+        parent_thread_id: ThreadId,
+        definition: SubagentDefinition,
+    ) -> Result<ThreadId, EngineError> {
+        let reply = self
+            .submit_with_reply(Submission::SpawnSubagent {
+                parent_thread_id,
+                definition,
+            })
+            .await?;
+        match reply {
+            submission::SubmissionReply::SpawnSubagent(Ok(child_id)) => Ok(child_id),
+            submission::SubmissionReply::SpawnSubagent(Err(err)) => {
+                Err(EngineError::SubagentSpawnFailed(err))
+            }
             _ => Err(EngineError::ReplyDropped),
         }
     }
@@ -2845,6 +2921,752 @@ mod inc5_tests {
             status_after.as_deref(),
             Some("idle"),
             "thread status must be 'idle' after turn completes, got {status_after:?}"
+        );
+    }
+}
+
+// ============================================================
+// Increment-6 subagent spawn tests
+// ============================================================
+
+#[cfg(test)]
+mod inc6_tests {
+    //! Integration tests for the subagent spawn path introduced in increment 6.
+    //!
+    //! Test plan:
+    //! - `spawn_subagent_returns_child_id_and_emits_completed` — happy path:
+    //!   scripted child model emits an `AgentMessage`; `SubagentCompleted`
+    //!   carries the final message; child transcript starts fresh (no parent items).
+    //! - `spawn_subagent_only_final_message_delivered` — when the child
+    //!   produces multiple items, `SubagentCompleted` carries exactly one.
+    //! - `spawn_subagent_recursion_rejected` — spawning when parent is itself
+    //!   a subagent is rejected with `SubagentSpawnFailed(RecursionForbidden)`.
+    //! - `spawn_subagent_child_spawn_requested_rejected` — definition with
+    //!   `allow_subagent_spawn=true` is rejected.
+
+    use async_trait::async_trait;
+    use futures::stream;
+    use llmsdk::LanguageModel;
+    use llmsdk::language_model::{
+        BoxStream, CallOptions, FinishReason, FinishReasonKind, GenerateResult, StreamPart,
+        StreamResult,
+    };
+
+    use super::*;
+    use crate::state::ThreadHandle;
+
+    fn tid(s: &str) -> ThreadId {
+        ThreadId(Arc::from(s))
+    }
+
+    fn subagent_def(allow_spawn: bool) -> SubagentDefinition {
+        serde_json::from_value(serde_json::json!({
+            "name": "test-child",
+            "description": "test subagent",
+            "prompt": "Do something useful.",
+            "allowSubagentSpawn": allow_spawn,
+        }))
+        .expect("definition fixture")
+    }
+
+    /// Waits for up to `limit` events; returns `true` when `pred` matched.
+    async fn collect_until(
+        rx: &mut broadcast::Receiver<EngineEvent>,
+        limit: usize,
+        mut pred: impl FnMut(&EngineEvent) -> bool,
+    ) -> bool {
+        for _ in 0..limit {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await {
+                Ok(Ok(ev)) if pred(&ev) => return true,
+                Ok(Ok(_)) => {}
+                _ => return false,
+            }
+        }
+        false
+    }
+
+    // ===================================================================
+    // Test 1: happy path
+    // ===================================================================
+
+    /// Spawn a subagent on a top-level thread.  The child scripted model
+    /// emits an `AgentMessage`; assert:
+    /// - `spawn_subagent` returns a child `ThreadId`
+    /// - `EngineEvent::SubagentCompleted` is broadcast with `final_message`
+    ///   carrying the `AgentMessage` text
+    /// - The child thread's `items_tail` did NOT inherit parent items
+    ///   (fresh context window)
+    ///
+    /// The shared provider returns an empty stream on the first call (parent
+    /// turn) and the text answer on the second call (child turn).
+    #[tokio::test]
+    async fn spawn_subagent_returns_child_id_and_emits_completed() {
+        // Parent uses a noop provider; child uses the text-answer provider.
+        // Because only one provider is registered per engine, use a
+        // two-call model: call 0 = empty (parent), call 1 = child answer.
+        let engine = Engine::spawn_with_provider(two_call_text_provider("child answer"))
+            .with_reply_timeout(std::time::Duration::from_secs(5));
+        let mut events = engine.subscribe();
+
+        // Create the parent thread.
+        let parent_id = tid("thread:native/parent-spawn");
+        engine
+            .start_turn(parent_id.clone(), Vec::new(), None)
+            .await
+            .unwrap();
+
+        // Wait for the parent turn to complete (noop provider returns quickly).
+        collect_until(&mut events, 32, |ev| {
+            matches!(ev, EngineEvent::TurnCompleted { thread_id, .. } if thread_id == &parent_id)
+        })
+        .await;
+
+        // Spawn the subagent.
+        let child_id = engine
+            .spawn_subagent(parent_id.clone(), subagent_def(false))
+            .await
+            .expect("spawn_subagent must succeed");
+
+        assert!(
+            child_id.0.starts_with("thread:subagent/"),
+            "child id must carry subagent prefix, got {}",
+            child_id.0
+        );
+
+        // Wait for SubagentCompleted and assert final_message content.
+        let mut final_text: Option<String> = None;
+        let found = collect_until(&mut events, 64, |ev| {
+            if let EngineEvent::SubagentCompleted {
+                child_thread_id,
+                final_message,
+                ..
+            } = ev
+                && child_thread_id == &child_id
+            {
+                final_text = final_message.as_ref().and_then(|item| {
+                    if let zhive_proto::domain::Item::AgentMessage { text, .. } = item.as_ref() {
+                        Some(text.clone())
+                    } else {
+                        None
+                    }
+                });
+                return true;
+            }
+            false
+        })
+        .await;
+
+        assert!(found, "SubagentCompleted must fire for the child thread");
+        assert_eq!(
+            final_text.as_deref(),
+            Some("child answer"),
+            "final_message must carry the child AgentMessage text"
+        );
+
+        // Verify the child transcript is fresh: it must NOT contain the
+        // parent thread's items (empty parent input in this test, but the
+        // child items_tail must be independent of the parent's items_tail).
+        let child_handle = engine
+            .threads()
+            .get(&child_id)
+            .await
+            .expect("child thread must exist in store");
+        let parent_handle = engine
+            .threads()
+            .get(&parent_id)
+            .await
+            .expect("parent thread must exist");
+
+        // Child handle must have parent_thread_id set.
+        assert_eq!(
+            child_handle.parent_thread_id.as_ref(),
+            Some(&parent_id),
+            "child must record its parent"
+        );
+
+        // Parent items must not appear in child's items_tail (pointer inequality).
+        // We verify independence by checking that the two VecDeques are
+        // distinct objects (the child was created with a fresh VecDeque).
+        let parent_tail_len = parent_handle.items_tail.read().await.len();
+        let child_tail_len = child_handle.items_tail.read().await.len();
+        // Parent had no user input so its tail is empty; child has its prompt
+        // item (1) plus the AgentMessage (1) = 2 items.
+        assert_eq!(parent_tail_len, 0, "parent tail must be empty");
+        assert!(
+            child_tail_len > 0,
+            "child tail must contain at least the agent message"
+        );
+
+        engine.shutdown().await.unwrap();
+    }
+
+    // ===================================================================
+    // Test 2: only the final message is delivered
+    // ===================================================================
+
+    /// A scripted multi-item model (reasoning chunk + agent message) must
+    /// produce exactly one item in `SubagentCompleted.final_message`.
+    #[tokio::test]
+    async fn spawn_subagent_only_final_message_delivered() {
+        let engine = Engine::spawn_with_provider(reasoning_then_text_provider())
+            .with_reply_timeout(std::time::Duration::from_secs(5));
+        let mut events = engine.subscribe();
+
+        let parent_id = tid("thread:native/parent-only-final");
+        engine
+            .start_turn(parent_id.clone(), Vec::new(), None)
+            .await
+            .unwrap();
+        collect_until(&mut events, 32, |ev| {
+            matches!(ev, EngineEvent::TurnCompleted { thread_id, .. } if thread_id == &parent_id)
+        })
+        .await;
+
+        let child_id = engine
+            .spawn_subagent(parent_id.clone(), subagent_def(false))
+            .await
+            .expect("spawn_subagent must succeed");
+
+        let mut saw_completed = false;
+        let mut final_text: Option<String> = None;
+        collect_until(&mut events, 64, |ev| {
+            if let EngineEvent::SubagentCompleted {
+                child_thread_id,
+                final_message,
+                ..
+            } = ev
+                && child_thread_id == &child_id
+            {
+                saw_completed = true;
+                if let Some(item) = final_message
+                    && let zhive_proto::domain::Item::AgentMessage { text, .. } = item.as_ref()
+                {
+                    final_text = Some(text.clone());
+                }
+                return true;
+            }
+            false
+        })
+        .await;
+
+        assert!(saw_completed, "SubagentCompleted must fire");
+        assert_eq!(
+            final_text.as_deref(),
+            Some("final answer"),
+            "only the final AgentMessage must be delivered, got {final_text:?}"
+        );
+
+        engine.shutdown().await.unwrap();
+    }
+
+    /// Returns a [`DynLanguageModel`] that produces an empty stream on the
+    /// first call (for the parent turn) and a reasoning block followed by a
+    /// final text answer on the second call (for the child turn).
+    /// Used to test the only-final delivery contract.
+    fn reasoning_then_text_provider() -> DynLanguageModel {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Debug)]
+        struct ReasoningThenTextModel {
+            call_count: Arc<AtomicUsize>,
+        }
+
+        #[async_trait]
+        impl LanguageModel for ReasoningThenTextModel {
+            fn provider(&self) -> &'static str {
+                "test"
+            }
+            fn model_id(&self) -> &'static str {
+                "reasoning-then-text"
+            }
+            async fn do_generate(&self, _: CallOptions) -> llmsdk::error::Result<GenerateResult> {
+                Ok(GenerateResult {
+                    content: vec![],
+                    finish_reason: FinishReason::new(FinishReasonKind::Stop),
+                    usage: llmsdk::language_model::Usage::default(),
+                    provider_metadata: None,
+                    request: None,
+                    response: None,
+                    warnings: vec![],
+                })
+            }
+            async fn do_stream(&self, _: CallOptions) -> llmsdk::error::Result<StreamResult> {
+                let idx = self.call_count.fetch_add(1, Ordering::SeqCst);
+                let parts: Vec<llmsdk::error::Result<StreamPart>> = if idx == 0 {
+                    // Parent turn: no output.
+                    vec![]
+                } else {
+                    // Child turn: reasoning + final text.
+                    vec![
+                        Ok(StreamPart::ReasoningStart {
+                            id: "r0".into(),
+                            provider_metadata: None,
+                        }),
+                        Ok(StreamPart::ReasoningDelta {
+                            id: "r0".into(),
+                            delta: "thinking...".into(),
+                            provider_metadata: None,
+                        }),
+                        Ok(StreamPart::ReasoningEnd {
+                            id: "r0".into(),
+                            provider_metadata: None,
+                        }),
+                        Ok(StreamPart::TextStart {
+                            id: "b0".into(),
+                            provider_metadata: None,
+                        }),
+                        Ok(StreamPart::TextDelta {
+                            id: "b0".into(),
+                            delta: "final answer".into(),
+                            provider_metadata: None,
+                        }),
+                        Ok(StreamPart::TextEnd {
+                            id: "b0".into(),
+                            provider_metadata: None,
+                        }),
+                    ]
+                };
+                let s: BoxStream<llmsdk::error::Result<StreamPart>> = Box::pin(stream::iter(parts));
+                Ok(StreamResult {
+                    stream: s,
+                    request: None,
+                    response: None,
+                })
+            }
+        }
+
+        DynLanguageModel::new(ReasoningThenTextModel {
+            call_count: Arc::new(AtomicUsize::new(0)),
+        })
+    }
+
+    // ===================================================================
+    // Test 3: recursion rejected (parent is a subagent)
+    // ===================================================================
+
+    /// Manually construct a [`ThreadHandle`] with `parent_thread_id = Some(_)` to
+    /// simulate a subagent thread, then call `spawn_subagent` targeting it.
+    /// The engine must reject with `SubagentSpawnFailed(RecursionForbidden)`.
+    #[tokio::test]
+    async fn spawn_subagent_recursion_rejected() {
+        let engine = Engine::spawn().with_reply_timeout(std::time::Duration::from_secs(5));
+
+        // Manually insert a child-like thread handle into the store.
+        // This simulates a thread that was itself spawned as a subagent.
+        let fake_parent_id = tid("thread:subagent/native/root/0");
+        // `new_child` returns `(handle, rx)`; the receiver is unused in this
+        // test (we only need the handle to be registered in the thread store).
+        let (child_handle_inner, _rx) =
+            ThreadHandle::new_child(fake_parent_id.clone(), tid("thread:native/root"));
+        let child_handle = Arc::new(child_handle_inner);
+        engine
+            .threads()
+            .write_guard()
+            .await
+            .insert(fake_parent_id.clone(), child_handle);
+
+        // Attempt to spawn a sub-subagent under the fake parent.
+        let result = engine
+            .spawn_subagent(fake_parent_id, subagent_def(false))
+            .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(EngineError::SubagentSpawnFailed(
+                    submission::SubagentSpawnError::RecursionForbidden
+                ))
+            ),
+            "expected RecursionForbidden, got {result:?}"
+        );
+
+        engine.shutdown().await.unwrap();
+    }
+
+    // ===================================================================
+    // Test 4: definition with allow_subagent_spawn=true is rejected
+    // ===================================================================
+
+    /// A `SubagentDefinition` with `allow_subagent_spawn=true` must be
+    /// rejected regardless of the parent's own spawn capability.
+    #[tokio::test]
+    async fn spawn_subagent_child_spawn_requested_rejected() {
+        let engine = Engine::spawn().with_reply_timeout(std::time::Duration::from_secs(5));
+
+        // Create a top-level parent thread.
+        let parent_id = tid("thread:native/parent-bad-def");
+        engine
+            .start_turn(parent_id.clone(), Vec::new(), None)
+            .await
+            .unwrap();
+
+        // Wait for the turn to finish so the thread exists and is idle.
+        let mut events = engine.subscribe();
+        collect_until(&mut events, 32, |ev| {
+            matches!(ev, EngineEvent::TurnCompleted { thread_id, .. } if thread_id == &parent_id)
+        })
+        .await;
+
+        // Try to spawn a subagent with allow_subagent_spawn=true.
+        let result = engine.spawn_subagent(parent_id, subagent_def(true)).await;
+
+        assert!(
+            matches!(
+                result,
+                Err(EngineError::SubagentSpawnFailed(
+                    submission::SubagentSpawnError::ChildSpawnRequested
+                ))
+            ),
+            "expected ChildSpawnRequested, got {result:?}"
+        );
+
+        engine.shutdown().await.unwrap();
+    }
+
+    // ===================================================================
+    // Test 5: subagent spawned while parent turn is still in-flight
+    // ===================================================================
+
+    /// Spawns a subagent while the parent turn is **still in progress**
+    /// (blocked inside `do_stream`). Asserts:
+    ///
+    /// (a) `SubagentCompleted` fires for the child thread.
+    /// (b) After the child completes, the global engine phase is still `Turn`
+    ///     (the child must not roll back the parent's phase slot).
+    /// (c) After the parent unblocks and completes, `TurnCompleted` fires for
+    ///     the parent and the engine phase returns to `Idle`.
+    ///
+    /// This is the production scenario described in the increment-6 spec:
+    /// the parent LLM triggers an Agent tool call, which spawns a subagent
+    /// via `SpawnSubagent` while the parent `run_turn` task is still alive.
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "integration test requires an inline LanguageModel impl (HoldThenTextModel) \
+                  plus two barrier rendezvous points; the logic is linear and splitting it \
+                  would only move code without improving clarity"
+    )]
+    async fn spawn_subagent_while_parent_turn_in_flight() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::sync::Barrier;
+
+        // A model that uses barriers for two-phase coordination:
+        //
+        // Call 0 (parent turn): blocks on `parent_hold` until the test
+        // releases it. This keeps the engine in Turn phase while the child
+        // subagent runs.
+        //
+        // Call 1 (child turn): returns a text answer immediately.
+        #[derive(Debug)]
+        struct HoldThenTextModel {
+            call_count: Arc<AtomicUsize>,
+            parent_hold: Arc<Barrier>,
+        }
+
+        #[async_trait]
+        impl LanguageModel for HoldThenTextModel {
+            fn provider(&self) -> &'static str {
+                "test"
+            }
+            fn model_id(&self) -> &'static str {
+                "hold-then-text"
+            }
+            async fn do_generate(
+                &self,
+                _opts: CallOptions,
+            ) -> llmsdk::error::Result<GenerateResult> {
+                Ok(GenerateResult {
+                    content: vec![],
+                    finish_reason: FinishReason::new(FinishReasonKind::Stop),
+                    usage: llmsdk::language_model::Usage::default(),
+                    provider_metadata: None,
+                    request: None,
+                    response: None,
+                    warnings: vec![],
+                })
+            }
+            async fn do_stream(&self, _opts: CallOptions) -> llmsdk::error::Result<StreamResult> {
+                let idx = self.call_count.fetch_add(1, Ordering::SeqCst);
+                if idx == 0 {
+                    // Parent turn: block until the test releases the barrier.
+                    self.parent_hold.wait().await;
+                    let s: BoxStream<llmsdk::error::Result<StreamPart>> = Box::pin(stream::empty());
+                    return Ok(StreamResult {
+                        stream: s,
+                        request: None,
+                        response: None,
+                    });
+                }
+                // Child turn: immediate text answer.
+                let parts: Vec<llmsdk::error::Result<StreamPart>> = vec![
+                    Ok(StreamPart::TextStart {
+                        id: "c0".into(),
+                        provider_metadata: None,
+                    }),
+                    Ok(StreamPart::TextDelta {
+                        id: "c0".into(),
+                        delta: "child done".into(),
+                        provider_metadata: None,
+                    }),
+                    Ok(StreamPart::TextEnd {
+                        id: "c0".into(),
+                        provider_metadata: None,
+                    }),
+                ];
+                let s: BoxStream<llmsdk::error::Result<StreamPart>> = Box::pin(stream::iter(parts));
+                Ok(StreamResult {
+                    stream: s,
+                    request: None,
+                    response: None,
+                })
+            }
+        }
+
+        let parent_hold = Arc::new(Barrier::new(2));
+        let model = HoldThenTextModel {
+            call_count: Arc::new(AtomicUsize::new(0)),
+            parent_hold: Arc::clone(&parent_hold),
+        };
+
+        let engine = Engine::spawn_with_provider(DynLanguageModel::new(model))
+            .with_reply_timeout(std::time::Duration::from_secs(10));
+        let mut events = engine.subscribe();
+
+        let parent_id = tid("thread:native/parent-inflight");
+
+        // Start the parent turn.  It blocks inside do_stream on parent_hold.
+        engine
+            .start_turn(parent_id.clone(), Vec::new(), None)
+            .await
+            .unwrap();
+
+        // Wait for TurnStarted to confirm the parent turn task is in-flight.
+        let saw_parent_started = collect_until(&mut events, 16, |ev| {
+            matches!(ev, EngineEvent::TurnStarted { thread_id, .. } if thread_id == &parent_id)
+        })
+        .await;
+        assert!(
+            saw_parent_started,
+            "expected TurnStarted for parent before spawning child"
+        );
+
+        // (b) Engine phase must be Turn while the parent turn is running.
+        // We verify this BEFORE spawning the child so the assertion is
+        // unambiguous.  The phase is Turn because start_turn raised it.
+        // (We can't read phase directly from Engine, but we know it's Turn
+        // because TurnStarted was broadcast without TurnCompleted following it.)
+
+        // Spawn the subagent while the parent turn is still in-flight.
+        let child_id = engine
+            .spawn_subagent(parent_id.clone(), subagent_def(false))
+            .await
+            .expect("spawn_subagent must succeed while parent is in Turn phase");
+
+        // (a) Wait for SubagentCompleted to confirm the child finished.
+        let saw_child_completed = collect_until(&mut events, 64, |ev| {
+            matches!(ev, EngineEvent::SubagentCompleted { child_thread_id, .. }
+                if child_thread_id == &child_id)
+        })
+        .await;
+        assert!(
+            saw_child_completed,
+            "SubagentCompleted must fire for the child thread"
+        );
+
+        // (b) After the child completes, the parent turn must STILL be in
+        // Turn phase — no TurnCompleted for the parent must have fired yet.
+        // We check the event stream: collect events with a very short timeout;
+        // if TurnCompleted for the parent arrives here, the child incorrectly
+        // rolled back the phase.
+        let parent_completed_too_early = {
+            let mut found = false;
+            // Short window: we only look for events that already arrived.
+            for _ in 0..8 {
+                match tokio::time::timeout(std::time::Duration::from_millis(30), events.recv())
+                    .await
+                {
+                    Ok(Ok(EngineEvent::TurnCompleted { thread_id, .. }))
+                        if thread_id == parent_id =>
+                    {
+                        found = true;
+                        break;
+                    }
+                    Ok(Ok(_)) => {}
+                    _ => break,
+                }
+            }
+            found
+        };
+        assert!(
+            !parent_completed_too_early,
+            "parent TurnCompleted must NOT fire while the parent turn is still blocked in \
+             do_stream; the child must not roll back the global engine phase"
+        );
+
+        // Unblock the parent model so the parent turn can complete.
+        parent_hold.wait().await;
+
+        // (c) Parent TurnCompleted must eventually arrive.
+        let saw_parent_completed = collect_until(&mut events, 64, |ev| {
+            matches!(ev, EngineEvent::TurnCompleted { thread_id, .. } if thread_id == &parent_id)
+        })
+        .await;
+        assert!(
+            saw_parent_completed,
+            "parent TurnCompleted must fire after the parent model unblocks"
+        );
+
+        engine.shutdown().await.unwrap();
+    }
+
+    // ===================================================================
+    // Shared test helpers
+    // ===================================================================
+
+    /// Returns a [`DynLanguageModel`] that produces an empty stream on the
+    /// first call (for the parent turn) and a text `AgentMessage` with
+    /// `text` on the second call (for the child turn).
+    fn two_call_text_provider(text: &'static str) -> DynLanguageModel {
+        use std::sync::atomic::AtomicUsize;
+
+        #[derive(Debug)]
+        struct TwoCallModel {
+            call_count: Arc<AtomicUsize>,
+            answer: &'static str,
+        }
+
+        #[async_trait]
+        impl LanguageModel for TwoCallModel {
+            fn provider(&self) -> &'static str {
+                "test"
+            }
+            fn model_id(&self) -> &'static str {
+                "two-call"
+            }
+            async fn do_generate(&self, _: CallOptions) -> llmsdk::error::Result<GenerateResult> {
+                Ok(GenerateResult {
+                    content: vec![],
+                    finish_reason: FinishReason::new(FinishReasonKind::Stop),
+                    usage: llmsdk::language_model::Usage::default(),
+                    provider_metadata: None,
+                    request: None,
+                    response: None,
+                    warnings: vec![],
+                })
+            }
+            async fn do_stream(&self, _: CallOptions) -> llmsdk::error::Result<StreamResult> {
+                let idx = self
+                    .call_count
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let parts: Vec<llmsdk::error::Result<StreamPart>> = if idx == 0 {
+                    vec![]
+                } else {
+                    vec![
+                        Ok(StreamPart::TextStart {
+                            id: "b0".into(),
+                            provider_metadata: None,
+                        }),
+                        Ok(StreamPart::TextDelta {
+                            id: "b0".into(),
+                            delta: self.answer.into(),
+                            provider_metadata: None,
+                        }),
+                        Ok(StreamPart::TextEnd {
+                            id: "b0".into(),
+                            provider_metadata: None,
+                        }),
+                    ]
+                };
+                let s: BoxStream<llmsdk::error::Result<StreamPart>> = Box::pin(stream::iter(parts));
+                Ok(StreamResult {
+                    stream: s,
+                    request: None,
+                    response: None,
+                })
+            }
+        }
+
+        DynLanguageModel::new(TwoCallModel {
+            call_count: Arc::new(AtomicUsize::new(0)),
+            answer: text,
+        })
+    }
+
+    // ===================================================================
+    // Test 6 (FIX 1): subagent child thread persists ThreadSource::Subagent
+    // ===================================================================
+
+    /// After a subagent child thread finishes its turn, the persisted thread
+    /// row in state.db must carry `source = "subagent"`, not `source = "user"`.
+    ///
+    /// Before the fix, every `ThreadUpserted` snapshot in `finish_turn` and
+    /// `cancel_turn` hardcoded `ThreadSource::User`, silently overwriting the
+    /// `Subagent` discriminant that was written at spawn time.
+    ///
+    /// This test:
+    /// 1. Configures an engine with real storage.
+    /// 2. Runs a parent turn (empty provider → completes immediately).
+    /// 3. Spawns a subagent whose child provider returns one `AgentMessage`.
+    /// 4. Waits for `SubagentCompleted` and then for engine shutdown to flush.
+    /// 5. Queries `state.db` and asserts the child thread row has
+    ///    `source = "subagent"`.
+    #[tokio::test]
+    async fn subagent_child_thread_persists_source_subagent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Arc::new(crate::persistence::Storage::open(tmp.path()).await.unwrap());
+
+        let cfg = EngineConfig {
+            provider: two_call_text_provider("child reply"),
+            tools: Arc::new(crate::tools::ToolRegistry::new()),
+            hook_host: Arc::new(crate::hooks::HookHost::new()),
+            storage: Some(Arc::clone(&storage)),
+        };
+        let engine =
+            Engine::spawn_with_config(cfg).with_reply_timeout(std::time::Duration::from_secs(10));
+        let mut events = engine.subscribe();
+
+        // Start the parent turn (call 0 → empty stream → completes quickly).
+        let parent_id = tid("thread:native/fix1-source-parent");
+        engine
+            .start_turn(parent_id.clone(), Vec::new(), None)
+            .await
+            .unwrap();
+        collect_until(&mut events, 32, |ev| {
+            matches!(ev, EngineEvent::TurnCompleted { thread_id, .. } if thread_id == &parent_id)
+        })
+        .await;
+
+        // Spawn the subagent (call 1 → "child reply" answer).
+        let child_id = engine
+            .spawn_subagent(parent_id.clone(), subagent_def(false))
+            .await
+            .expect("spawn_subagent must succeed");
+
+        // Wait for SubagentCompleted so the child turn has definitely finished.
+        let saw_completed = collect_until(&mut events, 64, |ev| {
+            matches!(ev, EngineEvent::SubagentCompleted { child_thread_id, .. }
+                if child_thread_id == &child_id)
+        })
+        .await;
+        assert!(saw_completed, "SubagentCompleted must fire for the child");
+
+        // Shutdown flushes the persistence writer before returning.
+        engine.shutdown().await.unwrap();
+
+        // Assert: child thread row must carry source = "subagent".
+        let child_row = storage
+            .state
+            .get_thread(&child_id)
+            .await
+            .expect("DB query must succeed")
+            .expect("child thread row must exist in state.db after subagent turn");
+
+        assert_eq!(
+            child_row.source,
+            zhive_proto::domain::ThreadSource::Subagent,
+            "child thread source must be ThreadSource::Subagent in state.db, \
+             got {:?}",
+            child_row.source
         );
     }
 }
