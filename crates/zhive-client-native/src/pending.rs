@@ -18,7 +18,21 @@ use zhive_proto::{Id, ResponseOutcome};
 /// inside the critical section beyond a single hashmap mutation).
 #[derive(Debug, Default)]
 pub struct PendingRequests {
-    pending: Mutex<HashMap<Id, oneshot::Sender<ResponseOutcome>>>,
+    pending: Mutex<HashMap<Id, oneshot::Sender<PendingSlot>>>,
+}
+
+/// The payload carried in each pending oneshot channel.
+///
+/// Separating this from `ResponseOutcome` lets the reader task deliver
+/// a human-readable disconnect reason without adding a sentinel error
+/// code to the normal response path.
+#[derive(Debug)]
+pub(crate) enum PendingSlot {
+    /// A JSON-RPC response arrived from the server.
+    Response(ResponseOutcome),
+    /// The connection closed before the response arrived; contains a
+    /// human-readable reason string.
+    Disconnected(String),
 }
 
 /// Outcome of [`PendingRequests::resolve`].
@@ -40,7 +54,7 @@ impl PendingRequests {
     ///
     /// The caller is responsible for shipping a [`zhive_proto::Request`]
     /// carrying the same `id` over the wire.
-    pub fn register(&self, id: Id) -> oneshot::Receiver<ResponseOutcome> {
+    pub(crate) fn register(&self, id: Id) -> oneshot::Receiver<PendingSlot> {
         let (tx, rx) = oneshot::channel();
         let mut guard = self.lock();
         guard.insert(id, tx);
@@ -56,21 +70,38 @@ impl PendingRequests {
         let Some(tx) = tx else {
             return ResolveResult::NoMatch;
         };
-        if tx.send(outcome).is_ok() {
+        if tx.send(PendingSlot::Response(outcome)).is_ok() {
             ResolveResult::Delivered
         } else {
             ResolveResult::AwaiterDropped
         }
     }
 
-    /// Drops every pending awaiter; the matching `call` futures
-    /// observe a [`crate::ClientError::ConnectionClosed`].
-    pub fn drain(&self) {
+    /// Drains every pending awaiter with a disconnected payload carrying
+    /// `reason`.
+    ///
+    /// In-flight `call` futures resolve to
+    /// [`crate::ClientError::Disconnected`] rather than hanging.
+    pub fn drain_with_disconnected(&self, reason: &str) {
         let drained: Vec<_> = {
             let mut guard = self.lock();
             guard.drain().map(|(_, tx)| tx).collect()
         };
-        drop(drained);
+        for tx in drained {
+            // If the receiver was already dropped (e.g. the caller
+            // gave up on the call) this is a benign no-op.
+            let _ = tx.send(PendingSlot::Disconnected(reason.to_owned()));
+        }
+    }
+
+    /// Drops every pending awaiter; the matching `call` futures
+    /// observe a [`crate::ClientError::Disconnected`].
+    ///
+    /// Prefer [`Self::drain_with_disconnected`] when a reason string is
+    /// available so callers receive the more informative
+    /// `ClientError::Disconnected` variant.
+    pub fn drain(&self) {
+        self.drain_with_disconnected("connection closed");
     }
 
     /// Number of in-flight requests.
@@ -88,7 +119,7 @@ impl PendingRequests {
         self.len() == 0
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<Id, oneshot::Sender<ResponseOutcome>>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<Id, oneshot::Sender<PendingSlot>>> {
         match self.pending.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
@@ -111,7 +142,7 @@ mod tests {
             ResolveResult::Delivered
         );
         let got = rx.await.unwrap();
-        assert_eq!(got, outcome);
+        assert!(matches!(got, PendingSlot::Response(_)));
         assert!(p.is_empty());
     }
 
@@ -141,8 +172,22 @@ mod tests {
         let rx2 = p.register(Id::Number(2));
         p.drain();
         assert!(p.is_empty());
-        assert!(rx1.await.is_err());
-        assert!(rx2.await.is_err());
+        // drain sends Disconnected, so receivers get Ok(Disconnected)
+        // not Err(RecvError).
+        assert!(rx1.await.is_ok());
+        assert!(rx2.await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn drain_with_disconnected_carries_reason() {
+        let p = PendingRequests::default();
+        let rx = p.register(Id::Number(3));
+        p.drain_with_disconnected("test reason");
+        let slot = rx.await.unwrap();
+        assert!(
+            matches!(slot, PendingSlot::Disconnected(ref r) if r == "test reason"),
+            "expected Disconnected with the provided reason"
+        );
     }
 }
 

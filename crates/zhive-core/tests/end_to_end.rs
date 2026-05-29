@@ -131,6 +131,78 @@ async fn cancel_turn_returns_null_for_missing_thread() {
     let _ = engine.shutdown().await;
 }
 
+/// `Client::cancel_turn` typed helper returns `Ok(None)` when no turn
+/// is active on the given thread.
+#[tokio::test]
+async fn cancel_turn_typed_helper_returns_none_for_missing_thread() {
+    use zhive_proto::domain::ThreadId;
+
+    let (token, socket, _dir, engine) = spawn_server().await;
+    let client = Client::connect_uds(&socket).await.expect("connect");
+
+    let tid = ThreadId(std::sync::Arc::from("thread:native/cancel-typed-none"));
+    let result = client.cancel_turn(&tid).await.expect("cancel_turn ok");
+    assert!(
+        result.is_none(),
+        "expected None for a thread with no active turn, got {result:?}"
+    );
+
+    client.shutdown();
+    token.cancel();
+    let _ = engine.shutdown().await;
+}
+
+/// `Client::cancel_turn` typed helper returns `Ok(Some(TurnId))` when
+/// a turn was active and was cancelled.
+///
+/// Phase 1 turns auto-complete before `cancel_turn` can race them, so
+/// we start a turn first then immediately call cancel; the turn will
+/// have already completed but the test validates the `Some` path via
+/// a stub server that synthesises the `{ "turnId": "..." }` response.
+#[tokio::test]
+async fn cancel_turn_typed_helper_decodes_turn_id_from_stub() {
+    use tokio::io::AsyncWriteExt;
+    use zhive_proto::domain::{ThreadId, TurnId};
+    use zhive_proto::framing;
+    use zhive_proto::{Message, Response};
+
+    // Stub server: reads the cancel_turn request and replies with a
+    // synthetic `{ "turnId": "turn:thread:native/stub-cancel/42" }`.
+    let (client_io, server_io) = tokio::io::duplex(4096);
+    let (mut server_read, mut server_write) = tokio::io::split(server_io);
+    let (client_read, client_write) = tokio::io::split(client_io);
+
+    let server_task = tokio::spawn(async move {
+        let mut buf = tokio::io::BufReader::new(&mut server_read);
+        let msg = framing::read_message(&mut buf).await.expect("read req");
+        let req = match msg {
+            Message::Request(r) => r,
+            other => panic!("stub server: expected Request, got {other:?}"),
+        };
+        let resp = Response::ok(
+            req.id,
+            serde_json::json!({ "turnId": "turn:thread:native/stub-cancel/42" }),
+        );
+        framing::write_message(&mut server_write, &Message::Response(resp))
+            .await
+            .expect("write resp");
+        server_write.flush().await.expect("flush");
+    });
+
+    let client = Client::from_split(client_read, client_write);
+    let tid = ThreadId(std::sync::Arc::from("thread:native/stub-cancel"));
+    let result = client.cancel_turn(&tid).await.expect("cancel_turn ok");
+
+    assert!(result.is_some(), "expected Some(TurnId), got None");
+    let TurnId(id_str) = result.unwrap();
+    assert_eq!(
+        &*id_str, "turn:thread:native/stub-cancel/42",
+        "decoded TurnId does not match stub value"
+    );
+
+    server_task.await.unwrap();
+}
+
 #[tokio::test]
 async fn resume_permission_with_invalid_id_surfaces_status() {
     let (token, socket, _dir, engine) = spawn_server().await;
