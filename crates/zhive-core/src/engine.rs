@@ -20,10 +20,13 @@
 //! Subscribers that want streaming updates (e.g. live `ItemAppended`,
 //! mid-turn `PhaseChanged`) still call [`Engine::subscribe`].
 //!
-//! Tool dispatch, the hook host, the provider fold, the persistence
-//! sync, and per-thread agent loops are added by later Block B
-//! tasks; today's actor finishes a turn synchronously inside the
-//! `StartTurn` dispatch.
+//! ## Provider injection
+//!
+//! [`Engine::spawn`] supplies a no-op [`crate::provider::ScriptedModel`]
+//! (empty stream) so all 107 pre-increment-2 tests remain green — they
+//! only assert `TurnStarted` → `TurnCompleted`, which still holds.
+//! [`Engine::spawn_with_provider`] injects a real or scripted provider
+//! for callers and tests that need to observe actual item output.
 //!
 //! [`EnginePhase`]: zhive_proto::hook::EnginePhase
 
@@ -31,6 +34,7 @@ pub mod event;
 mod inner;
 pub mod phase;
 pub mod submission;
+mod turn;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -42,6 +46,8 @@ use zhive_proto::hook::EnginePhase;
 use zhive_proto::permission::{PermissionOutcome, PermissionScope};
 
 use inner::EngineInner;
+
+use crate::provider::DynLanguageModel;
 
 #[doc(inline)]
 pub use event::{EngineEvent, TurnRejectionReason};
@@ -128,7 +134,13 @@ pub struct Engine {
 pub type SubmitError = EngineError;
 
 impl Engine {
-    /// Spawns a fresh engine actor and returns a handle to it.
+    /// Spawns a fresh engine actor with a no-op provider and returns a handle.
+    ///
+    /// The no-op provider is a [`crate::provider::ScriptedModel`] that
+    /// yields an **empty** stream (zero `StreamPart`s). A turn started
+    /// against it produces no items and completes cleanly
+    /// (`TurnStarted` → `TurnCompleted`), keeping all pre-increment-2
+    /// tests green.
     ///
     /// The actor runs on the current Tokio runtime. Drop the last
     /// [`Engine`] clone to let the actor exit, or call
@@ -145,9 +157,45 @@ impl Engine {
     /// ```
     #[must_use]
     pub fn spawn() -> Self {
+        use crate::provider::ScriptedModel;
+        let noop = ScriptedModel::new("noop", "noop", vec![]).into_dyn();
+        Self::spawn_with_provider(noop)
+    }
+
+    /// Spawns a fresh engine actor injecting a specific LLM provider.
+    ///
+    /// Use this constructor in tests or production code that needs to
+    /// observe real (or scripted) model output. The `provider` is called
+    /// once per turn; see [`crate::provider::ScriptedModel`] for an
+    /// in-memory deterministic implementation suitable for testing.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::sync::Arc;
+    /// use llmsdk::language_model::StreamPart;
+    /// use zhive_core::engine::Engine;
+    /// use zhive_core::provider::ScriptedModel;
+    ///
+    /// # async fn demo() {
+    /// let model = ScriptedModel::new(
+    ///     "test-provider",
+    ///     "test-model",
+    ///     vec![
+    ///         StreamPart::TextStart { id: "b0".into(), provider_metadata: None },
+    ///         StreamPart::TextDelta { id: "b0".into(), delta: "hello".into(), provider_metadata: None },
+    ///         StreamPart::TextEnd   { id: "b0".into(), provider_metadata: None },
+    ///     ],
+    /// );
+    /// let engine = Engine::spawn_with_provider(model.into_dyn());
+    /// engine.shutdown().await.unwrap();
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn spawn_with_provider(provider: DynLanguageModel) -> Self {
         let (submission_tx, submission_rx) = mpsc::channel(SUBMISSION_CHANNEL_CAP);
         let (events_tx, _) = broadcast::channel(EVENT_CHANNEL_CAP);
-        let inner = EngineInner::new(events_tx.clone());
+        let inner = Arc::new(EngineInner::new(events_tx.clone(), provider));
         let threads = Arc::clone(inner.threads());
         let permission = inner.permission_reducer();
         tokio::spawn(inner.run(submission_rx));
@@ -325,12 +373,136 @@ impl Engine {
     }
 }
 
+// ============================================================
+// Test helpers (always compiled with #[cfg(test)] on the module)
+// ============================================================
+
+#[cfg(test)]
+mod test_helpers {
+    use async_trait::async_trait;
+    use futures::stream;
+    use llmsdk::LanguageModel;
+    use llmsdk::language_model::{
+        BoxStream, CallOptions, FinishReason, FinishReasonKind, GenerateResult, StreamPart,
+        StreamResult,
+    };
+    use std::sync::Arc as StdArc;
+    use tokio::sync::Barrier;
+
+    /// A model that blocks on a [`Barrier`] inside `do_stream`.
+    ///
+    /// Used to keep the engine in Turn phase long enough for a second
+    /// `start_turn` to observe `EngineBusy`, and for cancel tests.
+    #[derive(Debug)]
+    pub(super) struct BarrierModel {
+        pub(super) barrier: StdArc<Barrier>,
+    }
+
+    impl BarrierModel {
+        pub(super) fn new_pair(parties: usize) -> (StdArc<Barrier>, Self) {
+            let b = StdArc::new(Barrier::new(parties));
+            let model = Self {
+                barrier: StdArc::clone(&b),
+            };
+            (b, model)
+        }
+    }
+
+    #[async_trait]
+    impl LanguageModel for BarrierModel {
+        fn provider(&self) -> &'static str {
+            "test"
+        }
+        fn model_id(&self) -> &'static str {
+            "barrier"
+        }
+        async fn do_generate(&self, _opts: CallOptions) -> llmsdk::error::Result<GenerateResult> {
+            Ok(GenerateResult {
+                content: vec![],
+                finish_reason: FinishReason::new(FinishReasonKind::Stop),
+                usage: llmsdk::language_model::Usage::default(),
+                provider_metadata: None,
+                request: None,
+                response: None,
+                warnings: vec![],
+            })
+        }
+        async fn do_stream(&self, _opts: CallOptions) -> llmsdk::error::Result<StreamResult> {
+            // Block until the test calls barrier.wait() — this keeps the
+            // engine in Turn phase for the duration needed by the test.
+            self.barrier.wait().await;
+            let s: BoxStream<llmsdk::error::Result<StreamPart>> = Box::pin(stream::empty());
+            Ok(StreamResult {
+                stream: s,
+                request: None,
+                response: None,
+            })
+        }
+    }
+
+    /// A model whose stream yields exactly one `Err` item.
+    ///
+    /// Used to verify that the in-stream error path emits `TurnFailed`
+    /// and does NOT follow it with `TurnCompleted`.
+    #[derive(Debug)]
+    pub(super) struct ErrorStreamModel;
+
+    #[async_trait]
+    impl LanguageModel for ErrorStreamModel {
+        fn provider(&self) -> &'static str {
+            "test"
+        }
+        fn model_id(&self) -> &'static str {
+            "error-stream"
+        }
+        async fn do_generate(&self, _opts: CallOptions) -> llmsdk::error::Result<GenerateResult> {
+            Ok(GenerateResult {
+                content: vec![],
+                finish_reason: FinishReason::new(FinishReasonKind::Stop),
+                usage: llmsdk::language_model::Usage::default(),
+                provider_metadata: None,
+                request: None,
+                response: None,
+                warnings: vec![],
+            })
+        }
+        async fn do_stream(&self, _opts: CallOptions) -> llmsdk::error::Result<StreamResult> {
+            let err = llmsdk::ProviderError::no_such_model("test", "languageModel");
+            let s: BoxStream<llmsdk::error::Result<StreamPart>> =
+                Box::pin(stream::iter(vec![Err(err)]));
+            Ok(StreamResult {
+                stream: s,
+                request: None,
+                response: None,
+            })
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::ScriptedModel;
+    use llmsdk::language_model::StreamPart;
 
     fn tid(s: &str) -> ThreadId {
         ThreadId(Arc::from(s))
+    }
+
+    /// Helper: receive events up to `limit` times, looking for `pred`.
+    async fn collect_events_until(
+        rx: &mut broadcast::Receiver<EngineEvent>,
+        limit: usize,
+        mut pred: impl FnMut(&EngineEvent) -> bool,
+    ) -> bool {
+        for _ in 0..limit {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await {
+                Ok(Ok(ev)) if pred(&ev) => return true,
+                Ok(Ok(_)) => {}
+                _ => return false,
+            }
+        }
+        false
     }
 
     #[tokio::test]
@@ -345,25 +517,71 @@ mod tests {
 
         let mut saw_started = false;
         let mut saw_completed = false;
-        while !(saw_started && saw_completed) {
-            match events.recv().await.unwrap() {
+        for _ in 0..32 {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
+                .await
+                .expect("timeout")
+                .expect("broadcast")
+            {
                 EngineEvent::TurnStarted { .. } => saw_started = true,
                 EngineEvent::TurnCompleted { .. } => saw_completed = true,
                 _ => {}
             }
+            if saw_started && saw_completed {
+                break;
+            }
         }
+        assert!(saw_started, "expected TurnStarted");
+        assert!(saw_completed, "expected TurnCompleted");
         engine.shutdown().await.unwrap();
     }
 
+    /// A turn started while the engine is already in Turn phase must
+    /// surface `EngineBusy`. We use a [`test_helpers::BarrierModel`] that
+    /// blocks inside `do_stream`, keeping the engine in Turn phase long
+    /// enough for the second `start_turn` call to observe the conflict.
+    ///
+    /// Synchronization is done by subscribing to the event channel before
+    /// the first `start_turn`, then awaiting `TurnStarted`. Once the
+    /// subscriber observes `TurnStarted` the phase is guaranteed to be
+    /// `Turn`, so the subsequent `start_turn` will always surface
+    /// `EngineBusy`. This avoids the inherent race in `yield_now` loops.
     #[tokio::test]
     async fn start_turn_returns_busy_when_engine_phase_not_idle() {
-        let engine = Engine::spawn();
-        // Manually flip the global phase to Turn so the next StartTurn
-        // is rejected. We do this via two concurrent submissions
-        // back-to-back through fire_and_forget — but Phase 1 finishes
-        // turns synchronously, so we can't observe Busy through the
-        // public API. Skip the test until B5/B10 introduce a real
-        // long-running turn.
+        let (barrier, model) = test_helpers::BarrierModel::new_pair(2);
+        let engine = Engine::spawn_with_provider(DynLanguageModel::new(model))
+            .with_reply_timeout(std::time::Duration::from_secs(5));
+
+        // Subscribe BEFORE the first start_turn so we can observe TurnStarted.
+        let mut events = engine.subscribe();
+
+        // First start_turn — the actor spawns a turn task that blocks on
+        // the barrier inside do_stream, keeping the engine in Turn phase.
+        engine
+            .start_turn(tid("thread:native/busy-1"), Vec::new(), None)
+            .await
+            .unwrap();
+
+        // Wait for TurnStarted: once we see it, the phase is guaranteed
+        // Turn and any subsequent start_turn will surface EngineBusy.
+        let saw_started = collect_events_until(&mut events, 16, |ev| {
+            matches!(ev, EngineEvent::TurnStarted { .. })
+        })
+        .await;
+        assert!(saw_started, "expected TurnStarted from first turn");
+
+        // Second start_turn while engine is still in Turn phase.
+        let result = engine
+            .start_turn(tid("thread:native/busy-2"), Vec::new(), None)
+            .await;
+
+        // Unblock the first turn so it can complete.
+        barrier.wait().await;
+
+        assert!(
+            matches!(result, Err(EngineError::EngineBusy { .. })),
+            "expected EngineBusy, got {result:?}"
+        );
         engine.shutdown().await.unwrap();
     }
 
@@ -379,8 +597,8 @@ mod tests {
 
         let mut saw_idle_to_turn = false;
         let mut saw_turn_to_idle = false;
-        for _ in 0..16 {
-            let ev = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
+        for _ in 0..32 {
+            let ev = tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
                 .await
                 .expect("event recv must not time out")
                 .expect("broadcast send error");
@@ -421,8 +639,6 @@ mod tests {
         let engine = Engine::spawn();
         let reducer = engine.permission_reducer();
 
-        // Enroll a pending request manually; the engine actor only
-        // resolves them via the ResumePermission submission path.
         let request: zhive_proto::permission::RequestPermissionRequest =
             serde_json::from_value(serde_json::json!({
                 "threadId": "thread:native/a",
@@ -454,11 +670,9 @@ mod tests {
         engine.shutdown().await.unwrap();
     }
 
-    // The full "cancel_turn cancels every pending permission" path
-    // is exercised in `engine/inner.rs#cancel_turn_cancels_pending_permissions`
-    // via a direct EngineInner test because the Phase 1 actor auto-
-    // completes turns synchronously and can't observe an `active_turn`
-    // present at the time a `Submission::CancelTurn` lands.
+    // The full "cancel_turn cancels every pending permission" path is
+    // exercised in `engine/inner.rs#cancel_turn_cancels_pending_permissions`
+    // via a direct EngineInner test.
 
     #[tokio::test]
     async fn cancel_turn_with_no_active_turn_is_noop() {
@@ -475,7 +689,6 @@ mod tests {
     async fn shutdown_stops_actor() {
         let engine = Engine::spawn();
         engine.shutdown().await.unwrap();
-        // Subsequent submits eventually surface ActorStopped.
         let mut last = Ok(());
         for _ in 0..20 {
             last = engine
@@ -489,6 +702,178 @@ mod tests {
             tokio::task::yield_now().await;
         }
         assert!(matches!(last, Err(EngineError::ActorStopped)));
+    }
+
+    // ============================================================
+    // Increment-2 provider-driven turn tests
+    // ============================================================
+
+    /// A turn over a scripted text response must emit
+    /// `ItemAppended(AgentMessage { text: "hello world" })` then `TurnCompleted`.
+    #[tokio::test]
+    async fn scripted_text_turn_emits_item_appended_then_completed() {
+        let model = ScriptedModel::new(
+            "test",
+            "m",
+            vec![
+                StreamPart::TextStart {
+                    id: "b0".into(),
+                    provider_metadata: None,
+                },
+                StreamPart::TextDelta {
+                    id: "b0".into(),
+                    delta: "hello ".into(),
+                    provider_metadata: None,
+                },
+                StreamPart::TextDelta {
+                    id: "b0".into(),
+                    delta: "world".into(),
+                    provider_metadata: None,
+                },
+                StreamPart::TextEnd {
+                    id: "b0".into(),
+                    provider_metadata: None,
+                },
+            ],
+        );
+        let engine = Engine::spawn_with_provider(model.into_dyn());
+        let mut events = engine.subscribe();
+
+        engine
+            .start_turn(tid("thread:native/scripted-text"), Vec::new(), None)
+            .await
+            .unwrap();
+
+        let mut saw_item = false;
+        let mut saw_completed = false;
+        for _ in 0..32 {
+            let ev = tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
+                .await
+                .expect("timeout")
+                .expect("broadcast");
+            match ev {
+                EngineEvent::ItemAppended { item, .. } => {
+                    if let zhive_proto::domain::Item::AgentMessage { text, .. } = *item {
+                        assert_eq!(text, "hello world");
+                        saw_item = true;
+                    }
+                }
+                EngineEvent::TurnCompleted { .. } => saw_completed = true,
+                _ => {}
+            }
+            if saw_item && saw_completed {
+                break;
+            }
+        }
+
+        assert!(saw_item, "expected ItemAppended(AgentMessage)");
+        assert!(saw_completed, "expected TurnCompleted");
+        engine.shutdown().await.unwrap();
+    }
+
+    /// `cancel_turn` mid-stream must stop item emission and yield
+    /// `SessionAborted`; `TurnCompleted` must NOT be emitted.
+    #[tokio::test]
+    async fn cancel_mid_stream_yields_session_aborted_no_completed() {
+        // BarrierModel blocks inside do_stream so we can cancel before
+        // any items arrive.
+        let (barrier, model) = test_helpers::BarrierModel::new_pair(2);
+        let engine = Engine::spawn_with_provider(DynLanguageModel::new(model))
+            .with_reply_timeout(std::time::Duration::from_secs(5));
+        let mut events = engine.subscribe();
+
+        let thread_id = tid("thread:native/cancel-mid");
+        engine
+            .start_turn(thread_id.clone(), Vec::new(), None)
+            .await
+            .unwrap();
+
+        // Wait for TurnStarted so the turn task is definitely in-flight.
+        let saw_started = collect_events_until(&mut events, 16, |ev| {
+            matches!(ev, EngineEvent::TurnStarted { .. })
+        })
+        .await;
+        assert!(saw_started, "expected TurnStarted");
+
+        // Cancel while the model is blocking in do_stream.
+        let cancelled = engine.cancel_turn(thread_id).await.unwrap();
+        assert!(cancelled.is_some(), "expected a turn id to be cancelled");
+
+        // Unblock the model so its task can exit cleanly.
+        barrier.wait().await;
+
+        // SessionAborted must appear; TurnCompleted must NOT.
+        let mut saw_aborted = false;
+        let mut saw_completed = false;
+        for _ in 0..32 {
+            match tokio::time::timeout(std::time::Duration::from_millis(300), events.recv()).await {
+                Ok(Ok(EngineEvent::SessionAborted(_))) => saw_aborted = true,
+                Ok(Ok(EngineEvent::TurnCompleted { .. })) => saw_completed = true,
+                Ok(Ok(_)) => {}
+                _ => break,
+            }
+            if saw_aborted {
+                break;
+            }
+        }
+        assert!(saw_aborted, "expected SessionAborted after cancel");
+        assert!(!saw_completed, "TurnCompleted must NOT appear after cancel");
+        engine.shutdown().await.unwrap();
+    }
+
+    /// An in-stream provider error must emit `TurnFailed` and must NOT
+    /// follow it with `TurnCompleted` — a turn has exactly one terminal
+    /// event.
+    ///
+    /// This test exercises the `Some(Err(…))` arm of the stream loop
+    /// in `run_turn`, which previously called `finish_turn` (emitting
+    /// `TurnCompleted`) immediately after broadcasting `TurnFailed`.
+    #[tokio::test]
+    async fn stream_error_emits_turn_failed_not_completed() {
+        let engine =
+            Engine::spawn_with_provider(DynLanguageModel::new(test_helpers::ErrorStreamModel))
+                .with_reply_timeout(std::time::Duration::from_secs(5));
+        let mut events = engine.subscribe();
+
+        engine
+            .start_turn(tid("thread:native/stream-err"), Vec::new(), None)
+            .await
+            .unwrap();
+
+        let mut saw_failed = false;
+        let mut saw_completed = false;
+        // Drain up to 32 events with a short per-event timeout so we
+        // don't block forever if TurnCompleted is never emitted.
+        for _ in 0..32 {
+            match tokio::time::timeout(std::time::Duration::from_millis(500), events.recv()).await {
+                Ok(Ok(EngineEvent::TurnFailed { .. })) => saw_failed = true,
+                Ok(Ok(EngineEvent::TurnCompleted { .. })) => saw_completed = true,
+                Ok(Ok(_)) => {}
+                _ => break,
+            }
+            if saw_failed {
+                // Give a brief window for a spurious TurnCompleted to arrive.
+                for _ in 0..4 {
+                    match tokio::time::timeout(std::time::Duration::from_millis(100), events.recv())
+                        .await
+                    {
+                        Ok(Ok(EngineEvent::TurnCompleted { .. })) => {
+                            saw_completed = true;
+                            break;
+                        }
+                        Ok(Ok(_)) => {}
+                        _ => break,
+                    }
+                }
+                break;
+            }
+        }
+        assert!(saw_failed, "expected TurnFailed for in-stream error");
+        assert!(
+            !saw_completed,
+            "TurnCompleted must NOT follow TurnFailed for the same turn"
+        );
+        engine.shutdown().await.unwrap();
     }
 }
 

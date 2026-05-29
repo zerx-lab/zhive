@@ -9,6 +9,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use tokio::sync::{Mutex, RwLock};
+use tokio_util::sync::CancellationToken;
 use zhive_proto::domain::{Item, ItemId, ThreadId, ThreadStatus, TurnId};
 
 /// Single owner record for an active or recently-loaded thread.
@@ -79,24 +80,53 @@ impl ThreadHandle {
 
 /// In-progress turn metadata; created when the engine accepts
 /// [`crate::engine::submission::Submission::StartTurn`].
+///
+/// The `cancel` token is fired by `cancel_turn` so the spawned turn task
+/// exits its streaming `select!` loop without waiting for the stream to
+/// drain. `next_item_seq` is reserved for any engine-minted items; items
+/// produced by `StreamFold` get their IDs from the fold's own counter and
+/// do not consume from `next_item_seq`.
 #[derive(Debug, Clone)]
 pub struct ActiveTurn {
     /// Stable turn id.
     pub id: TurnId,
     /// Unix-seconds timestamp at acceptance.
     pub started_at: i64,
-    /// Sequence counter for the next [`ItemId`].
+    /// Sequence counter for engine-minted items (user-input items and any
+    /// internal notices the engine itself creates outside of `StreamFold`).
+    ///
+    /// Provider-output items have their `ItemId` minted by `StreamFold`,
+    /// so this field is not consumed by the provider streaming path.
     pub next_item_seq: u32,
+    /// Per-turn cancellation token; cancelled by [`cancel_turn`] to stop
+    /// the in-flight provider stream task.
+    ///
+    /// [`cancel_turn`]: crate::engine::submission::Submission::CancelTurn
+    pub cancel: CancellationToken,
 }
 
 impl ActiveTurn {
-    /// Builds a fresh active-turn record.
+    /// Builds a fresh active-turn record with a new cancellation token.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use zhive_proto::domain::TurnId;
+    /// use zhive_core::state::ActiveTurn;
+    ///
+    /// let id = TurnId(Arc::from("turn:t/0"));
+    /// let active = ActiveTurn::new(id.clone(), 0);
+    /// assert_eq!(active.id, id);
+    /// assert!(!active.cancel.is_cancelled());
+    /// ```
     #[must_use]
     pub fn new(id: TurnId, started_at: i64) -> Self {
         Self {
             id,
             started_at,
             next_item_seq: 0,
+            cancel: CancellationToken::new(),
         }
     }
 }

@@ -1,13 +1,11 @@
 //! Engine actor body.
 //!
 //! Owns the live thread map and the broadcast event channel, and
-//! consumes the [`Submission`] stream serially. Most of the meaningful
-//! behaviour is plugged in by later Block B tasks (B5 hook host, B6
-//! permission reducer, B10 provider). Phase 1 dispatch only handles
-//! `StartTurn` / `CancelTurn` / `Shutdown` end-to-end; the remaining
-//! variants emit a structured event so subscribers can observe the
-//! command landed even though the heavy lifting still needs the
-//! downstream actors.
+//! consumes the [`Submission`] stream serially. The actor dispatches
+//! `StartTurn` by immediately replying with the assigned `TurnId`, then
+//! spawns a separate async task (`run_turn`) that calls the LLM provider
+//! and streams items back. This keeps the actor loop responsive to
+//! `CancelTurn` while a turn is in flight.
 //!
 //! ## Phase invariant
 //!
@@ -18,6 +16,18 @@
 //! Phase + per-thread [`ThreadStatus`] transitions for one turn happen
 //! inside the same critical section so external observers can never see
 //! the two views disagree.
+//!
+//! ## Prompt mapping (Phase 1, documented deviations)
+//!
+//! `run_turn` maps the thread's `items_tail` to `llmsdk::Prompt` with
+//! the following Phase-1 rules:
+//! - `Item::UserMessage` → `Message::User { content: [UserPart::Text(…)] }`
+//! - `Item::AgentMessage` → `Message::Assistant { content: [AssistantPart::Text(…)] }`
+//! - All other item kinds are skipped (no tool results, no context items, …).
+//!
+//! If the resulting prompt is empty (no convertible history), the call is
+//! still issued — the provider may generate a greeting or refuse; both
+//! outcomes are valid.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -29,6 +39,7 @@ use zhive_proto::domain::{ThreadId, ThreadStatus, TurnId};
 use zhive_proto::hook::EnginePhase;
 
 use crate::permission::{PermissionReducer, ReducerError};
+use crate::provider::DynLanguageModel;
 use crate::state::{ActiveTurn, ThreadStore};
 
 use super::event::{EngineEvent, TurnRejectionReason};
@@ -38,7 +49,14 @@ use super::submission::{
     Submission, SubmissionEnvelope, SubmissionReply,
 };
 
+// ============================================================
+// EngineInner
+// ============================================================
+
 /// Shared state owned by the engine actor.
+///
+/// Wrapped in `Arc` so the actor loop and each spawned turn task can
+/// both hold a reference without lifetime coupling.
 pub(crate) struct EngineInner {
     threads: Arc<ThreadStore>,
     events_tx: broadcast::Sender<EngineEvent>,
@@ -54,16 +72,25 @@ pub(crate) struct EngineInner {
     /// (and future hook host) can use the same `PendingPermissions`
     /// store for outbound prompts.
     permission: PermissionReducer,
+    /// LLM provider used for every turn. A no-op [`crate::provider::ScriptedModel`]
+    /// (empty stream) is supplied by [`super::Engine::spawn`] for backward
+    /// compatibility; real providers are injected via
+    /// [`super::Engine::spawn_with_provider`].
+    provider: DynLanguageModel,
 }
 
 impl EngineInner {
-    pub(crate) fn new(events_tx: broadcast::Sender<EngineEvent>) -> Self {
+    pub(crate) fn new(
+        events_tx: broadcast::Sender<EngineEvent>,
+        provider: DynLanguageModel,
+    ) -> Self {
         Self {
             threads: Arc::new(ThreadStore::new()),
             events_tx,
             phase: Mutex::new(EnginePhase::Idle),
             turn_counter: AtomicU64::new(0),
             permission: PermissionReducer::new(),
+            provider,
         }
     }
 
@@ -71,7 +98,26 @@ impl EngineInner {
         self.permission.clone()
     }
 
-    pub(crate) async fn run(self, mut submission_rx: mpsc::Receiver<SubmissionEnvelope>) {
+    /// Returns the event broadcast sender for sibling modules within
+    /// the `engine` module (e.g. [`super::turn`]).
+    pub(in crate::engine) fn events_tx(&self) -> &broadcast::Sender<EngineEvent> {
+        &self.events_tx
+    }
+
+    /// Returns the LLM provider for sibling modules within
+    /// the `engine` module (e.g. [`super::turn`]).
+    pub(in crate::engine) fn provider(&self) -> &DynLanguageModel {
+        &self.provider
+    }
+
+    /// Runs the actor loop, consuming submissions until `Shutdown`.
+    ///
+    /// Takes `Arc<Self>` so the loop can clone the `Arc` into each
+    /// spawned turn task without capturing `self` by reference.
+    pub(crate) async fn run(
+        self: Arc<Self>,
+        mut submission_rx: mpsc::Receiver<SubmissionEnvelope>,
+    ) {
         while let Some(env) = submission_rx.recv().await {
             let SubmissionEnvelope { submission, reply } = env;
             if matches!(submission, Submission::Shutdown) {
@@ -85,7 +131,7 @@ impl EngineInner {
     }
 
     async fn dispatch(
-        &self,
+        self: &Arc<Self>,
         sub: Submission,
         reply: Option<tokio::sync::oneshot::Sender<SubmissionReply>>,
     ) {
@@ -127,8 +173,6 @@ impl EngineInner {
                 // If the caller attached a reply oneshot, drop it
                 // explicitly so the awaiter surfaces
                 // `EngineError::ReplyDropped` instead of timing out.
-                // A future variant will replace this with a typed
-                // SubmissionReply once the matching action lands.
                 drop(reply);
             }
         }
@@ -173,8 +217,15 @@ impl EngineInner {
         }
     }
 
+    /// Accepts a turn submission: transitions the phase, installs
+    /// `ActiveTurn`, pushes user-input items, emits `TurnStarted`,
+    /// then **spawns** the provider task and returns `StartTurnReply`
+    /// immediately — without waiting for the provider to finish.
+    ///
+    /// The spawned task runs [`Self::run_turn`] and calls
+    /// [`Self::finish_turn`] when it completes.
     async fn start_turn(
-        &self,
+        self: &Arc<Self>,
         thread_id: ThreadId,
         user_input: Vec<zhive_proto::domain::Item>,
     ) -> Result<StartTurnReply, StartTurnError> {
@@ -202,20 +253,32 @@ impl EngineInner {
         let turn_id = self.allocate_turn_id(&thread_id);
         let started_at = unix_now();
 
-        // active_turn + status are flipped to In-progress before any
-        // event is emitted so subscribers observing `TurnStarted` are
-        // guaranteed to see the matching state if they look it up.
-        let mut active = handle.active_turn.lock().await;
-        *active = Some(ActiveTurn::new(turn_id.clone(), started_at));
-        drop(active);
+        // Install the ActiveTurn (including its cancel token) and flip
+        // the thread status to Active. Both happen before TurnStarted
+        // is emitted so subscribers observing that event see a
+        // consistent in-memory state.
+        let cancel = {
+            let mut active = handle.active_turn.lock().await;
+            let active_turn = ActiveTurn::new(turn_id.clone(), started_at);
+            let cancel = active_turn.cancel.clone();
+            *active = Some(active_turn);
+            cancel
+        };
+
         let mut status = handle.status.write().await;
         *status = ThreadStatus::Active {
             active_flags: vec![zhive_proto::domain::ThreadActiveFlag::TurnInProgress],
         };
         drop(status);
 
+        // Push user-input items and emit ItemAppended for each one.
         for item in user_input {
-            handle.push_item(item).await;
+            handle.push_item(item.clone()).await;
+            let _ = self.events_tx.send(EngineEvent::ItemAppended {
+                thread_id: thread_id.clone(),
+                turn_id: turn_id.clone(),
+                item: Box::new(item),
+            });
         }
 
         let _ = self.events_tx.send(EngineEvent::TurnStarted {
@@ -223,38 +286,72 @@ impl EngineInner {
             turn_id: turn_id.clone(),
         });
 
+        // Build the reply before spawning so the borrow of `turn_id` is
+        // still available here.
         let reply = StartTurnReply {
             turn_id: turn_id.clone(),
         };
-        // Phase 1: immediately complete the turn after recording the
-        // user input. The real agent loop wiring lands once B5 / B6 /
-        // B10 are in place.
-        self.finish_turn(&handle, thread_id, turn_id).await;
+
+        // Spawn the provider task. The actor returns to consuming
+        // submissions immediately so CancelTurn can be processed
+        // while the turn is in flight.
+        let inner = Arc::clone(self);
+        tokio::spawn(async move {
+            super::turn::run_turn(&inner, handle, thread_id, turn_id, cancel).await;
+        });
+
         Ok(reply)
     }
 
-    /// Completes the turn that the calling [`Self::start_turn`] put in
-    /// flight. The thread status flips back to `Idle`, the engine phase
-    /// rolls back to `Idle`, and a `TurnCompleted` event is emitted.
-    async fn finish_turn(
+    /// Completes the turn that `run_turn` put in flight.
+    ///
+    /// Thread status flips back to `Idle`, the engine phase rolls back to
+    /// `Idle`, and a `TurnCompleted` event is emitted — unless `failed` is
+    /// `true`, in which case `TurnCompleted` is suppressed because `TurnFailed`
+    /// was already broadcast (a turn has exactly one terminal event).
+    ///
+    /// If `cancel_turn` already took the `active_turn` slot
+    /// (`we_owned_the_turn == false`), this method is a no-op so there is
+    /// no double rollback.
+    ///
+    /// Exposed as `pub(in crate::engine)` so [`super::turn::run_turn`] can
+    /// call it from the spawned turn task.
+    pub(in crate::engine) async fn finish_turn(
         &self,
         handle: &Arc<crate::state::ThreadHandle>,
         thread_id: ThreadId,
         turn_id: TurnId,
+        failed: bool,
     ) {
-        // Take the active turn slot. If it was already cleared by a
-        // racing `cancel_turn`, the cancel path is responsible for the
-        // status + phase rollback; finish_turn skips both to avoid a
-        // double rollback and avoid logging a spurious "state machine
-        // drift" event for a legitimate race.
+        // Take the active turn slot only if it belongs to *this* turn.
+        //
+        // There are two cases where the slot no longer belongs to us:
+        //
+        // 1. `cancel_turn` raced us: it cleared `active_turn`, emitted
+        //    `SessionAborted`, and rolled the engine phase back to Idle
+        //    before we got here. `active` is `None`.
+        //
+        // 2. A stale `run_turn` task from a *cancelled* turn resumed after
+        //    the actor had already processed a new `StartTurn`: `active` is
+        //    `Some(new_turn)` where `new_turn.id != turn_id`. Clobbering that
+        //    slot would destroy the new turn's state and produce a spurious
+        //    `TurnCompleted` for an already-cancelled turn.
+        //
+        // Both cases are handled by the `map_or(false, |a| a.id == turn_id)`
+        // guard: if the slot is absent or belongs to a different turn, this
+        // method becomes a complete no-op and all rollback / event emission
+        // responsibility rests with whoever owns (or owned) that slot.
         let mut active = handle.active_turn.lock().await;
-        let we_owned_the_turn = active.is_some();
-        *active = None;
+        let we_owned_the_turn = active.as_ref().is_some_and(|a| a.id == turn_id);
+        if we_owned_the_turn {
+            *active = None;
+        }
         drop(active);
         if !we_owned_the_turn {
             tracing::debug!(
-                name: "zhive.engine.finish_turn.cancelled_concurrently",
-                "finish_turn observed active_turn already None; cancel path already handled it"
+                name: "zhive.engine.finish_turn.not_owner",
+                ?turn_id,
+                "finish_turn skipped: active_turn slot absent or belongs to a different turn"
             );
             return;
         }
@@ -281,9 +378,14 @@ impl EngineInner {
                 to: EnginePhase::Idle,
             });
         }
-        let _ = self
-            .events_tx
-            .send(EngineEvent::TurnCompleted { thread_id, turn_id });
+        // Only emit TurnCompleted when the turn did not fail. A turn that
+        // already broadcast TurnFailed must not also emit TurnCompleted —
+        // each turn has exactly one terminal event.
+        if !failed {
+            let _ = self
+                .events_tx
+                .send(EngineEvent::TurnCompleted { thread_id, turn_id });
+        }
     }
 
     async fn cancel_turn(&self, thread_id: ThreadId) -> CancelTurnReply {
@@ -292,9 +394,19 @@ impl EngineInner {
         };
         // Take the active turn under the per-thread lock; if there was
         // no active turn the cancel is a no-op (matches Pi behaviour).
+        // Fire the cancel token BEFORE releasing the lock so the
+        // `run_turn` select! wakes as soon as possible; ownership of
+        // `active` means the cancellation is visible to run_turn's
+        // `finish_turn` call (it will see `active_turn == None`).
         let active = {
             let mut guard = handle.active_turn.lock().await;
-            guard.take()
+            let taken = guard.take();
+            // Fire the per-turn token so the streaming task exits its
+            // select! loop without waiting for the next stream item.
+            if let Some(ref a) = taken {
+                a.cancel.cancel();
+            }
+            taken
         };
         let Some(active) = active else {
             return CancelTurnReply::NoActiveTurn;
@@ -400,6 +512,10 @@ impl EngineInner {
     }
 }
 
+// ============================================================
+// PhaseTransitionError
+// ============================================================
+
 /// Failure modes for [`EngineInner::try_set_phase_atomic`].
 ///
 /// Distinguishes between a caller passing a forbidden `from→to` pair
@@ -430,6 +546,10 @@ impl PhaseTransitionError {
     }
 }
 
+// ============================================================
+// Helpers
+// ============================================================
+
 fn unix_now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -449,6 +569,10 @@ fn error_kind(err: &ReducerError) -> &'static str {
         ReducerError::TimedOut(_) => "timed_out",
     }
 }
+
+// ============================================================
+// Tests
+// ============================================================
 
 #[cfg(test)]
 mod tests {
@@ -470,6 +594,16 @@ mod tests {
         .expect("fixture")
     }
 
+    fn noop_provider() -> DynLanguageModel {
+        use crate::provider::ScriptedModel;
+        ScriptedModel::new("noop", "noop", vec![]).into_dyn()
+    }
+
+    fn new_inner() -> Arc<EngineInner> {
+        let (events_tx, _) = broadcast::channel::<EngineEvent>(16);
+        Arc::new(EngineInner::new(events_tx, noop_provider()))
+    }
+
     /// Exercises `cancel_turn`'s full effect set end to end: the engine
     /// actor's auto-completing Phase 1 turn would normally clear
     /// `active_turn` before a `CancelTurn` submission landed, so this
@@ -479,7 +613,7 @@ mod tests {
     #[tokio::test]
     async fn cancel_turn_cancels_pending_permissions() {
         let (events_tx, mut events_rx) = tokio::sync::broadcast::channel::<EngineEvent>(16);
-        let inner = EngineInner::new(events_tx);
+        let inner = Arc::new(EngineInner::new(events_tx, noop_provider()));
         let reducer = inner.permission_reducer();
 
         let thread_id = tid("thread:native/cancel-perm");
@@ -545,8 +679,7 @@ mod tests {
 
     #[test]
     fn try_set_phase_atomic_reports_illegal_vs_mismatch() {
-        let (events_tx, _events_rx) = tokio::sync::broadcast::channel::<EngineEvent>(4);
-        let inner = EngineInner::new(events_tx);
+        let inner = new_inner();
         // Illegal: Idle → Retry is not in the legality table.
         let err = inner
             .try_set_phase_atomic(EnginePhase::Idle, EnginePhase::Retry)
@@ -563,6 +696,94 @@ mod tests {
                 actual: EnginePhase::Idle,
             }
         ));
+    }
+
+    /// Verify that `ActiveTurn` carries a live cancellation token and
+    /// that `cancel_turn` fires it before returning.
+    #[tokio::test]
+    async fn cancel_turn_fires_active_turn_cancel_token() {
+        let inner = new_inner();
+        let thread_id = tid("thread:native/cancel-token");
+        let handle = inner.threads.get_or_init(&thread_id).await;
+
+        let turn_id = inner.allocate_turn_id(&thread_id);
+        let active_turn = ActiveTurn::new(turn_id.clone(), unix_now());
+        let cancel = active_turn.cancel.clone();
+        assert!(!cancel.is_cancelled(), "token must start uncancelled");
+
+        let mut guard = handle.active_turn.lock().await;
+        *guard = Some(active_turn);
+        drop(guard);
+        inner
+            .try_set_phase_atomic(EnginePhase::Idle, EnginePhase::Turn)
+            .expect("seed phase");
+
+        inner.cancel_turn(thread_id).await;
+        assert!(
+            cancel.is_cancelled(),
+            "cancel_turn must fire the per-turn token"
+        );
+    }
+
+    /// Regression test for the stale-turn clobber scenario:
+    ///
+    /// A cancelled turn's `run_turn` task may call `finish_turn` *after*
+    /// `cancel_turn` has already cleared `active_turn` and a new
+    /// `StartTurn` has installed a fresh `ActiveTurn` (different id).
+    /// `finish_turn` must be a strict no-op in that case: it must not
+    /// clear the new turn's slot, must not flip the engine phase back to
+    /// Idle, and must not emit `TurnCompleted` for the old (cancelled) turn.
+    #[tokio::test]
+    async fn finish_turn_is_noop_when_active_turn_belongs_to_different_id() {
+        let (events_tx, mut events_rx) = tokio::sync::broadcast::channel::<EngineEvent>(16);
+        let inner = Arc::new(EngineInner::new(events_tx, noop_provider()));
+        let thread_id = tid("thread:native/stale-finish");
+        let handle = inner.threads.get_or_init(&thread_id).await;
+
+        // Simulate the engine state after a cancel + new StartTurn:
+        // Phase is Turn (new turn in flight), active_turn holds the NEW turn.
+        let old_turn_id = inner.allocate_turn_id(&thread_id);
+        let new_turn_id = inner.allocate_turn_id(&thread_id);
+
+        let new_active = ActiveTurn::new(new_turn_id.clone(), unix_now());
+        {
+            let mut guard = handle.active_turn.lock().await;
+            *guard = Some(new_active);
+        };
+        inner
+            .try_set_phase_atomic(EnginePhase::Idle, EnginePhase::Turn)
+            .expect("seed phase to Turn");
+
+        // Drain any buffered events from the setup above.
+        while events_rx.try_recv().is_ok() {}
+
+        // Now the old (stale) run_turn calls finish_turn with its own id.
+        // This must be a complete no-op.
+        inner
+            .finish_turn(&handle, thread_id.clone(), old_turn_id, false)
+            .await;
+
+        // Engine phase must still be Turn (not rolled back to Idle).
+        let phase = *inner.phase.lock().expect("phase lock");
+        assert_eq!(
+            phase,
+            EnginePhase::Turn,
+            "stale finish_turn must not roll engine phase back to Idle"
+        );
+
+        // active_turn slot must still hold the NEW turn.
+        let active = handle.active_turn.lock().await;
+        assert!(
+            active.as_ref().is_some_and(|a| a.id == new_turn_id),
+            "stale finish_turn must not clear the new turn's active_turn slot"
+        );
+        drop(active);
+
+        // No TurnCompleted event must have been emitted.
+        assert!(
+            !matches!(events_rx.try_recv(), Ok(EngineEvent::TurnCompleted { .. })),
+            "stale finish_turn must not emit TurnCompleted"
+        );
     }
 }
 
