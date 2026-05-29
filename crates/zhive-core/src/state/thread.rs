@@ -4,6 +4,15 @@
 //! carries enough state for the engine actor to route messages and emit
 //! events; the lazy-loaded transcript window and the persistence sync
 //! point land in B2 / B3.
+//!
+//! ## Injection queues
+//!
+//! Each [`ThreadHandle`] owns an [`InjectionQueues`] wrapped in a
+//! `std::sync::Mutex` (not `tokio::sync::Mutex`).  Pushes and drains are
+//! synchronous and always complete immediately — they never cross an
+//! `await` point — so the lighter std lock is appropriate.  The lock
+//! is taken and released within a single non-async statement, matching
+//! the same pattern used for `EngineInner::phase`.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -11,6 +20,8 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 use zhive_proto::domain::{Item, ItemId, ThreadId, ThreadStatus, TurnId};
+
+use crate::queues::InjectionQueues;
 
 /// Single owner record for an active or recently-loaded thread.
 #[derive(Debug)]
@@ -27,6 +38,18 @@ pub struct ThreadHandle {
     /// Maximum tail length before older items are evicted to the rollout
     /// loader.
     pub items_tail_capacity: usize,
+    /// Three-queue injection buffer for this thread.
+    ///
+    /// Steer items are drained before each LLM request within the active
+    /// turn; follow-up items extend the turn at its natural boundary;
+    /// next-turn items seed the *next* turn and survive `cancel_turn`.
+    ///
+    /// A `std::sync::Mutex` is used instead of a `tokio::sync::Mutex`
+    /// because `push_back`, `drain`, and `abort` are synchronous and
+    /// complete immediately without yielding — the same rationale as
+    /// `EngineInner::phase`.  Lock poison is recovered via
+    /// `into_inner()` (consistent with `phase_lock`).
+    pub injection: std::sync::Mutex<InjectionQueues>,
 }
 
 impl ThreadHandle {
@@ -51,6 +74,20 @@ impl ThreadHandle {
             active_turn: Mutex::new(None),
             items_tail: RwLock::new(VecDeque::with_capacity(capacity)),
             items_tail_capacity: capacity,
+            injection: std::sync::Mutex::new(InjectionQueues::new()),
+        }
+    }
+
+    /// Returns a lock guard on the injection queues.
+    ///
+    /// Recovers from mutex poison (same pattern as `EngineInner::phase_lock`):
+    /// a poisoned lock means another thread panicked while holding it, which
+    /// is a programming error; recovering the inner value lets the engine
+    /// continue rather than tearing down the actor.
+    pub(crate) fn injection_lock(&self) -> std::sync::MutexGuard<'_, InjectionQueues> {
+        match self.injection.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
         }
     }
 
@@ -127,6 +164,40 @@ impl ActiveTurn {
             started_at,
             next_item_seq: 0,
             cancel: CancellationToken::new(),
+        }
+    }
+
+    /// Builds a fresh active-turn record with an **explicit** cancellation
+    /// token supplied by the caller.
+    ///
+    /// This variant is used by the engine when the turn cancel token must be
+    /// a child of the engine-wide [`crate::cancel::CancellationTree`] root so
+    /// that `cancel_tree.cancel_all()` (engine shutdown) propagates to all
+    /// in-flight turns automatically.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use tokio_util::sync::CancellationToken;
+    /// use zhive_proto::domain::TurnId;
+    /// use zhive_core::state::ActiveTurn;
+    ///
+    /// let parent = CancellationToken::new();
+    /// let child = parent.child_token();
+    /// let id = TurnId(Arc::from("turn:t/0"));
+    /// let active = ActiveTurn::new_with_cancel(id.clone(), 0, child);
+    /// assert!(!active.cancel.is_cancelled());
+    /// parent.cancel();
+    /// assert!(active.cancel.is_cancelled(), "child inherits parent cancel");
+    /// ```
+    #[must_use]
+    pub fn new_with_cancel(id: TurnId, started_at: i64, cancel: CancellationToken) -> Self {
+        Self {
+            id,
+            started_at,
+            next_item_seq: 0,
+            cancel,
         }
     }
 }

@@ -40,6 +40,7 @@ use zhive_proto::permission::{
     HookOutput, HookSpecificOutput, PermissionDecision, PermissionOutcome,
 };
 
+use crate::cancel::CancellationTree;
 use crate::engine::event::EngineEvent;
 use crate::engine::inner::EngineInner;
 use crate::hooks::HookHost;
@@ -453,10 +454,17 @@ pub(super) async fn dispatch_tool_call(
     };
 
     let thread_id = zhive_proto::domain::ThreadId(Arc::from(thread_id_str));
+    // Each tool call gets its own child token so the tool scope sits below
+    // the turn in the hierarchy.  Firing the turn token propagates to the
+    // tool child (cancelling the tool); firing only the tool child (if we
+    // were to add per-tool cancellation later) does not affect the turn.
+    // The existing `select!` on `cancel` (the turn token) continues to work
+    // because the turn token is the child's parent.
+    let tool_cancel = CancellationTree::child_for_tool(cancel);
     let ctx = ToolContext {
         thread_id,
         turn_id: turn_id.clone(),
-        cancel: cancel.clone(),
+        cancel: tool_cancel.clone(),
     };
 
     // Race the tool body against turn cancellation.  Without this, a
@@ -465,6 +473,9 @@ pub(super) async fn dispatch_tool_call(
     // engine has already abandoned (it rolled back to Idle).  On cancel we
     // skip the remaining work (post-hook, item append) and return a Blocked
     // outcome whose item carries no orphan output.
+    //
+    // We race against `cancel` (the turn token) rather than `tool_cancel`
+    // (the child) so that firing the turn also aborts the tool select! arm.
     let exec_result = tokio::select! {
         biased;
         () = cancel.cancelled() => {

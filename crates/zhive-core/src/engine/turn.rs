@@ -59,6 +59,7 @@ use zhive_proto::domain::{Item, ItemId, NoticeLevel, ThreadId, TurnError, TurnId
 use zhive_proto::permission::PermissionScope;
 
 use crate::provider::{ProviderError, StreamFold};
+use crate::queues::QueueTarget;
 use crate::state::ThreadHandle;
 
 use super::event::EngineEvent;
@@ -123,12 +124,53 @@ pub(super) async fn run_turn(
     let mut fallback_id_counter: u64 = 0;
 
     'outer: for iteration in 0..MAX_TURN_ITERATIONS {
+        // ── Steer drain (Pi model §3.1): drain BEFORE each LLM request ────────
+        //
+        // Steer items are injected as user-turn items visible to the *next*
+        // LLM call.  They do NOT cancel in-flight tool calls; the in-flight
+        // work continues to completion and steer messages only influence the
+        // following model decision.
+        //
+        // Steer items cannot cause a meaningful failure after being pushed
+        // (push_item + ItemAppended are infallible wrt item content), so we
+        // do NOT need `restore_front` rollback here — the Pi failure-semantics
+        // path (drain + rollback on downstream failure) is only relevant when
+        // the consumer may reject the drained batch, which does not apply to
+        // this integration.
+        {
+            let steer_items: Vec<Item> = handle.injection_lock().drain(QueueTarget::Steer);
+            for item in steer_items {
+                handle.push_item(item.clone()).await;
+                let _ = inner.events_tx().send(EngineEvent::ItemAppended {
+                    thread_id: thread_id.clone(),
+                    turn_id: turn_id.clone(),
+                    item: Box::new(item),
+                });
+            }
+        }
+
         // 1. Build the prompt by reconstructing it from the thread's item tail
         //    (the single source of truth; see `build_call_options`).
         let call_options = build_call_options(&handle).await;
 
-        // 2. Call the provider.
-        let stream_result = inner.provider().do_stream(call_options).await;
+        // 2. Call the provider, racing against the per-turn cancel token.
+        //
+        // `biased` ensures the cancel arm is always polled first so that a
+        // token already cancelled before we enter the select! (e.g. from an
+        // immediate cancel_turn or shutdown) is observed without starting the
+        // provider call at all.  When the cancel arm wins — whether because
+        // the token was pre-cancelled or because cancel_tree.cancel_all()
+        // fires during the await — we call finish_turn (failed=false; the
+        // cancel path, not an error) and return promptly, satisfying the
+        // "abort promptly on shutdown" requirement.
+        let stream_result = tokio::select! {
+            biased;
+            () = cancel.cancelled() => {
+                inner.finish_turn(&handle, thread_id, turn_id, false).await;
+                return;
+            }
+            r = inner.provider().do_stream(call_options) => r,
+        };
         let mut stream = match stream_result {
             Ok(r) => r.stream,
             Err(err) => {
@@ -225,8 +267,51 @@ pub(super) async fn run_turn(
 
         // 4. Tool dispatch for all tool-call items produced this iteration.
         if new_tool_call_items.is_empty() {
-            // No tool calls — turn is done normally.
-            break 'outer;
+            // ── FollowUp drain (Pi model §3.2): at the turn boundary ──────────
+            //
+            // Before finishing the turn, check whether the follow-up queue
+            // holds any items.  If it does, inject them as user messages and
+            // continue the outer loop (keeping the turn alive for one more
+            // provider iteration).  If the queue is empty, the turn ends
+            // normally.
+            //
+            // Like the steer drain above, `restore_front` is not needed here
+            // because push_item + ItemAppended are infallible.
+            let follow_up_items: Vec<Item> = handle.injection_lock().drain(QueueTarget::FollowUp);
+            if follow_up_items.is_empty() {
+                // No follow-up items — turn is done normally.
+                break 'outer;
+            }
+            // Inject follow-up items and continue the loop.
+            for item in follow_up_items {
+                handle.push_item(item.clone()).await;
+                let _ = inner.events_tx().send(EngineEvent::ItemAppended {
+                    thread_id: thread_id.clone(),
+                    turn_id: turn_id.clone(),
+                    item: Box::new(item),
+                });
+            }
+            // Fall through to the next iteration (the iteration cap still
+            // applies — if we are at MAX_TURN_ITERATIONS the notice below
+            // fires before continuing).
+            if iteration + 1 >= MAX_TURN_ITERATIONS {
+                let notice_id = ItemId(Arc::from(format!("item:{}/max-iter-fu", turn_id.0)));
+                let notice = Item::SystemNotice {
+                    id: notice_id,
+                    level: NoticeLevel::Warn,
+                    message: format!(
+                        "max turn iterations reached ({MAX_TURN_ITERATIONS}); turn ended"
+                    ),
+                };
+                handle.push_item(notice.clone()).await;
+                let _ = inner.events_tx().send(EngineEvent::ItemAppended {
+                    thread_id: thread_id.clone(),
+                    turn_id: turn_id.clone(),
+                    item: Box::new(notice),
+                });
+                break 'outer;
+            }
+            continue 'outer;
         }
 
         let hook_host = Arc::clone(inner.hook_host());

@@ -32,6 +32,7 @@
 
 pub mod event;
 mod inner;
+mod lifecycle;
 pub mod phase;
 pub mod submission;
 mod tool_dispatch;
@@ -1771,6 +1772,600 @@ mod inc3_tests {
             "TurnCompleted must NOT fire for a cancelled turn"
         );
         engine.shutdown().await.unwrap();
+    }
+}
+
+// ============================================================
+// Increment-4 injection-queue + CancellationTree tests
+// ============================================================
+
+#[cfg(test)]
+mod inc4_tests {
+    //! Integration tests for the three-queue injection model and
+    //! `CancellationTree` wiring introduced in increment 4.
+    //!
+    //! Test plan:
+    //! - `steer_item_appears_before_next_provider_call` — steer drain before
+    //!   the second LLM request makes the item visible in `build_call_options`.
+    //! - `follow_up_extends_turn_without_tool_calls` — a `FollowUp` item causes
+    //!   the turn to do a second provider iteration.
+    //! - `next_turn_survives_cancel_and_seeds_next_turn` — `NextTurn` items are
+    //!   preserved across `cancel_turn`; `SessionAborted` reports the count;
+    //!   the following `start_turn` consumes them.
+    //! - `shutdown_cancels_in_flight_turn` — engine shutdown cancels a turn
+    //!   that is blocked inside the provider `do_stream`.
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use async_trait::async_trait;
+    use futures::stream;
+    use llmsdk::LanguageModel;
+    use llmsdk::language_model::{
+        BoxStream, CallOptions, FinishReason, FinishReasonKind, GenerateResult, StreamPart,
+        StreamResult,
+    };
+    use tokio::sync::Barrier;
+    use tokio_util::sync::CancellationToken;
+
+    use super::*;
+    use zhive_proto::permission::StreamingBehavior;
+
+    fn tid(s: &str) -> ThreadId {
+        ThreadId(Arc::from(s))
+    }
+
+    fn user_item(text: &str) -> zhive_proto::domain::Item {
+        use zhive_proto::domain::{ItemContent, ItemId};
+        zhive_proto::domain::Item::UserMessage {
+            id: ItemId(Arc::from(text)),
+            content: vec![ItemContent::Text {
+                text: text.to_owned(),
+                annotations: None,
+            }],
+        }
+    }
+
+    /// Waits for up to `limit` events; returns `true` when `pred` matched.
+    async fn collect_until(
+        rx: &mut broadcast::Receiver<EngineEvent>,
+        limit: usize,
+        mut pred: impl FnMut(&EngineEvent) -> bool,
+    ) -> bool {
+        for _ in 0..limit {
+            match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
+                Ok(Ok(ev)) if pred(&ev) => return true,
+                Ok(Ok(_)) => {}
+                _ => return false,
+            }
+        }
+        false
+    }
+
+    // ---- Shared test model helpers ----------------------------------------
+
+    /// A model whose each call emits a simple text response.
+    ///
+    /// The call counter lets the test observe that the provider was called
+    /// more than once (e.g. for a `FollowUp` continuation).
+    #[derive(Debug, Clone)]
+    struct CountedTextModel {
+        call_count: Arc<AtomicUsize>,
+    }
+
+    impl CountedTextModel {
+        fn new() -> Self {
+            Self {
+                call_count: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LanguageModel for CountedTextModel {
+        fn provider(&self) -> &'static str {
+            "test"
+        }
+        fn model_id(&self) -> &'static str {
+            "counted-text"
+        }
+        async fn do_generate(&self, _opts: CallOptions) -> llmsdk::error::Result<GenerateResult> {
+            Ok(GenerateResult {
+                content: vec![],
+                finish_reason: FinishReason::new(FinishReasonKind::Stop),
+                usage: llmsdk::language_model::Usage::default(),
+                provider_metadata: None,
+                request: None,
+                response: None,
+                warnings: vec![],
+            })
+        }
+        async fn do_stream(&self, _opts: CallOptions) -> llmsdk::error::Result<StreamResult> {
+            let idx = self.call_count.fetch_add(1, Ordering::SeqCst);
+            let text = format!("response-{idx}");
+            let parts = vec![
+                Ok(StreamPart::TextStart {
+                    id: format!("b{idx}"),
+                    provider_metadata: None,
+                }),
+                Ok(StreamPart::TextDelta {
+                    id: format!("b{idx}"),
+                    delta: text,
+                    provider_metadata: None,
+                }),
+                Ok(StreamPart::TextEnd {
+                    id: format!("b{idx}"),
+                    provider_metadata: None,
+                }),
+            ];
+            let s: BoxStream<llmsdk::error::Result<StreamPart>> = Box::pin(stream::iter(parts));
+            Ok(StreamResult {
+                stream: s,
+                request: None,
+                response: None,
+            })
+        }
+    }
+
+    /// A model that blocks until both parties of the internal `Barrier`
+    /// have called `.wait()` — used to keep the engine in Turn phase for
+    /// the duration of an async test window.
+    #[derive(Debug)]
+    struct BarrierModel {
+        barrier: Arc<Barrier>,
+    }
+
+    impl BarrierModel {
+        fn new_pair(parties: usize) -> (Arc<Barrier>, Self) {
+            let b = Arc::new(Barrier::new(parties));
+            let m = Self {
+                barrier: Arc::clone(&b),
+            };
+            (b, m)
+        }
+    }
+
+    #[async_trait]
+    impl LanguageModel for BarrierModel {
+        fn provider(&self) -> &'static str {
+            "test"
+        }
+        fn model_id(&self) -> &'static str {
+            "barrier-inc4"
+        }
+        async fn do_generate(&self, _opts: CallOptions) -> llmsdk::error::Result<GenerateResult> {
+            Ok(GenerateResult {
+                content: vec![],
+                finish_reason: FinishReason::new(FinishReasonKind::Stop),
+                usage: llmsdk::language_model::Usage::default(),
+                provider_metadata: None,
+                request: None,
+                response: None,
+                warnings: vec![],
+            })
+        }
+        async fn do_stream(&self, _opts: CallOptions) -> llmsdk::error::Result<StreamResult> {
+            self.barrier.wait().await;
+            let s: BoxStream<llmsdk::error::Result<StreamPart>> = Box::pin(stream::empty());
+            Ok(StreamResult {
+                stream: s,
+                request: None,
+                response: None,
+            })
+        }
+    }
+
+    /// A model whose `do_stream` blocks until its `CancellationToken` is
+    /// cancelled.
+    ///
+    /// This makes the shutdown-cancels test self-contained and deterministic:
+    /// the test fires `engine.shutdown()`, which calls `cancel_tree.cancel_all()`,
+    /// which cancels the per-turn token, which in turn causes the `biased
+    /// select!` in `run_turn` to abort the in-flight `do_stream` future
+    /// immediately — without any external barrier release.
+    #[derive(Debug)]
+    struct CancelAwaitModel {
+        token: CancellationToken,
+    }
+
+    impl CancelAwaitModel {
+        /// Creates a model/token pair.
+        ///
+        /// The returned [`CancellationToken`] is a *child* of the model's
+        /// internal token; cancelling it (or any ancestor) will unblock
+        /// `do_stream`.
+        fn new() -> (CancellationToken, Self) {
+            let token = CancellationToken::new();
+            let model = Self {
+                token: token.clone(),
+            };
+            (token, model)
+        }
+    }
+
+    #[async_trait]
+    impl LanguageModel for CancelAwaitModel {
+        fn provider(&self) -> &'static str {
+            "test"
+        }
+        fn model_id(&self) -> &'static str {
+            "cancel-await-inc4"
+        }
+        async fn do_generate(&self, _opts: CallOptions) -> llmsdk::error::Result<GenerateResult> {
+            Ok(GenerateResult {
+                content: vec![],
+                finish_reason: FinishReason::new(FinishReasonKind::Stop),
+                usage: llmsdk::language_model::Usage::default(),
+                provider_metadata: None,
+                request: None,
+                response: None,
+                warnings: vec![],
+            })
+        }
+        /// Blocks until the model's `CancellationToken` is cancelled.
+        ///
+        /// In a real engine run, the `biased select!` in `run_turn` drops
+        /// this future before the token fires, so this function never actually
+        /// returns `Ok` — the test relies on the cancel arm winning the race.
+        async fn do_stream(&self, _opts: CallOptions) -> llmsdk::error::Result<StreamResult> {
+            // Block indefinitely until cancelled; the engine's biased select!
+            // will drop this future when cancel fires.
+            self.token.cancelled().await;
+            // Unreachable in practice when used with run_turn's cancel guard,
+            // but must be valid so the model compiles as a LanguageModel impl.
+            let s: BoxStream<llmsdk::error::Result<StreamPart>> = Box::pin(stream::empty());
+            Ok(StreamResult {
+                stream: s,
+                request: None,
+                response: None,
+            })
+        }
+    }
+
+    // ===================================================================
+    // Test 1: Steer — item appears as ItemAppended before the provider call.
+    // ===================================================================
+
+    /// Pre-enqueue a `Steer` item before starting the turn.  The steer
+    /// drain fires at the start of every iteration (before the LLM request),
+    /// so the item is pushed to the thread tail and broadcast as
+    /// `ItemAppended` before the first provider call begins.
+    ///
+    /// We assert:
+    /// - A `UserMessage { id: "steer-message" }` event is broadcast.
+    /// - `TurnCompleted` fires (turn ends normally).
+    ///
+    /// A simple no-op provider (empty stream) is used; the turn completes
+    /// after one empty iteration (no tool calls, no follow-up), which is
+    /// sufficient to verify the steer drain path.
+    #[tokio::test]
+    async fn steer_item_appears_as_item_appended() {
+        let engine = Engine::spawn().with_reply_timeout(Duration::from_secs(10));
+        let mut events = engine.subscribe();
+
+        let thread_id = tid("thread:native/steer-test");
+
+        // Pre-enqueue a steer item before the turn starts.  It will be
+        // drained at the start of iteration 0 (before the first LLM call).
+        engine
+            .submit(Submission::EnqueueInjection {
+                thread_id: thread_id.clone(),
+                behavior: StreamingBehavior::Steer,
+                items: vec![user_item("steer-message")],
+            })
+            .await
+            .unwrap();
+
+        engine
+            .start_turn(thread_id.clone(), Vec::new(), None)
+            .await
+            .unwrap();
+
+        // Collect events until TurnCompleted; verify steer item appeared.
+        let mut saw_steer_item = false;
+        let saw_completed = collect_until(&mut events, 64, |ev| {
+            if let EngineEvent::ItemAppended { item, .. } = ev
+                && matches!(item.as_ref(), zhive_proto::domain::Item::UserMessage { id, .. }
+                    if id.0.as_ref() == "steer-message")
+            {
+                saw_steer_item = true;
+            }
+            matches!(ev, EngineEvent::TurnCompleted { .. })
+        })
+        .await;
+
+        assert!(
+            saw_steer_item,
+            "steer item must be broadcast as ItemAppended"
+        );
+        assert!(saw_completed, "TurnCompleted must still fire");
+        engine.shutdown().await.unwrap();
+    }
+
+    // ===================================================================
+    // Test 2: FollowUp — pre-enqueued item causes a second provider call.
+    // ===================================================================
+
+    /// Pre-enqueue a `FollowUp` item before starting the turn (it sits in the
+    /// queue and is drained at the turn boundary).  A model that returns a
+    /// simple text answer (no tool calls) would normally finish immediately,
+    /// but the `FollowUp` drain injects the item and forces a second iteration.
+    ///
+    /// We verify the turn calls the provider **twice** by observing two
+    /// distinct `AgentMessage` events (`response-0` and `response-1`).
+    #[tokio::test]
+    async fn follow_up_extends_turn_without_tool_calls() {
+        let model = CountedTextModel::new();
+        let engine = Engine::spawn_with_provider(DynLanguageModel::new(model))
+            .with_reply_timeout(Duration::from_secs(10));
+        let mut events = engine.subscribe();
+
+        let thread_id = tid("thread:native/follow-up-test");
+
+        // Enqueue a FollowUp item BEFORE starting the turn.  It will be
+        // drained at the first no-tool-call turn boundary.
+        engine
+            .submit(Submission::EnqueueInjection {
+                thread_id: thread_id.clone(),
+                behavior: StreamingBehavior::FollowUp,
+                items: vec![user_item("follow-up-msg")],
+            })
+            .await
+            .unwrap();
+
+        engine
+            .start_turn(thread_id.clone(), Vec::new(), None)
+            .await
+            .unwrap();
+
+        // Collect AgentMessage items until TurnCompleted; expect both
+        // "response-0" (first iteration) and "response-1" (follow-up
+        // iteration).
+        let mut agent_texts: Vec<String> = Vec::new();
+        let saw_completed = collect_until(&mut events, 64, |ev| {
+            if let EngineEvent::ItemAppended { item, .. } = ev
+                && let zhive_proto::domain::Item::AgentMessage { text, .. } = item.as_ref()
+            {
+                agent_texts.push(text.clone());
+            }
+            matches!(ev, EngineEvent::TurnCompleted { .. })
+        })
+        .await;
+
+        assert!(saw_completed, "TurnCompleted must fire");
+        assert!(
+            agent_texts.len() >= 2,
+            "expected at least 2 agent messages (follow-up forced a second iteration), got {agent_texts:?}"
+        );
+        assert!(
+            agent_texts.iter().any(|t| t == "response-0"),
+            "expected response-0, got {agent_texts:?}"
+        );
+        assert!(
+            agent_texts.iter().any(|t| t == "response-1"),
+            "expected response-1 from follow-up iteration, got {agent_texts:?}"
+        );
+        engine.shutdown().await.unwrap();
+    }
+
+    // ===================================================================
+    // Test 3: NextTurn survives abort and seeds the following turn.
+    // ===================================================================
+
+    /// Start a turn (blocked on a barrier model), then while the turn is
+    /// in-flight enqueue a `NextTurn` item and a `Steer` item.  Cancel the
+    /// turn and assert:
+    /// - `SessionAborted.next_turn_retained_count == 1`
+    /// - `SessionAborted.cleared_steer.len() == 1` (steer was cleared)
+    ///
+    /// Then start a second turn and verify the `NextTurn` item seeds it
+    /// (appears as `ItemAppended` before the normal user input).
+    ///
+    /// **Key invariant**: `NextTurn` items enqueued *during* a turn survive
+    /// `cancel_turn` because `abort()` does not clear the `next_turn` queue.
+    /// Items enqueued *before* `start_turn` are consumed immediately by
+    /// `start_turn`'s drain and therefore do not appear in `SessionAborted`.
+    #[tokio::test]
+    async fn next_turn_survives_cancel_and_seeds_next_turn() {
+        let (barrier, model) = BarrierModel::new_pair(2);
+        let engine = Engine::spawn_with_provider(DynLanguageModel::new(model))
+            .with_reply_timeout(Duration::from_secs(10));
+        let mut events = engine.subscribe();
+
+        let thread_id = tid("thread:native/next-turn-test");
+
+        // Start a turn.  The barrier model blocks inside `do_stream` so
+        // the turn stays in-flight until we release the barrier.
+        engine
+            .start_turn(thread_id.clone(), Vec::new(), None)
+            .await
+            .unwrap();
+
+        // Wait for TurnStarted to confirm the turn task is actually running.
+        let saw_started = collect_until(&mut events, 16, |ev| {
+            matches!(ev, EngineEvent::TurnStarted { .. })
+        })
+        .await;
+        assert!(saw_started, "expected TurnStarted");
+
+        // NOW enqueue items while the turn is in-flight.  The NextTurn item
+        // will survive cancel; the Steer item will be cleared.
+        engine
+            .submit(Submission::EnqueueNextTurn {
+                thread_id: thread_id.clone(),
+                items: vec![user_item("next-turn-item")],
+            })
+            .await
+            .unwrap();
+        engine
+            .submit(Submission::EnqueueInjection {
+                thread_id: thread_id.clone(),
+                behavior: StreamingBehavior::Steer,
+                items: vec![user_item("steer-to-be-cleared")],
+            })
+            .await
+            .unwrap();
+
+        let cancelled = engine.cancel_turn(thread_id.clone()).await.unwrap();
+        assert!(cancelled.is_some(), "expected a turn id to be cancelled");
+
+        // Unblock the barrier model so it can exit.
+        barrier.wait().await;
+
+        // Collect until we see SessionAborted; extract queue snapshot.
+        let mut aborted_notif: Option<zhive_proto::permission::SessionAbortedNotification> = None;
+        for _ in 0..32 {
+            match tokio::time::timeout(Duration::from_millis(500), events.recv()).await {
+                Ok(Ok(EngineEvent::SessionAborted(n))) => {
+                    aborted_notif = Some(*n);
+                    break;
+                }
+                Ok(Ok(_)) => {}
+                _ => break,
+            }
+        }
+        let notif = aborted_notif.expect("expected SessionAborted");
+
+        // NextTurn is preserved, steer is cleared.
+        assert_eq!(
+            notif.next_turn_retained_count, 1,
+            "next_turn_retained_count must be 1 (we enqueued one item)"
+        );
+        assert_eq!(
+            notif.cleared_steer.len(),
+            1,
+            "cleared_steer must contain the 1 steer item we enqueued"
+        );
+        assert!(
+            notif.cleared_follow_up.is_empty(),
+            "cleared_follow_up must be empty (we did not enqueue any)"
+        );
+
+        // Now subscribe again for the second turn.
+        let mut events2 = engine.subscribe();
+
+        // Start a new turn.  The NextTurn item must be prepended before the
+        // user input and appear as the first ItemAppended event.
+        engine
+            .start_turn(thread_id.clone(), vec![user_item("new-user-input")], None)
+            .await
+            .unwrap();
+
+        // The BarrierModel resets after each full cycle, so the second turn's
+        // `do_stream` call will block again on the barrier.  Spawn a task to
+        // release it so the second turn can complete.
+        let b2 = Arc::clone(&barrier);
+        tokio::spawn(async move {
+            b2.wait().await;
+        });
+
+        let mut item_ids_in_order: Vec<String> = Vec::new();
+        let saw_completed = collect_until(&mut events2, 64, |ev| {
+            if let EngineEvent::ItemAppended { item, .. } = ev
+                && let zhive_proto::domain::Item::UserMessage { id, .. } = item.as_ref()
+            {
+                item_ids_in_order.push(id.0.to_string());
+            }
+            matches!(ev, EngineEvent::TurnCompleted { .. })
+        })
+        .await;
+
+        assert!(saw_completed, "second turn must complete");
+        // The NextTurn item ("next-turn-item") must appear before "new-user-input".
+        let pos_next = item_ids_in_order.iter().position(|s| s == "next-turn-item");
+        let pos_new = item_ids_in_order.iter().position(|s| s == "new-user-input");
+        assert!(
+            pos_next.is_some(),
+            "next-turn-item must appear in second turn items; got {item_ids_in_order:?}"
+        );
+        assert!(
+            pos_new.is_some(),
+            "new-user-input must appear in second turn items; got {item_ids_in_order:?}"
+        );
+        assert!(
+            pos_next.unwrap() < pos_new.unwrap(),
+            "next-turn-item must be prepended before new-user-input"
+        );
+        engine.shutdown().await.unwrap();
+    }
+
+    // ===================================================================
+    // Test 4: Shutdown cancels in-flight turn promptly.
+    // ===================================================================
+
+    /// A turn blocked inside `do_stream` must abort **promptly** when
+    /// `shutdown` is called, exercising the `biased select!` guard in
+    /// `run_turn` that races the provider call against the per-turn
+    /// `CancellationToken`.
+    ///
+    /// The [`CancelAwaitModel`] blocks forever in `do_stream` until its
+    /// internal token is cancelled; there is no external unblock step.
+    /// When `engine.shutdown()` fires `cancel_tree.cancel_all()`, the
+    /// cancel arm of the `biased select!` wins immediately, drops the
+    /// blocking `do_stream` future, calls `finish_turn(failed=false)`,
+    /// and the engine broadcasts `TurnCompleted`.  This test asserts that
+    /// `TurnCompleted` (or any other turn-terminal event) arrives within
+    /// 500 ms, proving that cancellation actually interrupted the blocking
+    /// provider call rather than merely completing shutdown bookkeeping
+    /// while the turn task continued to run.
+    ///
+    /// Note: `SessionAborted` is emitted by the `cancel_turn` submission
+    /// path, not by the shutdown path; the shutdown path emits `TurnCompleted`.
+    #[tokio::test]
+    async fn shutdown_cancels_in_flight_turn() {
+        let (_token, model) = CancelAwaitModel::new();
+        let engine = Engine::spawn_with_provider(DynLanguageModel::new(model))
+            .with_reply_timeout(Duration::from_secs(10));
+        let mut events = engine.subscribe();
+
+        let thread_id = tid("thread:native/shutdown-cancel-test");
+        engine
+            .start_turn(thread_id.clone(), Vec::new(), None)
+            .await
+            .unwrap();
+
+        // Wait for TurnStarted — the turn task is now blocking in do_stream.
+        let saw_started = collect_until(&mut events, 16, |ev| {
+            matches!(ev, EngineEvent::TurnStarted { .. })
+        })
+        .await;
+        assert!(saw_started, "expected TurnStarted before shutdown");
+
+        // Trigger shutdown.  This fires `cancel_tree.cancel_all()` on the
+        // actor, which cancels the per-turn `CancellationToken`.  The actor
+        // replies immediately (before the turn task drains).
+        engine.shutdown().await.expect("shutdown must succeed");
+
+        // After shutdown, the biased `select!` in `run_turn` must observe the
+        // cancelled token promptly, drop the blocking `do_stream` future, and
+        // call `finish_turn(failed=false)`, which broadcasts `TurnCompleted`.
+        //
+        // We assert that this terminal event arrives within 500 ms.  If the
+        // cancel guard were absent the `CancelAwaitModel` would block forever
+        // and `TurnCompleted` would never be emitted.
+        //
+        // Note: the shutdown path does NOT call `cancel_turn`, so `SessionAborted`
+        // is NOT emitted here; the terminal signal is `TurnCompleted`.
+        let saw_turn_ended = tokio::time::timeout(Duration::from_millis(500), async {
+            loop {
+                match events.recv().await {
+                    Ok(
+                        EngineEvent::TurnCompleted { .. }
+                        | EngineEvent::TurnFailed { .. }
+                        | EngineEvent::SessionAborted(_),
+                    ) => return true,
+                    Ok(_) => {}
+                    Err(_) => return false,
+                }
+            }
+        })
+        .await
+        .unwrap_or(false);
+
+        assert!(
+            saw_turn_ended,
+            "TurnCompleted/TurnFailed/SessionAborted must arrive within 500 ms of shutdown; \
+             cancel guard in run_turn did not abort the blocking do_stream"
+        );
     }
 }
 
