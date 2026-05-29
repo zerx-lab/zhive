@@ -34,6 +34,7 @@ mod helpers;
 use std::sync::{Arc, OnceLock};
 
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument as _;
 use zhive_proto::domain::{Item, ItemContent, ItemId, ItemToolCallContent, ToolCallStatus, TurnId};
 use zhive_proto::hook::{ExtensionRef, HookEvent};
 use zhive_proto::permission::{
@@ -132,6 +133,21 @@ fn engine_ext_ref() -> Option<ExtensionRef> {
 }
 
 // ============================================================
+// Permission wait result
+// ============================================================
+
+/// Outcome of the async select! inside the `Ask` permission sub-flow.
+///
+/// Defined at module level so it can be named before any statements inside
+/// `dispatch_tool_call_inner` (clippy `items_after_statements` lint).
+enum PermResult {
+    /// The reducer returned an outcome (allow / deny / cancelled / timed out).
+    Outcome(Result<PermissionOutcome, crate::permission::ReducerError>),
+    /// The turn cancel token fired before the reducer resolved.
+    Cancelled,
+}
+
+// ============================================================
 // dispatch_tool_call
 // ============================================================
 
@@ -142,21 +158,74 @@ fn engine_ext_ref() -> Option<ExtensionRef> {
 /// that appears in the original `ToolCall` item's `raw_input` if the
 /// provider emitted it, or a synthetic id otherwise).
 ///
+/// Opens a `zhive.tool_call` span with `session.id`, `zhive.turn.id`, and
+/// `gen_ai.tool.name` fields.  The permission sub-flow additionally opens a
+/// nested `zhive.permission` span when the decision is `Ask`.
+///
 /// # Errors
 ///
 /// This function does not return a `Result`; all failure modes are folded
 /// into the returned [`DispatchOutcome`] so the caller can log and continue
 /// without early-return complexity.
-#[expect(
-    clippy::too_many_lines,
-    reason = "dispatch_tool_call spans all six hook/permission/execute steps as one conceptual unit; \
-              extracting sub-functions would hurt readability without reducing complexity"
-)]
 #[allow(
     clippy::too_many_arguments,
     reason = "All args are required context; no good grouping"
 )]
 pub(super) async fn dispatch_tool_call(
+    inner: &Arc<EngineInner>,
+    hook_host: &Arc<HookHost>,
+    tools: &Arc<ToolRegistry>,
+    reducer: &PermissionReducer,
+    thread_id_str: &str,
+    turn_id: &TurnId,
+    item_id: ItemId,
+    tool_name: &str,
+    raw_args: serde_json::Value,
+    tool_use_id: &str,
+    scope: &zhive_proto::permission::PermissionScope,
+    cancel: &CancellationToken,
+) -> DispatchOutcome {
+    // Span name and field names are string literals (tracing macro
+    // requirement).  The constants spans::TOOL_CALL, fields::THREAD_ID,
+    // fields::TURN_ID, and fields::TOOL_NAME are the single source of
+    // truth; observability tests assert the literals match.
+    let span = tracing::info_span!(
+        "zhive.tool_call",
+        "session.id"       = thread_id_str,
+        "zhive.turn.id"    = %turn_id.0,
+        "gen_ai.tool.name" = tool_name,
+    );
+    dispatch_tool_call_inner(
+        inner,
+        hook_host,
+        tools,
+        reducer,
+        thread_id_str,
+        turn_id,
+        item_id,
+        tool_name,
+        raw_args,
+        tool_use_id,
+        scope,
+        cancel,
+    )
+    .instrument(span)
+    .await
+}
+
+/// Inner body of [`dispatch_tool_call`], instrumented by the caller
+/// with the `zhive.tool_call` span.
+#[expect(
+    clippy::too_many_lines,
+    reason = "dispatch_tool_call_inner spans all six hook/permission/execute steps as one \
+              conceptual unit; extracting sub-functions would hurt readability without \
+              reducing complexity"
+)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "All args are required context; no good grouping"
+)]
+async fn dispatch_tool_call_inner(
     inner: &Arc<EngineInner>,
     hook_host: &Arc<HookHost>,
     tools: &Arc<ToolRegistry>,
@@ -309,8 +378,25 @@ pub(super) async fn dispatch_tool_call(
             );
         }
         PermissionDecision::Ask => {
-            // Build reverse-RPC request.
-            let request = match build_permission_request(thread_id_str, tool_name) {
+            // Open a `zhive.permission` span for the interactive Ask sub-flow:
+            // enroll → emit PermissionRequested → await user decision.
+            //
+            // Span name is a literal; spans::PERMISSION / fields::TOOL_NAME are
+            // the single source of truth (see observability tests).
+            // The `Span` handle is `Send`; only `EnteredSpan` guards are not.
+            // We use `perm_span.in_scope(...)` for sync work and
+            // `.instrument(perm_span)` on the awaited future so the span
+            // is correctly entered across yield points without holding a
+            // non-Send guard across any `.await`.
+            let perm_span = tracing::info_span!(
+                "zhive.permission",
+                "session.id" = thread_id_str,
+                "gen_ai.tool.name" = tool_name,
+            );
+
+            // Build reverse-RPC request inside the span context (sync).
+            let request = perm_span.in_scope(|| build_permission_request(thread_id_str, tool_name));
+            let request = match request {
                 Ok(r) => r,
                 Err(err) => {
                     tracing::warn!(
@@ -346,9 +432,21 @@ pub(super) async fn dispatch_tool_call(
             // map before enroll() inserted this entry (a narrow but real race
             // window), as well as the more common case where cancel fires during
             // the wait itself.
-            let outcome = tokio::select! {
-                outcome = reducer.wait(rx) => outcome,
-                () = cancel.cancelled() => {
+            //
+            // The async block is instrumented with perm_span so the span
+            // context flows across every await point.
+            let perm_result = async {
+                tokio::select! {
+                    outcome = reducer.wait(rx) => PermResult::Outcome(outcome),
+                    () = cancel.cancelled() => PermResult::Cancelled,
+                }
+            }
+            .instrument(perm_span.clone())
+            .await;
+
+            let outcome = match perm_result {
+                PermResult::Outcome(o) => o,
+                PermResult::Cancelled => {
                     return blocked_outcome(
                         item_id,
                         tool_name,
@@ -359,9 +457,17 @@ pub(super) async fn dispatch_tool_call(
                     );
                 }
             };
+
             match outcome {
                 Ok(PermissionOutcome::Selected { option_id }) if option_id.starts_with("allow") => {
                     // Allowed by the user — proceed to execution.
+                    perm_span.in_scope(|| {
+                        tracing::debug!(
+                            name: "zhive.permission.allowed",
+                            decision = "allow",
+                            "permission granted"
+                        );
+                    });
                 }
                 Ok(PermissionOutcome::Cancelled) | Err(_) => {
                     // B6 §2.1: distinguish a silent timeout (unresponsive
@@ -370,12 +476,15 @@ pub(super) async fn dispatch_tool_call(
                     // production logs so operators can tune the timeout or
                     // investigate client connectivity issues.
                     if let Err(crate::permission::ReducerError::TimedOut(dur)) = outcome {
-                        tracing::warn!(
-                            name: "zhive.tool.permission_timeout",
-                            tool = tool_name,
-                            timeout_secs = dur.as_secs(),
-                            "permission request timed out; treating as deny"
-                        );
+                        perm_span.in_scope(|| {
+                            tracing::warn!(
+                                name: "zhive.tool.permission_timeout",
+                                tool = tool_name,
+                                timeout_secs = dur.as_secs(),
+                                decision = "deny",
+                                "permission request timed out; treating as deny"
+                            );
+                        });
                     }
                     return blocked_outcome(
                         item_id,
@@ -403,7 +512,7 @@ pub(super) async fn dispatch_tool_call(
                         tool_name,
                         raw_args,
                         tool_use_id,
-                        "permission denied (unrecognised outcome variant)".to_owned(),
+                        "permission denied (unrecognised decision variant)".to_owned(),
                         stop_loop,
                     );
                 }

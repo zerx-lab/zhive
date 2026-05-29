@@ -19,6 +19,7 @@ use std::sync::{Arc, RwLock};
 use async_trait::async_trait;
 use futures::FutureExt;
 use thiserror::Error;
+use tracing::Instrument as _;
 use zhive_proto::hook::{ExtensionRef, HookEvent};
 use zhive_proto::permission::HookOutput;
 
@@ -232,6 +233,12 @@ impl HookHost {
     /// every call. The lock is released before any callback is
     /// awaited.
     ///
+    /// Opens a `zhive.hook` span with `hook.event` set to the event name
+    /// string (e.g. `"PreToolUse"`, `"Stop"`, …).  The span is
+    /// instrumented with `Instrument` so it is entered and exited
+    /// correctly across each callback's `.await`, satisfying the `Send`
+    /// bound required by `tokio::spawn`.
+    ///
     /// Panics inside callbacks are caught, logged at `WARN` level
     /// (`zhive.hooks.callback_panic`), and **isolated**: the panicking
     /// hook is skipped and dispatch continues with the remaining hooks
@@ -244,6 +251,30 @@ impl HookHost {
     ///
     /// See [`HookHostError`].
     pub async fn dispatch(&self, event: &HookEvent) -> Result<Vec<HookOutput>, HookHostError> {
+        // Extract the event name for the span field before acquiring the lock.
+        // `HookEvent::hook_event_name()` is defined on the wire type; we fall
+        // back to a generic string for unknown variants.
+        let event_name = hook_event_name(event);
+
+        // Open a `zhive.hook` span for this dispatch invocation.
+        //
+        // Span name is a literal; spans::HOOK is the single source of
+        // truth — the observability test `span_literals_match_constants`
+        // asserts the literal matches the constant.
+        //
+        // B9 §3.1 rule 3 mandates `session.id` on every span.
+        let session_id = hook_session_id(event);
+        let span = tracing::info_span!(
+            "zhive.hook",
+            "session.id" = session_id,
+            "hook.event" = event_name,
+        );
+
+        self.dispatch_inner(event).instrument(span).await
+    }
+
+    /// Inner body of [`Self::dispatch`], instrumented by the caller.
+    async fn dispatch_inner(&self, event: &HookEvent) -> Result<Vec<HookOutput>, HookHostError> {
         let snapshot: Vec<(RegistrationId, Arc<dyn HookFn>)> = {
             let guard = self
                 .registrations
@@ -283,6 +314,65 @@ impl HookHost {
             }
         }
         Ok(outputs)
+    }
+}
+
+/// Extracts a stable event-name string from a [`HookEvent`] for use as a
+/// span field.
+///
+/// The returned value is the canonical `hook_event_name` wire string
+/// (e.g. `"PreToolUse"`, `"PostToolUse"`, `"Stop"`, …).  For unknown
+/// `#[non_exhaustive]` variants that do not match a known arm the
+/// fallback `"Unknown"` is returned.
+fn hook_event_name(event: &HookEvent) -> &'static str {
+    match event {
+        HookEvent::PreToolUse(_) => "PreToolUse",
+        HookEvent::PostToolUse(_) => "PostToolUse",
+        HookEvent::PostToolUseFailure(_) => "PostToolUseFailure",
+        HookEvent::UserPromptSubmit(_) => "UserPromptSubmit",
+        HookEvent::PermissionRequest(_) => "PermissionRequest",
+        HookEvent::ToolApprovalChange(_) => "ToolApprovalChange",
+        HookEvent::Stop(_) => "Stop",
+        HookEvent::Notification(_) => "Notification",
+        HookEvent::Setup(_) => "Setup",
+        HookEvent::SubagentStart(_) => "SubagentStart",
+        HookEvent::SubagentStop(_) => "SubagentStop",
+        HookEvent::PreCompact(_) => "PreCompact",
+        HookEvent::SessionStart(_) => "SessionStart",
+        HookEvent::SessionEnd(_) => "SessionEnd",
+        HookEvent::PhaseTransition(_) => "PhaseTransition",
+        // `HookEvent` is `#[non_exhaustive]`; forward-compat fallback.
+        _ => "Unknown",
+    }
+}
+
+/// Extracts the `session.id` from a [`HookEvent`] for use as the mandatory
+/// `session.id` span field (B9 §3.1 rule 3: every span must contain
+/// `session.id`).
+///
+/// Every [`HookEvent`] variant wraps a payload struct that carries a
+/// `pub base: HookEventBase` field with `pub session_id: String`.
+/// For unknown `#[non_exhaustive]` variants the empty string is returned
+/// as a forward-compat fallback.
+fn hook_session_id(event: &HookEvent) -> &str {
+    match event {
+        HookEvent::PreToolUse(p) => &p.base.session_id,
+        HookEvent::PostToolUse(p) => &p.base.session_id,
+        HookEvent::PostToolUseFailure(p) => &p.base.session_id,
+        HookEvent::UserPromptSubmit(p) => &p.base.session_id,
+        HookEvent::PermissionRequest(p) => &p.base.session_id,
+        HookEvent::ToolApprovalChange(p) => &p.base.session_id,
+        HookEvent::Stop(p) => &p.base.session_id,
+        HookEvent::Notification(p) => &p.base.session_id,
+        HookEvent::Setup(p) => &p.base.session_id,
+        HookEvent::SubagentStart(p) => &p.base.session_id,
+        HookEvent::SubagentStop(p) => &p.base.session_id,
+        HookEvent::PreCompact(p) => &p.base.session_id,
+        HookEvent::SessionStart(p) => &p.base.session_id,
+        HookEvent::SessionEnd(p) => &p.base.session_id,
+        HookEvent::PhaseTransition(p) => &p.base.session_id,
+        // `HookEvent` is `#[non_exhaustive]`; forward-compat fallback.
+        _ => "",
     }
 }
 

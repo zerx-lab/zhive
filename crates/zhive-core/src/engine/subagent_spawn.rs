@@ -25,6 +25,7 @@
 
 use std::sync::Arc;
 
+use tracing::Instrument as _;
 use zhive_proto::domain::ThreadId;
 use zhive_proto::permission::{PermissionScope, SubagentDefinition};
 
@@ -272,6 +273,10 @@ impl EngineInner {
     /// `child_handle` and the engine-wide broadcast
     /// [`EngineEvent::SubagentCompleted`].
     ///
+    /// Opens a `zhive.subagent` span with `session.id` (child) and
+    /// `zhive.parent.session.id` (parent) fields.  The span wraps the entire
+    /// child turn lifetime so an OTLP backend can visualise subagent depth.
+    ///
     /// ## Delivery ordering
     ///
     /// 1. The in-process `subagent_final_tx` is sent first so the spawning
@@ -289,6 +294,39 @@ impl EngineInner {
     /// Claude Code contract ("child error = tool result error, parent sees
     /// no final message").
     async fn run_child_turn_and_deliver(
+        inner: Arc<Self>,
+        child_handle: Arc<ThreadHandle>,
+        child_tid: ThreadId,
+        child_turn_id: zhive_proto::domain::TurnId,
+        child_cancel: tokio_util::sync::CancellationToken,
+        parent_tid: ThreadId,
+    ) {
+        // Open a `zhive.subagent` span that spans the entire child turn.
+        //
+        // Span name is a literal; spans::SUBAGENT is the single source of
+        // truth (see observability tests).  `Instrument` ensures the span
+        // is entered/exited correctly across every await point.
+        let span = tracing::info_span!(
+            "zhive.subagent",
+            "session.id"              = %child_tid.0,
+            "zhive.parent.session.id" = %parent_tid.0,
+        );
+
+        Self::run_child_turn_inner(
+            inner,
+            child_handle,
+            child_tid,
+            child_turn_id,
+            child_cancel,
+            parent_tid,
+        )
+        .instrument(span)
+        .await;
+    }
+
+    /// Inner body of [`Self::run_child_turn_and_deliver`], instrumented by
+    /// the caller with the `zhive.subagent` span.
+    async fn run_child_turn_inner(
         inner: Arc<Self>,
         child_handle: Arc<ThreadHandle>,
         child_tid: ThreadId,

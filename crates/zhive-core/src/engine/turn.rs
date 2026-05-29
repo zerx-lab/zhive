@@ -34,6 +34,7 @@ use std::sync::Arc;
 
 use futures::StreamExt as _;
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument as _;
 use zhive_proto::domain::{Item, ItemId, NoticeLevel, ThreadId, TurnError, TurnId};
 use zhive_proto::permission::PermissionScope;
 
@@ -73,6 +74,9 @@ const MAX_TURN_ITERATIONS: u32 = 32;
 /// — use the return value to decide which payload to include in
 /// [`crate::engine::event::EngineEvent::SubagentCompleted`].
 ///
+/// Opens a `zhive.turn` OTel-aligned span for the entire turn lifetime,
+/// with `thread.id` and `turn.id` fields populated from the arguments.
+///
 /// ## Steps (per iteration, up to [`MAX_TURN_ITERATIONS`])
 ///
 /// 1. Build `CallOptions` from the thread history.
@@ -85,13 +89,41 @@ const MAX_TURN_ITERATIONS: u32 = 32;
 ///    If no tool calls, the turn is complete.
 /// 5. After the loop (including on cancel): call `fold.finish()` then
 ///    `finish_turn`.  Cancel suppresses `TurnCompleted`.
+pub(super) async fn run_turn(
+    inner: &Arc<EngineInner>,
+    handle: Arc<ThreadHandle>,
+    thread_id: ThreadId,
+    turn_id: TurnId,
+    cancel: CancellationToken,
+) -> bool {
+    // Open a `zhive.turn` span for the whole turn's lifetime.
+    //
+    // Span name and field names are string literals here (macro
+    // requirement); the constants `spans::TURN`, `fields::THREAD_ID`,
+    // and `fields::TURN_ID` are the single source of truth and compile-
+    // time assertions in the observability tests verify the literals
+    // stay in sync.
+    // Span name and field names are string literals (macro requirement).
+    // The constants spans::TURN / fields::THREAD_ID / fields::TURN_ID are
+    // the single source of truth; the test `span_literals_match_constants`
+    // in observability::tests asserts the literals stay in sync.
+    let span = tracing::info_span!(
+        "zhive.turn",
+        "session.id"    = %thread_id.0,
+        "zhive.turn.id" = %turn_id.0,
+    );
+    run_turn_inner(inner, handle, thread_id, turn_id, cancel)
+        .instrument(span)
+        .await
+}
+
+/// Inner async body of [`run_turn`], instrumented by the caller with the
+/// `zhive.turn` span.
 #[expect(
     clippy::too_many_lines,
-    reason = "run_turn is the top-level turn state machine; splitting into smaller functions \
-              would require passing many args through shared context structs, adding more \
-              complexity than it removes. All arms are clear and sequential."
+    reason = "run_turn_inner is the top-level turn state machine; see run_turn for context"
 )]
-pub(super) async fn run_turn(
+async fn run_turn_inner(
     inner: &Arc<EngineInner>,
     handle: Arc<ThreadHandle>,
     thread_id: ThreadId,

@@ -27,6 +27,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use tokio::sync::mpsc;
+use tracing::Instrument as _;
 use zhive_proto::domain::{Item, Thread, ThreadId, TurnError, TurnId, TurnStatus};
 
 use super::error::StorageResult;
@@ -389,7 +390,21 @@ async fn apply_turn_ended(
                 "failed to append leaf entry to rollout"
             );
         }
-        if let Err(err) = w.sync_all().await {
+        // Open a `zhive.rollback_point` span that wraps the fsync save-point.
+        //
+        // This span marks the durability boundary: after `sync_all` the
+        // turn's items are guaranteed to survive a crash. An OTLP exporter
+        // can use this span to measure fsync latency.
+        //
+        // Span name is a literal; spans::ROLLBACK_POINT / fields::THREAD_ID /
+        // fields::DB_OPERATION are the single source of truth (see
+        // observability tests).
+        let sync_span = tracing::info_span!(
+            "zhive.rollback_point",
+            "session.id"   = %thread_id.0,
+            "db.operation" = "fsync",
+        );
+        if let Err(err) = w.sync_all().instrument(sync_span).await {
             tracing::error!(
                 name: "zhive.persistence.writer.sync_failed",
                 error = %err,
