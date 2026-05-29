@@ -9,13 +9,15 @@
 //! `impl EngineInner` block; Rust allows multiple `impl` blocks for a
 //! single type across different files in the same module tree.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use zhive_proto::domain::{ThreadId, ThreadStatus, TurnId};
+use zhive_proto::domain::{Thread, ThreadId, ThreadSource, ThreadStatus, TurnId, TurnStatus};
 use zhive_proto::hook::EnginePhase;
 
+use crate::persistence::writer::StorageWriteOp;
 use crate::queues::QueueTarget;
 use crate::state::ActiveTurn;
 
@@ -120,6 +122,39 @@ impl EngineInner {
             turn_id: turn_id.clone(),
         });
 
+        // Enqueue persistence ops for the new thread and turn.
+        // ThreadUpserted first (ensures the rollout header is written).
+        // The persisted thread status reflects the live state: Active while the
+        // turn is running.  Note: active_flags is serialised as the generic
+        // "active" discriminant in state_db — the individual flags (e.g.
+        // TurnInProgress) are intentionally not persisted because they are
+        // transient and always correct in memory; on DB round-trip the flags
+        // field is restored as an empty vec (see thread_status_from_str).
+        // DELIBERATE: active_flags detail is not persisted to state.db.
+        let thread_snapshot = Thread {
+            id: thread_id.clone(),
+            session_id: None,
+            forked_from: None,
+            preview: String::new(),
+            ephemeral: false,
+            model_provider: "unknown".to_owned(),
+            created_at: started_at,
+            updated_at: started_at,
+            status: ThreadStatus::Active {
+                active_flags: vec![zhive_proto::domain::ThreadActiveFlag::TurnInProgress],
+            },
+            cwd: PathBuf::from("."),
+            source: ThreadSource::User,
+            name: None,
+            turns: vec![],
+        };
+        self.enqueue_storage_op(StorageWriteOp::ThreadUpserted(Box::new(thread_snapshot)));
+        self.enqueue_storage_op(StorageWriteOp::TurnStarted {
+            thread_id: thread_id.clone(),
+            turn_id: turn_id.clone(),
+            started_at,
+        });
+
         // Build the reply before spawning so the borrow of `turn_id` is
         // still available here.
         let reply = StartTurnReply {
@@ -177,6 +212,8 @@ impl EngineInner {
         // responsibility rests with whoever owns (or owned) that slot.
         let mut active = handle.active_turn.lock().await;
         let we_owned_the_turn = active.as_ref().is_some_and(|a| a.id == turn_id);
+        // Capture started_at before clearing the slot so we can compute duration.
+        let turn_started_at = active.as_ref().map(|a| a.started_at);
         if we_owned_the_turn {
             *active = None;
         }
@@ -216,10 +253,46 @@ impl EngineInner {
         // already broadcast TurnFailed must not also emit TurnCompleted —
         // each turn has exactly one terminal event.
         if !failed {
-            let _ = self
-                .events_tx()
-                .send(EngineEvent::TurnCompleted { thread_id, turn_id });
+            let _ = self.events_tx().send(EngineEvent::TurnCompleted {
+                thread_id: thread_id.clone(),
+                turn_id: turn_id.clone(),
+            });
         }
+
+        // Enqueue persistence TurnEnded op and flip the thread row back to Idle.
+        // Ordering: TurnEnded first (triggers fsync save point), then
+        // ThreadUpserted (updates the thread status column).
+        let completed_at = unix_now();
+        let duration_ms = turn_started_at.map(|s| (completed_at - s).saturating_mul(1_000));
+        self.enqueue_storage_op(StorageWriteOp::TurnEnded {
+            thread_id: thread_id.clone(),
+            turn_id,
+            status: if failed {
+                TurnStatus::Failed
+            } else {
+                TurnStatus::Completed
+            },
+            error: None,
+            completed_at,
+            duration_ms,
+        });
+        // Update the persisted thread status to Idle now that the turn has ended.
+        let idle_snapshot = Thread {
+            id: thread_id.clone(),
+            session_id: None,
+            forked_from: None,
+            preview: String::new(),
+            ephemeral: false,
+            model_provider: "unknown".to_owned(),
+            created_at: completed_at,
+            updated_at: completed_at,
+            status: ThreadStatus::Idle,
+            cwd: PathBuf::from("."),
+            source: ThreadSource::User,
+            name: None,
+            turns: vec![],
+        };
+        self.enqueue_storage_op(StorageWriteOp::ThreadUpserted(Box::new(idle_snapshot)));
     }
 
     pub(super) async fn cancel_turn(&self, thread_id: ThreadId) -> CancelTurnReply {
@@ -246,6 +319,8 @@ impl EngineInner {
             return CancelTurnReply::NoActiveTurn;
         };
         let cancelled_turn_id = active.id.clone();
+        // Capture started_at before active.id is moved into SessionAbortedNotification.
+        let turn_started_at = active.started_at;
 
         // ACP 0.12 hard requirement: cancel resolves every outstanding
         // permission/request with `Cancelled` so the client never has
@@ -276,6 +351,41 @@ impl EngineInner {
         let _ = self
             .events_tx()
             .send(EngineEvent::SessionAborted(Box::new(aborted)));
+
+        // Persist the cancelled turn as Interrupted.  Only enqueued when
+        // storage is configured (enqueue_storage_op is a no-op when the
+        // sender is absent).  Must be enqueued BEFORE the phase rolls back
+        // so the writer's ordering (JSONL → SQL) still sees the turn row as
+        // active when it processes the TurnEnded op.
+        let cancel_at = unix_now();
+        // duration_ms: wall time from turn start to cancellation, in ms.
+        // saturating_mul(1_000) converts seconds to milliseconds.
+        let duration_ms = Some((cancel_at - turn_started_at).saturating_mul(1_000));
+        self.enqueue_storage_op(StorageWriteOp::TurnEnded {
+            thread_id: thread_id.clone(),
+            turn_id: cancelled_turn_id.clone(),
+            status: TurnStatus::Interrupted,
+            error: None,
+            completed_at: cancel_at,
+            duration_ms,
+        });
+        // Flip the thread row back to Idle in the persistence index.
+        let idle_snapshot = Thread {
+            id: thread_id.clone(),
+            session_id: None,
+            forked_from: None,
+            preview: String::new(),
+            ephemeral: false,
+            model_provider: "unknown".to_owned(),
+            created_at: cancel_at,
+            updated_at: cancel_at,
+            status: ThreadStatus::Idle,
+            cwd: PathBuf::from("."),
+            source: ThreadSource::User,
+            name: None,
+            turns: vec![],
+        };
+        self.enqueue_storage_op(StorageWriteOp::ThreadUpserted(Box::new(idle_snapshot)));
 
         // Roll the global phase back to Idle. With `finish_turn` now
         // gated by `we_owned_the_turn`, the only way to land in the

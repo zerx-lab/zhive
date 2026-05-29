@@ -38,11 +38,13 @@ use std::sync::atomic::AtomicU64;
 use std::sync::{Mutex, MutexGuard};
 
 use tokio::sync::{broadcast, mpsc};
+use tokio::task::JoinHandle;
 use zhive_proto::hook::EnginePhase;
 
 use crate::cancel::CancellationTree;
 use crate::hooks::HookHost;
 use crate::permission::{PermissionReducer, ReducerError};
+use crate::persistence::writer::StorageWriteOp;
 use crate::provider::DynLanguageModel;
 use crate::queues::QueueTarget;
 use crate::state::ThreadStore;
@@ -53,6 +55,20 @@ use super::phase::allows_transition;
 use super::submission::{
     PermissionRequestId, ResumePermissionReply, Submission, SubmissionEnvelope, SubmissionReply,
 };
+
+// ============================================================
+// StorageWriterState
+// ============================================================
+
+/// Bundles the persistence writer sender and its join handle so both can be
+/// held in a single `Mutex` and taken together at shutdown.
+struct StorageWriterState {
+    /// Sender end of the write-op channel; drop to close the channel and
+    /// signal the writer task to drain and exit.
+    tx: Option<mpsc::Sender<StorageWriteOp>>,
+    /// Join handle for the background writer task.
+    handle: Option<JoinHandle<()>>,
+}
 
 // ============================================================
 // EngineInner
@@ -94,6 +110,18 @@ pub(crate) struct EngineInner {
     /// or the engine itself.  Each tool call gets a further child via
     /// `child_for_tool`.
     cancel_tree: CancellationTree,
+    /// Optional persistence write-through sender.
+    ///
+    /// When `Some`, every lifecycle event (thread upserted, turn started,
+    /// item appended, turn ended) is enqueued here.  The [`PersistenceWriter`]
+    /// task drains it asynchronously.
+    ///
+    /// Wrapped in `Mutex<Option<…>>` so `run()` can `take()` the sender on
+    /// shutdown (dropping it closes the channel, signalling the writer to
+    /// drain and exit).
+    ///
+    /// [`PersistenceWriter`]: crate::persistence::writer::PersistenceWriter
+    storage_writer: Mutex<StorageWriterState>,
 }
 
 impl EngineInner {
@@ -101,20 +129,24 @@ impl EngineInner {
         events_tx: broadcast::Sender<EngineEvent>,
         provider: DynLanguageModel,
     ) -> Self {
-        Self::new_with_hooks_tools(
+        Self::new_with_hooks_tools_storage(
             events_tx,
             provider,
             Arc::new(HookHost::new()),
             Arc::new(ToolRegistry::new()),
+            None,
+            None,
         )
     }
 
-    /// Low-level constructor used by [`super::Engine::spawn_with_config`].
-    pub(crate) fn new_with_hooks_tools(
+    /// Full constructor used by [`super::Engine::spawn_with_config`].
+    pub(crate) fn new_with_hooks_tools_storage(
         events_tx: broadcast::Sender<EngineEvent>,
         provider: DynLanguageModel,
         hook_host: Arc<HookHost>,
         tools: Arc<ToolRegistry>,
+        storage_tx: Option<mpsc::Sender<StorageWriteOp>>,
+        storage_handle: Option<JoinHandle<()>>,
     ) -> Self {
         Self {
             threads: Arc::new(ThreadStore::new()),
@@ -126,6 +158,10 @@ impl EngineInner {
             hook_host,
             tools,
             cancel_tree: CancellationTree::new(),
+            storage_writer: Mutex::new(StorageWriterState {
+                tx: storage_tx,
+                handle: storage_handle,
+            }),
         }
     }
 
@@ -160,6 +196,27 @@ impl EngineInner {
         &self.cancel_tree
     }
 
+    /// Non-blocking enqueue of a persistence write op.
+    ///
+    /// Logs at `warn` when the channel is full (back-pressure exceeded) but
+    /// does not block or return an error — persistence is best-effort and
+    /// must never stall the turn loop.
+    pub(in crate::engine) fn enqueue_storage_op(&self, op: StorageWriteOp) {
+        let guard = self
+            .storage_writer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(tx) = &guard.tx
+            && let Err(err) = tx.try_send(op)
+        {
+            tracing::warn!(
+                name: "zhive.engine.storage.enqueue_failed",
+                error = %err,
+                "persistence write op dropped; writer channel full or closed"
+            );
+        }
+    }
+
     /// Returns the turn counter for sibling modules (e.g. lifecycle).
     pub(in crate::engine) fn turn_counter(&self) -> &AtomicU64 {
         &self.turn_counter
@@ -183,6 +240,26 @@ impl EngineInner {
                 // Cancel all in-flight turns before acknowledging the
                 // shutdown so the spawned turn tasks abort promptly.
                 self.cancel_tree.cancel_all();
+
+                // Drop the persistence sender (closes the channel) then await
+                // the writer task (best-effort, 5 s cap) so the last
+                // completed turn is durable before the reply fires.
+                let (writer_tx_drop, writer_handle) = {
+                    let mut guard = self
+                        .storage_writer
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    // Take both fields out of the mutex guard so they are
+                    // dropped *outside* the lock (the handle.await below must
+                    // not hold the Mutex).
+                    (guard.tx.take(), guard.handle.take())
+                };
+                // Drop the sender here to signal the writer task.
+                drop(writer_tx_drop);
+                if let Some(h) = writer_handle {
+                    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), h).await;
+                }
+
                 if let Some(tx) = reply {
                     let _ = tx.send(SubmissionReply::Shutdown);
                 }

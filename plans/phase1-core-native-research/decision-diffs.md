@@ -335,6 +335,8 @@ A4 实装 `HookEvent` 时补这一 case。
 
 **决策点**：✅ **方案 d** 落定 (2026-05-28)。Phase 1 单用户写入低频，串行可接受；如未来出现 SQLITE_BUSY 瓶颈再切方案 c 自写 mini pool。方案 b/c 触红线 1 不进 Phase 1。
 
+> **决策修订（2026-05-29，用户确认）**：Phase 1 落地阶段改用 **`sqlx = "0.8"`**（features `runtime-tokio, sqlite, migrate, json`；不用 `query!` 宏以免 `cargo check` 依赖 `DATABASE_URL`）取代 rusqlite + 方案 d。理由：sqlx 原生 tokio async pool（`SqlitePool`，每库一个，WAL + `Synchronous::Normal`），免去 `Arc<Mutex<Connection>>` 串行写瓶颈与跨 await 持锁问题；`sqlx::migrate!("./migrations/<db>")` 直接内嵌 4 库迁移 SQL。代价：引入 sqlx 作为新依赖（已在 `Cargo.toml` 落地，commit `6f46b57`）。这覆盖上面的"方案 d / rusqlite + bundled"决定与 R-2（rusqlite cold build 78-80s 不再适用）。`research/99-decisions/README.md` 的 D-011 同步待办。
+
 ---
 
 ### 2.3 R-8: 跨库一致性（已自决，方案已选）

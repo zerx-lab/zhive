@@ -26,6 +26,7 @@ pub mod logs_db;
 pub mod memories_db;
 pub mod rollout;
 pub mod state_db;
+pub mod writer;
 
 #[doc(inline)]
 pub use error::{StorageError, StorageResult};

@@ -34,6 +34,7 @@ pub mod event;
 mod inner;
 mod lifecycle;
 pub mod phase;
+mod prompt;
 pub mod submission;
 mod tool_dispatch;
 mod turn;
@@ -50,6 +51,8 @@ use zhive_proto::permission::{PermissionOutcome, PermissionScope};
 use inner::EngineInner;
 
 use crate::hooks::HookHost;
+use crate::persistence::Storage;
+use crate::persistence::writer::PersistenceWriter;
 use crate::provider::DynLanguageModel;
 use crate::tools::ToolRegistry;
 
@@ -84,7 +87,7 @@ const DEFAULT_REPLY_TIMEOUT: Duration = Duration::from_secs(30);
 ///
 /// Groups all injectable dependencies so callers do not need to chain many
 /// builder calls.  [`Default`] supplies an empty-stream provider, empty tool
-/// registry, and an empty hook host — the same defaults used by
+/// registry, empty hook host, and no storage — the same defaults used by
 /// [`Engine::spawn`].
 ///
 /// # Examples
@@ -94,6 +97,7 @@ const DEFAULT_REPLY_TIMEOUT: Duration = Duration::from_secs(30);
 /// use zhive_core::engine::EngineConfig;
 /// let cfg = EngineConfig::default();
 /// assert!(cfg.tools.is_empty());
+/// assert!(cfg.storage.is_none());
 /// ```
 #[derive(Debug)]
 pub struct EngineConfig {
@@ -103,6 +107,13 @@ pub struct EngineConfig {
     pub tools: Arc<ToolRegistry>,
     /// Hook host dispatched on `PreToolUse` / `PostToolUse` events.
     pub hook_host: Arc<HookHost>,
+    /// Optional persistent storage.
+    ///
+    /// When `Some`, the engine spawns a [`PersistenceWriter`] background
+    /// task and enqueues `ThreadUpserted`, `TurnStarted`, `ItemAppended`,
+    /// and `TurnEnded` ops on every turn.  When `None` (the default) no
+    /// persistence takes place and the engine is purely in-memory.
+    pub storage: Option<Arc<Storage>>,
 }
 
 impl Default for EngineConfig {
@@ -112,6 +123,7 @@ impl Default for EngineConfig {
             provider: ScriptedModel::new("noop", "noop", vec![]).into_dyn(),
             tools: Arc::new(ToolRegistry::new()),
             hook_host: Arc::new(HookHost::new()),
+            storage: None,
         }
     }
 }
@@ -271,6 +283,7 @@ impl Engine {
     ///     provider: ScriptedModel::new("p", "m", vec![]).into_dyn(),
     ///     tools: Arc::new(tools),
     ///     hook_host: Arc::new(HookHost::new()),
+    ///     storage: None,
     /// };
     /// let engine = Engine::spawn_with_config(cfg);
     /// engine.shutdown().await.unwrap();
@@ -280,11 +293,28 @@ impl Engine {
     pub fn spawn_with_config(config: EngineConfig) -> Self {
         let (submission_tx, submission_rx) = mpsc::channel(SUBMISSION_CHANNEL_CAP);
         let (events_tx, _) = broadcast::channel(EVENT_CHANNEL_CAP);
-        let inner = Arc::new(inner::EngineInner::new_with_hooks_tools(
+
+        // When storage is configured, spawn the PersistenceWriter background
+        // task and wire the sender into EngineInner.
+        let storage_tx = config.storage.as_ref().map(|s| {
+            let (tx, handle) = PersistenceWriter::spawn(Arc::clone(s));
+            // The handle is stored in the inner; see EngineInner::new_with_hooks_tools_storage.
+            // We pass the sender + handle together.
+            (tx, handle)
+        });
+
+        let (maybe_tx, maybe_handle) = match storage_tx {
+            Some((tx, handle)) => (Some(tx), Some(handle)),
+            None => (None, None),
+        };
+
+        let inner = Arc::new(inner::EngineInner::new_with_hooks_tools_storage(
             events_tx.clone(),
             config.provider,
             config.hook_host,
             config.tools,
+            maybe_tx,
+            maybe_handle,
         ));
         let threads = Arc::clone(inner.threads());
         let permission = inner.permission_reducer();
@@ -1239,6 +1269,7 @@ mod inc3_tests {
             provider: model.into_dyn(),
             tools: Arc::new(tools),
             hook_host: Arc::new(HookHost::new()),
+            storage: None,
         };
         let engine =
             Engine::spawn_with_config(cfg).with_reply_timeout(std::time::Duration::from_secs(5));
@@ -1335,6 +1366,7 @@ mod inc3_tests {
             provider: MultiScriptedModel::new(vec![script0, script1]).into_dyn(),
             tools: Arc::new(tools),
             hook_host,
+            storage: None,
         };
         let engine =
             Engine::spawn_with_config(cfg).with_reply_timeout(std::time::Duration::from_secs(5));
@@ -1429,6 +1461,7 @@ mod inc3_tests {
             provider: MultiScriptedModel::new(vec![script0, script1]).into_dyn(),
             tools: Arc::new(tools),
             hook_host,
+            storage: None,
         };
         let engine =
             Engine::spawn_with_config(cfg).with_reply_timeout(std::time::Duration::from_secs(5));
@@ -1507,6 +1540,7 @@ mod inc3_tests {
             provider: MultiScriptedModel::new(vec![script0, script1]).into_dyn(),
             tools: Arc::new(tools),
             hook_host,
+            storage: None,
         };
         let engine =
             Engine::spawn_with_config(cfg).with_reply_timeout(std::time::Duration::from_secs(10));
@@ -1575,6 +1609,7 @@ mod inc3_tests {
             provider: DynLanguageModel::new(AlwaysToolCallModel),
             tools: Arc::new(tools),
             hook_host: Arc::new(HookHost::new()),
+            storage: None,
         };
         let engine =
             Engine::spawn_with_config(cfg).with_reply_timeout(std::time::Duration::from_secs(60));
@@ -1636,6 +1671,7 @@ mod inc3_tests {
             provider: MultiScriptedModel::new(vec![script0, script1]).into_dyn(),
             tools: Arc::new(tools),
             hook_host: Arc::new(HookHost::new()),
+            storage: None,
         };
         let engine =
             Engine::spawn_with_config(cfg).with_reply_timeout(std::time::Duration::from_secs(5));
@@ -1708,6 +1744,7 @@ mod inc3_tests {
             provider: MultiScriptedModel::new(vec![script0, vec![]]).into_dyn(),
             tools: Arc::new(tools),
             hook_host: Arc::new(HookHost::new()),
+            storage: None,
         };
         let engine =
             Engine::spawn_with_config(cfg).with_reply_timeout(std::time::Duration::from_secs(10));
@@ -2365,6 +2402,449 @@ mod inc4_tests {
             saw_turn_ended,
             "TurnCompleted/TurnFailed/SessionAborted must arrive within 500 ms of shutdown; \
              cancel guard in run_turn did not abort the blocking do_stream"
+        );
+    }
+}
+
+// ============================================================
+// Increment-5 persistence write-through tests
+// ============================================================
+
+#[cfg(test)]
+mod inc5_tests {
+    //! End-to-end test for the Part D write-through path: engine configured
+    //! with storage runs a turn and the JSONL rollout + state.db are updated.
+
+    use llmsdk::language_model::StreamPart;
+
+    use super::*;
+    use crate::persistence::writer::rebuild_state_from_rollout;
+    use crate::provider::ScriptedModel;
+
+    fn tid(s: &str) -> ThreadId {
+        ThreadId(Arc::from(s))
+    }
+
+    // ------------------------------------------------------------------
+    // Helpers shared by the new FIX-1 / FIX-2 tests
+    // ------------------------------------------------------------------
+
+    /// Queries the raw turn row status from state.db for the given turn id.
+    ///
+    /// Returns the status string (e.g. "inProgress", "interrupted", "completed")
+    /// or `None` when the row does not exist.
+    async fn query_turn_status(
+        storage: &crate::persistence::Storage,
+        turn_id: &str,
+    ) -> Option<String> {
+        use sqlx::Row as _;
+        sqlx::query("SELECT status FROM turns WHERE id = ?1")
+            .bind(turn_id)
+            .fetch_optional(storage.state.pool())
+            .await
+            .ok()
+            .flatten()
+            .map(|r| r.try_get::<String, _>("status").unwrap_or_default())
+    }
+
+    /// Queries the thread row status from state.db for the given thread id.
+    async fn query_thread_status(
+        storage: &crate::persistence::Storage,
+        thread_id: &str,
+    ) -> Option<String> {
+        use sqlx::Row as _;
+        sqlx::query("SELECT status FROM threads WHERE id = ?1")
+            .bind(thread_id)
+            .fetch_optional(storage.state.pool())
+            .await
+            .ok()
+            .flatten()
+            .map(|r| r.try_get::<String, _>("status").unwrap_or_default())
+    }
+
+    /// A turn driven through an engine with `storage: Some(…)` must:
+    /// - persist the thread row in `state.db`,
+    /// - append an `Item` entry to the JSONL rollout, and
+    /// - write a `Leaf` pointer after the turn ends (confirmed via
+    ///   `rebuild_state_from_rollout`).
+    #[tokio::test]
+    async fn engine_turn_with_storage_writes_rollout_and_state_db() {
+        // Create a temporary storage directory.
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Arc::new(Storage::open(tmp.path()).await.unwrap());
+
+        // Build a scripted model that emits one text item.
+        let model = ScriptedModel::new(
+            "test",
+            "m",
+            vec![
+                StreamPart::TextStart {
+                    id: "b0".into(),
+                    provider_metadata: None,
+                },
+                StreamPart::TextDelta {
+                    id: "b0".into(),
+                    delta: "hello from storage".into(),
+                    provider_metadata: None,
+                },
+                StreamPart::TextEnd {
+                    id: "b0".into(),
+                    provider_metadata: None,
+                },
+            ],
+        );
+
+        let cfg = EngineConfig {
+            provider: model.into_dyn(),
+            tools: Arc::new(crate::tools::ToolRegistry::new()),
+            hook_host: Arc::new(crate::hooks::HookHost::new()),
+            storage: Some(Arc::clone(&storage)),
+        };
+
+        let engine =
+            Engine::spawn_with_config(cfg).with_reply_timeout(std::time::Duration::from_secs(10));
+        let mut events = engine.subscribe();
+
+        let thread_id = tid("thread:native/inc5-e2e");
+        engine
+            .start_turn(thread_id.clone(), Vec::new(), None)
+            .await
+            .unwrap();
+
+        // Wait for TurnCompleted.
+        let mut saw_completed = false;
+        for _ in 0..32 {
+            let ev = tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
+                .await
+                .expect("timeout")
+                .expect("broadcast");
+            if matches!(ev, EngineEvent::TurnCompleted { .. }) {
+                saw_completed = true;
+                break;
+            }
+        }
+        assert!(saw_completed, "expected TurnCompleted");
+
+        // Graceful shutdown — this awaits the writer task.
+        engine.shutdown().await.unwrap();
+
+        // Verify the JSONL rollout and state DB.
+        let rollout_path = storage.rollout_path(&thread_id.0);
+
+        // Rebuild from rollout — must succeed (not NotFound or any error).
+        rebuild_state_from_rollout(&storage.state, &rollout_path)
+            .await
+            .expect("rebuild must succeed after engine turn with storage");
+
+        // The thread must be present in state.db.
+        let t = storage
+            .state
+            .get_thread(&thread_id)
+            .await
+            .unwrap()
+            .expect("thread row must be present in state.db after turn");
+        assert_eq!(t.id, thread_id);
+
+        // At least one item must have been persisted.
+        let all_threads = storage.state.list_threads().await.unwrap();
+        assert!(
+            !all_threads.is_empty(),
+            "state.db must have at least one thread"
+        );
+
+        // The JSONL rollout must contain at least one Item entry.
+        let entries = crate::persistence::read_all(&rollout_path)
+            .await
+            .expect("rollout must be readable");
+        let has_item = entries.iter().any(|e| {
+            matches!(e, crate::persistence::RolloutEntry::Item { thread_id: tid, .. }
+                if tid == "thread:native/inc5-e2e")
+        });
+        assert!(
+            has_item,
+            "JSONL rollout must contain at least one ItemAppended entry"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // FIX 1: cancel_turn must persist turn as Interrupted in state.db
+    // ------------------------------------------------------------------
+
+    /// When a turn is cancelled while storage is configured, the state.db
+    /// turn row must be updated to `status = "interrupted"` (not left as
+    /// `"inProgress"` forever).
+    ///
+    /// Uses a `BarrierModel`-style blocking provider so the cancel races
+    /// the in-flight `do_stream` call deterministically.
+    #[tokio::test]
+    async fn cancelled_turn_persisted_as_interrupted() {
+        use async_trait::async_trait;
+        use futures::stream;
+        use llmsdk::LanguageModel;
+        use llmsdk::language_model::{
+            BoxStream, CallOptions, FinishReason, FinishReasonKind, GenerateResult, StreamPart,
+            StreamResult,
+        };
+        use tokio::sync::Barrier as TokioBarrier;
+
+        #[derive(Debug)]
+        struct BarrierModel2 {
+            barrier: Arc<TokioBarrier>,
+        }
+
+        #[async_trait]
+        impl LanguageModel for BarrierModel2 {
+            fn provider(&self) -> &'static str {
+                "test"
+            }
+            fn model_id(&self) -> &'static str {
+                "barrier2"
+            }
+            async fn do_generate(&self, _: CallOptions) -> llmsdk::error::Result<GenerateResult> {
+                Ok(GenerateResult {
+                    content: vec![],
+                    finish_reason: FinishReason::new(FinishReasonKind::Stop),
+                    usage: llmsdk::language_model::Usage::default(),
+                    provider_metadata: None,
+                    request: None,
+                    response: None,
+                    warnings: vec![],
+                })
+            }
+            async fn do_stream(&self, _: CallOptions) -> llmsdk::error::Result<StreamResult> {
+                self.barrier.wait().await;
+                let s: BoxStream<llmsdk::error::Result<StreamPart>> = Box::pin(stream::empty());
+                Ok(StreamResult {
+                    stream: s,
+                    request: None,
+                    response: None,
+                })
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Arc::new(Storage::open(tmp.path()).await.unwrap());
+
+        let barrier = Arc::new(TokioBarrier::new(2));
+        let model = BarrierModel2 {
+            barrier: Arc::clone(&barrier),
+        };
+
+        let cfg = EngineConfig {
+            provider: DynLanguageModel::new(model),
+            tools: Arc::new(crate::tools::ToolRegistry::new()),
+            hook_host: Arc::new(crate::hooks::HookHost::new()),
+            storage: Some(Arc::clone(&storage)),
+        };
+        let engine =
+            Engine::spawn_with_config(cfg).with_reply_timeout(std::time::Duration::from_secs(10));
+        let mut events = engine.subscribe();
+
+        let thread_id = tid("thread:native/cancel-persist");
+        let turn_id = engine
+            .start_turn(thread_id.clone(), Vec::new(), None)
+            .await
+            .unwrap();
+
+        // Wait for TurnStarted — the turn task is in-flight inside do_stream.
+        let saw_started = {
+            let mut found = false;
+            for _ in 0..32 {
+                match tokio::time::timeout(std::time::Duration::from_secs(5), events.recv()).await {
+                    Ok(Ok(EngineEvent::TurnStarted { .. })) => {
+                        found = true;
+                        break;
+                    }
+                    Ok(Ok(_)) => {}
+                    _ => break,
+                }
+            }
+            found
+        };
+        assert!(saw_started, "expected TurnStarted");
+
+        // Cancel while blocked in do_stream.
+        let cancelled = engine.cancel_turn(thread_id.clone()).await.unwrap();
+        assert!(cancelled.is_some(), "expected a turn id to be cancelled");
+
+        // Unblock the provider so the spawned task can clean up.
+        barrier.wait().await;
+
+        // Graceful shutdown — awaits the writer task so ops are flushed.
+        engine.shutdown().await.unwrap();
+
+        // Verify turn status in state.db is "interrupted".
+        let status = query_turn_status(&storage, turn_id.0.as_ref()).await;
+        assert_eq!(
+            status.as_deref(),
+            Some("interrupted"),
+            "cancelled turn must be persisted as 'interrupted', got {status:?}"
+        );
+
+        // Verify thread status in state.db is back to "idle".
+        let thread_status = query_thread_status(&storage, thread_id.0.as_ref()).await;
+        assert_eq!(
+            thread_status.as_deref(),
+            Some("idle"),
+            "thread status must be 'idle' after cancel, got {thread_status:?}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // FIX 2: thread status tracks Active during turn, Idle after
+    // ------------------------------------------------------------------
+
+    /// The persisted thread status must be `"active"` while a turn is
+    /// in-flight and `"idle"` after the turn completes.
+    ///
+    /// Uses a barrier model to observe the intermediate `"active"` state
+    /// before releasing the turn to complete.
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "integration test requires two in-test models and two barrier rendezvous; \
+                  splitting into helper functions would not improve readability"
+    )]
+    async fn thread_status_tracks_turn_lifecycle_in_state_db() {
+        use async_trait::async_trait;
+        use futures::stream;
+        use llmsdk::LanguageModel;
+        use llmsdk::language_model::{
+            BoxStream, CallOptions, FinishReason, FinishReasonKind, GenerateResult, StreamPart,
+            StreamResult,
+        };
+        use tokio::sync::Barrier as TokioBarrier;
+
+        #[derive(Debug)]
+        struct TwoPhaseModel {
+            /// Released after the model start is visible but before streaming.
+            start_barrier: Arc<TokioBarrier>,
+            /// Released by the test to let the model return an empty stream.
+            finish_barrier: Arc<TokioBarrier>,
+        }
+
+        #[async_trait]
+        impl LanguageModel for TwoPhaseModel {
+            fn provider(&self) -> &'static str {
+                "test"
+            }
+            fn model_id(&self) -> &'static str {
+                "two-phase"
+            }
+            async fn do_generate(&self, _: CallOptions) -> llmsdk::error::Result<GenerateResult> {
+                Ok(GenerateResult {
+                    content: vec![],
+                    finish_reason: FinishReason::new(FinishReasonKind::Stop),
+                    usage: llmsdk::language_model::Usage::default(),
+                    provider_metadata: None,
+                    request: None,
+                    response: None,
+                    warnings: vec![],
+                })
+            }
+            async fn do_stream(&self, _: CallOptions) -> llmsdk::error::Result<StreamResult> {
+                // Signal that do_stream is active, then block until released.
+                self.start_barrier.wait().await;
+                self.finish_barrier.wait().await;
+                let s: BoxStream<llmsdk::error::Result<StreamPart>> = Box::pin(stream::empty());
+                Ok(StreamResult {
+                    stream: s,
+                    request: None,
+                    response: None,
+                })
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Arc::new(Storage::open(tmp.path()).await.unwrap());
+
+        let start_barrier = Arc::new(TokioBarrier::new(2));
+        let finish_barrier = Arc::new(TokioBarrier::new(2));
+
+        let model = TwoPhaseModel {
+            start_barrier: Arc::clone(&start_barrier),
+            finish_barrier: Arc::clone(&finish_barrier),
+        };
+
+        let cfg = EngineConfig {
+            provider: DynLanguageModel::new(model),
+            tools: Arc::new(crate::tools::ToolRegistry::new()),
+            hook_host: Arc::new(crate::hooks::HookHost::new()),
+            storage: Some(Arc::clone(&storage)),
+        };
+        let engine =
+            Engine::spawn_with_config(cfg).with_reply_timeout(std::time::Duration::from_secs(10));
+        let mut events = engine.subscribe();
+
+        let thread_id = tid("thread:native/thread-status-lifecycle");
+        engine
+            .start_turn(thread_id.clone(), Vec::new(), None)
+            .await
+            .unwrap();
+
+        // Wait for TurnStarted.
+        let saw_started = {
+            let mut found = false;
+            for _ in 0..32 {
+                match tokio::time::timeout(std::time::Duration::from_secs(5), events.recv()).await {
+                    Ok(Ok(EngineEvent::TurnStarted { .. })) => {
+                        found = true;
+                        break;
+                    }
+                    Ok(Ok(_)) => {}
+                    _ => break,
+                }
+            }
+            found
+        };
+        assert!(saw_started, "expected TurnStarted");
+
+        // Rendezvous with the model inside do_stream: at this point the
+        // ThreadUpserted(Active) op has been enqueued but may not yet
+        // have been processed by the writer.  Release the start barrier
+        // so the model is about to begin streaming.
+        start_barrier.wait().await;
+
+        // Give the writer task a moment to process the enqueued
+        // ThreadUpserted(Active) operation before we read the DB.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let status_during = query_thread_status(&storage, thread_id.0.as_ref()).await;
+        assert_eq!(
+            status_during.as_deref(),
+            Some("active"),
+            "thread must be 'active' while turn is in-flight, got {status_during:?}"
+        );
+
+        // Release the model to return an empty stream so the turn can complete.
+        finish_barrier.wait().await;
+
+        // Wait for TurnCompleted so we know finish_turn has been called and
+        // the Idle upsert has been enqueued.
+        let saw_completed = {
+            let mut found = false;
+            for _ in 0..32 {
+                match tokio::time::timeout(std::time::Duration::from_secs(5), events.recv()).await {
+                    Ok(Ok(EngineEvent::TurnCompleted { .. })) => {
+                        found = true;
+                        break;
+                    }
+                    Ok(Ok(_)) => {}
+                    _ => break,
+                }
+            }
+            found
+        };
+        assert!(saw_completed, "expected TurnCompleted");
+
+        // Shutdown awaits the writer; all enqueued ops must now be applied.
+        engine.shutdown().await.unwrap();
+
+        // After shutdown: thread status must be "idle".
+        let status_after = query_thread_status(&storage, thread_id.0.as_ref()).await;
+        assert_eq!(
+            status_after.as_deref(),
+            Some("idle"),
+            "thread status must be 'idle' after turn completes, got {status_after:?}"
         );
     }
 }
