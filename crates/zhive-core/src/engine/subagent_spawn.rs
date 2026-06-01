@@ -334,7 +334,12 @@ impl EngineInner {
         child_cancel: tokio_util::sync::CancellationToken,
         parent_tid: ThreadId,
     ) {
-        let child_failed = super::turn::run_turn(
+        // `None` = clean completion or cancellation; `Some(e)` = the real
+        // failure error. This value is threaded verbatim into
+        // `deliver_subagent_outcome` below, which maps `Some(e)` to
+        // `SubagentFinalEvent::Errored { error: e }` so the parent sees the
+        // actual provider/turn failure rather than a sentinel.
+        let child_error = super::turn::run_turn(
             &inner,
             Arc::clone(&child_handle),
             child_tid.clone(),
@@ -345,7 +350,7 @@ impl EngineInner {
 
         // `run_turn` has already called `finish_turn`, so the child transcript
         // is stable and the `active_turn` slot is `None`.
-        let final_msg = if child_failed {
+        let final_msg = if child_error.is_some() {
             // The child turn emitted TurnFailed; surface no final message to
             // the parent so the Claude Code "child error = tool result error"
             // contract is satisfied.
@@ -359,7 +364,7 @@ impl EngineInner {
                     parent_tid,
                     child_tid,
                     None,
-                    child_failed,
+                    child_error,
                 )
                 .await;
                 return;
@@ -375,7 +380,7 @@ impl EngineInner {
             parent_tid,
             child_tid,
             final_msg,
-            child_failed,
+            child_error,
         )
         .await;
     }
@@ -391,30 +396,24 @@ impl EngineInner {
         parent_tid: ThreadId,
         child_tid: ThreadId,
         final_msg: Option<std::sync::Arc<zhive_proto::domain::Item>>,
-        child_failed: bool,
+        child_error: Option<zhive_proto::domain::TurnError>,
     ) {
         use crate::subagent::SubagentFinalEvent;
-        use zhive_proto::domain::TurnError;
 
         // In-process delivery: fire the mpsc channel stored on the child
         // handle so the spawner can `await` the result directly.
         if let Some(tx) = &child_handle.subagent_final_tx {
-            let event = if child_failed {
-                SubagentFinalEvent::Errored {
+            let event = match child_error {
+                // The real `TurnError` from `run_turn` is threaded through
+                // verbatim, so the parent sees the actual failure cause.
+                Some(error) => SubagentFinalEvent::Errored {
                     child_thread_id: child_tid.clone(),
-                    // Phase 1: error detail is not yet propagated from
-                    // `run_turn`; use a sentinel error string. A future
-                    // increment can thread the real `TurnError` through here.
-                    error: TurnError {
-                        message: "subagent turn failed".to_owned(),
-                        additional_details: None,
-                    },
-                }
-            } else {
-                SubagentFinalEvent::Completed {
+                    error,
+                },
+                None => SubagentFinalEvent::Completed {
                     child_thread_id: child_tid.clone(),
                     final_message: final_msg.clone(),
-                }
+                },
             };
             // Ignore send errors: the spawner may have dropped the receiver
             // if it only cares about the broadcast bus.
@@ -566,6 +565,80 @@ mod tests {
             EnginePhase::Idle,
             "spawn_subagent must not change the global engine phase"
         );
+    }
+
+    /// A failing child turn must surface its **real** `TurnError` message to
+    /// the parent via `SubagentFinalEvent::Errored` — not the old sentinel
+    /// `"subagent turn failed"`.
+    #[tokio::test]
+    async fn deliver_subagent_outcome_errored_carries_real_message() {
+        use crate::subagent::SubagentFinalEvent;
+        use zhive_proto::domain::TurnError;
+
+        let inner = new_inner();
+        let child_tid = tid("thread:subagent/native/root/0");
+        let parent_tid = tid("thread:native/root");
+        let (child_handle, mut rx) =
+            crate::state::ThreadHandle::new_child(child_tid.clone(), parent_tid.clone());
+        let child_handle = Arc::new(child_handle);
+
+        let real = TurnError {
+            message: "provider exploded: no such model".to_owned(),
+            additional_details: None,
+        };
+        EngineInner::deliver_subagent_outcome(
+            &inner,
+            &child_handle,
+            parent_tid,
+            child_tid.clone(),
+            None,
+            Some(real.clone()),
+        )
+        .await;
+
+        match rx.recv().await.expect("final event") {
+            SubagentFinalEvent::Errored { error, .. } => {
+                assert_eq!(
+                    error.message, real.message,
+                    "Errored must carry the real provider error, not a sentinel"
+                );
+                assert_ne!(error.message, "subagent turn failed");
+            }
+            other => panic!("expected Errored, got {other:?}"),
+        }
+    }
+
+    /// `None` error (clean completion or cancellation) yields `Completed`.
+    #[tokio::test]
+    async fn deliver_subagent_outcome_completed_when_no_error() {
+        use crate::subagent::SubagentFinalEvent;
+
+        let inner = new_inner();
+        let child_tid = tid("thread:subagent/native/root/1");
+        let parent_tid = tid("thread:native/root");
+        let (child_handle, mut rx) =
+            crate::state::ThreadHandle::new_child(child_tid.clone(), parent_tid.clone());
+        let child_handle = Arc::new(child_handle);
+
+        EngineInner::deliver_subagent_outcome(
+            &inner,
+            &child_handle,
+            parent_tid,
+            child_tid,
+            None,
+            None,
+        )
+        .await;
+
+        match rx.recv().await.expect("final event") {
+            SubagentFinalEvent::Completed { final_message, .. } => {
+                assert!(
+                    final_message.is_none(),
+                    "passing final_msg=None must yield Completed with no message"
+                );
+            }
+            other => panic!("no error must map to Completed, got {other:?}"),
+        }
     }
 }
 
