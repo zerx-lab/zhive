@@ -36,6 +36,7 @@ use futures::StreamExt as _;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
 use zhive_proto::domain::{Item, ItemId, NoticeLevel, ThreadId, TurnError, TurnId};
+use zhive_proto::hook::CompactTrigger;
 use zhive_proto::permission::PermissionScope;
 
 use crate::persistence::writer::StorageWriteOp;
@@ -68,11 +69,13 @@ const MAX_TURN_ITERATIONS: u32 = 32;
 /// Runs in a dedicated `tokio::spawn` task; holds no lock across await
 /// points so `cancel_turn` can take the `active_turn` slot at any time.
 ///
-/// Returns `true` when the turn ended in a failure state (`TurnFailed` was
-/// broadcast), `false` on a clean completion or cancellation. Callers that
+/// Returns `Some(error)` carrying the real [`TurnError`] when the turn ended
+/// in a failure state (`TurnFailed` was broadcast), or `None` on a clean
+/// completion **or** cancellation (cancellation is not a failure). Callers that
 /// need to distinguish outcomes — notably [`super::inner::EngineInner::run_child_turn_and_deliver`]
 /// — use the return value to decide which payload to include in
-/// [`crate::engine::event::EngineEvent::SubagentCompleted`].
+/// [`crate::engine::event::EngineEvent::SubagentCompleted`]: a cancelled
+/// subagent stays Completed, only `Some(_)` surfaces as Errored.
 ///
 /// Opens a `zhive.turn` OTel-aligned span for the entire turn lifetime,
 /// with `thread.id` and `turn.id` fields populated from the arguments.
@@ -89,13 +92,14 @@ const MAX_TURN_ITERATIONS: u32 = 32;
 ///    If no tool calls, the turn is complete.
 /// 5. After the loop (including on cancel): call `fold.finish()` then
 ///    `finish_turn`.  Cancel suppresses `TurnCompleted`.
+#[must_use = "a returned TurnError carries the real failure cause; subagent callers must surface it"]
 pub(super) async fn run_turn(
     inner: &Arc<EngineInner>,
     handle: Arc<ThreadHandle>,
     thread_id: ThreadId,
     turn_id: TurnId,
     cancel: CancellationToken,
-) -> bool {
+) -> Option<TurnError> {
     // Open a `zhive.turn` span for the whole turn's lifetime.
     //
     // Span name and field names are string literals here (macro
@@ -129,7 +133,7 @@ async fn run_turn_inner(
     thread_id: ThreadId,
     turn_id: TurnId,
     cancel: CancellationToken,
-) -> bool {
+) -> Option<TurnError> {
     // Read the turn scope from the active turn record.
     //
     // Top-level turns store `PermissionScope::default_turn_scope()` (set by
@@ -209,7 +213,7 @@ async fn run_turn_inner(
             biased;
             () = cancel.cancelled() => {
                 inner.finish_turn(&handle, thread_id, turn_id, false).await;
-                return false;
+                return None;
             }
             r = inner.provider().do_stream(call_options) => r,
         };
@@ -224,16 +228,20 @@ async fn run_turn_inner(
                 let _ = inner.events_tx().send(EngineEvent::TurnFailed {
                     thread_id: thread_id.clone(),
                     turn_id: turn_id.clone(),
-                    error: turn_error,
+                    error: turn_error.clone(),
                 });
                 inner.finish_turn(&handle, thread_id, turn_id, true).await;
-                return true;
+                return Some(turn_error);
             }
         };
 
         // 3. Stream loop with per-turn cancellation.
         let mut fold = StreamFold::new(&turn_id);
-        let mut stream_failed = false;
+        // Captures the real error when the stream errors mid-flight, so it can
+        // be threaded out of the function. Stays `None` on cancellation (cancel
+        // is not a failure); `failure.is_some()` is the single source of truth
+        // for "did this iteration fail".
+        let mut failure: Option<TurnError> = None;
         // Track which tool-call items the model produced this iteration.
         let mut new_tool_call_items: Vec<Item> = Vec::new();
 
@@ -279,9 +287,9 @@ async fn run_turn_inner(
                             let _ = inner.events_tx().send(EngineEvent::TurnFailed {
                                 thread_id: thread_id.clone(),
                                 turn_id: turn_id.clone(),
-                                error: turn_error,
+                                error: turn_error.clone(),
                             });
-                            stream_failed = true;
+                            failure = Some(turn_error);
                             break;
                         }
                     }
@@ -312,13 +320,15 @@ async fn run_turn_inner(
             }
         }
 
-        if stream_failed || cancel.is_cancelled() {
+        if failure.is_some() || cancel.is_cancelled() {
             // finish_turn handles the Turn→Idle rollback; pass failed=true
             // when the stream errored so TurnCompleted is not emitted.
             inner
-                .finish_turn(&handle, thread_id, turn_id, stream_failed)
+                .finish_turn(&handle, thread_id, turn_id, failure.is_some())
                 .await;
-            return stream_failed;
+            // `failure` is `Some` only on a stream error; on cancellation it
+            // stays `None`, so a cancelled turn is reported as non-failure.
+            return failure;
         }
 
         // 4. Tool dispatch for all tool-call items produced this iteration.
@@ -440,7 +450,7 @@ async fn run_turn_inner(
             // be an orphan event. Just finish and exit.
             if cancel.is_cancelled() {
                 inner.finish_turn(&handle, thread_id, turn_id, false).await;
-                return false;
+                return None;
             }
 
             // The finalized item already carries `provider_tool_call_id`
@@ -497,8 +507,28 @@ async fn run_turn_inner(
 
     // 5. finish_turn handles the Turn→Idle rollback and TurnCompleted
     //    emission. Pass failed=false (normal completion).
-    inner.finish_turn(&handle, thread_id, turn_id, false).await;
-    false
+    inner
+        .finish_turn(&handle, thread_id.clone(), turn_id, false)
+        .await;
+
+    // 6. Auto-compaction: now that the engine is Idle again, fold the
+    //    transcript down if it has grown past the threshold. A concurrent
+    //    StartTurn may win the Idle→Compaction CAS, in which case
+    //    run_compaction returns EngineBusy and compaction is skipped this
+    //    round (it re-arms after the next turn).
+    //
+    //    Skip for subagent (child) threads: like `finish_turn` / `cancel_turn`
+    //    they do NOT own the global EnginePhase slot (the parent turn does), so
+    //    driving Idle→Compaction here would fight the parent's phase ownership.
+    //    Child-thread compaction, if ever wanted, must be parent-coordinated.
+    if handle.parent_thread_id.is_none()
+        && handle.items_tail.read().await.len() >= super::compaction::AUTO_COMPACT_ITEM_THRESHOLD
+    {
+        let _ = inner
+            .run_compaction(&handle, thread_id, CompactTrigger::Auto)
+            .await;
+    }
+    None
 }
 
 // Rust guideline compliant 2026-02-21

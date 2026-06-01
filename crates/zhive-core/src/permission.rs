@@ -183,6 +183,26 @@ impl PermissionReducer {
         }
     }
 
+    /// Waits for the client to resolve `rx` with **no timeout**.
+    ///
+    /// Used by the `Defer` decision path: a deferred tool call suspends the
+    /// turn indefinitely until the client sends `resume_permission`
+    /// (`Selected`/`Cancelled`) or the engine cancels it via
+    /// [`Self::cancel_all`]. Unlike [`Self::wait`], it never yields
+    /// [`ReducerError::TimedOut`]; the pending entry is the materialised
+    /// "suspended turn" registry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReducerError::Abandoned`] when the matching sender is dropped
+    /// without a resolution (e.g. engine shutdown without `cancel_all`).
+    pub async fn wait_unbounded(
+        &self,
+        rx: oneshot::Receiver<PermissionOutcome>,
+    ) -> Result<PermissionOutcome, ReducerError> {
+        rx.await.map_err(|_recv_err| ReducerError::Abandoned)
+    }
+
     /// Resolves a pending request with the supplied outcome.
     ///
     /// # Errors
@@ -292,6 +312,41 @@ mod tests {
         let (_key, _req, rx) = reducer.enroll(ask_request());
         let err = reducer.wait(rx).await.unwrap_err();
         assert!(matches!(err, ReducerError::TimedOut(_)));
+    }
+
+    /// `wait_unbounded` must NOT time out: even with a tiny configured
+    /// timeout, it waits until the request is resolved (the Defer path).
+    #[tokio::test]
+    async fn wait_unbounded_ignores_timeout_and_resolves() {
+        let reducer = PermissionReducer::new().with_timeout(Duration::from_millis(10));
+        let (key, _req, rx) = reducer.enroll(ask_request());
+
+        // Resolve only after a delay that exceeds the reducer timeout; a
+        // bounded `wait` would have timed out, but `wait_unbounded` must not.
+        let resolver = reducer.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let _ = resolver.resolve(
+                key,
+                PermissionOutcome::Selected {
+                    option_id: "allow_once".into(),
+                },
+            );
+        });
+
+        let outcome = reducer.wait_unbounded(rx).await.unwrap();
+        assert!(matches!(outcome, PermissionOutcome::Selected { .. }));
+    }
+
+    /// A suspended `Defer` wait must receive `Cancelled` when the engine
+    /// drains the pending map via `cancel_all` (the `cancel_turn` path).
+    #[tokio::test]
+    async fn wait_unbounded_receives_cancelled_on_cancel_all() {
+        let reducer = PermissionReducer::new();
+        let (_key, _req, rx) = reducer.enroll(ask_request());
+        reducer.cancel_all();
+        let outcome = reducer.wait_unbounded(rx).await.unwrap();
+        assert!(matches!(outcome, PermissionOutcome::Cancelled));
     }
 
     #[tokio::test]

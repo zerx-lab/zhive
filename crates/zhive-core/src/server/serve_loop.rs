@@ -18,16 +18,40 @@
 
 use std::sync::Arc;
 
+use serde::Deserialize;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use zhive_proto::initialize::InitializeRequest;
 use zhive_proto::{Message, Response};
 
 use super::ServerError;
+use super::events::SharedEventFilter;
 use super::initialize::{InitResult, handle_initialize, not_initialized_error, response_to_value};
 use super::reverse_rpc::{ResolveOutcome, ReverseRpcTracker};
 use super::router::{JsonRpcCode, Router};
 use super::transport::Transport;
+
+/// Parameters accepted by the `events/subscribe` request.
+///
+/// A `None` value for `methods` (or an empty list) is treated as "subscribe
+/// to all" — equivalent to calling `events/unsubscribe`.
+///
+/// # Examples
+///
+/// ```
+/// use zhive_core::server::serve_loop::SubscribeParams;
+///
+/// let p: SubscribeParams = serde_json::from_value(
+///     serde_json::json!({ "methods": ["events/turn_started"] })
+/// ).unwrap();
+/// assert_eq!(p.methods.as_deref(), Some(&["events/turn_started".to_string()][..]));
+/// ```
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SubscribeParams {
+    /// Allowed method names; `None` or empty means allow-all.
+    pub methods: Option<Vec<String>>,
+}
 
 /// Runs the server loop on `transport` until the peer closes the stream
 /// or `shutdown` fires.
@@ -76,7 +100,7 @@ pub async fn serve_loop_with_reverse<T>(
 where
     T: Transport + ?Sized,
 {
-    serve_loop_with_outbound(transport, router, reverse_rpc, None, shutdown).await
+    serve_loop_with_filter(transport, router, reverse_rpc, None, None, shutdown).await
 }
 
 /// Variant of [`serve_loop`] that drains an outbound message queue.
@@ -107,7 +131,47 @@ pub async fn serve_loop_with_outbound<T>(
     transport: &mut T,
     router: Arc<Router>,
     reverse_rpc: Option<Arc<ReverseRpcTracker>>,
+    outbound_rx: Option<mpsc::Receiver<Message>>,
+    shutdown: CancellationToken,
+) -> Result<(), ServerError>
+where
+    T: Transport + ?Sized,
+{
+    serve_loop_with_filter(transport, router, reverse_rpc, outbound_rx, None, shutdown).await
+}
+
+/// Internal variant of [`serve_loop_with_outbound`] that also accepts a
+/// per-connection [`SharedEventFilter`].
+///
+/// `event_filter` is `Some` when per-connection event filtering is active.
+/// The filter is written by `events/subscribe` and `events/unsubscribe`
+/// control messages intercepted inside this function. When `None`, those
+/// method names fall through to the router like any other request.
+///
+/// When both `outbound_rx` and `event_filter` are `None`, this function
+/// behaves exactly like [`serve_loop_with_reverse`].
+///
+/// ## Handshake gate
+///
+/// Same as [`serve_loop_with_outbound`].
+///
+/// ## Subscribe / unsubscribe gate
+///
+/// When `event_filter` is `Some`, the following requests are handled before
+/// reaching the router:
+///
+/// * `events/subscribe { methods?: [...] }` → update filter; respond `{}`.
+/// * `events/unsubscribe` → reset filter to allow-all; respond `{}`.
+///
+/// # Errors
+///
+/// Same surface as [`serve_loop`].
+pub(crate) async fn serve_loop_with_filter<T>(
+    transport: &mut T,
+    router: Arc<Router>,
+    reverse_rpc: Option<Arc<ReverseRpcTracker>>,
     mut outbound_rx: Option<mpsc::Receiver<Message>>,
+    event_filter: Option<SharedEventFilter>,
     shutdown: CancellationToken,
 ) -> Result<(), ServerError>
 where
@@ -168,11 +232,121 @@ where
             transport,
             &router,
             reverse_rpc.as_deref(),
+            event_filter.as_ref(),
             msg,
             &mut initialized,
         )
         .await?;
     }
+}
+
+/// Handles one inbound [`Request`] through the handshake gate, subscribe gate,
+/// and router dispatch.
+///
+/// Extracted from [`dispatch_message`] to keep that function within the
+/// 100-line limit while preserving all gate ordering.
+async fn dispatch_request<T>(
+    transport: &mut T,
+    router: &Router,
+    event_filter: Option<&SharedEventFilter>,
+    req: zhive_proto::Request,
+    initialized: &mut bool,
+) -> Result<(), ServerError>
+where
+    T: Transport + ?Sized,
+{
+    let id = req.id.clone();
+    // ── Handshake gate ──────────────────────────────────────────────────
+    if req.method == "initialize" {
+        let parsed: Result<InitializeRequest, _> =
+            serde_json::from_value(req.params.unwrap_or(serde_json::Value::Null));
+        let response = build_initialize_response(id, parsed, initialized);
+        transport.send(&Message::Response(response)).await?;
+        return Ok(());
+    }
+    // ── Not-initialized guard ───────────────────────────────────────────
+    if !*initialized {
+        let method = req.method.clone();
+        tracing::debug!(
+            name: "zhive.server.handshake.not_initialized",
+            rpc_method = %method,
+            "blocking request: connection not yet initialized"
+        );
+        transport
+            .send(&Message::Response(Response::err(
+                id,
+                not_initialized_error(),
+            )))
+            .await?;
+        return Ok(());
+    }
+    // ── Subscribe / unsubscribe gate ────────────────────────────────────
+    if let Some(filter) = event_filter {
+        if req.method == "events/subscribe" {
+            // Parse eagerly: malformed params must surface InvalidParams
+            // rather than silently falling back to allow-all (which would
+            // leave the client believing it narrowed its subscription).
+            let params: SubscribeParams = match req.params {
+                None => SubscribeParams::default(),
+                Some(v) => match serde_json::from_value(v) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        transport
+                            .send(&Message::Response(Response::err(
+                                id,
+                                zhive_proto::ErrorObject {
+                                    code: JsonRpcCode::InvalidParams.as_i64(),
+                                    message: JsonRpcCode::InvalidParams.message().to_string(),
+                                    data: Some(serde_json::Value::String(e.to_string())),
+                                },
+                            )))
+                            .await?;
+                        return Ok(());
+                    }
+                },
+            };
+            filter
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .set_methods(params.methods.unwrap_or_default());
+            tracing::debug!(
+                name: "zhive.events.subscribe",
+                "events/subscribe updated per-connection filter"
+            );
+            transport
+                .send(&Message::Response(Response::ok(
+                    id,
+                    serde_json::Value::Object(serde_json::Map::new()),
+                )))
+                .await?;
+            return Ok(());
+        }
+        if req.method == "events/unsubscribe" {
+            filter
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .reset();
+            tracing::debug!(
+                name: "zhive.events.unsubscribe",
+                "events/unsubscribe reset per-connection filter to allow-all"
+            );
+            transport
+                .send(&Message::Response(Response::ok(
+                    id,
+                    serde_json::Value::Object(serde_json::Map::new()),
+                )))
+                .await?;
+            return Ok(());
+        }
+    }
+    // ── Normal dispatch ─────────────────────────────────────────────────
+    let outcome = router.dispatch(&req.method, req.params).await;
+    let response = match outcome {
+        Ok(value) => Response::ok(id, value),
+        Err(err) => Response::err(id, err),
+    };
+    transport.send(&Message::Response(response)).await?;
+    Ok(())
 }
 
 /// Dispatches one inbound [`Message`] to the correct handler.
@@ -181,11 +355,13 @@ where
 /// under clippy's 100-line limit. All handshake-gate logic lives here.
 ///
 /// `initialized` is modified in place when a valid `initialize` request
-/// completes the handshake.
+/// completes the handshake. `event_filter` is updated in place when an
+/// `events/subscribe` or `events/unsubscribe` request is received.
 async fn dispatch_message<T>(
     transport: &mut T,
     router: &Router,
     reverse_rpc: Option<&ReverseRpcTracker>,
+    event_filter: Option<&SharedEventFilter>,
     msg: Message,
     initialized: &mut bool,
 ) -> Result<(), ServerError>
@@ -194,38 +370,7 @@ where
 {
     match msg {
         Message::Request(req) => {
-            let id = req.id.clone();
-            // ── Handshake gate ─────────────────────────────────────
-            if req.method == "initialize" {
-                let parsed: Result<InitializeRequest, _> =
-                    serde_json::from_value(req.params.unwrap_or(serde_json::Value::Null));
-                let response = build_initialize_response(id, parsed, initialized);
-                transport.send(&Message::Response(response)).await?;
-                return Ok(());
-            }
-            // ── Guard ─────────────────────────────────────────────
-            if !*initialized {
-                let method = req.method.clone();
-                tracing::debug!(
-                    name: "zhive.server.handshake.not_initialized",
-                    rpc_method = %method,
-                    "blocking request: connection not yet initialized"
-                );
-                transport
-                    .send(&Message::Response(Response::err(
-                        id,
-                        not_initialized_error(),
-                    )))
-                    .await?;
-                return Ok(());
-            }
-            // ── Normal dispatch ───────────────────────────────────
-            let outcome = router.dispatch(&req.method, req.params).await;
-            let response = match outcome {
-                Ok(value) => Response::ok(id, value),
-                Err(err) => Response::err(id, err),
-            };
-            transport.send(&Message::Response(response)).await?;
+            dispatch_request(transport, router, event_filter, req, initialized).await?;
         }
         Message::Notification(n) => {
             // `initialized` notification: client's handshake-complete

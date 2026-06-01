@@ -377,8 +377,17 @@ async fn dispatch_tool_call_inner(
                 stop_loop,
             );
         }
-        PermissionDecision::Ask => {
-            // Open a `zhive.permission` span for the interactive Ask sub-flow:
+        PermissionDecision::Ask | PermissionDecision::Defer => {
+            // `Ask` and `Defer` share the same reverse-RPC flow (enroll → emit
+            // PermissionRequested → await the client's decision). They differ
+            // only in the wait: `Ask` is bounded by the reducer timeout (a
+            // silent client → Deny), while `Defer` suspends the turn
+            // indefinitely (B6 §4) until `resume_permission` arrives. The live
+            // pending-permission entry IS the materialised "suspended turn";
+            // `cancel_turn` drains it via `cancel_all` (→ Cancelled).
+            let is_defer = matches!(decision, PermissionDecision::Defer);
+
+            // Open a `zhive.permission` span for the interactive sub-flow:
             // enroll → emit PermissionRequested → await user decision.
             //
             // Span name is a literal; spans::PERMISSION / fields::TOOL_NAME are
@@ -433,11 +442,28 @@ async fn dispatch_tool_call_inner(
             // window), as well as the more common case where cancel fires during
             // the wait itself.
             //
+            if is_defer {
+                perm_span.in_scope(|| {
+                    tracing::info!(
+                        name: "zhive.permission.deferred",
+                        tool = tool_name,
+                        "permission deferred; suspending turn until resume_permission (unbounded wait)"
+                    );
+                });
+            }
+
             // The async block is instrumented with perm_span so the span
-            // context flows across every await point.
+            // context flows across every await point. `Defer` waits without a
+            // timeout; `Ask` applies the reducer's bounded wait.
             let perm_result = async {
                 tokio::select! {
-                    outcome = reducer.wait(rx) => PermResult::Outcome(outcome),
+                    outcome = async {
+                        if is_defer {
+                            reducer.wait_unbounded(rx).await
+                        } else {
+                            reducer.wait(rx).await
+                        }
+                    } => PermResult::Outcome(outcome),
                     () = cancel.cancelled() => PermResult::Cancelled,
                 }
             }
@@ -475,6 +501,20 @@ async fn dispatch_tool_call_inner(
                     // Both map to Deny, but a timeout must be visible in
                     // production logs so operators can tune the timeout or
                     // investigate client connectivity issues.
+                    // On the Defer (unbounded) path a `TimedOut` never fires;
+                    // the only error is `Abandoned` (sender dropped, e.g. engine
+                    // shutdown). Surface it so a shutdown-with-suspended-Defer is
+                    // observable, mirroring the timeout warning.
+                    if let Err(crate::permission::ReducerError::Abandoned) = outcome {
+                        perm_span.in_scope(|| {
+                            tracing::warn!(
+                                name: "zhive.tool.permission_abandoned",
+                                tool = tool_name,
+                                decision = "deny",
+                                "permission waiter abandoned (sender dropped); treating as deny"
+                            );
+                        });
+                    }
                     if let Err(crate::permission::ReducerError::TimedOut(dur)) = outcome {
                         perm_span.in_scope(|| {
                             tracing::warn!(
@@ -517,24 +557,6 @@ async fn dispatch_tool_call_inner(
                     );
                 }
             }
-        }
-        PermissionDecision::Defer => {
-            // Phase-1 limitation: full suspend/resume not yet implemented.
-            // Treat Defer as a blocked tool call with an explanatory notice.
-            tracing::info!(
-                name: "zhive.tool.defer_not_implemented",
-                tool = tool_name,
-                "Defer permission decision received; suspend/resume not yet implemented (Phase 1)"
-            );
-            return blocked_outcome(
-                item_id,
-                tool_name,
-                raw_args,
-                tool_use_id,
-                "permission deferred; suspend/resume not yet implemented (Phase 1 limitation)"
-                    .to_owned(),
-                stop_loop,
-            );
         }
         // PermissionDecision is #[non_exhaustive]; future variants are treated
         // as Deny to stay on the safe side.

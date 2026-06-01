@@ -127,6 +127,8 @@ mod tests {
         assert_eq!(spans::SUBAGENT, "zhive.subagent");
         // persistence/writer.rs: info_span!("zhive.rollback_point", ...)
         assert_eq!(spans::ROLLBACK_POINT, "zhive.rollback_point");
+        // engine/compaction.rs: info_span!("zhive.compaction", ...)
+        assert_eq!(spans::COMPACTION, "zhive.compaction");
 
         // ---- field names (OTel semconv values) ----
         // All sites use "session.id", "zhive.turn.id", "gen_ai.tool.name",
@@ -139,12 +141,12 @@ mod tests {
         // parent_thread_id → zhive.parent.session.id).
         assert_eq!(fields::PARENT_THREAD_ID, "zhive.parent.session.id");
 
-        // ---- not yet instrumented (Phase 2 placeholders) ----
-        // These constants exist but are intentionally not wired to any
-        // info_span! call in Phase 1.  When Phase 2 instruments them,
-        // add assertions above and remove these comments.
-        let _ = spans::COMPACTION; // Phase 2: context compaction
-        let _ = spans::BRANCH_SUMMARY; // Phase 2: branch summary
+        // ---- not yet instrumented (deferred) ----
+        // `BRANCH_SUMMARY` corresponds to Pi's `navigateTree` branch-summary,
+        // which depends on a thread fork/branch model that does not exist yet
+        // and is not part of the codex core harness. It is deferred with the
+        // fork feature; the constant stays so the wire/field names are stable.
+        let _ = spans::BRANCH_SUMMARY;
     }
 }
 
@@ -380,6 +382,74 @@ mod span_emission_tests {
         assert!(
             names.iter().any(|n| n == "zhive.tool_call"),
             "expected 'zhive.tool_call' span, recorded: {names:?}"
+        );
+    }
+
+    /// Manually compacting a thread must open a `zhive.compaction` span and
+    /// replace the transcript with a summary.
+    #[tokio::test]
+    async fn compaction_opens_zhive_compaction_span() {
+        use zhive_proto::domain::{Item, ItemContent, ItemId, ThreadId};
+        use zhive_proto::hook::CompactTrigger;
+
+        let capture = SpanCapture::new();
+
+        // Scripted model yields a one-delta text on every call: the seeding
+        // turn produces an AgentMessage, and the summarisation call returns
+        // the same text as the summary body.
+        let model = ScriptedModel::new(
+            "test",
+            "m",
+            vec![
+                StreamPart::TextStart {
+                    id: "b".into(),
+                    provider_metadata: None,
+                },
+                StreamPart::TextDelta {
+                    id: "b".into(),
+                    delta: "done".into(),
+                    provider_metadata: None,
+                },
+                StreamPart::TextEnd {
+                    id: "b".into(),
+                    provider_metadata: None,
+                },
+            ],
+        )
+        .into_dyn();
+        let engine = Engine::spawn_with_provider(model);
+
+        let _guard = tracing::subscriber::set_default(capture.clone());
+
+        let tid = ThreadId(Arc::from("thread:native/span-compact"));
+        let user = Item::UserMessage {
+            id: ItemId(Arc::from("u0")),
+            content: vec![ItemContent::Text {
+                text: "hello".to_owned(),
+                annotations: None,
+            }],
+        };
+        // Seed the transcript and let the turn auto-complete (phase → Idle).
+        let _ = engine.start_turn(tid.clone(), vec![user], None).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let outcome = engine
+            .compact(tid, CompactTrigger::Manual)
+            .await
+            .expect("actor reachable")
+            .expect("compaction must succeed");
+        assert!(
+            matches!(
+                outcome,
+                crate::engine::submission::CompactReply::Compacted { .. }
+            ),
+            "expected Compacted, got {outcome:?}"
+        );
+
+        let names = capture.recorded();
+        assert!(
+            names.iter().any(|n| n == "zhive.compaction"),
+            "expected a 'zhive.compaction' span, recorded: {names:?}"
         );
     }
 }

@@ -30,6 +30,7 @@
 //!
 //! [`EnginePhase`]: zhive_proto::hook::EnginePhase
 
+mod compaction;
 pub mod event;
 mod inner;
 mod lifecycle;
@@ -483,6 +484,50 @@ impl Engine {
             .await?;
         match reply {
             submission::SubmissionReply::ResumePermission(r) => Ok(r),
+            _ => Err(EngineError::ReplyDropped),
+        }
+    }
+
+    /// Compacts a thread's transcript history into an LLM-generated summary.
+    ///
+    /// Requires the engine to be `Idle`; if a turn is in flight the dispatch
+    /// fails with [`submission::CompactError::EngineBusy`] rather than
+    /// blocking. Compaction is in-memory only in Phase 1 (it is not persisted
+    /// to the rollout).
+    ///
+    /// # Errors
+    ///
+    /// Channel-level [`EngineError`] variants on actor failure; the
+    /// compaction's own failures (unknown thread, busy engine, provider
+    /// error) are folded into the `Ok` value as
+    /// [`submission::CompactError`].
+    ///
+    /// ```no_run
+    /// use zhive_core::engine::Engine;
+    /// use zhive_proto::domain::ThreadId;
+    /// use zhive_proto::hook::CompactTrigger;
+    ///
+    /// # async fn demo() {
+    /// let engine = Engine::spawn();
+    /// // No turn has run on this thread, so there is nothing to compact.
+    /// let outcome = engine
+    ///     .compact(ThreadId(std::sync::Arc::from("thread:native/demo")), CompactTrigger::Manual)
+    ///     .await
+    ///     .expect("actor reachable");
+    /// assert!(outcome.is_err()); // ThreadNotFound: thread was never created
+    /// engine.shutdown().await.unwrap();
+    /// # }
+    /// ```
+    pub async fn compact(
+        &self,
+        thread_id: ThreadId,
+        trigger: zhive_proto::hook::CompactTrigger,
+    ) -> Result<Result<submission::CompactReply, submission::CompactError>, EngineError> {
+        let reply = self
+            .submit_with_reply(Submission::Compact { thread_id, trigger })
+            .await?;
+        match reply {
+            submission::SubmissionReply::Compact(r) => Ok(r),
             _ => Err(EngineError::ReplyDropped),
         }
     }
@@ -1671,6 +1716,245 @@ mod inc3_tests {
     }
 
     // =========================================================================
+    // Test 4b: Defer flow — turn suspends until resume_permission (#1a)
+    // =========================================================================
+
+    /// Helper: builds an engine whose hook returns `decision` for the single
+    /// `echo` tool call, then runs the turn and returns the engine + event rx.
+    /// The model emits one `echo` tool call (script0) then a clean text turn
+    /// (script1), matching the Ask-flow fixture.
+    async fn spawn_engine_with_decision(
+        thread: &str,
+        decision: PermissionDecision,
+    ) -> (Engine, broadcast::Receiver<EngineEvent>) {
+        use llmsdk::ToolCallPart;
+
+        let script0 = vec![StreamPart::ToolCall(ToolCallPart {
+            tool_call_id: "tc-defer".into(),
+            tool_name: "echo".into(),
+            input: serde_json::json!({"msg": "defer"}),
+            provider_executed: None,
+            dynamic: None,
+            provider_options: None,
+        })];
+        let script1 = vec![
+            StreamPart::TextStart {
+                id: "b0".into(),
+                provider_metadata: None,
+            },
+            StreamPart::TextEnd {
+                id: "b0".into(),
+                provider_metadata: None,
+            },
+        ];
+
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(EchoTool));
+
+        let hook_host = Arc::new(HookHost::new());
+        let _scope = hook_host
+            .register(
+                ext_ref("defer-hook"),
+                HookFilter::default(),
+                0,
+                Arc::new(FixedDecisionHook {
+                    decision,
+                    updated_input: None,
+                }),
+            )
+            .unwrap();
+
+        let cfg = EngineConfig {
+            provider: MultiScriptedModel::new(vec![script0, script1]).into_dyn(),
+            tools: Arc::new(tools),
+            hook_host,
+            storage: None,
+        };
+        let engine =
+            Engine::spawn_with_config(cfg).with_reply_timeout(std::time::Duration::from_secs(10));
+        let events = engine.subscribe();
+        engine
+            .start_turn(tid(thread), Vec::new(), None)
+            .await
+            .unwrap();
+        (engine, events)
+    }
+
+    /// A hook returning `Defer` must NOT block the tool (the pre-#1a
+    /// behaviour). Instead the turn suspends: a `PermissionRequested` event
+    /// fires and the tool only executes once `resume_permission` (Selected
+    /// allow) arrives.
+    #[tokio::test]
+    async fn defer_flow_suspends_then_resumes_on_allow() {
+        let (engine, mut events) =
+            spawn_engine_with_decision("thread:native/defer-allow", PermissionDecision::Defer)
+                .await;
+
+        // A PermissionRequested event is IMPOSSIBLE on the old Defer→blocked
+        // path (which never enrolled), so its presence is the load-bearing
+        // proof that Defer now enrolls + suspends. The TurnCompleted-before-
+        // resume panic guard additionally proves the turn does not auto-
+        // resolve. (Ask-vs-Defer unboundedness is covered at the reducer layer
+        // by `permission::tests::wait_unbounded_ignores_timeout_and_resolves`.)
+        let mut request_id_opt: Option<PermissionRequestId> = None;
+        for _ in 0..32 {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), events.recv()).await {
+                Ok(Ok(EngineEvent::PermissionRequested { request_id, .. })) => {
+                    request_id_opt = Some(request_id);
+                    break;
+                }
+                Ok(Ok(EngineEvent::TurnCompleted { .. })) => {
+                    panic!("turn must NOT complete while a Defer is suspended");
+                }
+                Ok(Ok(_)) => {}
+                _ => break,
+            }
+        }
+        let request_id = request_id_opt.expect("Defer must emit PermissionRequested (suspended)");
+
+        engine
+            .resume_permission(
+                request_id,
+                PermissionOutcome::Selected {
+                    option_id: "allow_once".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let mut saw_tool_completed = false;
+        let saw_turn_completed = collect_until(&mut events, 64, |ev| {
+            if let EngineEvent::ItemAppended { item, .. } = ev
+                && let zhive_proto::domain::Item::ToolCall { status, .. } = item.as_ref()
+                && *status == zhive_proto::domain::ToolCallStatus::Completed
+            {
+                saw_tool_completed = true;
+            }
+            matches!(ev, EngineEvent::TurnCompleted { .. })
+        })
+        .await;
+
+        assert!(
+            saw_tool_completed,
+            "tool must execute after Defer→resume(allow)"
+        );
+        assert!(saw_turn_completed, "TurnCompleted must fire after resume");
+        engine.shutdown().await.unwrap();
+    }
+
+    /// A suspended `Defer` resolved with `Cancelled` must block the tool
+    /// (`ToolCall` Failed) and complete the turn.
+    #[tokio::test]
+    async fn defer_flow_resume_cancelled_blocks_tool() {
+        let (engine, mut events) =
+            spawn_engine_with_decision("thread:native/defer-deny", PermissionDecision::Defer).await;
+
+        let mut request_id_opt: Option<PermissionRequestId> = None;
+        for _ in 0..32 {
+            if let Ok(Ok(EngineEvent::PermissionRequested { request_id, .. })) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), events.recv()).await
+            {
+                request_id_opt = Some(request_id);
+                break;
+            }
+        }
+        let request_id = request_id_opt.expect("Defer must emit PermissionRequested");
+
+        engine
+            .resume_permission(request_id, PermissionOutcome::Cancelled)
+            .await
+            .unwrap();
+
+        let mut saw_tool_failed = false;
+        let saw_turn_completed = collect_until(&mut events, 64, |ev| {
+            if let EngineEvent::ItemAppended { item, .. } = ev
+                && let zhive_proto::domain::Item::ToolCall { status, .. } = item.as_ref()
+                && *status == zhive_proto::domain::ToolCallStatus::Failed
+            {
+                saw_tool_failed = true;
+            }
+            matches!(ev, EngineEvent::TurnCompleted { .. })
+        })
+        .await;
+
+        assert!(
+            saw_tool_failed,
+            "Defer→resume(Cancelled) must block the tool"
+        );
+        assert!(saw_turn_completed, "TurnCompleted must fire");
+        engine.shutdown().await.unwrap();
+    }
+
+    /// A suspended `Defer` aborted via `cancel_turn` (the `cancel_all` path,
+    /// distinct from a client `resume_permission(Cancelled)`) must abort
+    /// cleanly: a `SessionAborted` fires, the tool never executes, and no
+    /// spurious `TurnCompleted` is emitted (ACP 0.12 Cancelled contract).
+    #[tokio::test]
+    async fn defer_flow_cancel_turn_aborts_cleanly() {
+        let (engine, mut events) =
+            spawn_engine_with_decision("thread:native/defer-cancel", PermissionDecision::Defer)
+                .await;
+
+        let mut found = false;
+        for _ in 0..32 {
+            if let Ok(Ok(EngineEvent::PermissionRequested { .. })) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), events.recv()).await
+            {
+                found = true;
+                break;
+            }
+        }
+        assert!(found, "Defer must emit PermissionRequested before cancel");
+
+        // cancel_turn drains the pending map via cancel_all → the suspended
+        // wait observes Cancelled, and the turn is aborted.
+        engine
+            .cancel_turn(tid("thread:native/defer-cancel"))
+            .await
+            .unwrap();
+
+        let mut saw_aborted = false;
+        let mut saw_tool_completed = false;
+        let mut saw_turn_completed = false;
+        for _ in 0..64 {
+            match tokio::time::timeout(std::time::Duration::from_secs(3), events.recv()).await {
+                Ok(Ok(EngineEvent::SessionAborted(_))) => saw_aborted = true,
+                Ok(Ok(EngineEvent::TurnCompleted { .. })) => saw_turn_completed = true,
+                Ok(Ok(EngineEvent::ItemAppended { item, .. }))
+                    if matches!(
+                        item.as_ref(),
+                        zhive_proto::domain::Item::ToolCall {
+                            status: zhive_proto::domain::ToolCallStatus::Completed,
+                            ..
+                        }
+                    ) =>
+                {
+                    saw_tool_completed = true;
+                }
+                Ok(Ok(_)) => {}
+                _ => break,
+            }
+            if saw_aborted {
+                break;
+            }
+        }
+
+        assert!(
+            saw_aborted,
+            "cancel_turn on a suspended Defer must emit SessionAborted"
+        );
+        assert!(
+            !saw_tool_completed,
+            "tool must NOT execute when a suspended Defer is cancelled"
+        );
+        assert!(
+            !saw_turn_completed,
+            "a cancelled turn must NOT emit TurnCompleted"
+        );
+        engine.shutdown().await.unwrap();
+    }
+
+    // =========================================================================
     // Test 5: Max-iteration cap terminates the turn
     // =========================================================================
 
@@ -1952,6 +2236,43 @@ mod inc4_tests {
             }
         }
         false
+    }
+
+    /// A turn that pushes the transcript to the auto-compaction threshold must
+    /// trigger automatic compaction once the turn completes, driving the
+    /// engine through the `Compaction` phase.
+    #[tokio::test]
+    async fn auto_compaction_fires_when_transcript_exceeds_threshold() {
+        use crate::provider::ScriptedModel;
+        use zhive_proto::hook::EnginePhase;
+
+        // Empty scripted model: the turn adds no agent message and the
+        // summarisation call returns an empty summary — both acceptable.
+        let engine = Engine::spawn_with_provider(ScriptedModel::new("t", "m", vec![]).into_dyn());
+        let mut events = engine.subscribe();
+        let id = tid("thread:native/auto-compact");
+
+        // Seed the transcript at the threshold in a single turn.
+        let items: Vec<_> = (0..super::compaction::AUTO_COMPACT_ITEM_THRESHOLD)
+            .map(|i| user_item(&format!("u{i}")))
+            .collect();
+        engine.start_turn(id.clone(), items, None).await.unwrap();
+
+        let saw_compaction = collect_until(&mut events, 512, |ev| {
+            matches!(
+                ev,
+                EngineEvent::PhaseChanged {
+                    to: EnginePhase::Compaction,
+                    ..
+                }
+            )
+        })
+        .await;
+        assert!(
+            saw_compaction,
+            "auto-compaction must enter the Compaction phase after an over-threshold turn"
+        );
+        engine.shutdown().await.unwrap();
     }
 
     // ---- Shared test model helpers ----------------------------------------

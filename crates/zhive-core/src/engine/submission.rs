@@ -22,7 +22,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 use zhive_proto::domain::{Item, ThreadId, TurnId};
-use zhive_proto::hook::EnginePhase;
+use zhive_proto::hook::{CompactTrigger, EnginePhase};
 use zhive_proto::permission::{
     PermissionOutcome, PermissionScope, StreamingBehavior, SubagentDefinition,
 };
@@ -81,6 +81,57 @@ pub enum ResumePermissionReply {
     Abandoned,
 }
 
+/// Outcome of a `Compact` dispatch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CompactReply {
+    /// Compaction ran; `entries_compacted` items were replaced by a summary.
+    Compacted {
+        /// Number of transcript items folded into the summary.
+        entries_compacted: u32,
+    },
+    /// The target thread had no items to compact; nothing was done.
+    NothingToCompact,
+}
+
+/// Reasons a `Compact` submission failed inside the actor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CompactError {
+    /// The target thread does not exist in the thread store.
+    ThreadNotFound,
+    /// Engine phase was not `Idle` at dispatch time; compaction requires an
+    /// idle engine so it does not race a live turn mutating the transcript.
+    EngineBusy {
+        /// Observed phase.
+        current: EnginePhase,
+    },
+    /// The summarisation provider call failed.
+    SummarizationFailed {
+        /// Human-readable provider error.
+        message: String,
+    },
+}
+
+impl fmt::Display for CompactError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ThreadNotFound => f.write_str("thread not found"),
+            Self::EngineBusy { current } => {
+                write!(
+                    f,
+                    "engine busy (phase {current:?}); compaction requires Idle"
+                )
+            }
+            Self::SummarizationFailed { message } => {
+                write!(f, "summarization failed: {message}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for CompactError {}
+
 /// One inbound command for the engine actor.
 ///
 /// `Clone` is intentionally NOT derived: a submission can carry a
@@ -134,6 +185,14 @@ pub enum Submission {
         parent_thread_id: ThreadId,
         /// Subagent declaration.
         definition: SubagentDefinition,
+    },
+    /// Compact the transcript history of a thread into a summary.
+    Compact {
+        /// Thread whose transcript is compacted.
+        thread_id: ThreadId,
+        /// Why compaction fires (`Manual` for `/compact`, `Auto` for the
+        /// engine-initiated token/length threshold).
+        trigger: CompactTrigger,
     },
     /// Gracefully stop the engine actor.
     Shutdown,
@@ -192,6 +251,8 @@ pub enum SubmissionReply {
     ResumePermission(ResumePermissionReply),
     /// Reply to a [`Submission::SpawnSubagent`].
     SpawnSubagent(Result<ThreadId, SubagentSpawnError>),
+    /// Reply to a [`Submission::Compact`].
+    Compact(Result<CompactReply, CompactError>),
     /// Reply to a [`Submission::Shutdown`].
     Shutdown,
 }
