@@ -30,6 +30,7 @@
 //!
 //! [`EnginePhase`]: zhive_proto::hook::EnginePhase
 
+mod compaction;
 pub mod event;
 mod inner;
 mod lifecycle;
@@ -483,6 +484,50 @@ impl Engine {
             .await?;
         match reply {
             submission::SubmissionReply::ResumePermission(r) => Ok(r),
+            _ => Err(EngineError::ReplyDropped),
+        }
+    }
+
+    /// Compacts a thread's transcript history into an LLM-generated summary.
+    ///
+    /// Requires the engine to be `Idle`; if a turn is in flight the dispatch
+    /// fails with [`submission::CompactError::EngineBusy`] rather than
+    /// blocking. Compaction is in-memory only in Phase 1 (it is not persisted
+    /// to the rollout).
+    ///
+    /// # Errors
+    ///
+    /// Channel-level [`EngineError`] variants on actor failure; the
+    /// compaction's own failures (unknown thread, busy engine, provider
+    /// error) are folded into the `Ok` value as
+    /// [`submission::CompactError`].
+    ///
+    /// ```no_run
+    /// use zhive_core::engine::Engine;
+    /// use zhive_proto::domain::ThreadId;
+    /// use zhive_proto::hook::CompactTrigger;
+    ///
+    /// # async fn demo() {
+    /// let engine = Engine::spawn();
+    /// // No turn has run on this thread, so there is nothing to compact.
+    /// let outcome = engine
+    ///     .compact(ThreadId(std::sync::Arc::from("thread:native/demo")), CompactTrigger::Manual)
+    ///     .await
+    ///     .expect("actor reachable");
+    /// assert!(outcome.is_err()); // ThreadNotFound: thread was never created
+    /// engine.shutdown().await.unwrap();
+    /// # }
+    /// ```
+    pub async fn compact(
+        &self,
+        thread_id: ThreadId,
+        trigger: zhive_proto::hook::CompactTrigger,
+    ) -> Result<Result<submission::CompactReply, submission::CompactError>, EngineError> {
+        let reply = self
+            .submit_with_reply(Submission::Compact { thread_id, trigger })
+            .await?;
+        match reply {
+            submission::SubmissionReply::Compact(r) => Ok(r),
             _ => Err(EngineError::ReplyDropped),
         }
     }
@@ -1952,6 +1997,43 @@ mod inc4_tests {
             }
         }
         false
+    }
+
+    /// A turn that pushes the transcript to the auto-compaction threshold must
+    /// trigger automatic compaction once the turn completes, driving the
+    /// engine through the `Compaction` phase.
+    #[tokio::test]
+    async fn auto_compaction_fires_when_transcript_exceeds_threshold() {
+        use crate::provider::ScriptedModel;
+        use zhive_proto::hook::EnginePhase;
+
+        // Empty scripted model: the turn adds no agent message and the
+        // summarisation call returns an empty summary — both acceptable.
+        let engine = Engine::spawn_with_provider(ScriptedModel::new("t", "m", vec![]).into_dyn());
+        let mut events = engine.subscribe();
+        let id = tid("thread:native/auto-compact");
+
+        // Seed the transcript at the threshold in a single turn.
+        let items: Vec<_> = (0..super::compaction::AUTO_COMPACT_ITEM_THRESHOLD)
+            .map(|i| user_item(&format!("u{i}")))
+            .collect();
+        engine.start_turn(id.clone(), items, None).await.unwrap();
+
+        let saw_compaction = collect_until(&mut events, 512, |ev| {
+            matches!(
+                ev,
+                EngineEvent::PhaseChanged {
+                    to: EnginePhase::Compaction,
+                    ..
+                }
+            )
+        })
+        .await;
+        assert!(
+            saw_compaction,
+            "auto-compaction must enter the Compaction phase after an over-threshold turn"
+        );
+        engine.shutdown().await.unwrap();
     }
 
     // ---- Shared test model helpers ----------------------------------------

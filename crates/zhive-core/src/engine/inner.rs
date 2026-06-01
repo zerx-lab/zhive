@@ -328,6 +328,12 @@ impl EngineInner {
                     let _ = tx.send(SubmissionReply::SpawnSubagent(outcome));
                 }
             }
+            Submission::Compact { thread_id, trigger } => {
+                let outcome = self.compact(thread_id, trigger).await;
+                if let Some(tx) = reply {
+                    let _ = tx.send(SubmissionReply::Compact(outcome));
+                }
+            }
             other => {
                 tracing::debug!(
                     name: "zhive.engine.submission.unhandled",

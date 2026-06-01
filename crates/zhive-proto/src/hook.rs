@@ -197,6 +197,8 @@ pub enum HookEvent {
     SubagentStop(SubagentStopInput),
     /// Fired immediately before context compaction.
     PreCompact(PreCompactInput),
+    /// Fired immediately after context compaction completes.
+    PostCompact(PostCompactInput),
     /// Fired when a permission/request reverse RPC is about to ship.
     PermissionRequest(PermissionRequestInput),
     /// Fired when the agent decides to stop.
@@ -433,6 +435,24 @@ pub struct PreCompactInput {
     /// Optional user-supplied summarisation guidance.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_instructions: Option<String>,
+}
+
+/// Payload of [`HookEvent::PostCompact`].
+///
+/// Dual of [`PreCompactInput`], fired immediately after the engine finishes
+/// replacing the transcript history with a summary.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct PostCompactInput {
+    /// Flattened generic fields.
+    #[serde(flatten)]
+    pub base: HookEventBase,
+    /// Why compaction fired (mirrors the originating `PreCompact`).
+    pub trigger: CompactTrigger,
+    /// Number of items that were compacted away.
+    pub entries_compacted: u32,
 }
 
 /// Payload of [`HookEvent::PermissionRequest`].

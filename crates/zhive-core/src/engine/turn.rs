@@ -36,6 +36,7 @@ use futures::StreamExt as _;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
 use zhive_proto::domain::{Item, ItemId, NoticeLevel, ThreadId, TurnError, TurnId};
+use zhive_proto::hook::CompactTrigger;
 use zhive_proto::permission::PermissionScope;
 
 use crate::persistence::writer::StorageWriteOp;
@@ -506,7 +507,27 @@ async fn run_turn_inner(
 
     // 5. finish_turn handles the Turn→Idle rollback and TurnCompleted
     //    emission. Pass failed=false (normal completion).
-    inner.finish_turn(&handle, thread_id, turn_id, false).await;
+    inner
+        .finish_turn(&handle, thread_id.clone(), turn_id, false)
+        .await;
+
+    // 6. Auto-compaction: now that the engine is Idle again, fold the
+    //    transcript down if it has grown past the threshold. A concurrent
+    //    StartTurn may win the Idle→Compaction CAS, in which case
+    //    run_compaction returns EngineBusy and compaction is skipped this
+    //    round (it re-arms after the next turn).
+    //
+    //    Skip for subagent (child) threads: like `finish_turn` / `cancel_turn`
+    //    they do NOT own the global EnginePhase slot (the parent turn does), so
+    //    driving Idle→Compaction here would fight the parent's phase ownership.
+    //    Child-thread compaction, if ever wanted, must be parent-coordinated.
+    if handle.parent_thread_id.is_none()
+        && handle.items_tail.read().await.len() >= super::compaction::AUTO_COMPACT_ITEM_THRESHOLD
+    {
+        let _ = inner
+            .run_compaction(&handle, thread_id, CompactTrigger::Auto)
+            .await;
+    }
     None
 }
 
