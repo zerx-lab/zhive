@@ -55,7 +55,9 @@ pub mod serve_loop;
 pub mod transport;
 
 #[doc(inline)]
-pub use events::{engine_event_to_notification, spawn_event_forwarder};
+pub use events::{
+    EventFilter, SharedEventFilter, engine_event_to_notification, spawn_event_forwarder,
+};
 #[doc(inline)]
 pub use handlers::{ENGINE_ERROR_CODE, register_engine_handlers};
 #[doc(inline)]
@@ -65,7 +67,9 @@ pub use reverse_rpc::{ResolveOutcome, ReverseRpcError, ReverseRpcResult, Reverse
 #[doc(inline)]
 pub use router::{Handler, JsonRpcCode, Router, error_object};
 #[doc(inline)]
-pub use serve_loop::{serve_loop, serve_loop_with_outbound, serve_loop_with_reverse};
+pub use serve_loop::{
+    SubscribeParams, serve_loop, serve_loop_with_outbound, serve_loop_with_reverse,
+};
 #[doc(inline)]
 pub use transport::{StdioTransport, Transport, TransportError};
 
@@ -214,22 +218,33 @@ fn spawn_connection(
     shutdown: CancellationToken,
     engine_for_events: Option<crate::engine::Engine>,
 ) {
+    use std::sync::Mutex;
     tasks.spawn(async move {
         let _permit = permit; // released when task exits
         let mut transport = UdsTransport::new(stream);
         // When events forwarding is enabled, create a per-connection
         // outbound channel and spawn a forwarder that pumps engine
-        // events into it.
-        let outbound_rx = if let Some(engine) = engine_for_events {
+        // events into it.  A shared EventFilter is also created so the
+        // connection can control which events are forwarded via
+        // `events/subscribe` / `events/unsubscribe`.
+        let (outbound_rx, event_filter) = if let Some(engine) = engine_for_events {
+            let filter = Arc::new(Mutex::new(EventFilter::new()));
             let (tx, rx) = mpsc::channel::<Message>(DEFAULT_OUTBOUND_QUEUE_CAP);
             let events_rx = engine.subscribe();
-            spawn_event_forwarder(events_rx, tx, shutdown.clone());
-            Some(rx)
+            spawn_event_forwarder(events_rx, tx, Arc::clone(&filter), shutdown.clone());
+            (Some(rx), Some(filter))
         } else {
-            None
+            (None, None)
         };
-        if let Err(e) =
-            serve_loop_with_outbound(&mut transport, router, None, outbound_rx, shutdown).await
+        if let Err(e) = serve_loop::serve_loop_with_filter(
+            &mut transport,
+            router,
+            None,
+            outbound_rx,
+            event_filter,
+            shutdown,
+        )
+        .await
         {
             let message = e.to_string();
             tracing::warn!(

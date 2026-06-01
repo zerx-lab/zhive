@@ -20,9 +20,17 @@
 //! | `SessionAborted`           | `events/session_aborted`       |
 //! | `PermissionRequested`      | `events/permission_requested`  |
 //!
-//! Subscribers do not need to "subscribe" through a separate RPC; the
-//! server forwards every event on every connection. Phase 2 will add
-//! per-connection filtering once the bridge crates need it.
+//! ## Per-connection filtering
+//!
+//! [`EventFilter`] controls which `events/*` notifications a connection
+//! receives. The default (empty allowed-set) means **allow all**, so
+//! connections that never call `events/subscribe` continue to receive
+//! every notification (backward-compatible). A client calls
+//! `events/subscribe` to restrict delivery to a named set of methods;
+//! `events/unsubscribe` resets the filter back to allow-all.
+
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
 use tokio::sync::{broadcast, mpsc};
@@ -33,6 +41,123 @@ use zhive_proto::domain::{ItemId, ThreadId, TurnError, TurnId};
 use zhive_proto::hook::EnginePhase;
 
 use crate::engine::{EngineEvent, TurnRejectionReason};
+
+/// Per-connection event filter controlling which `events/*` notifications are forwarded.
+///
+/// The filter is shared between the event-forwarder task (reads it) and the
+/// connection-level `dispatch_message` handler (writes it via `events/subscribe`
+/// and `events/unsubscribe`).
+///
+/// ## Default: allow-all
+///
+/// A freshly constructed `EventFilter` (via [`Default`] or [`EventFilter::new`])
+/// has an empty allowed-method set, which is interpreted as **pass through
+/// everything**. This ensures connections that never call `events/subscribe`
+/// continue to receive all notifications — backward compatibility is preserved.
+///
+/// ## Filtering: allow-listed set
+///
+/// After a client calls `events/subscribe` with a non-empty `methods` list,
+/// only notifications whose method appears in that list are forwarded.
+/// Calling `events/unsubscribe` (with no arguments) resets the filter back to
+/// allow-all.
+///
+/// # Examples
+///
+/// ```
+/// use zhive_core::server::events::EventFilter;
+///
+/// // Default allows every method.
+/// let f = EventFilter::default();
+/// assert!(f.allows_method("events/turn_started"));
+/// assert!(f.allows_method("events/phase_changed"));
+///
+/// // After subscribing to a specific set, only those pass.
+/// let f = EventFilter::for_methods(["events/turn_started", "events/turn_completed"]);
+/// assert!(f.allows_method("events/turn_started"));
+/// assert!(!f.allows_method("events/phase_changed"));
+///
+/// // Resetting returns to allow-all.
+/// let mut f = EventFilter::for_methods(["events/turn_started"]);
+/// f.reset();
+/// assert!(f.allows_method("events/phase_changed"));
+/// ```
+#[derive(Debug, Default, Clone)]
+pub struct EventFilter {
+    /// `None` ≡ allow all.  `Some(set)` ≡ allow only the listed methods.
+    allowed: Option<HashSet<String>>,
+}
+
+impl EventFilter {
+    /// Creates a new allow-all filter.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Creates a filter that allows only the given method names.
+    ///
+    /// Passing an empty iterator is treated equivalently to `new()` (allow-all).
+    #[must_use]
+    pub fn for_methods<I, S>(methods: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let set: HashSet<String> = methods.into_iter().map(Into::into).collect();
+        if set.is_empty() {
+            Self::default()
+        } else {
+            Self { allowed: Some(set) }
+        }
+    }
+
+    /// Returns `true` when `method` should be forwarded to the connection.
+    ///
+    /// An allow-all filter (the default) always returns `true`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use zhive_core::server::events::EventFilter;
+    ///
+    /// let f = EventFilter::for_methods(["events/turn_started"]);
+    /// assert!(f.allows_method("events/turn_started"));
+    /// assert!(!f.allows_method("events/turn_completed"));
+    /// ```
+    #[must_use]
+    pub fn allows_method(&self, method: &str) -> bool {
+        match &self.allowed {
+            None => true,
+            Some(set) => set.contains(method),
+        }
+    }
+
+    /// Replaces the allowed set; an empty `methods` slice resets to allow-all.
+    pub fn set_methods<I, S>(&mut self, methods: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let set: HashSet<String> = methods.into_iter().map(Into::into).collect();
+        if set.is_empty() {
+            self.allowed = None;
+        } else {
+            self.allowed = Some(set);
+        }
+    }
+
+    /// Resets the filter to allow-all (clears any subscription).
+    pub fn reset(&mut self) {
+        self.allowed = None;
+    }
+}
+
+/// Thread-safe shared handle to a per-connection [`EventFilter`].
+///
+/// Created once per connection in `spawn_connection` and cloned into
+/// both the event-forwarder task and the `dispatch_message` handler.
+pub type SharedEventFilter = Arc<Mutex<EventFilter>>;
 
 /// Wire-form payload for [`EngineEvent::TurnStarted`].
 #[derive(Debug, Serialize)]
@@ -204,9 +329,14 @@ pub fn engine_event_to_notification(event: &EngineEvent) -> Option<Notification>
 /// outbound queue.
 ///
 /// The task subscribes to the engine via `events_rx`, encodes each
-/// event with [`engine_event_to_notification`], and pushes the result
-/// into `outbound_tx`. The task exits when `shutdown` fires, when the
-/// outbound channel is closed, or when the upstream broadcast closes.
+/// event with [`engine_event_to_notification`], applies the per-connection
+/// `filter`, and pushes allowed notifications into `outbound_tx`. The task
+/// exits when `shutdown` fires, when the outbound channel is closed, or when
+/// the upstream broadcast closes.
+///
+/// The `filter` is the same [`SharedEventFilter`] owned by the connection's
+/// `dispatch_message` handler, so subscribe/unsubscribe control messages take
+/// effect immediately without any restart of this task.
 ///
 /// A lagged broadcast (subscriber too slow) is logged at `warn` and
 /// the task continues; an oversize subscriber will see resync points
@@ -214,6 +344,7 @@ pub fn engine_event_to_notification(event: &EngineEvent) -> Option<Notification>
 pub fn spawn_event_forwarder(
     mut events_rx: broadcast::Receiver<EngineEvent>,
     outbound_tx: mpsc::Sender<Message>,
+    filter: SharedEventFilter,
     shutdown: CancellationToken,
 ) {
     tokio::spawn(async move {
@@ -228,6 +359,18 @@ pub fn spawn_event_forwarder(
                     let Some(notif) = engine_event_to_notification(&event) else {
                         continue;
                     };
+                    // Check the filter BEFORE awaiting the send so the
+                    // MutexGuard is never held across an await point
+                    // (which would make the future !Send).
+                    let allowed = {
+                        let guard = filter
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        guard.allows_method(&notif.method)
+                    };
+                    if !allowed {
+                        continue;
+                    }
                     if outbound_tx
                         .send(Message::Notification(notif))
                         .await
@@ -254,7 +397,6 @@ pub fn spawn_event_forwarder(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
     use zhive_proto::domain::Item;
 
     fn tid(s: &str) -> ThreadId {

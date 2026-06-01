@@ -416,4 +416,195 @@ async fn wait_for_method(
     false
 }
 
+/// Helper: send `events/subscribe` with a list of methods and await the ok
+/// response so the caller can rely on the filter being set before emitting
+/// any engine events.
+async fn subscribe(client: &zhive_client_native::Client, methods: &[&str]) {
+    let params = serde_json::json!({ "methods": methods });
+    client
+        .call("events/subscribe", Some(params))
+        .await
+        .expect("events/subscribe must succeed");
+}
+
+/// Two connections with distinct subscriptions each receive only their
+/// subscribed events; the unsubscribed third connection receives all events.
+///
+/// Connection A subscribes to `events/turn_*` — must see `turn_started` and
+/// `turn_completed` but NOT `phase_changed`.
+/// Connection B subscribes to `events/phase_changed` — must see
+/// `phase_changed` but NOT `turn_started`.
+/// Connection C never subscribes — must see both kinds (backward compat).
+#[tokio::test]
+async fn per_connection_filter_turns_vs_phase() {
+    let (token, socket, _dir, engine) = spawn_server_with_events().await;
+
+    let client_a = Client::connect_uds(&socket).await.expect("connect A");
+    let client_b = Client::connect_uds(&socket).await.expect("connect B");
+    let client_c = Client::connect_uds(&socket).await.expect("connect C");
+
+    // Subscribe before triggering any turn so the filter is in place.
+    subscribe(&client_a, &["events/turn_started", "events/turn_completed"]).await;
+    subscribe(&client_b, &["events/phase_changed"]).await;
+    // client_c: no subscribe — allow-all.
+
+    let mut rx_a = client_a.subscribe_notifications();
+    let mut rx_b = client_b.subscribe_notifications();
+    let mut rx_c = client_c.subscribe_notifications();
+
+    let _ = client_a
+        .call(
+            "engine/start_turn",
+            Some(serde_json::json!({
+                "threadId": "thread:native/filter-test",
+                "userInput": [],
+                "scope": null,
+            })),
+        )
+        .await
+        .expect("start_turn ok");
+
+    let timeout = Duration::from_secs(3);
+
+    // A must see turn events, not phase.
+    let a_methods: Vec<String> = {
+        let end = std::time::Instant::now() + timeout;
+        let mut acc = Vec::new();
+        while std::time::Instant::now() < end {
+            match tokio::time::timeout(Duration::from_millis(300), rx_a.recv()).await {
+                Ok(Ok(n)) => acc.push(n.method),
+                _ => break,
+            }
+        }
+        acc
+    };
+    assert!(
+        a_methods
+            .iter()
+            .any(|m| m == "events/turn_started" || m == "events/turn_completed"),
+        "A must see at least one turn event; got {a_methods:?}"
+    );
+    assert!(
+        !a_methods.iter().any(|m| m == "events/phase_changed"),
+        "A must NOT see phase_changed; got {a_methods:?}"
+    );
+
+    // B must see phase events, not turn events. Collect B's full method
+    // stream (not predicate-filtered) so the negative assertion is real:
+    // a predicate filter would silently discard any leaked turn events.
+    let b_methods: Vec<String> = {
+        let end = std::time::Instant::now() + timeout;
+        let mut acc = Vec::new();
+        while std::time::Instant::now() < end {
+            match tokio::time::timeout(Duration::from_millis(300), rx_b.recv()).await {
+                Ok(Ok(n)) => acc.push(n.method),
+                _ => break,
+            }
+        }
+        acc
+    };
+    assert!(
+        b_methods.iter().any(|m| m == "events/phase_changed"),
+        "B must see at least one phase_changed event; got {b_methods:?}"
+    );
+    assert!(
+        !b_methods.iter().any(|m| m.contains("turn_")),
+        "B (phase-only subscriber) must NOT see turn events; got {b_methods:?}"
+    );
+
+    // C (unsubscribed) must see both kinds — backward compat.
+    let c_methods: Vec<String> = {
+        let end = std::time::Instant::now() + timeout;
+        let mut acc = Vec::new();
+        while std::time::Instant::now() < end {
+            match tokio::time::timeout(Duration::from_millis(300), rx_c.recv()).await {
+                Ok(Ok(n)) => acc.push(n.method),
+                _ => break,
+            }
+        }
+        acc
+    };
+    let c_has_turn = c_methods
+        .iter()
+        .any(|m| m == "events/turn_started" || m == "events/turn_completed");
+    let c_has_phase = c_methods.iter().any(|m| m == "events/phase_changed");
+    assert!(
+        c_has_turn,
+        "C (unsubscribed) must see turn events; got {c_methods:?}"
+    );
+    assert!(
+        c_has_phase,
+        "C (unsubscribed) must see phase_changed; got {c_methods:?}"
+    );
+
+    client_a.shutdown();
+    client_b.shutdown();
+    client_c.shutdown();
+    token.cancel();
+    let _ = engine.shutdown().await;
+}
+
+/// `events/unsubscribe` resets a previously narrowed filter back to allow-all.
+#[tokio::test]
+async fn unsubscribe_resets_to_allow_all() {
+    let (token, socket, _dir, engine) = spawn_server_with_events().await;
+    let client = Client::connect_uds(&socket).await.expect("connect");
+
+    // Narrow to only turn events.
+    subscribe(&client, &["events/turn_started"]).await;
+
+    // Unsubscribe — should go back to allow-all.
+    client
+        .call("events/unsubscribe", None)
+        .await
+        .expect("events/unsubscribe must succeed");
+
+    let mut rx = client.subscribe_notifications();
+
+    let _ = client
+        .call(
+            "engine/start_turn",
+            Some(serde_json::json!({
+                "threadId": "thread:native/unsub-test",
+                "userInput": [],
+                "scope": null,
+            })),
+        )
+        .await
+        .expect("start_turn ok");
+
+    // After unsubscribing, the connection must receive phase_changed again.
+    let saw_phase = wait_for_method(&mut rx, "events/phase_changed").await;
+    assert!(
+        saw_phase,
+        "after unsubscribe the connection must receive phase_changed (allow-all restored)"
+    );
+
+    client.shutdown();
+    token.cancel();
+    let _ = engine.shutdown().await;
+}
+
+/// Malformed `events/subscribe` params must surface `InvalidParams`
+/// rather than silently resetting the filter to allow-all.
+#[tokio::test]
+async fn subscribe_with_malformed_params_returns_invalid_params() {
+    let (token, socket, _dir, engine) = spawn_server_with_events().await;
+    let client = Client::connect_uds(&socket).await.expect("connect");
+
+    // `methods` must be an array of strings; send a number instead.
+    let err = client
+        .call("events/subscribe", Some(serde_json::json!({"methods": 42})))
+        .await
+        .expect_err("malformed subscribe must fail");
+    match err {
+        ClientError::Server(e) => assert_eq!(e.code, -32602), // InvalidParams
+        other => panic!("expected Server InvalidParams error, got {other:?}"),
+    }
+
+    client.shutdown();
+    token.cancel();
+    let _ = engine.shutdown().await;
+}
+
 // Rust guideline compliant 2026-02-21
