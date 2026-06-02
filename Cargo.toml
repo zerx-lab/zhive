@@ -12,6 +12,8 @@ members = [
   "crates/zhive-tui",
   "crates/zhive-cli",
   "crates/zhive-bridge-stdio",
+  "crates/zhive-mcp",
+  "crates/zhive-bridge-acp",
   "xtask",
 ]
 default-members = [
@@ -38,6 +40,8 @@ zhive-core          = { path = "crates/zhive-core",          version = "0.1.0" }
 zhive-client-native = { path = "crates/zhive-client-native", version = "0.1.0" }
 zhive-tui           = { path = "crates/zhive-tui",           version = "0.1.0" }
 zhive-bridge-stdio  = { path = "crates/zhive-bridge-stdio",  version = "0.1.0" }
+zhive-mcp           = { path = "crates/zhive-mcp",           version = "0.1.0" }
+zhive-bridge-acp    = { path = "crates/zhive-bridge-acp",    version = "0.1.0" }
 
 # ---- async runtime ----
 tokio       = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "sync", "io-util", "net", "time", "signal", "fs"] }
