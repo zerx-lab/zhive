@@ -186,6 +186,39 @@ pub trait Tool: Send + Sync {
         ToolKind::Other
     }
 
+    /// Natural-language description advertised to the model, if any.
+    ///
+    /// Returned to the provider as the tool's `description` so the model can
+    /// decide when to call it. The default `None` advertises no description.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use zhive_core::tools::{EchoTool, Tool};
+    /// assert!(EchoTool.description().is_some());
+    /// ```
+    fn description(&self) -> Option<String> {
+        None
+    }
+
+    /// JSON Schema (an object schema) describing this tool's input arguments.
+    ///
+    /// Advertised to the model so it emits well-formed arguments, and used as
+    /// the red-line-11 revalidation fallback for tools that did not register a
+    /// schema explicitly. The default is the permissive empty object schema
+    /// `{"type": "object"}`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use zhive_core::tools::{EchoTool, Tool};
+    /// let schema = EchoTool.input_schema();
+    /// assert_eq!(schema["type"], "object");
+    /// ```
+    fn input_schema(&self) -> serde_json::Value {
+        serde_json::json!({ "type": "object" })
+    }
+
     /// Executes the tool with JSON `args` and a read-only [`ToolContext`].
     ///
     /// # Errors
@@ -196,6 +229,40 @@ pub trait Tool: Send + Sync {
         args: serde_json::Value,
         ctx: &ToolContext,
     ) -> Result<ToolOutput, ToolError>;
+}
+
+// ============================================================
+// ToolSpec
+// ============================================================
+
+/// Advertisable description of one registered tool.
+///
+/// Produced by [`ToolRegistry::specs`] and consumed by the engine's prompt
+/// builder to advertise tools to the LLM provider. Carries only the
+/// model-facing surface (name, description, input schema); the executable
+/// behaviour stays behind the [`Tool`] trait object.
+///
+/// # Examples
+///
+/// ```
+/// use std::sync::Arc;
+/// use zhive_core::tools::{EchoTool, ToolRegistry};
+///
+/// let mut reg = ToolRegistry::new();
+/// reg.register(Arc::new(EchoTool));
+/// let specs = reg.specs();
+/// assert_eq!(specs[0].name, "echo");
+/// assert!(specs[0].description.is_some());
+/// assert_eq!(specs[0].input_schema["type"], "object");
+/// ```
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolSpec {
+    /// Stable, unique tool name (matches [`Tool::name`]).
+    pub name: String,
+    /// Optional natural-language description advertised to the model.
+    pub description: Option<String>,
+    /// JSON Schema (object) for the tool's input arguments.
+    pub input_schema: serde_json::Value,
 }
 
 // ============================================================
@@ -265,6 +332,39 @@ impl ToolRegistry {
     pub fn len(&self) -> usize {
         self.tools.len()
     }
+
+    /// Enumerates the model-facing [`ToolSpec`] of every registered tool.
+    ///
+    /// The result is sorted by tool name so the generated prompt is
+    /// deterministic across runs (a `HashMap` would otherwise iterate in an
+    /// unspecified order, making cached prompts and snapshots flaky).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use zhive_core::tools::{EchoTool, ToolRegistry};
+    ///
+    /// let mut reg = ToolRegistry::new();
+    /// reg.register(Arc::new(EchoTool));
+    /// let specs = reg.specs();
+    /// assert_eq!(specs.len(), 1);
+    /// assert_eq!(specs[0].name, "echo");
+    /// ```
+    #[must_use]
+    pub fn specs(&self) -> Vec<ToolSpec> {
+        let mut specs: Vec<ToolSpec> = self
+            .tools
+            .values()
+            .map(|tool| ToolSpec {
+                name: tool.name().to_owned(),
+                description: tool.description(),
+                input_schema: tool.input_schema(),
+            })
+            .collect();
+        specs.sort_by(|a, b| a.name.cmp(&b.name));
+        specs
+    }
 }
 
 // ============================================================
@@ -302,6 +402,26 @@ pub struct EchoTool;
 impl Tool for EchoTool {
     fn name(&self) -> &'static str {
         "echo"
+    }
+
+    fn description(&self) -> Option<String> {
+        Some("Echoes its JSON arguments back as text; used for testing.".to_owned())
+    }
+
+    fn input_schema(&self) -> serde_json::Value {
+        // `additionalProperties: true` keeps the tool free-form (any JSON
+        // object round-trips) while still advertising the conventional `msg`
+        // field so the model has a hint about the expected shape.
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "msg": {
+                    "type": "string",
+                    "description": "Free-form text to echo back."
+                }
+            },
+            "additionalProperties": true
+        })
     }
 
     async fn execute(
@@ -368,6 +488,45 @@ mod tests {
     fn tool_kind_converts_to_proto() {
         let k: zhive_proto::domain::ToolKind = ToolKind::Read.into();
         assert_eq!(k, zhive_proto::domain::ToolKind::Read);
+    }
+
+    #[test]
+    fn echo_tool_advertises_description_and_object_schema() {
+        assert!(EchoTool.description().is_some());
+        let schema = EchoTool.input_schema();
+        assert_eq!(schema["type"], "object");
+        assert!(schema["properties"]["msg"].is_object());
+    }
+
+    #[test]
+    fn registry_specs_are_sorted_by_name() {
+        struct AlphaTool;
+        #[async_trait]
+        impl Tool for AlphaTool {
+            fn name(&self) -> &'static str {
+                "alpha"
+            }
+            async fn execute(
+                &self,
+                _args: serde_json::Value,
+                _ctx: &ToolContext,
+            ) -> Result<ToolOutput, ToolError> {
+                Ok(ToolOutput::text("a"))
+            }
+        }
+
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(EchoTool));
+        reg.register(Arc::new(AlphaTool));
+        let specs = reg.specs();
+        assert_eq!(specs.len(), 2);
+        assert_eq!(specs[0].name, "alpha");
+        assert_eq!(specs[1].name, "echo");
+        // The default schema fallback applies to AlphaTool.
+        assert_eq!(
+            specs[0].input_schema,
+            serde_json::json!({ "type": "object" })
+        );
     }
 }
 

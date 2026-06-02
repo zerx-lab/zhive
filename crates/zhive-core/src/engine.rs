@@ -85,6 +85,75 @@ const EVENT_CHANNEL_CAP: usize = 1024;
 /// most calls return in microseconds.
 const DEFAULT_REPLY_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Default per-turn provider-call iteration cap.
+///
+/// Generous default so a multi-step tool-use turn is not cut short while
+/// still bounding runaway loops. Replaces the previous fixed cap of 32 (the
+/// old Claude Code default), which proved too low for deep tool chains.
+/// Callers override per engine via [`TurnLimits`] on [`EngineConfig`].
+pub const DEFAULT_MAX_TURN_ITERATIONS: u32 = 80;
+
+/// Hard safety ceiling for [`TurnLimits::effective_cap`].
+///
+/// Even an explicitly unbounded ([`TurnLimits::max_iterations`] = `None`) or
+/// absurdly large configured cap is clamped to this value so a single turn can
+/// never loop without limit and starve the actor. A backstop, not a tuning
+/// knob; chosen high enough that no legitimate turn reaches it.
+const MAX_TURN_ITERATIONS_SAFETY_CEILING: u32 = 1000;
+
+/// Per-turn iteration limit for the inner provider/tool-call loop.
+///
+/// `max_iterations = Some(n)` caps a turn at `n` provider iterations;
+/// `None` means "unbounded" except for the hard
+/// [`MAX_TURN_ITERATIONS_SAFETY_CEILING`] backstop. The effective cap used by
+/// the turn loop is computed by [`TurnLimits::effective_cap`].
+///
+/// # Examples
+///
+/// ```
+/// use zhive_core::engine::{TurnLimits, DEFAULT_MAX_TURN_ITERATIONS};
+/// assert_eq!(TurnLimits::default().max_iterations, Some(DEFAULT_MAX_TURN_ITERATIONS));
+/// ```
+#[derive(Debug, Clone, Copy)]
+pub struct TurnLimits {
+    /// Maximum provider iterations per turn; `None` = unbounded (capped only
+    /// by the internal hard safety ceiling).
+    pub max_iterations: Option<u32>,
+}
+
+impl Default for TurnLimits {
+    fn default() -> Self {
+        Self {
+            max_iterations: Some(DEFAULT_MAX_TURN_ITERATIONS),
+        }
+    }
+}
+
+impl TurnLimits {
+    /// Returns the concrete iteration cap the turn loop should enforce.
+    ///
+    /// A configured `Some(n)` is clamped to the hard safety ceiling; `None`
+    /// resolves to the ceiling itself. The result is always at least `1` so a
+    /// turn runs at least one provider iteration.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use zhive_core::engine::TurnLimits;
+    /// assert_eq!(TurnLimits { max_iterations: Some(10) }.effective_cap(), 10);
+    /// assert_eq!(TurnLimits { max_iterations: Some(0) }.effective_cap(), 1);
+    /// assert_eq!(TurnLimits { max_iterations: None }.effective_cap(), 1000);
+    /// ```
+    #[must_use]
+    pub fn effective_cap(self) -> u32 {
+        self.max_iterations
+            .map_or(MAX_TURN_ITERATIONS_SAFETY_CEILING, |n| {
+                n.min(MAX_TURN_ITERATIONS_SAFETY_CEILING)
+            })
+            .max(1)
+    }
+}
+
 /// Configuration bundle for [`Engine::spawn_with_config`].
 ///
 /// Groups all injectable dependencies so callers do not need to chain many
@@ -116,6 +185,10 @@ pub struct EngineConfig {
     /// and `TurnEnded` ops on every turn.  When `None` (the default) no
     /// persistence takes place and the engine is purely in-memory.
     pub storage: Option<Arc<Storage>>,
+    /// Per-turn iteration limit for the inner provider/tool-call loop.
+    ///
+    /// Defaults to [`TurnLimits::default`] (`Some(DEFAULT_MAX_TURN_ITERATIONS)`).
+    pub turn_limits: TurnLimits,
 }
 
 impl Default for EngineConfig {
@@ -126,6 +199,7 @@ impl Default for EngineConfig {
             tools: Arc::new(ToolRegistry::new()),
             hook_host: Arc::new(HookHost::new()),
             storage: None,
+            turn_limits: TurnLimits::default(),
         }
     }
 }
@@ -294,6 +368,7 @@ impl Engine {
     ///     tools: Arc::new(tools),
     ///     hook_host: Arc::new(HookHost::new()),
     ///     storage: None,
+    ///     turn_limits: Default::default(),
     /// };
     /// let engine = Engine::spawn_with_config(cfg);
     /// engine.shutdown().await.unwrap();
@@ -318,11 +393,33 @@ impl Engine {
             None => (None, None),
         };
 
+        // Backfill the SchemaCache from each trait tool's advertised schema so
+        // red line 11 (updated_input revalidation) has a schema to check even
+        // for tools registered purely through the `Tool` trait (no manifest).
+        // `register_if_absent` never overwrites a schema an extension already
+        // registered. A backfill failure is logged and skipped — it must never
+        // block engine construction.
+        for spec in config.tools.specs() {
+            if let Err(err) = config
+                .hook_host
+                .schemas()
+                .register_if_absent(&spec.name, &spec.input_schema)
+            {
+                tracing::warn!(
+                    name: "zhive.engine.tool_schema_backfill_failed",
+                    tool = %spec.name,
+                    error = %err,
+                    "failed to backfill tool input schema into SchemaCache; continuing"
+                );
+            }
+        }
+
         let inner = Arc::new(inner::EngineInner::new_with_hooks_tools_storage(
             events_tx.clone(),
             config.provider,
             config.hook_host,
             config.tools,
+            config.turn_limits,
             maybe_tx,
             maybe_handle,
         ));
@@ -1391,6 +1488,7 @@ mod inc3_tests {
             tools: Arc::new(tools),
             hook_host: Arc::new(HookHost::new()),
             storage: None,
+            turn_limits: TurnLimits::default(),
         };
         let engine =
             Engine::spawn_with_config(cfg).with_reply_timeout(std::time::Duration::from_secs(5));
@@ -1488,6 +1586,7 @@ mod inc3_tests {
             tools: Arc::new(tools),
             hook_host,
             storage: None,
+            turn_limits: TurnLimits::default(),
         };
         let engine =
             Engine::spawn_with_config(cfg).with_reply_timeout(std::time::Duration::from_secs(5));
@@ -1583,6 +1682,7 @@ mod inc3_tests {
             tools: Arc::new(tools),
             hook_host,
             storage: None,
+            turn_limits: TurnLimits::default(),
         };
         let engine =
             Engine::spawn_with_config(cfg).with_reply_timeout(std::time::Duration::from_secs(5));
@@ -1662,6 +1762,7 @@ mod inc3_tests {
             tools: Arc::new(tools),
             hook_host,
             storage: None,
+            turn_limits: TurnLimits::default(),
         };
         let engine =
             Engine::spawn_with_config(cfg).with_reply_timeout(std::time::Duration::from_secs(10));
@@ -1769,6 +1870,7 @@ mod inc3_tests {
             tools: Arc::new(tools),
             hook_host,
             storage: None,
+            turn_limits: TurnLimits::default(),
         };
         let engine =
             Engine::spawn_with_config(cfg).with_reply_timeout(std::time::Duration::from_secs(10));
@@ -1965,11 +2067,16 @@ mod inc3_tests {
         let mut tools = ToolRegistry::new();
         tools.register(Arc::new(EchoTool));
 
+        // Cap the turn at 4 iterations so the always-tool-calling model
+        // terminates quickly instead of running the default 80 iterations.
         let cfg = EngineConfig {
             provider: DynLanguageModel::new(AlwaysToolCallModel),
             tools: Arc::new(tools),
             hook_host: Arc::new(HookHost::new()),
             storage: None,
+            turn_limits: TurnLimits {
+                max_iterations: Some(4),
+            },
         };
         let engine =
             Engine::spawn_with_config(cfg).with_reply_timeout(std::time::Duration::from_secs(60));
@@ -1980,7 +2087,7 @@ mod inc3_tests {
             .await
             .unwrap();
 
-        // The turn must complete within a reasonable bound even though the
+        // The turn must complete within the 4-iteration cap even though the
         // model never stops emitting tool calls.
         let saw_completed = collect_until(&mut events, 256, |ev| {
             matches!(ev, EngineEvent::TurnCompleted { .. })
@@ -2032,6 +2139,7 @@ mod inc3_tests {
             tools: Arc::new(tools),
             hook_host: Arc::new(HookHost::new()),
             storage: None,
+            turn_limits: TurnLimits::default(),
         };
         let engine =
             Engine::spawn_with_config(cfg).with_reply_timeout(std::time::Duration::from_secs(5));
@@ -2105,6 +2213,7 @@ mod inc3_tests {
             tools: Arc::new(tools),
             hook_host: Arc::new(HookHost::new()),
             storage: None,
+            turn_limits: TurnLimits::default(),
         };
         let engine =
             Engine::spawn_with_config(cfg).with_reply_timeout(std::time::Duration::from_secs(10));
@@ -2896,6 +3005,7 @@ mod inc5_tests {
             tools: Arc::new(crate::tools::ToolRegistry::new()),
             hook_host: Arc::new(crate::hooks::HookHost::new()),
             storage: Some(Arc::clone(&storage)),
+            turn_limits: TurnLimits::default(),
         };
 
         let engine =
@@ -3032,6 +3142,7 @@ mod inc5_tests {
             tools: Arc::new(crate::tools::ToolRegistry::new()),
             hook_host: Arc::new(crate::hooks::HookHost::new()),
             storage: Some(Arc::clone(&storage)),
+            turn_limits: TurnLimits::default(),
         };
         let engine =
             Engine::spawn_with_config(cfg).with_reply_timeout(std::time::Duration::from_secs(10));
@@ -3168,6 +3279,7 @@ mod inc5_tests {
             tools: Arc::new(crate::tools::ToolRegistry::new()),
             hook_host: Arc::new(crate::hooks::HookHost::new()),
             storage: Some(Arc::clone(&storage)),
+            turn_limits: TurnLimits::default(),
         };
         let engine =
             Engine::spawn_with_config(cfg).with_reply_timeout(std::time::Duration::from_secs(10));
@@ -3941,6 +4053,7 @@ mod inc6_tests {
             tools: Arc::new(crate::tools::ToolRegistry::new()),
             hook_host: Arc::new(crate::hooks::HookHost::new()),
             storage: Some(Arc::clone(&storage)),
+            turn_limits: TurnLimits::default(),
         };
         let engine =
             Engine::spawn_with_config(cfg).with_reply_timeout(std::time::Duration::from_secs(10));

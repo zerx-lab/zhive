@@ -102,6 +102,8 @@ pub(crate) struct EngineInner {
     pub(in crate::engine) hook_host: Arc<HookHost>,
     /// Tool registry shared across all turn tasks spawned by this engine.
     pub(in crate::engine) tools: Arc<ToolRegistry>,
+    /// Per-turn iteration limit applied by [`super::turn::run_turn`].
+    turn_limits: super::TurnLimits,
     /// Engine-wide cancellation hierarchy.
     ///
     /// The root token represents engine shutdown.  Each turn gets a child
@@ -134,6 +136,7 @@ impl EngineInner {
             provider,
             Arc::new(HookHost::new()),
             Arc::new(ToolRegistry::new()),
+            super::TurnLimits::default(),
             None,
             None,
         )
@@ -145,6 +148,7 @@ impl EngineInner {
         provider: DynLanguageModel,
         hook_host: Arc<HookHost>,
         tools: Arc<ToolRegistry>,
+        turn_limits: super::TurnLimits,
         storage_tx: Option<mpsc::Sender<StorageWriteOp>>,
         storage_handle: Option<JoinHandle<()>>,
     ) -> Self {
@@ -157,6 +161,7 @@ impl EngineInner {
             provider,
             hook_host,
             tools,
+            turn_limits,
             cancel_tree: CancellationTree::new(),
             storage_writer: Mutex::new(StorageWriterState {
                 tx: storage_tx,
@@ -189,6 +194,11 @@ impl EngineInner {
     /// Returns the tool registry for sibling modules.
     pub(in crate::engine) fn tools(&self) -> &Arc<ToolRegistry> {
         &self.tools
+    }
+
+    /// Returns the effective per-turn iteration cap for [`super::turn`].
+    pub(in crate::engine) fn max_turn_iterations(&self) -> u32 {
+        self.turn_limits.effective_cap()
     }
 
     /// Returns the cancellation tree for sibling modules (e.g. lifecycle).

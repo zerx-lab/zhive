@@ -13,7 +13,7 @@
 //!
 //! ## Inner tool-call loop
 //!
-//! `run_turn` is a **bounded loop** (cap: [`MAX_TURN_ITERATIONS`]):
+//! `run_turn` is a **bounded loop** (cap: [`super::inner::EngineInner::max_turn_iterations`]):
 //!
 //! 1. Build `CallOptions` by reconstructing the prompt from the thread tail
 //!    (via [`super::prompt::build_call_options`]).
@@ -51,17 +51,6 @@ use super::prompt::build_call_options;
 use super::tool_dispatch::dispatch_tool_call;
 
 // ============================================================
-// Constants
-// ============================================================
-
-/// Maximum number of provider call iterations within a single turn.
-///
-/// Prevents runaway tool-calling loops.  At this limit the turn ends
-/// cleanly (with an optional `SystemNotice`) rather than looping
-/// indefinitely.  32 matches the Claude Code default.
-const MAX_TURN_ITERATIONS: u32 = 32;
-
-// ============================================================
 // Turn execution
 // ============================================================
 
@@ -81,7 +70,7 @@ const MAX_TURN_ITERATIONS: u32 = 32;
 /// Opens a `zhive.turn` OTel-aligned span for the entire turn lifetime,
 /// with `thread.id` and `turn.id` fields populated from the arguments.
 ///
-/// ## Steps (per iteration, up to [`MAX_TURN_ITERATIONS`])
+/// ## Steps (per iteration, up to the engine's configured iteration cap)
 ///
 /// 1. Build `CallOptions` from the thread history.
 /// 2. Call `provider.do_stream(call_options)`.  On outer `Err` → `TurnFailed`.
@@ -163,7 +152,11 @@ async fn run_turn_inner(
     // still emit a matching tool_use / tool_result pair.
     let mut fallback_id_counter: u64 = 0;
 
-    'outer: for iteration in 0..MAX_TURN_ITERATIONS {
+    // Effective per-turn iteration cap (from the engine's `TurnLimits`).
+    // Read once so every comparison below uses a single stable value.
+    let max_iterations = inner.max_turn_iterations();
+
+    'outer: for iteration in 0..max_iterations {
         // ── Steer drain (Pi model §3.1): drain BEFORE each LLM request ────────
         //
         // Steer items are injected as user-turn items visible to the *next*
@@ -198,7 +191,7 @@ async fn run_turn_inner(
 
         // 1. Build the prompt by reconstructing it from the thread's item tail
         //    (the single source of truth; see `build_call_options`).
-        let call_options = build_call_options(&handle).await;
+        let call_options = build_call_options(&handle, inner.tools()).await;
 
         // 2. Call the provider, racing against the per-turn cancel token.
         //
@@ -380,14 +373,12 @@ async fn run_turn_inner(
             // Fall through to the next iteration (the iteration cap still
             // applies — if we are at MAX_TURN_ITERATIONS the notice below
             // fires before continuing).
-            if iteration + 1 >= MAX_TURN_ITERATIONS {
+            if iteration + 1 >= max_iterations {
                 let notice_id = ItemId(Arc::from(format!("item:{}/max-iter-fu", turn_id.0)));
                 let notice = Item::SystemNotice {
                     id: notice_id,
                     level: NoticeLevel::Warn,
-                    message: format!(
-                        "max turn iterations reached ({MAX_TURN_ITERATIONS}); turn ended"
-                    ),
+                    message: format!("max turn iterations reached ({max_iterations}); turn ended"),
                 };
                 handle.push_item(notice.clone()).await;
                 let _ = inner.events_tx().send(EngineEvent::ItemAppended {
@@ -494,12 +485,12 @@ async fn run_turn_inner(
         }
 
         // If we are at the last allowed iteration, append a notice.
-        if iteration + 1 >= MAX_TURN_ITERATIONS {
+        if iteration + 1 >= max_iterations {
             let notice_id = ItemId(Arc::from(format!("item:{}/max-iter", turn_id.0)));
             let notice = Item::SystemNotice {
                 id: notice_id,
                 level: NoticeLevel::Warn,
-                message: format!("max tool iterations reached ({MAX_TURN_ITERATIONS}); turn ended"),
+                message: format!("max tool iterations reached ({max_iterations}); turn ended"),
             };
             handle.push_item(notice.clone()).await;
             let _ = inner.events_tx().send(EngineEvent::ItemAppended {

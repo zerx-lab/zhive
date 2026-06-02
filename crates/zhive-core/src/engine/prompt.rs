@@ -19,6 +19,13 @@
 //! reconstruction emits matching `tool_use` / `tool_result` id pairs, in order,
 //! for every prior iteration — exactly what Anthropic/OpenAI message-pair
 //! validation requires.
+//!
+//! ## Tool advertisement
+//!
+//! When the engine's [`crate::tools::ToolRegistry`] is non-empty, the built
+//! `CallOptions` also carries `tools` (one `Tool::Function` per registered
+//! tool) and `tool_choice = ToolChoice::Auto`, so the provider knows which
+//! tools the model may call. An empty registry leaves both fields `None`.
 
 use zhive_proto::domain::Item;
 
@@ -34,14 +41,20 @@ use crate::state::ThreadHandle;
 /// and maps each item to provider messages using the rules documented in the
 /// module header.
 ///
-/// The returned `CallOptions` has all optional fields set to `None`
-/// (no tool list, no `max_output_tokens`, no temperature override).
-/// Provider defaults apply.
+/// When `tools` is non-empty, the returned `CallOptions` advertises each
+/// registered tool via `tools = Some(vec![Tool::Function(..)])` and sets
+/// `tool_choice = Some(ToolChoice::Auto)` so the model may pick a tool. A
+/// tool whose `input_schema` cannot be converted to a provider `JsonSchema`
+/// is logged and skipped rather than failing the whole turn. An empty
+/// registry leaves both `tools` and `tool_choice` as `None`. All other
+/// optional fields (`max_output_tokens`, `temperature`, …) stay `None`, so
+/// provider defaults apply.
 ///
 /// This function is crate-internal (`pub(in crate::engine)`).
 /// See the `#[cfg(test)]` block in this file for usage examples.
 pub(in crate::engine) async fn build_call_options(
     handle: &ThreadHandle,
+    tools: &crate::tools::ToolRegistry,
 ) -> llmsdk::language_model::CallOptions {
     use llmsdk::language_model::{
         AssistantPart, Message, TextPart, ToolCallPart, ToolMessagePart, ToolResultOutput,
@@ -133,8 +146,48 @@ pub(in crate::engine) async fn build_call_options(
     }
     drop(tail);
 
+    // Advertise registered tools to the provider. An invalid schema for one
+    // tool is logged and that tool is skipped; it must never abort the turn.
+    let mut advertised: Vec<llmsdk::language_model::Tool> = Vec::new();
+    for spec in tools.specs() {
+        match serde_json::from_value::<llmsdk::json::JsonSchema>(spec.input_schema.clone()) {
+            Ok(input_schema) => {
+                advertised.push(llmsdk::language_model::Tool::Function(
+                    llmsdk::language_model::FunctionTool {
+                        name: spec.name,
+                        description: spec.description,
+                        input_schema,
+                        input_examples: None,
+                        strict: None,
+                        provider_options: None,
+                    },
+                ));
+            }
+            Err(err) => {
+                tracing::warn!(
+                    name: "zhive.prompt.tool_schema_invalid",
+                    tool = %spec.name,
+                    error = %err,
+                    "tool input schema is not a valid JSON schema; skipping tool advertisement"
+                );
+            }
+        }
+    }
+
+    let (tools_opt, tool_choice) = if advertised.is_empty() {
+        // Empty registry (or every schema invalid) → no behavior change.
+        (None, None)
+    } else {
+        (
+            Some(advertised),
+            Some(llmsdk::language_model::ToolChoice::Auto),
+        )
+    };
+
     llmsdk::language_model::CallOptions {
         prompt,
+        tools: tools_opt,
+        tool_choice,
         ..Default::default()
     }
 }
@@ -240,7 +293,7 @@ mod tests {
             .push_item(completed_tool_call("item:2", "toolu_C", "echo", "rC"))
             .await;
 
-        let opts = build_call_options(&handle).await;
+        let opts = build_call_options(&handle, &crate::tools::ToolRegistry::new()).await;
 
         let mut pairs: Vec<(String, String, String)> = Vec::new();
         let msgs = &opts.prompt;
@@ -315,7 +368,7 @@ mod tests {
             })
             .await;
 
-        let opts = build_call_options(&handle).await;
+        let opts = build_call_options(&handle, &crate::tools::ToolRegistry::new()).await;
         assert_eq!(opts.prompt.len(), 2, "one Assistant + one Tool message");
 
         let use_id = match &opts.prompt[0] {
@@ -362,7 +415,7 @@ mod tests {
             })
             .await;
 
-        let opts = build_call_options(&handle).await;
+        let opts = build_call_options(&handle, &crate::tools::ToolRegistry::new()).await;
         assert_eq!(opts.prompt.len(), 2, "failed call still yields a pair");
         match (&opts.prompt[0], &opts.prompt[1]) {
             (Message::Assistant { .. }, Message::Tool { content, .. }) => {
@@ -401,9 +454,37 @@ mod tests {
             })
             .await;
 
-        let opts = build_call_options(&handle).await;
+        let opts = build_call_options(&handle, &crate::tools::ToolRegistry::new()).await;
         assert_eq!(opts.prompt.len(), 1);
         assert!(matches!(opts.prompt[0], Message::User { .. }));
+    }
+
+    /// A non-empty registry advertises each tool as a `Tool::Function` and
+    /// sets `tool_choice = Auto`, so the provider learns the callable surface.
+    #[tokio::test]
+    async fn build_call_options_advertises_registered_tools() {
+        use llmsdk::language_model::{Tool, ToolChoice};
+
+        use crate::tools::{EchoTool, ToolRegistry};
+
+        let handle = ThreadHandle::new_idle(ThreadId(Arc::from("thread:native/advertise")));
+        handle.push_item(user_msg("item:u0", "go")).await;
+
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(EchoTool));
+
+        let opts = build_call_options(&handle, &reg).await;
+
+        let tools = opts.tools.expect("registered tools must be advertised");
+        assert_eq!(tools.len(), 1, "exactly one tool advertised");
+        match &tools[0] {
+            Tool::Function(f) => assert_eq!(f.name, "echo", "echo tool advertised by name"),
+            other => panic!("expected Tool::Function, got {other:?}"),
+        }
+        assert!(
+            matches!(opts.tool_choice, Some(ToolChoice::Auto)),
+            "tool_choice must be Auto when tools are advertised"
+        );
     }
 }
 

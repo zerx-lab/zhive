@@ -99,6 +99,56 @@ impl SchemaCache {
         Ok(())
     }
 
+    /// Registers a schema for `tool` only when none exists yet.
+    ///
+    /// Unlike [`Self::register`], a schema a caller registered deliberately is
+    /// never clobbered. Returns `true` when the schema was inserted, `false`
+    /// when one was already present. The engine uses this to backfill
+    /// tool-trait fallback schemas without stomping caller-provided ones.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValidatorError::InvalidSchema`] when the schema does not
+    /// compile, or [`ValidatorError::RegistryPoisoned`] when the internal lock
+    /// is in a poisoned state.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use zhive_core::hooks::validator::SchemaCache;
+    /// let cache = SchemaCache::new();
+    /// let schema = serde_json::json!({ "type": "object" });
+    /// assert!(cache.register_if_absent("echo", &schema).unwrap());
+    /// assert!(!cache.register_if_absent("echo", &schema).unwrap());
+    /// ```
+    pub fn register_if_absent(&self, tool: &str, schema: &Value) -> Result<bool, ValidatorError> {
+        {
+            let guard = self
+                .schemas
+                .read()
+                .map_err(|_poisoned| ValidatorError::RegistryPoisoned)?;
+            if guard.contains_key(tool) {
+                return Ok(false);
+            }
+        }
+        let compiled =
+            jsonschema::validator_for(schema).map_err(|e| ValidatorError::InvalidSchema {
+                tool: tool.to_string(),
+                reason: e.to_string(),
+            })?;
+        let mut guard = self
+            .schemas
+            .write()
+            .map_err(|_poisoned| ValidatorError::RegistryPoisoned)?;
+        // Re-check under the write lock: a concurrent writer may have inserted
+        // between dropping the read guard and acquiring the write guard.
+        if guard.contains_key(tool) {
+            return Ok(false);
+        }
+        guard.insert(tool.to_string(), compiled);
+        Ok(true)
+    }
+
     /// Re-validates `input` against the registered schema for `tool`.
     ///
     /// # Errors

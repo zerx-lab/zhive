@@ -173,7 +173,7 @@ mod span_emission_tests {
         StreamResult,
     };
 
-    use crate::engine::{Engine, EngineConfig};
+    use crate::engine::{Engine, EngineConfig, TurnLimits};
     use crate::hooks::HookHost;
     use crate::provider::{DynLanguageModel, ScriptedModel};
     use crate::tools::{EchoTool, ToolRegistry};
@@ -362,6 +362,7 @@ mod span_emission_tests {
             tools: Arc::new(tools),
             hook_host: Arc::new(HookHost::new()),
             storage: None,
+            turn_limits: TurnLimits::default(),
         };
         let engine = Engine::spawn_with_config(cfg);
 
