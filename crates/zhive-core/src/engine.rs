@@ -1262,6 +1262,25 @@ mod inc3_tests {
         ThreadId(Arc::from(s))
     }
 
+    /// Waits for the next `PermissionRequested` id, or `None` on timeout.
+    ///
+    /// Scans up to 64 events, ignoring everything else; lets a test drive
+    /// successive permission prompts in one turn.
+    async fn next_permission_request(
+        rx: &mut broadcast::Receiver<EngineEvent>,
+    ) -> Option<PermissionRequestId> {
+        for _ in 0..64 {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await {
+                Ok(Ok(EngineEvent::PermissionRequested { request_id, .. })) => {
+                    return Some(request_id);
+                }
+                Ok(Ok(_)) => {}
+                _ => return None,
+            }
+        }
+        None
+    }
+
     /// Waits for up to `limit` events, returns `true` if `pred` matched one.
     async fn collect_until(
         rx: &mut broadcast::Receiver<EngineEvent>,
@@ -1934,6 +1953,274 @@ mod inc3_tests {
 
         assert!(saw_tool_completed, "tool must have executed after Allow");
         assert!(saw_turn_completed, "TurnCompleted must fire");
+        engine.shutdown().await.unwrap();
+    }
+
+    // =========================================================================
+    // Test 4a: allow-always persistence (P1-1)
+    // =========================================================================
+
+    /// Builds an engine whose `Ask` hook fires for every `echo` call, with the
+    /// model emitting `echo` on two consecutive turn-loop iterations (script0,
+    /// script1) before a clean text turn (script2). The single turn therefore
+    /// reaches the permission gate twice for the same tool name.
+    async fn spawn_engine_two_echo_asks(
+        thread: &str,
+    ) -> (Engine, broadcast::Receiver<EngineEvent>) {
+        use llmsdk::ToolCallPart;
+
+        let echo_call = |id: &str| {
+            vec![StreamPart::ToolCall(ToolCallPart {
+                tool_call_id: id.into(),
+                tool_name: "echo".into(),
+                input: serde_json::json!({"msg": "again"}),
+                provider_executed: None,
+                dynamic: None,
+                provider_options: None,
+            })]
+        };
+        let clean_turn = vec![
+            StreamPart::TextStart {
+                id: "b0".into(),
+                provider_metadata: None,
+            },
+            StreamPart::TextEnd {
+                id: "b0".into(),
+                provider_metadata: None,
+            },
+        ];
+
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(EchoTool));
+
+        let hook_host = Arc::new(HookHost::new());
+        // Leak the scope so the hook stays registered for the whole turn
+        // (this fixture drives two tool-call iterations; a dropped scope would
+        // deregister the hook after the first, silently turning the second
+        // call's decision into a no-hook Allow).
+        let _id = hook_host
+            .register(
+                ext_ref("allow-always-hook"),
+                HookFilter::default(),
+                0,
+                Arc::new(FixedDecisionHook {
+                    decision: PermissionDecision::Ask,
+                    updated_input: None,
+                }),
+            )
+            .unwrap()
+            .leak();
+
+        let cfg = EngineConfig {
+            provider: MultiScriptedModel::new(vec![
+                echo_call("tc-aa-1"),
+                echo_call("tc-aa-2"),
+                clean_turn,
+            ])
+            .into_dyn(),
+            tools: Arc::new(tools),
+            hook_host,
+            storage: None,
+            turn_limits: TurnLimits::default(),
+            system_prompt: None,
+        };
+        let engine =
+            Engine::spawn_with_config(cfg).with_reply_timeout(std::time::Duration::from_secs(10));
+        let events = engine.subscribe();
+        engine
+            .start_turn(tid(thread), Vec::new(), None)
+            .await
+            .unwrap();
+        (engine, events)
+    }
+
+    /// Picking `AllowAlways` for a tool must suppress the second prompt: the
+    /// same tool's next `Ask` is auto-allowed and executes without any further
+    /// `PermissionRequested` event.
+    #[tokio::test]
+    async fn allow_always_suppresses_second_prompt() {
+        let (engine, mut events) = spawn_engine_two_echo_asks("thread:native/allow-always").await;
+
+        // Answer the FIRST PermissionRequested with allow-always.
+        let request_id = next_permission_request(&mut events)
+            .await
+            .expect("first PermissionRequested must fire");
+        engine
+            .resume_permission(
+                request_id,
+                PermissionOutcome::Selected {
+                    option_id: "allow-always".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        // From here on: the second echo must execute WITHOUT another prompt.
+        // Collect to TurnCompleted; assert two tool completions and NO second
+        // PermissionRequested.
+        let mut completed_tools = 0_usize;
+        let mut second_prompt = false;
+        let saw_turn_completed = collect_until(&mut events, 128, |ev| {
+            match ev {
+                EngineEvent::PermissionRequested { .. } => second_prompt = true,
+                EngineEvent::ItemAppended { item, .. } => {
+                    if let zhive_proto::domain::Item::ToolCall { status, .. } = item.as_ref()
+                        && *status == zhive_proto::domain::ToolCallStatus::Completed
+                    {
+                        completed_tools += 1;
+                    }
+                }
+                _ => {}
+            }
+            matches!(ev, EngineEvent::TurnCompleted { .. })
+        })
+        .await;
+
+        assert!(saw_turn_completed, "TurnCompleted must fire");
+        assert!(
+            !second_prompt,
+            "allow-always must suppress the second prompt"
+        );
+        assert_eq!(
+            completed_tools, 2,
+            "both echo calls must complete (first via allow-always grant, second auto-allowed)"
+        );
+        engine.shutdown().await.unwrap();
+    }
+
+    /// Picking `AllowOnce` must NOT persist: the same tool's next `Ask` prompts
+    /// again. This is the contrast case for `allow_always_suppresses_second_prompt`.
+    #[tokio::test]
+    async fn allow_once_still_prompts_second_time() {
+        let (engine, mut events) = spawn_engine_two_echo_asks("thread:native/allow-once").await;
+
+        // Answer the FIRST prompt with allow-once.
+        let req1 = next_permission_request(&mut events)
+            .await
+            .expect("first PermissionRequested must fire");
+        engine
+            .resume_permission(
+                req1,
+                PermissionOutcome::Selected {
+                    option_id: "allow-once".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        // A SECOND prompt MUST fire (allow-once did not persist). Answer it too
+        // so the turn can complete cleanly.
+        let req2 = next_permission_request(&mut events)
+            .await
+            .expect("second PermissionRequested must fire (allow-once does not persist)");
+        engine
+            .resume_permission(
+                req2,
+                PermissionOutcome::Selected {
+                    option_id: "allow-once".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let saw_turn_completed = collect_until(&mut events, 64, |ev| {
+            matches!(ev, EngineEvent::TurnCompleted { .. })
+        })
+        .await;
+        assert!(saw_turn_completed, "TurnCompleted must fire");
+        engine.shutdown().await.unwrap();
+    }
+
+    /// SECURITY RED LINE: a hook returning `Deny` blocks the tool even when the
+    /// reducer has the tool recorded as allow-always. Allow-always must only
+    /// downgrade an `Ask`, never override a folded `Deny`.
+    #[tokio::test]
+    async fn deny_overrides_allow_always() {
+        use llmsdk::ToolCallPart;
+
+        let script0 = vec![StreamPart::ToolCall(ToolCallPart {
+            tool_call_id: "tc-deny".into(),
+            tool_name: "echo".into(),
+            input: serde_json::json!({"msg": "deny"}),
+            provider_executed: None,
+            dynamic: None,
+            provider_options: None,
+        })];
+        let script1 = vec![
+            StreamPart::TextStart {
+                id: "b0".into(),
+                provider_metadata: None,
+            },
+            StreamPart::TextEnd {
+                id: "b0".into(),
+                provider_metadata: None,
+            },
+        ];
+
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(EchoTool));
+
+        let hook_host = Arc::new(HookHost::new());
+        let _scope = hook_host
+            .register(
+                ext_ref("deny-hook"),
+                HookFilter::default(),
+                0,
+                Arc::new(FixedDecisionHook {
+                    decision: PermissionDecision::Deny,
+                    updated_input: None,
+                }),
+            )
+            .unwrap();
+
+        let cfg = EngineConfig {
+            provider: MultiScriptedModel::new(vec![script0, script1]).into_dyn(),
+            tools: Arc::new(tools),
+            hook_host,
+            storage: None,
+            turn_limits: TurnLimits::default(),
+            system_prompt: None,
+        };
+        let engine =
+            Engine::spawn_with_config(cfg).with_reply_timeout(std::time::Duration::from_secs(10));
+
+        // Pre-record allow-always for `echo` on the SHARED reducer. The red line
+        // is that this must not relax the hook's Deny.
+        engine.permission_reducer().record_allow_always("echo");
+
+        let mut events = engine.subscribe();
+        engine
+            .start_turn(tid("thread:native/deny-aa"), Vec::new(), None)
+            .await
+            .unwrap();
+
+        let mut saw_tool_failed = false;
+        let mut saw_prompt = false;
+        let saw_turn_completed = collect_until(&mut events, 64, |ev| {
+            match ev {
+                EngineEvent::PermissionRequested { .. } => saw_prompt = true,
+                EngineEvent::ItemAppended { item, .. } => {
+                    if let zhive_proto::domain::Item::ToolCall { status, .. } = item.as_ref()
+                        && *status == zhive_proto::domain::ToolCallStatus::Failed
+                    {
+                        saw_tool_failed = true;
+                    }
+                }
+                _ => {}
+            }
+            matches!(ev, EngineEvent::TurnCompleted { .. })
+        })
+        .await;
+
+        assert!(saw_turn_completed, "TurnCompleted must fire");
+        assert!(
+            saw_tool_failed,
+            "Deny must block the tool despite allow-always (security red line)"
+        );
+        assert!(
+            !saw_prompt,
+            "Deny short-circuits before any prompt; allow-always is never consulted"
+        );
         engine.shutdown().await.unwrap();
     }
 

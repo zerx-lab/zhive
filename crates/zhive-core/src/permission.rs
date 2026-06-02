@@ -16,6 +16,11 @@
 //! * **`Cancelled` injection** — when a turn is cancelled, every
 //!   pending request resolves to [`PermissionOutcome::Cancelled`]
 //!   (ACP 0.12 schema verbatim) via [`PermissionReducer::cancel_all`].
+//! * **Allow-always memoization** — when the user picks `AllowAlways`
+//!   for a tool, its name is recorded in a per-engine, session-scoped set
+//!   (in-memory, keyed strictly by tool name). The next `Ask` for the same
+//!   tool is then downgraded to `Allow` without re-prompting. This only
+//!   relaxes calls that *would have asked*; a folded `Deny` always wins.
 //!
 //! `Defer` outcomes are surfaced verbatim; the engine actor is
 //! responsible for parking the turn until a matching
@@ -26,7 +31,8 @@ pub mod pending;
 #[doc(inline)]
 pub use pending::{InvalidRequestId, PendingPermissions, RequestKey};
 
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use thiserror::Error;
@@ -102,9 +108,25 @@ pub fn evaluate(
 }
 
 /// Coordinates `permission/request` reverse RPCs.
+///
+/// Also owns the per-engine, session-scoped **allow-always** set: when the
+/// user picks `AllowAlways` for a tool, its name is recorded here so the
+/// next [`PermissionDecision::Ask`] for the *same tool name* is downgraded
+/// to `Allow` without raising another prompt. The set is in-memory only
+/// (never persisted to disk) and keyed strictly by tool name, so it can
+/// never widen access to a tool the user did not approve.
+///
+/// `Clone` is shallow: every clone shares the same pending store **and**
+/// the same allow-always set via `Arc`, matching the reverse-RPC tracker
+/// sharing contract.
 #[derive(Debug, Clone)]
 pub struct PermissionReducer {
     pending: Arc<PendingPermissions>,
+    /// Tool names the user approved with `AllowAlways` this session.
+    ///
+    /// Shared across clones so a record made on one handle is visible to
+    /// every other handle (the engine, the reverse-RPC tracker, …).
+    allow_always: Arc<Mutex<HashSet<String>>>,
     timeout: Duration,
 }
 
@@ -120,6 +142,7 @@ impl PermissionReducer {
     pub fn new() -> Self {
         Self {
             pending: Arc::new(PendingPermissions::new()),
+            allow_always: Arc::new(Mutex::new(HashSet::new())),
             timeout: DEFAULT_PERMISSION_TIMEOUT,
         }
     }
@@ -128,6 +151,61 @@ impl PermissionReducer {
     #[must_use]
     pub fn pending(&self) -> Arc<PendingPermissions> {
         Arc::clone(&self.pending)
+    }
+
+    /// Returns `true` when `tool_name` was approved with `AllowAlways`.
+    ///
+    /// Used by the dispatch path to downgrade an [`PermissionDecision::Ask`]
+    /// to `Allow` without re-prompting. The lookup is strictly by tool
+    /// name; it never widens access to any other tool, and it has **no**
+    /// effect on a folded `Deny` (the dispatch path only consults it on the
+    /// `Ask` branch, so `Deny` always wins — see the module docs).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use zhive_core::permission::PermissionReducer;
+    /// let reducer = PermissionReducer::new();
+    /// assert!(!reducer.is_tool_allow_always("read_file"));
+    /// reducer.record_allow_always("read_file");
+    /// assert!(reducer.is_tool_allow_always("read_file"));
+    /// assert!(!reducer.is_tool_allow_always("bash"));
+    /// ```
+    #[must_use]
+    pub fn is_tool_allow_always(&self, tool_name: &str) -> bool {
+        self.lock_allow_always().contains(tool_name)
+    }
+
+    /// Records that the user approved `tool_name` with `AllowAlways`.
+    ///
+    /// The record is session-scoped and in-memory; subsequent
+    /// [`PermissionDecision::Ask`] checks for the same tool name are
+    /// downgraded to `Allow`. Calling this twice for the same name is a
+    /// no-op (set semantics). It never affects any other tool name.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use zhive_core::permission::PermissionReducer;
+    /// let a = PermissionReducer::new();
+    /// let b = a.clone(); // clones share one allow-always set
+    /// a.record_allow_always("edit_file");
+    /// assert!(b.is_tool_allow_always("edit_file"));
+    /// ```
+    pub fn record_allow_always(&self, tool_name: &str) {
+        self.lock_allow_always().insert(tool_name.to_owned());
+    }
+
+    /// Locks the allow-always set, recovering from a poisoned mutex.
+    ///
+    /// A poisoned mutex is the consequence of a panic in another task;
+    /// recover the inner value rather than amplify the failure into a
+    /// second panic (mirrors [`PendingPermissions`]'s lock policy).
+    fn lock_allow_always(&self) -> std::sync::MutexGuard<'_, HashSet<String>> {
+        match self.allow_always.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        }
     }
 
     /// Overrides the default reverse-RPC timeout.
@@ -376,6 +454,37 @@ mod tests {
             .resolve(RequestKey(99), PermissionOutcome::Cancelled)
             .unwrap_err();
         assert!(matches!(err, ReducerError::UnknownRequest(_)));
+    }
+
+    #[test]
+    fn allow_always_record_then_query_round_trip() {
+        let reducer = PermissionReducer::new();
+        assert!(!reducer.is_tool_allow_always("read_file"));
+        reducer.record_allow_always("read_file");
+        assert!(reducer.is_tool_allow_always("read_file"));
+        // Strictly keyed by name: a different tool stays un-allowed.
+        assert!(!reducer.is_tool_allow_always("bash"));
+    }
+
+    #[test]
+    fn allow_always_is_idempotent() {
+        let reducer = PermissionReducer::new();
+        reducer.record_allow_always("edit_file");
+        reducer.record_allow_always("edit_file");
+        assert!(reducer.is_tool_allow_always("edit_file"));
+    }
+
+    #[test]
+    fn allow_always_set_is_shared_across_clones() {
+        let original = PermissionReducer::new();
+        let clone = original.clone();
+        // A record made on the clone is visible on the original, proving
+        // both handles share the same Arc-backed set.
+        clone.record_allow_always("write_file");
+        assert!(original.is_tool_allow_always("write_file"));
+        // And vice versa.
+        original.record_allow_always("grep");
+        assert!(clone.is_tool_allow_always("grep"));
     }
 }
 

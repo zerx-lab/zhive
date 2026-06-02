@@ -6,7 +6,7 @@
 //! values.
 
 use zhive_proto::domain::{Item, ItemContent, ItemId, ItemToolCallContent, ToolCallStatus};
-use zhive_proto::permission::RequestPermissionRequest;
+use zhive_proto::permission::{PermissionOption, PermissionOptionKind, RequestPermissionRequest};
 
 use super::DispatchOutcome;
 
@@ -68,7 +68,27 @@ pub(super) fn cancelled_during_execution(
     )
 }
 
+/// Stable option id for a one-shot allow choice.
+///
+/// Hyphenated to match the rest of the codebase (the ACP bridge emits the
+/// same id). The dispatch classifier also accepts the underscore form for
+/// backward compatibility, but new requests advertise this form.
+pub(super) const OPT_ALLOW_ONCE: &str = "allow-once";
+/// Stable option id for a persistent allow choice (records allow-always).
+pub(super) const OPT_ALLOW_ALWAYS: &str = "allow-always";
+/// Stable option id for a one-shot reject choice.
+pub(super) const OPT_REJECT_ONCE: &str = "reject-once";
+/// Stable option id for a persistent reject choice.
+pub(super) const OPT_REJECT_ALWAYS: &str = "reject-always";
+
 /// Builds a minimal [`RequestPermissionRequest`] for a tool call.
+///
+/// Advertises all four ACP option kinds — `AllowOnce`, `AllowAlways`,
+/// `RejectOnce`, `RejectAlways` — so the client can persist an
+/// allow/reject decision for the tool. The dispatch path classifies the
+/// returned `option_id` structurally by [`zhive_proto::permission::PermissionOptionKind`]
+/// (never by string prefix) and records allow-always on the reducer when
+/// the user picks `AllowAlways`.
 ///
 /// # Errors
 ///
@@ -81,7 +101,9 @@ pub(super) fn build_permission_request(
     tool_name: &str,
 ) -> Result<RequestPermissionRequest, serde_json::Error> {
     // RequestPermissionRequest and PermissionOption are #[non_exhaustive];
-    // use JSON construction to stay future-safe.
+    // use JSON construction to stay future-safe. `PermissionOptionKind`
+    // serializes with its variant names verbatim (no rename_all), so the
+    // "AllowOnce" / "AllowAlways" / … strings below are the wire form.
     serde_json::from_value(serde_json::json!({
         "threadId": thread_id_str,
         "resourceType": "tool",
@@ -89,17 +111,116 @@ pub(super) fn build_permission_request(
         "reason": format!("agent wants to call tool: {tool_name}"),
         "options": [
             {
-                "id": "allow_once",
+                "id": OPT_ALLOW_ONCE,
                 "kind": "AllowOnce",
-                "description": "Allow once"
+                "description": "Allow once / 允许一次"
             },
             {
-                "id": "reject_once",
+                "id": OPT_ALLOW_ALWAYS,
+                "kind": "AllowAlways",
+                "description": "Always allow this tool / 始终允许此工具"
+            },
+            {
+                "id": OPT_REJECT_ONCE,
                 "kind": "RejectOnce",
-                "description": "Reject"
+                "description": "Reject once / 拒绝一次"
+            },
+            {
+                "id": OPT_REJECT_ALWAYS,
+                "kind": "RejectAlways",
+                "description": "Always reject this tool / 始终拒绝此工具"
             }
         ]
     }))
+}
+
+/// Classifies a selected `option_id` into its [`PermissionOptionKind`].
+///
+/// Resolution order, picking the first that matches:
+///
+/// 1. The kind of the matching option in `options` (the authoritative
+///    source — what the request actually advertised).
+/// 2. A fallback mapping of the well-known stable ids, tolerant of both
+///    the hyphenated (`allow-always`) and underscored (`allow_always`)
+///    forms, so clients/tests that echo a legacy id still classify.
+///
+/// Returns `None` when the id matches neither, signalling the dispatch
+/// path to deny conservatively (an unrecognised choice is never an
+/// implicit allow).
+///
+/// This is the structural replacement for the former
+/// `option_id.starts_with("allow")` string-prefix heuristic: classification
+/// is driven by [`PermissionOptionKind`], so a tool named, e.g.,
+/// `allow_dangerous` can never be mistaken for an allow vote.
+pub(super) fn classify_option_id(
+    options: &[PermissionOption],
+    option_id: &str,
+) -> Option<PermissionOptionKind> {
+    if let Some(opt) = options.iter().find(|o| o.id == option_id) {
+        return Some(opt.kind);
+    }
+    match option_id {
+        OPT_ALLOW_ONCE | "allow_once" => Some(PermissionOptionKind::AllowOnce),
+        OPT_ALLOW_ALWAYS | "allow_always" => Some(PermissionOptionKind::AllowAlways),
+        OPT_REJECT_ONCE | "reject_once" => Some(PermissionOptionKind::RejectOnce),
+        OPT_REJECT_ALWAYS | "reject_always" => Some(PermissionOptionKind::RejectAlways),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn options() -> Vec<PermissionOption> {
+        build_permission_request("thread:native/t", "read_file")
+            .expect("request fixture")
+            .options
+    }
+
+    #[test]
+    fn build_request_advertises_all_four_kinds() {
+        let opts = options();
+        let kinds: Vec<PermissionOptionKind> = opts.iter().map(|o| o.kind).collect();
+        assert!(kinds.contains(&PermissionOptionKind::AllowOnce));
+        assert!(kinds.contains(&PermissionOptionKind::AllowAlways));
+        assert!(kinds.contains(&PermissionOptionKind::RejectOnce));
+        assert!(kinds.contains(&PermissionOptionKind::RejectAlways));
+    }
+
+    #[test]
+    fn classify_uses_advertised_option_kind() {
+        let opts = options();
+        assert_eq!(
+            classify_option_id(&opts, OPT_ALLOW_ALWAYS),
+            Some(PermissionOptionKind::AllowAlways)
+        );
+        assert_eq!(
+            classify_option_id(&opts, OPT_REJECT_ONCE),
+            Some(PermissionOptionKind::RejectOnce)
+        );
+    }
+
+    #[test]
+    fn classify_falls_back_to_legacy_underscore_ids() {
+        // Empty option set forces the fallback path; legacy underscore ids
+        // (used by older clients and existing tests) must still classify.
+        assert_eq!(
+            classify_option_id(&[], "allow_once"),
+            Some(PermissionOptionKind::AllowOnce)
+        );
+        assert_eq!(
+            classify_option_id(&[], "reject_always"),
+            Some(PermissionOptionKind::RejectAlways)
+        );
+    }
+
+    #[test]
+    fn classify_unknown_id_is_none() {
+        // A tool-name-looking id must NOT be mistaken for an allow vote.
+        assert_eq!(classify_option_id(&[], "allow_dangerous"), None);
+        assert_eq!(classify_option_id(&options(), "totally-unknown"), None);
+    }
 }
 
 // Rust guideline compliant 2026-02-21

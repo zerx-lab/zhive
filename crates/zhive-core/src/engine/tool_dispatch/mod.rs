@@ -42,7 +42,7 @@ use tracing::Instrument as _;
 use zhive_proto::domain::{Item, ItemContent, ItemId, ItemToolCallContent, ToolCallStatus, TurnId};
 use zhive_proto::hook::{ExtensionRef, HookEvent};
 use zhive_proto::permission::{
-    HookOutput, HookSpecificOutput, PermissionDecision, PermissionOutcome,
+    HookOutput, HookSpecificOutput, PermissionDecision, PermissionOptionKind, PermissionOutcome,
 };
 
 use crate::cancel::CancellationTree;
@@ -52,7 +52,9 @@ use crate::hooks::HookHost;
 use crate::permission::{PermissionReducer, evaluate};
 use crate::tools::{SubagentSpawner, ToolContext, ToolRegistry};
 
-use helpers::{blocked_outcome, build_permission_request, cancelled_during_execution};
+use helpers::{
+    blocked_outcome, build_permission_request, cancelled_during_execution, classify_option_id,
+};
 
 // ============================================================
 // DispatchOutcome
@@ -489,6 +491,24 @@ async fn resolve_tool_permission_inner(
             // `cancel_turn` drains it via `cancel_all` (→ Cancelled).
             let is_defer = matches!(decision, PermissionDecision::Defer);
 
+            // Allow-always short-circuit (Ask only). If the user previously
+            // approved this exact tool name with `AllowAlways`, downgrade the
+            // `Ask` to `Allow` without raising another prompt. Scoped strictly
+            // to the `Ask` path: `Defer` carries an explicit "suspend the turn"
+            // semantic that a prior allow-always must not silently bypass, and
+            // a folded `Deny` never reaches this arm — so allow-always can only
+            // relax a call that would otherwise have prompted, never one that
+            // was denied.
+            if !is_defer && reducer.is_tool_allow_always(tool_name) {
+                tracing::debug!(
+                    name: "zhive.permission.allow_always_hit",
+                    tool = tool_name,
+                    decision = "allow",
+                    "allow-always recorded for tool; skipping prompt"
+                );
+                return ToolResolution::Approved { args, stop_loop };
+            }
+
             // Open a `zhive.permission` span for the interactive sub-flow:
             // enroll → emit PermissionRequested → await user decision.
             //
@@ -526,6 +546,12 @@ async fn resolve_tool_permission_inner(
                     ));
                 }
             };
+            // Retain the advertised options so the selected `option_id` can be
+            // classified structurally (by `PermissionOptionKind`) once the
+            // outcome arrives. `enroll` consumes and returns the request, so
+            // clone the small option vec up front rather than reaching into the
+            // boxed event copy afterwards.
+            let options = request.options.clone();
             let (key, req, rx) = reducer.enroll(request);
 
             // Emit PermissionRequested so the client/test can answer.
@@ -587,15 +613,62 @@ async fn resolve_tool_permission_inner(
             };
 
             match outcome {
-                Ok(PermissionOutcome::Selected { option_id }) if option_id.starts_with("allow") => {
-                    // Allowed by the user — proceed to approval.
-                    perm_span.in_scope(|| {
-                        tracing::debug!(
-                            name: "zhive.permission.allowed",
-                            decision = "allow",
-                            "permission granted"
-                        );
-                    });
+                Ok(PermissionOutcome::Selected { option_id }) => {
+                    // Classify the selected option structurally by its
+                    // `PermissionOptionKind` (never by string prefix): look it
+                    // up in the advertised options, falling back to the
+                    // well-known stable ids. Allow kinds (`AllowOnce` /
+                    // `AllowAlways`) proceed; reject kinds and unrecognised ids
+                    // deny. `AllowAlways` additionally records the tool name so
+                    // future `Ask`s for it are auto-allowed.
+                    match classify_option_id(&options, &option_id) {
+                        Some(PermissionOptionKind::AllowOnce) => {
+                            perm_span.in_scope(|| {
+                                tracing::debug!(
+                                    name: "zhive.permission.allowed",
+                                    decision = "allow",
+                                    "permission granted (allow once)"
+                                );
+                            });
+                        }
+                        Some(PermissionOptionKind::AllowAlways) => {
+                            reducer.record_allow_always(tool_name);
+                            perm_span.in_scope(|| {
+                                tracing::debug!(
+                                    name: "zhive.permission.allow_always_recorded",
+                                    tool = tool_name,
+                                    decision = "allow",
+                                    "permission granted and recorded as allow-always"
+                                );
+                            });
+                        }
+                        Some(
+                            PermissionOptionKind::RejectOnce | PermissionOptionKind::RejectAlways,
+                        ) => {
+                            return ToolResolution::Blocked(blocked_outcome(
+                                item_id,
+                                tool_name,
+                                raw_args,
+                                tool_use_id,
+                                format!("permission denied by user (option: {option_id})"),
+                                stop_loop,
+                            ));
+                        }
+                        // Either an unrecognised option id (`None`) or a future
+                        // `PermissionOptionKind` variant (`#[non_exhaustive]`).
+                        // Deny conservatively: an unknown choice is never an
+                        // implicit allow.
+                        None | Some(_) => {
+                            return ToolResolution::Blocked(blocked_outcome(
+                                item_id,
+                                tool_name,
+                                raw_args,
+                                tool_use_id,
+                                format!("permission denied (unrecognised option: {option_id})"),
+                                stop_loop,
+                            ));
+                        }
+                    }
                 }
                 Ok(PermissionOutcome::Cancelled) | Err(_) => {
                     // B6 §2.1: distinguish a silent timeout (unresponsive
@@ -634,16 +707,6 @@ async fn resolve_tool_permission_inner(
                         raw_args,
                         tool_use_id,
                         "permission request cancelled or timed out".to_owned(),
-                        stop_loop,
-                    ));
-                }
-                Ok(PermissionOutcome::Selected { option_id }) => {
-                    return ToolResolution::Blocked(blocked_outcome(
-                        item_id,
-                        tool_name,
-                        raw_args,
-                        tool_use_id,
-                        format!("permission denied by user (option: {option_id})"),
                         stop_loop,
                     ));
                 }
