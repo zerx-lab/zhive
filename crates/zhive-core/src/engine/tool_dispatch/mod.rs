@@ -909,7 +909,10 @@ async fn execute_resolved_tool_inner(
     let item = Item::ToolCall {
         id: item_id,
         name: tool_name.to_owned(),
-        kind: zhive_proto::domain::ToolKind::Other,
+        // Propagate the tool's self-declared kind (Read / Edit / Execute) so
+        // UI grouping and permission policy can distinguish, e.g., a read from
+        // a shell execution. `tool` is the resolved registry entry above.
+        kind: tool.kind().into(),
         status,
         content,
         locations: vec![],

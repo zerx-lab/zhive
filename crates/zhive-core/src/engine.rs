@@ -189,6 +189,16 @@ pub struct EngineConfig {
     ///
     /// Defaults to [`TurnLimits::default`] (`Some(DEFAULT_MAX_TURN_ITERATIONS)`).
     pub turn_limits: TurnLimits,
+
+    /// Optional system prompt prepended to every provider call.
+    ///
+    /// When `Some`, the engine emits it as the leading
+    /// [`llmsdk::language_model::Message::System`] of every reconstructed
+    /// prompt. Hosts assemble this from persona, environment, and project
+    /// instructions (e.g. `AGENTS.md` / `CLAUDE.md`); the engine treats it as
+    /// opaque text. `None` (the default) sends no system message, preserving
+    /// the prior behaviour.
+    pub system_prompt: Option<Arc<str>>,
 }
 
 impl Default for EngineConfig {
@@ -200,6 +210,7 @@ impl Default for EngineConfig {
             hook_host: Arc::new(HookHost::new()),
             storage: None,
             turn_limits: TurnLimits::default(),
+            system_prompt: None,
         }
     }
 }
@@ -369,6 +380,7 @@ impl Engine {
     ///     hook_host: Arc::new(HookHost::new()),
     ///     storage: None,
     ///     turn_limits: Default::default(),
+    ///     system_prompt: None,
     /// };
     /// let engine = Engine::spawn_with_config(cfg);
     /// engine.shutdown().await.unwrap();
@@ -420,6 +432,7 @@ impl Engine {
             config.hook_host,
             config.tools,
             config.turn_limits,
+            config.system_prompt,
             maybe_tx,
             maybe_handle,
         ));
@@ -1489,6 +1502,7 @@ mod inc3_tests {
             hook_host: Arc::new(HookHost::new()),
             storage: None,
             turn_limits: TurnLimits::default(),
+            system_prompt: None,
         };
         let engine =
             Engine::spawn_with_config(cfg).with_reply_timeout(std::time::Duration::from_secs(5));
@@ -1591,6 +1605,7 @@ mod inc3_tests {
             hook_host: Arc::new(HookHost::new()),
             storage: None,
             turn_limits: TurnLimits::default(),
+            system_prompt: None,
         };
         let engine =
             Engine::spawn_with_config(cfg).with_reply_timeout(std::time::Duration::from_secs(5));
@@ -1690,6 +1705,7 @@ mod inc3_tests {
             hook_host,
             storage: None,
             turn_limits: TurnLimits::default(),
+            system_prompt: None,
         };
         let engine =
             Engine::spawn_with_config(cfg).with_reply_timeout(std::time::Duration::from_secs(5));
@@ -1786,6 +1802,7 @@ mod inc3_tests {
             hook_host,
             storage: None,
             turn_limits: TurnLimits::default(),
+            system_prompt: None,
         };
         let engine =
             Engine::spawn_with_config(cfg).with_reply_timeout(std::time::Duration::from_secs(5));
@@ -1866,6 +1883,7 @@ mod inc3_tests {
             hook_host,
             storage: None,
             turn_limits: TurnLimits::default(),
+            system_prompt: None,
         };
         let engine =
             Engine::spawn_with_config(cfg).with_reply_timeout(std::time::Duration::from_secs(10));
@@ -1974,6 +1992,7 @@ mod inc3_tests {
             hook_host,
             storage: None,
             turn_limits: TurnLimits::default(),
+            system_prompt: None,
         };
         let engine =
             Engine::spawn_with_config(cfg).with_reply_timeout(std::time::Duration::from_secs(10));
@@ -2180,6 +2199,7 @@ mod inc3_tests {
             turn_limits: TurnLimits {
                 max_iterations: Some(4),
             },
+            system_prompt: None,
         };
         let engine =
             Engine::spawn_with_config(cfg).with_reply_timeout(std::time::Duration::from_secs(60));
@@ -2243,6 +2263,7 @@ mod inc3_tests {
             hook_host: Arc::new(HookHost::new()),
             storage: None,
             turn_limits: TurnLimits::default(),
+            system_prompt: None,
         };
         let engine =
             Engine::spawn_with_config(cfg).with_reply_timeout(std::time::Duration::from_secs(5));
@@ -2317,6 +2338,7 @@ mod inc3_tests {
             hook_host: Arc::new(HookHost::new()),
             storage: None,
             turn_limits: TurnLimits::default(),
+            system_prompt: None,
         };
         let engine =
             Engine::spawn_with_config(cfg).with_reply_timeout(std::time::Duration::from_secs(10));
@@ -3109,6 +3131,7 @@ mod inc5_tests {
             hook_host: Arc::new(crate::hooks::HookHost::new()),
             storage: Some(Arc::clone(&storage)),
             turn_limits: TurnLimits::default(),
+            system_prompt: None,
         };
 
         let engine =
@@ -3246,6 +3269,7 @@ mod inc5_tests {
             hook_host: Arc::new(crate::hooks::HookHost::new()),
             storage: Some(Arc::clone(&storage)),
             turn_limits: TurnLimits::default(),
+            system_prompt: None,
         };
         let engine =
             Engine::spawn_with_config(cfg).with_reply_timeout(std::time::Duration::from_secs(10));
@@ -3383,6 +3407,7 @@ mod inc5_tests {
             hook_host: Arc::new(crate::hooks::HookHost::new()),
             storage: Some(Arc::clone(&storage)),
             turn_limits: TurnLimits::default(),
+            system_prompt: None,
         };
         let engine =
             Engine::spawn_with_config(cfg).with_reply_timeout(std::time::Duration::from_secs(10));
@@ -4157,6 +4182,7 @@ mod inc6_tests {
             hook_host: Arc::new(crate::hooks::HookHost::new()),
             storage: Some(Arc::clone(&storage)),
             turn_limits: TurnLimits::default(),
+            system_prompt: None,
         };
         let engine =
             Engine::spawn_with_config(cfg).with_reply_timeout(std::time::Duration::from_secs(10));

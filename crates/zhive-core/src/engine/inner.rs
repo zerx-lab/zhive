@@ -104,6 +104,11 @@ pub(crate) struct EngineInner {
     pub(in crate::engine) tools: Arc<ToolRegistry>,
     /// Per-turn iteration limit applied by [`super::turn::run_turn`].
     turn_limits: super::TurnLimits,
+    /// Optional system prompt prepended to every provider call.
+    ///
+    /// Cloned cheaply (`Arc`) into each [`super::prompt::build_call_options`]
+    /// call; see [`super::EngineConfig::system_prompt`].
+    system_prompt: Option<Arc<str>>,
     /// Engine-wide cancellation hierarchy.
     ///
     /// The root token represents engine shutdown.  Each turn gets a child
@@ -139,16 +144,22 @@ impl EngineInner {
             super::TurnLimits::default(),
             None,
             None,
+            None,
         )
     }
 
     /// Full constructor used by [`super::Engine::spawn_with_config`].
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "constructor mirrors EngineConfig fields; a builder would add more complexity"
+    )]
     pub(crate) fn new_with_hooks_tools_storage(
         events_tx: broadcast::Sender<EngineEvent>,
         provider: DynLanguageModel,
         hook_host: Arc<HookHost>,
         tools: Arc<ToolRegistry>,
         turn_limits: super::TurnLimits,
+        system_prompt: Option<Arc<str>>,
         storage_tx: Option<mpsc::Sender<StorageWriteOp>>,
         storage_handle: Option<JoinHandle<()>>,
     ) -> Self {
@@ -162,6 +173,7 @@ impl EngineInner {
             hook_host,
             tools,
             turn_limits,
+            system_prompt,
             cancel_tree: CancellationTree::new(),
             storage_writer: Mutex::new(StorageWriterState {
                 tx: storage_tx,
@@ -194,6 +206,11 @@ impl EngineInner {
     /// Returns the tool registry for sibling modules.
     pub(in crate::engine) fn tools(&self) -> &Arc<ToolRegistry> {
         &self.tools
+    }
+
+    /// Returns the configured system prompt for sibling modules, if any.
+    pub(in crate::engine) fn system_prompt(&self) -> Option<&str> {
+        self.system_prompt.as_deref()
     }
 
     /// Returns the effective per-turn iteration cap for [`super::turn`].

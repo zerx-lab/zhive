@@ -299,6 +299,10 @@ impl App {
     }
 
     /// Key handling on the conversation screen.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "exhaustive key-dispatch table; splitting it would harm readability"
+    )]
     fn on_conversation_key(&mut self, key: KeyEvent) -> Action {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
@@ -361,6 +365,14 @@ impl App {
                 self.input.delete();
                 Action::None
             }
+            KeyCode::Left if ctrl => {
+                self.input.move_word_left();
+                Action::None
+            }
+            KeyCode::Right if ctrl => {
+                self.input.move_word_right();
+                Action::None
+            }
             KeyCode::Left => {
                 self.input.move_left();
                 Action::None
@@ -377,21 +389,37 @@ impl App {
                 self.input.move_end();
                 Action::None
             }
+            // ↑ / PageUp: try history first (single-line input), else scrollback.
             KeyCode::Up | KeyCode::PageUp => {
                 let step = if matches!(key.code, KeyCode::PageUp) {
                     5
                 } else {
                     1
                 };
+                if !matches!(key.code, KeyCode::PageUp)
+                    && !palette
+                    && self.input.should_history_navigate()
+                    && self.input.history_prev()
+                {
+                    return Action::None;
+                }
                 self.scrollback = self.scrollback.saturating_add(step);
                 Action::None
             }
+            // ↓ / PageDown: try history first, else scrollback.
             KeyCode::Down | KeyCode::PageDown => {
                 let step = if matches!(key.code, KeyCode::PageDown) {
                     5
                 } else {
                     1
                 };
+                if !matches!(key.code, KeyCode::PageDown)
+                    && !palette
+                    && self.input.should_history_navigate()
+                    && self.input.history_next()
+                {
+                    return Action::None;
+                }
                 self.scrollback = self.scrollback.saturating_sub(step);
                 Action::None
             }
@@ -405,6 +433,8 @@ impl App {
             return Action::None;
         }
         let text = self.input.take();
+        // Push to history before routing, so every submitted text is captured.
+        self.input.push_history(&text);
         if let Some(cmd) = text.strip_prefix('/') {
             return self.run_slash(cmd);
         }

@@ -224,7 +224,7 @@ async fn run_turn_inner(
 
         // 1. Build the prompt by reconstructing it from the thread's item tail
         //    (the single source of truth; see `build_call_options`).
-        let call_options = build_call_options(&handle, inner.tools()).await;
+        let call_options = build_call_options(&handle, inner.tools(), inner.system_prompt()).await;
 
         // 2. Call the provider, racing against the per-turn cancel token.
         //

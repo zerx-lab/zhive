@@ -37,7 +37,7 @@ pub use theme::{Accent, Density, Theme};
 
 use std::time::Duration;
 
-use crossterm::event::{Event, EventStream, KeyEventKind};
+use crossterm::event::{Event, EventStream, KeyEventKind, MouseEventKind};
 use futures::StreamExt;
 use zhive_client_native::{Client, ClientEvent};
 
@@ -118,7 +118,19 @@ async fn event_loop(
                     perform(client, app, action, &cmd_tx);
                 }
                 Some(Ok(Event::Paste(text))) => app.input.insert_str(&text),
-                Some(Ok(_)) => {}            // resize / focus / mouse: redraw next loop
+                Some(Ok(Event::Mouse(mouse))) => {
+                    // Scroll wheel adjusts the transcript scrollback.
+                    match mouse.kind {
+                        MouseEventKind::ScrollUp => {
+                            app.scrollback = app.scrollback.saturating_add(3);
+                        }
+                        MouseEventKind::ScrollDown => {
+                            app.scrollback = app.scrollback.saturating_sub(3);
+                        }
+                        _ => {} // clicks / moves: redraw next loop
+                    }
+                }
+                Some(Ok(_)) => {}            // resize / focus: redraw next loop
                 Some(Err(err)) => {
                     app.flash = Some(format!("input error: {err}"));
                 }

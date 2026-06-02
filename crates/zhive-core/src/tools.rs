@@ -534,4 +534,11 @@ mod tests {
     }
 }
 
+/// Built-in coding tools (read / write / edit / grep / glob / ls / bash).
+///
+/// Gated behind the `tools` feature so consumers that inject their own tools
+/// do not pull in `ignore` / `regex` / `glob`.
+#[cfg(feature = "tools")]
+pub mod builtin;
+
 // Rust guideline compliant 2026-02-21

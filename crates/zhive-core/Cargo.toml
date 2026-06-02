@@ -17,17 +17,18 @@ workspace = true
 #   * `sandbox`     -> Landlock / Seatbelt / Job Object adapters (Phase 3)
 #   * `skills`      -> on-disk Agent-Skills discovery (SKILL.md loader). Gated
 #                      so pure-engine consumers do not compile the YAML parser.
+#   * `tools`       -> built-in coding tools (read/write/edit/grep/glob/ls/bash).
+#                      Gated so a host that injects its own tools does not pull
+#                      `ignore` / `regex` / `glob`.
 [features]
 default = []
 sandbox = []
 skills  = ["dep:serde_norway"]
+tools   = ["dep:ignore", "dep:regex", "dep:glob"]
 
 [dependencies]
 zhive-proto = { workspace = true }
-
-# `io-std` adds tokio::io::{stdin, stdout} for the stdio transport in
-# `crate::server::transport`; the rest stays at the workspace defaults.
-tokio       = { workspace = true, features = ["io-std"] }
+tokio = { workspace = true, features = ["io-std", "process"] }
 tokio-util  = { workspace = true }
 async-trait = { workspace = true }
 futures     = { workspace = true }
@@ -54,6 +55,13 @@ tracing-opentelemetry = { workspace = true }
 opentelemetry         = { workspace = true }
 opentelemetry_sdk     = { workspace = true }
 serde_norway = { version = "0.9.42", optional = true }
+
+# Built-in coding tools (read / write / edit / grep / glob / ls / bash) behind
+# the `tools` feature. `ignore` + `regex` + `glob` were user-approved
+# 2026-06-02; see the workspace manifest for rationale.
+ignore = { workspace = true, optional = true }
+regex  = { workspace = true, optional = true }
+glob   = { workspace = true, optional = true }
 
 # Safe syscall wrappers; only the UDS fallback path uses
 # `rustix::process::getuid` to compose `/tmp/zhive-<uid>.sock` without

@@ -50,11 +50,20 @@ use crate::state::ThreadHandle;
 /// optional fields (`max_output_tokens`, `temperature`, …) stay `None`, so
 /// provider defaults apply.
 ///
+/// When `system_prompt` is `Some` and non-empty, it is prepended as the
+/// leading [`llmsdk::language_model::Message::System`] so the provider applies
+/// it to the whole conversation; an empty or `None` system prompt is omitted.
+///
 /// This function is crate-internal (`pub(in crate::engine)`).
 /// See the `#[cfg(test)]` block in this file for usage examples.
+#[expect(
+    clippy::too_many_lines,
+    reason = "single-pass message assembly; refactoring into smaller fns would scatter the protocol logic"
+)]
 pub(in crate::engine) async fn build_call_options(
     handle: &ThreadHandle,
     tools: &crate::tools::ToolRegistry,
+    system_prompt: Option<&str>,
 ) -> llmsdk::language_model::CallOptions {
     use llmsdk::language_model::{
         AssistantPart, Message, TextPart, ToolCallPart, ToolMessagePart, ToolResultOutput,
@@ -63,7 +72,18 @@ pub(in crate::engine) async fn build_call_options(
     use zhive_proto::domain::ToolCallStatus;
 
     let tail = handle.items_tail.read().await;
-    let mut prompt: Vec<Message> = Vec::with_capacity(tail.len());
+    // Reserve room for the optional leading system message plus one entry per
+    // item (tool-call items expand to two, but this is only a hint).
+    let mut prompt: Vec<Message> = Vec::with_capacity(tail.len() + 1);
+
+    // The system instruction, when configured, must be the first message so a
+    // provider applies it to the whole conversation.
+    if let Some(system) = system_prompt.filter(|s| !s.is_empty()) {
+        prompt.push(Message::System {
+            content: system.to_owned(),
+            provider_options: None,
+        });
+    }
 
     for item in tail.iter() {
         match item {
@@ -101,7 +121,7 @@ pub(in crate::engine) async fn build_call_options(
             Item::ToolCall {
                 id,
                 name,
-                status: ToolCallStatus::Completed | ToolCallStatus::Failed,
+                status: status @ (ToolCallStatus::Completed | ToolCallStatus::Failed),
                 content,
                 raw_input,
                 raw_output,
@@ -135,14 +155,26 @@ pub(in crate::engine) async fn build_call_options(
                     provider_options: None,
                 });
 
+                // A failed tool call is sent back as `ErrorText` so providers
+                // that distinguish error results (Anthropic's `is_error: true`)
+                // see the failure instead of treating it as a normal result.
+                let result_value = tool_result_text(content, raw_output.as_ref());
+                let output = if matches!(status, ToolCallStatus::Failed) {
+                    ToolResultOutput::ErrorText {
+                        value: result_value,
+                        provider_options: None,
+                    }
+                } else {
+                    ToolResultOutput::Text {
+                        value: result_value,
+                        provider_options: None,
+                    }
+                };
                 prompt.push(Message::Tool {
                     content: vec![ToolMessagePart::ToolResult(ToolResultPart {
                         tool_call_id,
                         tool_name: name.clone(),
-                        output: ToolResultOutput::Text {
-                            value: tool_result_text(content, raw_output.as_ref()),
-                            provider_options: None,
-                        },
+                        output,
                         provider_options: None,
                     })],
                     provider_options: None,
@@ -311,7 +343,7 @@ mod tests {
             .push_item(completed_tool_call("item:2", "toolu_C", "echo", "rC"))
             .await;
 
-        let opts = build_call_options(&handle, &crate::tools::ToolRegistry::new()).await;
+        let opts = build_call_options(&handle, &crate::tools::ToolRegistry::new(), None).await;
 
         let mut pairs: Vec<(String, String, String)> = Vec::new();
         let msgs = &opts.prompt;
@@ -386,7 +418,7 @@ mod tests {
             })
             .await;
 
-        let opts = build_call_options(&handle, &crate::tools::ToolRegistry::new()).await;
+        let opts = build_call_options(&handle, &crate::tools::ToolRegistry::new(), None).await;
         assert_eq!(opts.prompt.len(), 2, "one Assistant + one Tool message");
 
         let use_id = match &opts.prompt[0] {
@@ -433,18 +465,19 @@ mod tests {
             })
             .await;
 
-        let opts = build_call_options(&handle, &crate::tools::ToolRegistry::new()).await;
+        let opts = build_call_options(&handle, &crate::tools::ToolRegistry::new(), None).await;
         assert_eq!(opts.prompt.len(), 2, "failed call still yields a pair");
         match (&opts.prompt[0], &opts.prompt[1]) {
             (Message::Assistant { .. }, Message::Tool { content, .. }) => {
                 let ToolMessagePart::ToolResult(tr) = content.first().expect("result part") else {
                     panic!("expected ToolResult");
                 };
+                // A Failed tool call must serialize as ErrorText (is_error).
                 match &tr.output {
-                    ToolResultOutput::Text { value, .. } => {
+                    ToolResultOutput::ErrorText { value, .. } => {
                         assert_eq!(value, "permission denied");
                     }
-                    other => panic!("expected Text output, got {other:?}"),
+                    other => panic!("expected ErrorText output, got {other:?}"),
                 }
             }
             other => panic!("expected (Assistant, Tool) pair, got {other:?}"),
@@ -472,9 +505,51 @@ mod tests {
             })
             .await;
 
-        let opts = build_call_options(&handle, &crate::tools::ToolRegistry::new()).await;
+        let opts = build_call_options(&handle, &crate::tools::ToolRegistry::new(), None).await;
         assert_eq!(opts.prompt.len(), 1);
         assert!(matches!(opts.prompt[0], Message::User { .. }));
+    }
+
+    /// A non-empty `system_prompt` becomes the leading `Message::System`,
+    /// ahead of the reconstructed conversation; `None`/empty adds nothing.
+    #[tokio::test]
+    async fn build_call_options_prepends_system_prompt() {
+        let handle = ThreadHandle::new_idle(ThreadId(Arc::from("thread:native/sys")));
+        handle.push_item(user_msg("item:u0", "hi")).await;
+
+        // With a system prompt: it is the first message, before the user turn.
+        let with_sys = build_call_options(
+            &handle,
+            &crate::tools::ToolRegistry::new(),
+            Some("You are zhive."),
+        )
+        .await;
+        assert!(
+            matches!(&with_sys.prompt[0], Message::System { content, .. } if content == "You are zhive."),
+            "system prompt must be the leading message"
+        );
+        assert!(matches!(with_sys.prompt[1], Message::User { .. }));
+
+        // Without a system prompt (None): no System message is emitted.
+        let no_sys = build_call_options(&handle, &crate::tools::ToolRegistry::new(), None).await;
+        assert!(
+            !no_sys
+                .prompt
+                .iter()
+                .any(|m| matches!(m, Message::System { .. })),
+            "None system prompt must emit no System message"
+        );
+
+        // An empty system prompt is treated like None.
+        let empty_sys =
+            build_call_options(&handle, &crate::tools::ToolRegistry::new(), Some("")).await;
+        assert!(
+            !empty_sys
+                .prompt
+                .iter()
+                .any(|m| matches!(m, Message::System { .. })),
+            "empty system prompt must emit no System message"
+        );
     }
 
     /// A non-empty registry advertises each tool as a `Tool::Function` and
@@ -491,7 +566,7 @@ mod tests {
         let mut reg = ToolRegistry::new();
         reg.register(Arc::new(EchoTool));
 
-        let opts = build_call_options(&handle, &reg).await;
+        let opts = build_call_options(&handle, &reg, None).await;
 
         let tools = opts.tools.expect("registered tools must be advertised");
         assert_eq!(tools.len(), 1, "exactly one tool advertised");

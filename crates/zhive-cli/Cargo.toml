@@ -26,7 +26,8 @@ default      = ["tui", "serve", "bridge-stdio", "mcp", "acp", "skills"]
 # The in-process engine plus the Anthropic/OpenAI provider builders. Pulled
 # in by both `tui` and `serve`; `bridge-stdio` deliberately omits it because
 # it only pipes bytes to an already-running engine socket (D-002 / D-004).
-engine       = ["dep:zhive-core", "dep:llmsdk"]
+# `zhive-core/tools` enables the built-in coding tools registered in `boot`.
+engine       = ["dep:zhive-core", "dep:llmsdk", "zhive-core/tools"]
 tui          = ["engine", "dep:zhive-tui"]
 serve        = ["engine"]
 bridge-stdio = ["dep:zhive-bridge-stdio"]

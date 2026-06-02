@@ -363,6 +363,7 @@ mod span_emission_tests {
             hook_host: Arc::new(HookHost::new()),
             storage: None,
             turn_limits: TurnLimits::default(),
+            system_prompt: None,
         };
         let engine = Engine::spawn_with_config(cfg);
 

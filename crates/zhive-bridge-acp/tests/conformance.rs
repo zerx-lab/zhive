@@ -608,6 +608,7 @@ fn scripted_tool_call_engine(decision: PermissionDecision) -> Engine {
         hook_host,
         storage: None,
         turn_limits: TurnLimits::default(),
+        system_prompt: None,
     };
     Engine::spawn_with_config(cfg)
 }

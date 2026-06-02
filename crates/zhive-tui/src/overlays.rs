@@ -46,13 +46,15 @@ fn hint_row(key: &str, desc: &str, p: &Palette) -> Line<'static> {
 /// Renders the help overlay (keybindings and commands).
 fn render_help(frame: &mut Frame, app: &App, area: Rect) {
     let p = &app.palette;
-    let popup = area.centered(Constraint::Length(54), Constraint::Length(14));
+    let popup = area.centered(Constraint::Length(58), Constraint::Length(16));
     let inner = open_popup(frame, popup, "⌘ help", p);
     let lines = vec![
         hint_row("↵", "send message", p),
         hint_row("⌥↵ / ⌃J", "insert newline", p),
         hint_row("esc", "interrupt the running turn", p),
-        hint_row("↑↓ / PgUp PgDn", "scroll transcript", p),
+        hint_row("↑↓ (single-line)", "browse input history", p),
+        hint_row("PgUp PgDn", "scroll transcript", p),
+        hint_row("⌃← ⌃→", "word-left / word-right", p),
         hint_row("/clear", "start a fresh thread", p),
         hint_row("/compact", "summarize the conversation", p),
         hint_row("/theme, /accent", "restyle the UI", p),
@@ -110,10 +112,25 @@ fn render_settings(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(Text::from(lines)), inner);
 }
 
+/// Computes the approval popup height from the number of options.
+///
+/// Base rows: title + reason + blank + footer + blank + key-hint = 6.
+/// Each option adds one row.  A minimum of 8 rows keeps the panel readable;
+/// there is no hard cap — tall option lists render fully without clipping.
+fn approval_height(option_count: usize) -> u16 {
+    /// Rows for the fixed header and footer of the approval panel.
+    const APPROVAL_FIXED_ROWS: u16 = 6;
+    /// Minimum total height so the panel is always readable.
+    const APPROVAL_MIN_HEIGHT: u16 = 8;
+    let rows = APPROVAL_FIXED_ROWS.saturating_add(u16::try_from(option_count).unwrap_or(u16::MAX));
+    rows.max(APPROVAL_MIN_HEIGHT)
+}
+
 /// Renders the destructive-operation approval overlay (warn-bordered).
 fn render_approval(frame: &mut Frame, app: &App, area: Rect, request: &RequestPermissionRequest) {
     let p = &app.palette;
-    let popup = area.centered(Constraint::Percentage(70), Constraint::Length(12));
+    let height = approval_height(request.options.len());
+    let popup = area.centered(Constraint::Percentage(70), Constraint::Length(height));
     frame.render_widget(Clear, popup);
     let block = widgets::panel_rounded("⚠ approval required", None, true, p)
         .border_style(Style::new().fg(p.warn));

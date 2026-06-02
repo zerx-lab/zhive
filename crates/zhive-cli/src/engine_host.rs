@@ -61,8 +61,9 @@ impl Host {
             provider,
             tools: std::sync::Arc::clone(&runtime.registry),
             hook_host: std::sync::Arc::new(HookHost::new()),
-            storage: None,
+            storage: runtime.storage.clone(),
             turn_limits: runtime.turn_limits,
+            system_prompt: Some(std::sync::Arc::clone(&runtime.system_prompt)),
         });
         let mut router = Router::new();
         register_engine_handlers(&mut router, engine.clone());

@@ -94,6 +94,14 @@ jsonschema = { version = "0.46", default-features = false }
 # ---- safe syscall wrappers (B4: UDS fallback path avoids unsafe libc::getuid) ----
 rustix = { version = "1", default-features = false, features = ["process", "std"] }
 
+# ---- built-in coding tools (grep / glob / ls / edit) — user-approved 2026-06-02 ----
+# `ignore` walks directories honouring .gitignore (grep / glob / ls tools);
+# `regex` powers the grep tool's content matching; `glob` matches path
+# patterns for the glob tool. Consumed only by `zhive-core::tools::builtin`.
+ignore = "0.4.25"
+regex  = "1.12.3"
+glob   = "0.3.3"
+
 # ---- tracing + OpenTelemetry (D-014 revised 2026-05-28: OTel ships in
 #      Phase 1 per user decision). Field names follow OTel semantic
 #      conventions (thread.id, turn.id, tool.name, …) so attaching an

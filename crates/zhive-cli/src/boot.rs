@@ -31,6 +31,12 @@ pub struct RuntimeTools {
     pub registry: Arc<ToolRegistry>,
     /// Per-turn iteration cap resolved from the `[engine]` config section.
     pub turn_limits: TurnLimits,
+    /// System prompt assembled by [`crate::system_prompt`], ready to hand to
+    /// `EngineConfig::system_prompt`.
+    pub system_prompt: Arc<str>,
+    /// Persistent storage for the engine, or `None` when it could not be
+    /// opened (the engine then runs purely in-memory). See [`open_storage`].
+    pub storage: Option<Arc<zhive_core::persistence::Storage>>,
     /// Live MCP manager whose tools were registered, if any.
     #[cfg(feature = "mcp")]
     pub mcp: Option<zhive_mcp::McpManager>,
@@ -62,13 +68,13 @@ impl RuntimeTools {
 
 /// Builds the engine runtime tools from `cfg`.
 ///
-/// Starts from an empty registry — no demo tools are advertised to the model by
-/// default (the built-in `EchoTool` is a test fixture; advertising it makes a
-/// real model call it for no reason). When the `mcp` feature is enabled and
-/// `[mcp.servers]` is non-empty, connects to every server in parallel and
-/// registers their tools (failing servers are skipped with a warning by the
-/// manager). When the `skills` feature is enabled and `[skills].enabled` is
-/// true, discovers on-disk skills and registers the model-invocable ones.
+/// Registers the built-in coding tools (read/write/edit/grep/glob/ls/bash) as
+/// the base layer so the engine is usable out of the box. When the `mcp`
+/// feature is enabled and `[mcp.servers]` is non-empty, connects to every
+/// server in parallel and registers their tools (failing servers are skipped
+/// with a warning by the manager). When the `skills` feature is enabled and
+/// `[skills].enabled` is true, discovers on-disk skills and registers the
+/// model-invocable ones. MCP and skill tools may override built-ins by name.
 ///
 /// # Errors
 ///
@@ -97,16 +103,15 @@ impl RuntimeTools {
     )
 )]
 pub async fn build_runtime(cfg: &Config) -> anyhow::Result<RuntimeTools> {
-    // Real tools come from MCP servers and on-disk skills; the registry starts
-    // empty so no demo tool is advertised to the model.
-    #[cfg_attr(
-        not(any(feature = "mcp", feature = "skills")),
-        expect(
-            unused_mut,
-            reason = "registry is only mutated when the mcp or skills feature populates it"
-        )
-    )]
     let mut registry = ToolRegistry::new();
+
+    // The built-in coding tools (read/write/edit/grep/glob/ls/bash) are the
+    // base layer that makes the engine usable out of the box. MCP server tools
+    // and on-disk skills are layered on afterwards and may override by name.
+    zhive_core::tools::builtin::register_builtins(
+        &mut registry,
+        &zhive_core::tools::builtin::BuiltinToolsConfig::default(),
+    );
 
     #[cfg(feature = "mcp")]
     let mcp = build_mcp(cfg, &mut registry).await;
@@ -114,12 +119,81 @@ pub async fn build_runtime(cfg: &Config) -> anyhow::Result<RuntimeTools> {
     #[cfg(feature = "skills")]
     register_skills(cfg, &mut registry);
 
+    // The system prompt is a host (process) concern: it folds in the working
+    // directory and the project's instruction file. A failed `current_dir`
+    // (e.g. the directory was removed) degrades to ".".
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let system_prompt = crate::system_prompt::assemble(&cwd);
+
+    // Open persistent storage so threads, turns, and items survive restarts
+    // (D-011). Best-effort: a failure degrades to an in-memory engine.
+    let storage = open_storage().await;
+
     Ok(RuntimeTools {
         registry: Arc::new(registry),
         turn_limits: turn_limits_from(cfg),
+        system_prompt,
+        storage,
         #[cfg(feature = "mcp")]
         mcp,
     })
+}
+
+/// Opens persistent engine storage under the user data directory.
+///
+/// Returns `None` (the engine then runs in-memory) when the data directory
+/// cannot be resolved or the databases cannot be opened, logging a warning —
+/// persistence is best-effort and must never block startup.
+async fn open_storage() -> Option<Arc<zhive_core::persistence::Storage>> {
+    let Some(base) = data_dir() else {
+        tracing::warn!(
+            name: "zhive.storage.no_data_dir",
+            "no data directory (set $HOME or $XDG_DATA_HOME); running in-memory"
+        );
+        return None;
+    };
+    match zhive_core::persistence::Storage::open(&base).await {
+        Ok(storage) => {
+            tracing::info!(
+                name: "zhive.storage.opened",
+                path = %base.display(),
+                "storage.opened: persistent storage at {{path}}"
+            );
+            Some(Arc::new(storage))
+        }
+        Err(err) => {
+            tracing::warn!(
+                name: "zhive.storage.open_failed",
+                path = %base.display(),
+                error = %err,
+                "storage open failed; running in-memory"
+            );
+            None
+        }
+    }
+}
+
+/// Resolves the zhive data directory from the environment.
+///
+/// Honours `$ZHIVE_DATA_DIR`, then `$XDG_DATA_HOME/zhive`, then
+/// `$HOME/.local/share/zhive`. Returns `None` when none can be resolved.
+fn data_dir() -> Option<std::path::PathBuf> {
+    use std::path::PathBuf;
+    if let Some(explicit) = std::env::var_os("ZHIVE_DATA_DIR") {
+        return Some(PathBuf::from(explicit));
+    }
+    if let Some(xdg) = std::env::var_os("XDG_DATA_HOME")
+        && !xdg.is_empty()
+    {
+        return Some(PathBuf::from(xdg).join("zhive"));
+    }
+    let home = std::env::var_os("HOME")?;
+    Some(
+        PathBuf::from(home)
+            .join(".local")
+            .join("share")
+            .join("zhive"),
+    )
 }
 
 /// Maps the `[engine]` config section to engine [`TurnLimits`].

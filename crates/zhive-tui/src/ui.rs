@@ -13,7 +13,8 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::Paragraph;
 use zhive_proto::domain::{
-    CommandExecutionStatus, Item, ItemContent, NoticeLevel, PlanStepStatus, ToolCallStatus,
+    CommandExecutionStatus, FileUpdateChange, Item, ItemContent, ItemToolCallContent, NoticeLevel,
+    PatchChangeKind, PlanStepStatus, ToolCallStatus,
 };
 
 use crate::app::App;
@@ -24,6 +25,23 @@ use crate::{markdown, wrap};
 
 /// Width of the left role-label gutter, in cells.
 const GUTTER: u16 = 8;
+
+/// Maximum lines of tool-call input/output shown before truncation.
+///
+/// Keeps busy tool calls from flooding the transcript; the full content
+/// is always stored in the item and readable via the engine log.
+const TOOL_PREVIEW_LINES: usize = 8;
+
+/// Maximum characters of a JSON argument summary before ellipsis truncation.
+///
+/// Long argument values (e.g. full file paths or multi-kb content) would
+/// otherwise overflow the content column on a standard 80-column terminal.
+const TOOL_ARG_SUMMARY_MAX: usize = 120;
+
+/// Maximum lines of command output shown before truncation.
+///
+/// Mirrors [`TOOL_PREVIEW_LINES`] for visual consistency.
+const CMD_OUTPUT_LINES: usize = 8;
 
 /// Draws the entire frame for the current [`App`] state.
 pub fn draw(frame: &mut Frame, app: &App) {
@@ -130,7 +148,10 @@ fn render_body(frame: &mut Frame, app: &App, area: Rect) {
     let total = u16::try_from(lines.len()).unwrap_or(u16::MAX);
     let visible = inner.height;
     let max_scroll = total.saturating_sub(visible);
-    let scroll_y = max_scroll.saturating_sub(app.scrollback);
+    // Clamp scrollback to [0, max_scroll] so we never scroll past the top or
+    // get stuck above it when the transcript shrinks (e.g. after /clear).
+    let scrollback = app.scrollback.min(max_scroll);
+    let scroll_y = max_scroll.saturating_sub(scrollback);
     frame.render_widget(
         Paragraph::new(Text::from(lines)).scroll((scroll_y, 0)),
         inner,
@@ -252,24 +273,51 @@ fn item_body(item: &Item, p: &Palette, width: u16) -> Vec<Line<'static>> {
             Style::new().fg(p.fg_dim).add_modifier(Modifier::ITALIC),
             width,
         ),
-        Item::ToolCall { name, status, .. } => tool_call_lines(name, *status, p),
+        Item::ToolCall {
+            name,
+            status,
+            raw_input,
+            raw_output,
+            content,
+            ..
+        } => tool_call_lines(
+            name,
+            *status,
+            raw_input.as_ref(),
+            raw_output.as_ref(),
+            content,
+            p,
+            width,
+        ),
         Item::CommandExecution {
             command,
             status,
             exit_code,
+            aggregated_output,
+            duration_ms,
             ..
-        } => command_lines(command, *status, *exit_code, p, width),
-        Item::Diff { path, .. } => vec![Line::styled(
-            format!("± {}", path.display()),
-            Style::new().fg(p.info),
-        )],
-        Item::FileEdit { changes, .. } => {
-            let count = changes.len();
-            vec![Line::styled(
-                format!("✎ file edit · {count} change(s)"),
-                Style::new().fg(p.info),
-            )]
-        }
+        } => command_lines(
+            command,
+            *status,
+            *exit_code,
+            aggregated_output.as_deref(),
+            *duration_ms,
+            p,
+            width,
+        ),
+        Item::Diff {
+            path,
+            old_text,
+            new_text,
+            ..
+        } => diff_lines(
+            path.to_string_lossy().as_ref(),
+            old_text.as_deref(),
+            new_text,
+            p,
+            width,
+        ),
+        Item::FileEdit { changes, .. } => file_edit_lines(changes, p),
         Item::Plan { steps, .. } => steps
             .iter()
             .map(|s| {
@@ -305,30 +353,110 @@ fn item_body(item: &Item, p: &Palette, width: u16) -> Vec<Line<'static>> {
     }
 }
 
-/// Renders a tool-call header line: `▸ name  <status>`.
-fn tool_call_lines(name: &str, status: ToolCallStatus, p: &Palette) -> Vec<Line<'static>> {
-    let (label, color) = match status {
+/// Renders a tool-call block: header, argument summary, and output preview.
+fn tool_call_lines(
+    name: &str,
+    status: ToolCallStatus,
+    raw_input: Option<&serde_json::Value>,
+    raw_output: Option<&serde_json::Value>,
+    content: &[ItemToolCallContent],
+    p: &Palette,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let (status_label, status_color) = match status {
         ToolCallStatus::Pending => ("pending", p.fg_dim),
         ToolCallStatus::InProgress => ("running", p.warn),
         ToolCallStatus::Completed => ("ok", p.success),
         ToolCallStatus::Failed => ("failed", p.error),
         _ => ("…", p.fg_dim),
     };
-    vec![Line::from(vec![
+
+    let mut out = vec![Line::from(vec![
         Span::styled(
             format!("▸ {name}"),
             Style::new().fg(p.accent).add_modifier(Modifier::BOLD),
         ),
         Span::raw("  "),
-        Span::styled(label.to_owned(), Style::new().fg(color)),
-    ])]
+        Span::styled(status_label.to_owned(), Style::new().fg(status_color)),
+    ])];
+
+    // Argument summary from raw_input (JSON → compact one-liner, truncated).
+    if let Some(input) = raw_input {
+        let summary = json_summary(input);
+        if !summary.is_empty() {
+            out.extend(wrap_plain(
+                &format!("  args: {summary}"),
+                Style::new().fg(p.fg_dim),
+                width,
+            ));
+        }
+    }
+
+    // Output: prefer structured `content` list, fall back to raw_output JSON.
+    let output_text = if !content.is_empty() {
+        Some(tool_content_text(content))
+    } else if let Some(raw) = raw_output {
+        let s = json_summary(raw);
+        if s.is_empty() { None } else { Some(s) }
+    } else {
+        None
+    };
+
+    if let Some(text) = output_text {
+        let lines: Vec<&str> = text.lines().collect();
+        let visible = lines.len().min(TOOL_PREVIEW_LINES);
+        let truncated = lines.len() > TOOL_PREVIEW_LINES;
+        for line in &lines[..visible] {
+            out.push(Line::from(vec![
+                Span::styled("  ", Style::new()),
+                Span::styled((*line).to_owned(), Style::new().fg(p.fg).bg(p.bg_overlay)),
+            ]));
+        }
+        if truncated {
+            out.push(Line::styled(
+                format!("  … ({} more lines)", lines.len() - TOOL_PREVIEW_LINES),
+                Style::new().fg(p.fg_mute),
+            ));
+        }
+    }
+
+    out
 }
 
-/// Renders a command-execution block: `$ cmd` plus a status line.
+/// Extracts a plain-text summary from a list of tool-call content blocks.
+fn tool_content_text(content: &[ItemToolCallContent]) -> String {
+    let mut parts = Vec::new();
+    for block in content {
+        // Only Content blocks carry displayable text; Diff and Terminal are skipped.
+        if let ItemToolCallContent::Content {
+            content: ItemContent::Text { text, .. },
+            ..
+        } = block
+        {
+            parts.push(text.as_str());
+        }
+    }
+    parts.join("\n")
+}
+
+/// Produces a compact one-line summary of a JSON value, truncated at
+/// [`TOOL_ARG_SUMMARY_MAX`] characters.
+fn json_summary(value: &serde_json::Value) -> String {
+    let raw = value.to_string();
+    if raw.len() <= TOOL_ARG_SUMMARY_MAX {
+        raw
+    } else {
+        format!("{}…", &raw[..TOOL_ARG_SUMMARY_MAX])
+    }
+}
+
+/// Renders a command-execution block: `$ cmd`, optional output, status + timing.
 fn command_lines(
     command: &str,
     status: CommandExecutionStatus,
     exit_code: Option<i32>,
+    aggregated_output: Option<&str>,
+    duration_ms: Option<i64>,
     p: &Palette,
     width: u16,
 ) -> Vec<Line<'static>> {
@@ -338,7 +466,27 @@ fn command_lines(
         Span::styled(command.to_owned(), Style::new().fg(p.fg)),
     ]);
     out.extend(wrap::wrap_line(&head, width));
-    let (label, color) = match status {
+
+    // Show the first N lines of captured output.
+    if let Some(output) = aggregated_output {
+        let lines: Vec<&str> = output.lines().collect();
+        let visible = lines.len().min(CMD_OUTPUT_LINES);
+        let truncated = lines.len() > CMD_OUTPUT_LINES;
+        for line in &lines[..visible] {
+            out.push(Line::from(vec![
+                Span::styled("  ", Style::new()),
+                Span::styled((*line).to_owned(), Style::new().fg(p.fg).bg(p.bg_overlay)),
+            ]));
+        }
+        if truncated {
+            out.push(Line::styled(
+                format!("  … (truncated, {} total lines)", lines.len()),
+                Style::new().fg(p.fg_mute),
+            ));
+        }
+    }
+
+    let (status_label, color) = match status {
         CommandExecutionStatus::InProgress => ("running".to_owned(), p.warn),
         CommandExecutionStatus::Completed => {
             (format!("exit {}", exit_code.unwrap_or(0)), p.success)
@@ -346,7 +494,278 @@ fn command_lines(
         CommandExecutionStatus::Failed => (format!("exit {}", exit_code.unwrap_or(-1)), p.error),
         _ => ("…".to_owned(), p.fg_dim),
     };
-    out.push(Line::styled(label, Style::new().fg(color)));
+
+    // Append duration when available.
+    let footer = if let Some(ms) = duration_ms {
+        format!("{status_label}  ({ms}ms)")
+    } else {
+        status_label
+    };
+    out.push(Line::styled(footer, Style::new().fg(color)));
+    out
+}
+
+/// Renders a unified-diff view for `Item::Diff`, coloring +/- lines with
+/// the theme's `diff_add_bg` / `diff_del_bg` tokens.
+fn diff_lines(
+    path: &str,
+    old_text: Option<&str>,
+    new_text: &str,
+    p: &Palette,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let mut out = Vec::new();
+
+    // File header line.
+    out.push(Line::from(vec![
+        Span::styled("± ", Style::new().fg(p.info)),
+        Span::styled(
+            path.to_owned(),
+            Style::new().fg(p.info).add_modifier(Modifier::BOLD),
+        ),
+    ]));
+
+    // Generate and render unified diff lines.
+    let unified = build_unified_diff(old_text.unwrap_or(""), new_text);
+    for diff_line in unified {
+        let styled = style_diff_line(&diff_line, p, width);
+        out.push(styled);
+    }
+
+    out
+}
+
+/// A single classified diff output line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiffLineKind {
+    /// A line added in the new version (`+` prefix).
+    Add,
+    /// A line removed from the old version (`-` prefix).
+    Del,
+    /// An unchanged context line (` ` prefix).
+    Context,
+    /// A hunk header (`@@` range line).
+    Header,
+}
+
+/// Classifies a raw diff output line by its leading character.
+#[must_use]
+fn classify_diff_line(line: &str) -> DiffLineKind {
+    if line.starts_with('+') {
+        DiffLineKind::Add
+    } else if line.starts_with('-') {
+        DiffLineKind::Del
+    } else if line.starts_with("@@") {
+        DiffLineKind::Header
+    } else {
+        DiffLineKind::Context
+    }
+}
+
+/// Converts a raw diff line into a styled ratatui [`Line`].
+fn style_diff_line(raw: &str, p: &Palette, _width: u16) -> Line<'static> {
+    match classify_diff_line(raw) {
+        DiffLineKind::Add => Line::from(vec![Span::styled(
+            raw.to_owned(),
+            Style::new().fg(p.diff_add_fg).bg(p.diff_add_bg),
+        )]),
+        DiffLineKind::Del => Line::from(vec![Span::styled(
+            raw.to_owned(),
+            Style::new().fg(p.diff_del_fg).bg(p.diff_del_bg),
+        )]),
+        DiffLineKind::Header => Line::from(vec![Span::styled(
+            raw.to_owned(),
+            Style::new().fg(p.accent).add_modifier(Modifier::BOLD),
+        )]),
+        DiffLineKind::Context => Line::from(vec![Span::styled(
+            raw.to_owned(),
+            Style::new().fg(p.diff_ctx_fg),
+        )]),
+    }
+}
+
+/// Builds a minimal unified-diff between `old` and `new`.
+///
+/// Uses a simple LCS-based diff limited to 3-line context windows.
+/// Does not introduce any external dependency — the diff is computed
+/// entirely with stdlib slices.
+fn build_unified_diff(old: &str, new_text: &str) -> Vec<String> {
+    /// Lines of context to show around each changed hunk.
+    const CONTEXT: usize = 3;
+
+    let old_lines: Vec<&str> = old.lines().collect();
+    let new_lines: Vec<&str> = new_text.lines().collect();
+
+    // Compute edit script via Myers-style shortest-edit-sequence.
+    let edits = compute_edits(&old_lines, &new_lines);
+
+    // Group edits into hunks with context.
+    group_into_hunks(&old_lines, &new_lines, &edits, CONTEXT)
+}
+
+/// Edit operation for one line in the old/new sequence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Edit {
+    /// Keep line at `old_idx` (appears in both sides).
+    Keep { old_idx: usize, new_idx: usize },
+    /// Delete line `old_idx` (only in old).
+    Delete { old_idx: usize },
+    /// Insert line `new_idx` (only in new).
+    Insert { new_idx: usize },
+}
+
+/// Computes the edit script between two line slices using a greedy LCS.
+///
+/// Returns an ordered list of [`Edit`] operations.
+fn compute_edits(old: &[&str], new_s: &[&str]) -> Vec<Edit> {
+    // Build the longest-common-subsequence table.
+    let m = old.len();
+    let n = new_s.len();
+    // `dp[i][j]` = LCS length of `old[..i]` vs `new[..j]`.
+    let mut dp = vec![vec![0usize; n + 1]; m + 1];
+    for i in (0..m).rev() {
+        for j in (0..n).rev() {
+            dp[i][j] = if old[i] == new_s[j] {
+                dp[i + 1][j + 1] + 1
+            } else {
+                dp[i + 1][j].max(dp[i][j + 1])
+            };
+        }
+    }
+
+    // Trace back the edit script.
+    let mut edits = Vec::new();
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < m || j < n {
+        if i < m && j < n && old[i] == new_s[j] {
+            edits.push(Edit::Keep {
+                old_idx: i,
+                new_idx: j,
+            });
+            i += 1;
+            j += 1;
+        } else if j < n && (i >= m || dp[i + 1][j] <= dp[i][j + 1]) {
+            edits.push(Edit::Insert { new_idx: j });
+            j += 1;
+        } else {
+            edits.push(Edit::Delete { old_idx: i });
+            i += 1;
+        }
+    }
+    edits
+}
+
+/// Emits unified-diff output strings from an edit script.
+fn group_into_hunks(old: &[&str], new_s: &[&str], edits: &[Edit], context: usize) -> Vec<String> {
+    if edits.is_empty() {
+        return Vec::new();
+    }
+
+    // Identify changed positions in the edit list.
+    let changed: Vec<usize> = edits
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| !matches!(e, Edit::Keep { .. }))
+        .map(|(i, _)| i)
+        .collect();
+
+    if changed.is_empty() {
+        return Vec::new();
+    }
+
+    // Build hunk ranges [start, end) with context padding.
+    let mut hunk_ranges: Vec<(usize, usize)> = Vec::new();
+    let mut start = changed[0].saturating_sub(context);
+    let mut end = (changed[0] + context + 1).min(edits.len());
+    for &ci in &changed[1..] {
+        if ci.saturating_sub(context) <= end {
+            end = (ci + context + 1).min(edits.len());
+        } else {
+            hunk_ranges.push((start, end));
+            start = ci.saturating_sub(context);
+            end = (ci + context + 1).min(edits.len());
+        }
+    }
+    hunk_ranges.push((start, end));
+
+    let mut out = Vec::new();
+    for (hstart, hend) in hunk_ranges {
+        // Compute old/new line number ranges for the @@ header.
+        let old_start = hunk_old_start(&edits[hstart..hend]);
+        let new_start = hunk_new_start(&edits[hstart..hend]);
+        let old_count = edits[hstart..hend]
+            .iter()
+            .filter(|e| matches!(e, Edit::Keep { .. } | Edit::Delete { .. }))
+            .count();
+        let new_count = edits[hstart..hend]
+            .iter()
+            .filter(|e| matches!(e, Edit::Keep { .. } | Edit::Insert { .. }))
+            .count();
+        out.push(format!(
+            "@@ -{old_start},{old_count} +{new_start},{new_count} @@"
+        ));
+        for edit in &edits[hstart..hend] {
+            match edit {
+                Edit::Keep { old_idx, .. } => out.push(format!(" {}", old[*old_idx])),
+                Edit::Delete { old_idx } => out.push(format!("-{}", old[*old_idx])),
+                Edit::Insert { new_idx } => out.push(format!("+{}", new_s[*new_idx])),
+            }
+        }
+    }
+    out
+}
+
+/// First old-file line number (1-based) referenced in a hunk's edit slice.
+fn hunk_old_start(slice: &[Edit]) -> usize {
+    for e in slice {
+        match e {
+            Edit::Keep { old_idx, .. } | Edit::Delete { old_idx } => {
+                return old_idx + 1;
+            }
+            Edit::Insert { .. } => {}
+        }
+    }
+    1
+}
+
+/// First new-file line number (1-based) referenced in a hunk's edit slice.
+fn hunk_new_start(slice: &[Edit]) -> usize {
+    for e in slice {
+        match e {
+            Edit::Keep { new_idx, .. } | Edit::Insert { new_idx } => {
+                return new_idx + 1;
+            }
+            Edit::Delete { .. } => {}
+        }
+    }
+    1
+}
+
+/// Renders a `FileEdit` as one line per changed file.
+fn file_edit_lines(changes: &[FileUpdateChange], p: &Palette) -> Vec<Line<'static>> {
+    if changes.is_empty() {
+        return vec![Line::styled(
+            "✎ file edit · no changes",
+            Style::new().fg(p.info),
+        )];
+    }
+    let mut out = Vec::new();
+    for change in changes {
+        let (mark, color) = match change.kind {
+            PatchChangeKind::Create => ("+", p.diff_add_fg),
+            PatchChangeKind::Delete => ("-", p.diff_del_fg),
+            PatchChangeKind::Rename => ("↷", p.warn),
+            PatchChangeKind::Update | _ => ("~", p.info),
+        };
+        let path = change.path.to_string_lossy();
+        out.push(Line::from(vec![
+            Span::styled(
+                format!("{mark} "),
+                Style::new().fg(color).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(path.into_owned(), Style::new().fg(p.fg)),
+        ]));
+    }
     out
 }
 
@@ -476,6 +895,96 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         Paragraph::new(widgets::kbd_hints(&hints, p)).style(bar_bg),
         area,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- scrollback clamping ----
+
+    #[test]
+    fn scrollback_clamp_prevents_over_scroll() {
+        // transcript has 5 lines, visible area has 10 rows → max_scroll = 0
+        // scrollback = 99 should be clamped to 0 so scroll_y stays 0.
+        let total: u16 = 5;
+        let visible: u16 = 10;
+        let max_scroll = total.saturating_sub(visible);
+        let scrollback: u16 = 99;
+        let clamped = scrollback.min(max_scroll);
+        assert_eq!(clamped, 0);
+    }
+
+    #[test]
+    fn scrollback_clamp_allows_valid_range() {
+        let total: u16 = 100;
+        let visible: u16 = 20;
+        let max_scroll = total.saturating_sub(visible); // 80
+        let scrollback: u16 = 40;
+        let clamped = scrollback.min(max_scroll);
+        assert_eq!(clamped, 40);
+    }
+
+    // ---- diff classification ----
+
+    #[test]
+    fn diff_classify_add() {
+        assert_eq!(classify_diff_line("+new line"), DiffLineKind::Add);
+    }
+
+    #[test]
+    fn diff_classify_del() {
+        assert_eq!(classify_diff_line("-old line"), DiffLineKind::Del);
+    }
+
+    #[test]
+    fn diff_classify_context() {
+        assert_eq!(classify_diff_line(" ctx line"), DiffLineKind::Context);
+    }
+
+    #[test]
+    fn diff_classify_header() {
+        assert_eq!(classify_diff_line("@@ -1,3 +1,4 @@"), DiffLineKind::Header);
+    }
+
+    // ---- unified diff generation ----
+
+    #[test]
+    fn build_unified_diff_identical_files_empty() {
+        let diff = build_unified_diff("a\nb\n", "a\nb\n");
+        assert!(diff.is_empty(), "no diff for identical content");
+    }
+
+    #[test]
+    fn build_unified_diff_added_line() {
+        let diff = build_unified_diff("a\n", "a\nb\n");
+        let has_add = diff.iter().any(|l| l.starts_with('+'));
+        assert!(has_add);
+    }
+
+    #[test]
+    fn build_unified_diff_deleted_line() {
+        let diff = build_unified_diff("a\nb\n", "a\n");
+        let has_del = diff.iter().any(|l| l.starts_with('-'));
+        assert!(has_del);
+    }
+
+    #[test]
+    fn json_summary_short_passthrough() {
+        let v = serde_json::json!({"x": 1});
+        let s = json_summary(&v);
+        assert!(s.len() <= TOOL_ARG_SUMMARY_MAX);
+    }
+
+    #[test]
+    fn json_summary_truncates_long_values() {
+        let long: String = "x".repeat(300);
+        let v = serde_json::json!({ "k": long });
+        let s = json_summary(&v);
+        // `…` is a 3-byte UTF-8 char appended to a TOOL_ARG_SUMMARY_MAX-byte prefix.
+        assert!(s.len() <= TOOL_ARG_SUMMARY_MAX + 3, "len={}", s.len());
+        assert!(s.ends_with('…'));
+    }
 }
 
 // Rust guideline compliant 2026-02-21
