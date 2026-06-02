@@ -28,6 +28,7 @@
 //! tools the model may call. An empty registry leaves both fields `None`.
 
 use zhive_proto::domain::Item;
+use zhive_proto::permission::PermissionScope;
 
 use crate::state::ThreadHandle;
 
@@ -54,6 +55,11 @@ use crate::state::ThreadHandle;
 /// leading [`llmsdk::language_model::Message::System`] so the provider applies
 /// it to the whole conversation; an empty or `None` system prompt is omitted.
 ///
+/// Only tools the turn's `scope` permits ([`PermissionScope::permits`]) are
+/// advertised, so a subagent (or a scope with `disallowed_tools` /
+/// `allowed_tools`) does not see tools it cannot call. This mirrors — but does
+/// not replace — the authoritative dispatch-side scope gate.
+///
 /// This function is crate-internal (`pub(in crate::engine)`).
 /// See the `#[cfg(test)]` block in this file for usage examples.
 #[expect(
@@ -64,6 +70,7 @@ pub(in crate::engine) async fn build_call_options(
     handle: &ThreadHandle,
     tools: &crate::tools::ToolRegistry,
     system_prompt: Option<&str>,
+    scope: &PermissionScope,
 ) -> llmsdk::language_model::CallOptions {
     use llmsdk::language_model::{
         AssistantPart, Message, TextPart, ToolCallPart, ToolMessagePart, ToolResultOutput,
@@ -187,7 +194,7 @@ pub(in crate::engine) async fn build_call_options(
 
     // Advertise registered tools (if any). An empty result leaves both fields
     // `None` so an empty registry is a no-op (no behavior change).
-    let advertised = build_tool_advertisements(tools);
+    let advertised = build_tool_advertisements(tools, scope);
     let (tools_opt, tool_choice) = if advertised.is_empty() {
         (None, None)
     } else {
@@ -211,15 +218,23 @@ pub(in crate::engine) async fn build_call_options(
 
 /// Builds the provider `Tool::Function` list from the registry's specs.
 ///
-/// Each spec's `input_schema` is converted to a provider `JsonSchema`; a tool
-/// whose schema is not a valid JSON schema is logged (`zhive.prompt.tool_schema_invalid`)
+/// Tools the `scope` forbids ([`PermissionScope::permits`]) are skipped so the
+/// model is not offered tools it cannot call. Each remaining spec's
+/// `input_schema` is converted to a provider `JsonSchema`; a tool whose schema
+/// is not a valid JSON schema is logged (`zhive.prompt.tool_schema_invalid`)
 /// and skipped so one bad tool never aborts the turn. Returns an empty vec when
-/// the registry is empty (or every schema is invalid).
+/// the registry is empty (or every tool is filtered / invalid).
 fn build_tool_advertisements(
     tools: &crate::tools::ToolRegistry,
+    scope: &PermissionScope,
 ) -> Vec<llmsdk::language_model::Tool> {
     let mut advertised: Vec<llmsdk::language_model::Tool> = Vec::new();
     for spec in tools.specs() {
+        // Defense-in-depth + UX: do not advertise a tool the scope forbids
+        // (the dispatch gate is the authoritative block).
+        if !scope.permits(&spec.name) {
+            continue;
+        }
         match serde_json::from_value::<llmsdk::json::JsonSchema>(spec.input_schema.clone()) {
             Ok(input_schema) => {
                 advertised.push(llmsdk::language_model::Tool::Function(
@@ -293,6 +308,8 @@ mod tests {
         Item, ItemContent, ItemId, ItemToolCallContent, ThreadId, ToolCallStatus, ToolKind,
     };
 
+    use zhive_proto::permission::PermissionScope;
+
     use super::build_call_options;
     use crate::state::ThreadHandle;
 
@@ -343,7 +360,13 @@ mod tests {
             .push_item(completed_tool_call("item:2", "toolu_C", "echo", "rC"))
             .await;
 
-        let opts = build_call_options(&handle, &crate::tools::ToolRegistry::new(), None).await;
+        let opts = build_call_options(
+            &handle,
+            &crate::tools::ToolRegistry::new(),
+            None,
+            &PermissionScope::default_turn_scope(),
+        )
+        .await;
 
         let mut pairs: Vec<(String, String, String)> = Vec::new();
         let msgs = &opts.prompt;
@@ -418,7 +441,13 @@ mod tests {
             })
             .await;
 
-        let opts = build_call_options(&handle, &crate::tools::ToolRegistry::new(), None).await;
+        let opts = build_call_options(
+            &handle,
+            &crate::tools::ToolRegistry::new(),
+            None,
+            &PermissionScope::default_turn_scope(),
+        )
+        .await;
         assert_eq!(opts.prompt.len(), 2, "one Assistant + one Tool message");
 
         let use_id = match &opts.prompt[0] {
@@ -465,7 +494,13 @@ mod tests {
             })
             .await;
 
-        let opts = build_call_options(&handle, &crate::tools::ToolRegistry::new(), None).await;
+        let opts = build_call_options(
+            &handle,
+            &crate::tools::ToolRegistry::new(),
+            None,
+            &PermissionScope::default_turn_scope(),
+        )
+        .await;
         assert_eq!(opts.prompt.len(), 2, "failed call still yields a pair");
         match (&opts.prompt[0], &opts.prompt[1]) {
             (Message::Assistant { .. }, Message::Tool { content, .. }) => {
@@ -505,7 +540,13 @@ mod tests {
             })
             .await;
 
-        let opts = build_call_options(&handle, &crate::tools::ToolRegistry::new(), None).await;
+        let opts = build_call_options(
+            &handle,
+            &crate::tools::ToolRegistry::new(),
+            None,
+            &PermissionScope::default_turn_scope(),
+        )
+        .await;
         assert_eq!(opts.prompt.len(), 1);
         assert!(matches!(opts.prompt[0], Message::User { .. }));
     }
@@ -522,6 +563,7 @@ mod tests {
             &handle,
             &crate::tools::ToolRegistry::new(),
             Some("You are zhive."),
+            &PermissionScope::default_turn_scope(),
         )
         .await;
         assert!(
@@ -531,7 +573,13 @@ mod tests {
         assert!(matches!(with_sys.prompt[1], Message::User { .. }));
 
         // Without a system prompt (None): no System message is emitted.
-        let no_sys = build_call_options(&handle, &crate::tools::ToolRegistry::new(), None).await;
+        let no_sys = build_call_options(
+            &handle,
+            &crate::tools::ToolRegistry::new(),
+            None,
+            &PermissionScope::default_turn_scope(),
+        )
+        .await;
         assert!(
             !no_sys
                 .prompt
@@ -541,8 +589,13 @@ mod tests {
         );
 
         // An empty system prompt is treated like None.
-        let empty_sys =
-            build_call_options(&handle, &crate::tools::ToolRegistry::new(), Some("")).await;
+        let empty_sys = build_call_options(
+            &handle,
+            &crate::tools::ToolRegistry::new(),
+            Some(""),
+            &PermissionScope::default_turn_scope(),
+        )
+        .await;
         assert!(
             !empty_sys
                 .prompt
@@ -566,7 +619,8 @@ mod tests {
         let mut reg = ToolRegistry::new();
         reg.register(Arc::new(EchoTool));
 
-        let opts = build_call_options(&handle, &reg, None).await;
+        let opts =
+            build_call_options(&handle, &reg, None, &PermissionScope::default_turn_scope()).await;
 
         let tools = opts.tools.expect("registered tools must be advertised");
         assert_eq!(tools.len(), 1, "exactly one tool advertised");
@@ -577,6 +631,30 @@ mod tests {
         assert!(
             matches!(opts.tool_choice, Some(ToolChoice::Auto)),
             "tool_choice must be Auto when tools are advertised"
+        );
+    }
+
+    /// A tool the scope forbids is omitted from the advertised set (defense in
+    /// depth + UX; the dispatch-side scope gate is the authoritative block).
+    #[tokio::test]
+    async fn build_call_options_omits_scope_disallowed_tools() {
+        use zhive_proto::permission::ToolName;
+
+        use crate::tools::{EchoTool, ToolRegistry};
+
+        let handle = ThreadHandle::new_idle(ThreadId(Arc::from("thread:native/scope")));
+        handle.push_item(user_msg("item:u0", "go")).await;
+
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(EchoTool));
+
+        let mut scope = PermissionScope::default_turn_scope();
+        scope.disallowed_tools.push(ToolName(Arc::from("echo")));
+
+        let opts = build_call_options(&handle, &reg, None, &scope).await;
+        assert!(
+            opts.tools.is_none(),
+            "the only registered tool is disallowed → nothing advertised"
         );
     }
 }

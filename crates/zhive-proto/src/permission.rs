@@ -248,6 +248,38 @@ impl PermissionScope {
         }
     }
 
+    /// Returns `true` when `tool_name` is permitted by this scope.
+    ///
+    /// A tool is permitted when it is **not** in `disallowed_tools` and, when
+    /// `allowed_tools` is `Some`, it appears in that allowlist. `disallowed`
+    /// always wins over `allowed`, so a tool present in both is rejected.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use zhive_proto::permission::{PermissionScope, ToolName};
+    /// let mut scope = PermissionScope::default_turn_scope();
+    /// assert!(scope.permits("read"), "default scope permits everything");
+    /// scope.disallowed_tools.push(ToolName(Arc::from("bash")));
+    /// assert!(!scope.permits("bash"), "disallowed tool is rejected");
+    /// assert!(scope.permits("read"));
+    /// ```
+    #[must_use]
+    pub fn permits(&self, tool_name: &str) -> bool {
+        if self
+            .disallowed_tools
+            .iter()
+            .any(|t| t.0.as_ref() == tool_name)
+        {
+            return false;
+        }
+        match &self.allowed_tools {
+            Some(allow) => allow.iter().any(|t| t.0.as_ref() == tool_name),
+            None => true,
+        }
+    }
+
     /// Returns `Ok` when `child` is a legal narrowing of `self`.
     ///
     /// # Errors

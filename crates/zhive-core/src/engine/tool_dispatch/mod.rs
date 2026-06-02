@@ -343,6 +343,25 @@ async fn resolve_tool_permission_inner(
     scope: &zhive_proto::permission::PermissionScope,
     cancel: &CancellationToken,
 ) -> ToolResolution {
+    // ---- Scope gate (authoritative enforcement) ----
+    // Reject a tool the active permission scope forbids — a subagent
+    // `disallowed_tools` entry (e.g. an `available_in_subagent()==false` skill)
+    // or a tool absent from an `allowed_tools` allowlist — before any hook or
+    // permission flow runs. The scope is *computed* elsewhere (start_turn /
+    // prepare_child_scope); this is the single runtime point that *enforces*
+    // it, so the narrowing contract has teeth. No hook has run yet, so
+    // `stop_loop` is `false`.
+    if !scope.permits(tool_name) {
+        return ToolResolution::Blocked(blocked_outcome(
+            item_id,
+            tool_name,
+            raw_args,
+            tool_use_id,
+            format!("tool `{tool_name}` is not permitted in the current permission scope"),
+            false,
+        ));
+    }
+
     let cwd = std::env::current_dir()
         .unwrap_or_else(|_| std::path::PathBuf::from("/"))
         .to_string_lossy()

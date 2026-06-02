@@ -1585,6 +1585,102 @@ mod inc3_tests {
     }
 
     // =========================================================================
+    // Test 1a': scope-disallowed tool is blocked (authoritative dispatch gate)
+    // =========================================================================
+
+    /// A turn whose scope forbids `echo` must block the model's `echo` tool
+    /// call (status `Failed`, body never executed). This is the regression for
+    /// the dispatch-side scope gate that enforces subagent `disallowed_tools` /
+    /// `allowed_tools` narrowing at runtime.
+    #[tokio::test]
+    async fn scope_disallowed_tool_is_blocked() {
+        use llmsdk::ToolCallPart;
+        use zhive_proto::permission::{PermissionScope, ToolName};
+
+        let script0 = vec![StreamPart::ToolCall(ToolCallPart {
+            tool_call_id: "tc-0".into(),
+            tool_name: "echo".into(),
+            input: serde_json::json!({"msg": "hello"}),
+            provider_executed: None,
+            dynamic: None,
+            provider_options: None,
+        })];
+        let script1 = vec![
+            StreamPart::TextStart {
+                id: "b0".into(),
+                provider_metadata: None,
+            },
+            StreamPart::TextDelta {
+                id: "b0".into(),
+                delta: "done".into(),
+                provider_metadata: None,
+            },
+            StreamPart::TextEnd {
+                id: "b0".into(),
+                provider_metadata: None,
+            },
+        ];
+
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(EchoTool));
+
+        let cfg = EngineConfig {
+            provider: MultiScriptedModel::new(vec![script0, script1]).into_dyn(),
+            tools: Arc::new(tools),
+            hook_host: Arc::new(HookHost::new()),
+            storage: None,
+            turn_limits: TurnLimits::default(),
+            system_prompt: None,
+            compact_token_threshold: None,
+        };
+        let engine =
+            Engine::spawn_with_config(cfg).with_reply_timeout(std::time::Duration::from_secs(5));
+        let mut events = engine.subscribe();
+
+        // Scope that forbids `echo`.
+        let mut scope = PermissionScope::default_turn_scope();
+        scope.disallowed_tools.push(ToolName(Arc::from("echo")));
+
+        engine
+            .start_turn(tid("thread:native/scope-block"), Vec::new(), Some(scope))
+            .await
+            .unwrap();
+
+        let mut echo_blocked = false;
+        let mut echo_executed = false;
+        for _ in 0..64 {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
+                .await
+                .expect("timeout")
+                .expect("broadcast")
+            {
+                EngineEvent::ItemAppended { item, .. } => {
+                    if let zhive_proto::domain::Item::ToolCall { name, status, .. } = &*item
+                        && name == "echo"
+                    {
+                        match status {
+                            zhive_proto::domain::ToolCallStatus::Failed => echo_blocked = true,
+                            zhive_proto::domain::ToolCallStatus::Completed => echo_executed = true,
+                            _ => {}
+                        }
+                    }
+                }
+                EngineEvent::TurnCompleted { .. } | EngineEvent::TurnFailed { .. } => break,
+                _ => {}
+            }
+        }
+        engine.shutdown().await.unwrap();
+        assert!(
+            echo_blocked,
+            "echo must be blocked (Failed) by the disallowing scope"
+        );
+        assert!(
+            !echo_executed,
+            "echo must NOT execute under a disallowing scope"
+        );
+    }
+
+    // =========================================================================
     // Test 1b: two tool calls in one turn → both execute (parallel dispatch)
     // =========================================================================
 

@@ -113,7 +113,9 @@ impl Tool for ReadFileTool {
         let total = lines.len();
         // Convert 1-based offset to 0-based index.
         let start = offset.saturating_sub(1).min(total);
-        let end = (start + limit).min(total);
+        // `saturating_add` guards against an absurd `limit` (e.g. u64::MAX from
+        // the model) overflowing `start + limit` in debug builds.
+        let end = start.saturating_add(limit).min(total);
 
         let mut out = String::new();
         let width = if total == 0 {

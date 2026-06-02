@@ -41,8 +41,10 @@ use crate::tools::{Tool, ToolContext, ToolError, ToolKind, ToolOutput};
 /// respected: if it fires the child is killed and [`ToolError::Cancelled`] is
 /// returned.
 ///
-/// The `value` field of the output contains a structured JSON object:
-/// `{ "exit_code": int, "stdout": str, "stderr": str, "timed_out": bool }`.
+/// On normal completion the `value` field carries a structured JSON object:
+/// `{ "exit_code": int, "stdout": str, "stderr": str, "timed_out": false }`.
+/// A timeout instead returns [`ToolError::Execution`] ("timed out …") with no
+/// value, so `timed_out` is always `false` on the success path.
 ///
 /// # Examples
 ///
