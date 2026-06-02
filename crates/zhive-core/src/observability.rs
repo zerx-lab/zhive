@@ -364,6 +364,7 @@ mod span_emission_tests {
             storage: None,
             turn_limits: TurnLimits::default(),
             system_prompt: None,
+            compact_token_threshold: None,
         };
         let engine = Engine::spawn_with_config(cfg);
 

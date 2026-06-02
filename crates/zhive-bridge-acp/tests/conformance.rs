@@ -609,6 +609,7 @@ fn scripted_tool_call_engine(decision: PermissionDecision) -> Engine {
         storage: None,
         turn_limits: TurnLimits::default(),
         system_prompt: None,
+        compact_token_threshold: None,
     };
     Engine::spawn_with_config(cfg)
 }

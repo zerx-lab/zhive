@@ -64,6 +64,7 @@ impl Host {
             storage: runtime.storage.clone(),
             turn_limits: runtime.turn_limits,
             system_prompt: Some(std::sync::Arc::clone(&runtime.system_prompt)),
+            compact_token_threshold: None,
         });
         let mut router = Router::new();
         register_engine_handlers(&mut router, engine.clone());

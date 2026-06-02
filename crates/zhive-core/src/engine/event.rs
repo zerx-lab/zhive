@@ -116,6 +116,27 @@ pub enum EngineEvent {
         /// Wire payload for the reverse RPC.
         request: Box<RequestPermissionRequest>,
     },
+    /// Token usage reported by the provider at the end of a turn iteration.
+    ///
+    /// Emitted once per provider stream call (i.e. once per tool-call loop
+    /// iteration that produced usage data). A multi-step (tool-using) turn
+    /// therefore emits one `Usage` per LLM call. The values are sourced
+    /// directly from [`llmsdk::language_model::Usage`]; a zero value
+    /// indicates the provider reported no usage (e.g. a scripted test model).
+    ///
+    /// Clients that need per-turn token accounting should sum all `Usage`
+    /// events for the same `turn_id`.
+    Usage {
+        /// Owning thread.
+        thread_id: ThreadId,
+        /// Active turn id.
+        turn_id: TurnId,
+        /// Total input tokens consumed by this provider call.
+        input_tokens: u64,
+        /// Total output tokens produced by this provider call.
+        output_tokens: u64,
+    },
+
     /// A subagent turn finished (completed or failed).
     ///
     /// External observers see exactly one `SubagentCompleted` per spawned

@@ -32,7 +32,7 @@
 
 mod connect;
 mod error;
-mod events;
+pub mod events;
 mod pending;
 mod reverse;
 mod transport;

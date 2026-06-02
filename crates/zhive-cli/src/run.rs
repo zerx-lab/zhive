@@ -168,6 +168,7 @@ async fn run_serve(
         storage: runtime.storage.clone(),
         turn_limits: runtime.turn_limits,
         system_prompt: Some(Arc::clone(&runtime.system_prompt)),
+        compact_token_threshold: None,
     });
     let mut router = Router::new();
     register_engine_handlers(&mut router, engine.clone());
@@ -298,6 +299,7 @@ async fn run_acp(config_path: Option<std::path::PathBuf>) -> Result<()> {
         storage: runtime.storage.clone(),
         turn_limits: runtime.turn_limits,
         system_prompt: Some(Arc::clone(&runtime.system_prompt)),
+        compact_token_threshold: None,
     });
 
     // `serve` owns the engine and drives it until the ACP client disconnects.

@@ -34,7 +34,7 @@
 //! outcomes are valid.
 
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use tokio::sync::{broadcast, mpsc};
@@ -129,6 +129,22 @@ pub(crate) struct EngineInner {
     ///
     /// [`PersistenceWriter`]: crate::persistence::writer::PersistenceWriter
     storage_writer: Mutex<StorageWriterState>,
+
+    /// Token threshold that triggers automatic compaction when the most
+    /// recently observed `input_tokens` meets or exceeds this value.
+    ///
+    /// `None` means compaction is governed solely by the item-count
+    /// threshold ([`super::compaction::AUTO_COMPACT_ITEM_THRESHOLD`]).
+    compact_token_threshold: Option<u64>,
+
+    /// Input tokens reported by the most recent provider call in this
+    /// engine. Written by [`super::turn`] after each stream completes;
+    /// read during the post-turn auto-compaction check.
+    ///
+    /// Uses `Relaxed` ordering: the write and read are both on the same
+    /// engine-owned async task, so no cross-thread synchronisation beyond
+    /// "last writer wins" is needed.
+    last_input_tokens: AtomicU64,
 }
 
 impl EngineInner {
@@ -142,6 +158,7 @@ impl EngineInner {
             Arc::new(HookHost::new()),
             Arc::new(ToolRegistry::new()),
             super::TurnLimits::default(),
+            None,
             None,
             None,
             None,
@@ -162,6 +179,7 @@ impl EngineInner {
         system_prompt: Option<Arc<str>>,
         storage_tx: Option<mpsc::Sender<StorageWriteOp>>,
         storage_handle: Option<JoinHandle<()>>,
+        compact_token_threshold: Option<u64>,
     ) -> Self {
         Self {
             threads: Arc::new(ThreadStore::new()),
@@ -179,6 +197,8 @@ impl EngineInner {
                 tx: storage_tx,
                 handle: storage_handle,
             }),
+            compact_token_threshold,
+            last_input_tokens: AtomicU64::new(0),
         }
     }
 
@@ -221,6 +241,29 @@ impl EngineInner {
     /// Returns the cancellation tree for sibling modules (e.g. lifecycle).
     pub(in crate::engine) fn cancel_tree(&self) -> &CancellationTree {
         &self.cancel_tree
+    }
+
+    /// Returns the optional token-based compaction threshold.
+    ///
+    /// `None` means only the item-count threshold governs auto-compaction.
+    /// `Some(n)` means a turn whose `input_tokens` meets or exceeds `n`
+    /// also triggers compaction regardless of transcript length.
+    pub(in crate::engine) fn compact_token_threshold(&self) -> Option<u64> {
+        self.compact_token_threshold
+    }
+
+    /// Returns the `input_tokens` reported by the most recent provider call.
+    ///
+    /// Returns `0` when no provider call has completed in this engine yet.
+    pub(in crate::engine) fn last_input_tokens(&self) -> u64 {
+        self.last_input_tokens.load(Ordering::Relaxed)
+    }
+
+    /// Stores the `input_tokens` from the most recent provider call.
+    ///
+    /// Called by [`super::turn`] immediately after the tracing usage event.
+    pub(in crate::engine) fn set_last_input_tokens(&self, tokens: u64) {
+        self.last_input_tokens.store(tokens, Ordering::Relaxed);
     }
 
     /// Non-blocking enqueue of a persistence write op.

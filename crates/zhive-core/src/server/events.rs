@@ -20,6 +20,7 @@
 //! | `PhaseChanged`             | `events/phase_changed`         |
 //! | `SessionAborted`           | `events/session_aborted`       |
 //! | `PermissionRequested`      | `events/permission_requested`  |
+//! | `Usage`                    | `events/usage`                 |
 //!
 //! ## Per-connection filtering
 //!
@@ -160,6 +161,19 @@ impl EventFilter {
 /// both the event-forwarder task and the `dispatch_message` handler.
 pub type SharedEventFilter = Arc<Mutex<EventFilter>>;
 
+/// Wire-form payload for [`EngineEvent::Usage`].
+///
+/// Carries the token counts reported by one provider call, identified by
+/// the owning thread and turn so clients can aggregate across iterations.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UsagePayload<'a> {
+    thread_id: &'a ThreadId,
+    turn_id: &'a TurnId,
+    input_tokens: u64,
+    output_tokens: u64,
+}
+
 /// Wire-form payload for [`EngineEvent::TurnStarted`].
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -245,6 +259,10 @@ struct PermissionRequestedPayload<'a> {
 /// Returns `None` for variants whose payload cannot be serialised
 /// (currently unreachable but defensively coded so a future enum
 /// variant cannot accidentally crash the forwarder task).
+#[expect(
+    clippy::too_many_lines,
+    reason = "exhaustive match over EngineEvent; each arm is a trivial serialization — splitting would add indirection without clarity"
+)]
 #[must_use]
 pub fn engine_event_to_notification(event: &EngineEvent) -> Option<Notification> {
     let (method, params) = match event {
@@ -334,6 +352,21 @@ pub fn engine_event_to_notification(event: &EngineEvent) -> Option<Notification>
             serde_json::to_value(PermissionRequestedPayload {
                 request_id: &request_id.0,
                 request: request.as_ref(),
+            })
+            .ok()?,
+        ),
+        EngineEvent::Usage {
+            thread_id,
+            turn_id,
+            input_tokens,
+            output_tokens,
+        } => (
+            "events/usage",
+            serde_json::to_value(UsagePayload {
+                thread_id,
+                turn_id,
+                input_tokens: *input_tokens,
+                output_tokens: *output_tokens,
             })
             .ok()?,
         ),
@@ -501,6 +534,23 @@ mod tests {
         let p = n.params.as_ref().unwrap();
         assert_eq!(p["itemId"], "item:0");
         assert!(p["item"].is_object());
+    }
+
+    #[test]
+    fn usage_maps_to_events_usage_with_camel_case_fields() {
+        let ev = EngineEvent::Usage {
+            thread_id: tid("thread:native/u"),
+            turn_id: turn_id("turn:thread:native/u/0"),
+            input_tokens: 200,
+            output_tokens: 50,
+        };
+        let n = engine_event_to_notification(&ev).unwrap();
+        assert_eq!(n.method, "events/usage");
+        let p = n.params.as_ref().unwrap();
+        assert_eq!(p["threadId"], "thread:native/u");
+        assert_eq!(p["turnId"], "turn:thread:native/u/0");
+        assert_eq!(p["inputTokens"], 200u64);
+        assert_eq!(p["outputTokens"], 50u64);
     }
 }
 

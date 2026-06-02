@@ -172,4 +172,127 @@ impl std::fmt::Debug for ClientEventStream {
     }
 }
 
+// ============================================================
+// Typed engine-event decode helpers
+// ============================================================
+
+/// Decoded payload of an `events/usage` wire notification.
+///
+/// Obtain by calling [`decode_usage`] on a raw [`Notification`].
+///
+/// # Examples
+///
+/// ```no_run
+/// # async fn example(client: zhive_client_native::Client) {
+/// use zhive_client_native::{ClientEvent, events::decode_usage};
+/// let mut stream = client.subscribe_events();
+/// while let Some(ClientEvent::Notification(n)) = stream.next_event().await {
+///     if let Some(u) = decode_usage(&n) {
+///         println!("input={} output={}", u.input_tokens, u.output_tokens);
+///     }
+/// }
+/// # }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsageEvent {
+    /// Owning thread id string.
+    pub thread_id: String,
+    /// Active turn id string.
+    pub turn_id: String,
+    /// Total input tokens consumed by this provider call.
+    pub input_tokens: u64,
+    /// Total output tokens produced by this provider call.
+    pub output_tokens: u64,
+}
+
+/// Decodes an `events/usage` [`Notification`] into a [`UsageEvent`].
+///
+/// Returns `None` when `notif.method` is not `"events/usage"` or when
+/// the params cannot be deserialized as [`UsageEvent`].
+///
+/// # Examples
+///
+/// ```
+/// use zhive_client_native::events::{UsageEvent, decode_usage};
+/// use zhive_proto::Notification;
+///
+/// let notif = Notification::new(
+///     "events/usage",
+///     Some(serde_json::json!({
+///         "threadId": "thread:native/t1",
+///         "turnId":   "turn:thread:native/t1/0",
+///         "inputTokens":  120,
+///         "outputTokens":  45,
+///     })),
+/// );
+/// let ev = decode_usage(&notif).expect("must decode");
+/// assert_eq!(ev.input_tokens, 120);
+/// assert_eq!(ev.output_tokens, 45);
+/// ```
+#[must_use]
+pub fn decode_usage(notif: &Notification) -> Option<UsageEvent> {
+    if notif.method != "events/usage" {
+        return None;
+    }
+    let params = notif.params.as_ref()?;
+    // Manual field extraction avoids adding a `serde` dependency to this crate.
+    let thread_id = params["threadId"].as_str()?.to_owned();
+    let turn_id = params["turnId"].as_str()?.to_owned();
+    let input_tokens = params["inputTokens"].as_u64()?;
+    let output_tokens = params["outputTokens"].as_u64()?;
+    Some(UsageEvent {
+        thread_id,
+        turn_id,
+        input_tokens,
+        output_tokens,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_usage_returns_correct_fields() {
+        let notif = Notification::new(
+            "events/usage",
+            Some(serde_json::json!({
+                "threadId":    "thread:native/t1",
+                "turnId":      "turn:thread:native/t1/0",
+                "inputTokens":  120u64,
+                "outputTokens":  45u64,
+            })),
+        );
+        let ev = decode_usage(&notif).expect("must decode events/usage");
+        assert_eq!(ev.thread_id, "thread:native/t1");
+        assert_eq!(ev.turn_id, "turn:thread:native/t1/0");
+        assert_eq!(ev.input_tokens, 120);
+        assert_eq!(ev.output_tokens, 45);
+    }
+
+    #[test]
+    fn decode_usage_returns_none_for_other_methods() {
+        let notif = Notification::new(
+            "events/turn_started",
+            Some(serde_json::json!({
+                "threadId": "t",
+                "turnId": "turn:t/0",
+            })),
+        );
+        assert!(
+            decode_usage(&notif).is_none(),
+            "non-usage notification must return None"
+        );
+    }
+
+    #[test]
+    fn decode_usage_returns_none_for_missing_fields() {
+        let notif = Notification::new("events/usage", Some(serde_json::json!({ "threadId": "t" })));
+        assert!(
+            decode_usage(&notif).is_none(),
+            "incomplete params must return None"
+        );
+    }
+}
+
 // Rust guideline compliant 2026-02-21

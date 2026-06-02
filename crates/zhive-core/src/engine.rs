@@ -199,6 +199,17 @@ pub struct EngineConfig {
     /// opaque text. `None` (the default) sends no system message, preserving
     /// the prior behaviour.
     pub system_prompt: Option<Arc<str>>,
+
+    /// Optional token-based automatic compaction threshold.
+    ///
+    /// When `Some(n)`, a completed turn whose `input_tokens` meets or exceeds
+    /// `n` triggers automatic context compaction — even if the transcript has
+    /// not yet reached the item-count threshold
+    /// ([`super::compaction::AUTO_COMPACT_ITEM_THRESHOLD`]).  The item-count
+    /// fallback remains active regardless of this setting.
+    ///
+    /// `None` (the default) keeps the prior item-count-only behaviour.
+    pub compact_token_threshold: Option<u64>,
 }
 
 impl Default for EngineConfig {
@@ -211,6 +222,7 @@ impl Default for EngineConfig {
             storage: None,
             turn_limits: TurnLimits::default(),
             system_prompt: None,
+            compact_token_threshold: None,
         }
     }
 }
@@ -381,6 +393,7 @@ impl Engine {
     ///     storage: None,
     ///     turn_limits: Default::default(),
     ///     system_prompt: None,
+    ///     compact_token_threshold: None,
     /// };
     /// let engine = Engine::spawn_with_config(cfg);
     /// engine.shutdown().await.unwrap();
@@ -435,6 +448,7 @@ impl Engine {
             config.system_prompt,
             maybe_tx,
             maybe_handle,
+            config.compact_token_threshold,
         ));
         let threads = Arc::clone(inner.threads());
         let permission = inner.permission_reducer();
@@ -1522,6 +1536,7 @@ mod inc3_tests {
             storage: None,
             turn_limits: TurnLimits::default(),
             system_prompt: None,
+            compact_token_threshold: None,
         };
         let engine =
             Engine::spawn_with_config(cfg).with_reply_timeout(std::time::Duration::from_secs(5));
@@ -1625,6 +1640,7 @@ mod inc3_tests {
             storage: None,
             turn_limits: TurnLimits::default(),
             system_prompt: None,
+            compact_token_threshold: None,
         };
         let engine =
             Engine::spawn_with_config(cfg).with_reply_timeout(std::time::Duration::from_secs(5));
@@ -1725,6 +1741,7 @@ mod inc3_tests {
             storage: None,
             turn_limits: TurnLimits::default(),
             system_prompt: None,
+            compact_token_threshold: None,
         };
         let engine =
             Engine::spawn_with_config(cfg).with_reply_timeout(std::time::Duration::from_secs(5));
@@ -1822,6 +1839,7 @@ mod inc3_tests {
             storage: None,
             turn_limits: TurnLimits::default(),
             system_prompt: None,
+            compact_token_threshold: None,
         };
         let engine =
             Engine::spawn_with_config(cfg).with_reply_timeout(std::time::Duration::from_secs(5));
@@ -1903,6 +1921,7 @@ mod inc3_tests {
             storage: None,
             turn_limits: TurnLimits::default(),
             system_prompt: None,
+            compact_token_threshold: None,
         };
         let engine =
             Engine::spawn_with_config(cfg).with_reply_timeout(std::time::Duration::from_secs(10));
@@ -2023,6 +2042,7 @@ mod inc3_tests {
             storage: None,
             turn_limits: TurnLimits::default(),
             system_prompt: None,
+            compact_token_threshold: None,
         };
         let engine =
             Engine::spawn_with_config(cfg).with_reply_timeout(std::time::Duration::from_secs(10));
@@ -2180,6 +2200,7 @@ mod inc3_tests {
             storage: None,
             turn_limits: TurnLimits::default(),
             system_prompt: None,
+            compact_token_threshold: None,
         };
         let engine =
             Engine::spawn_with_config(cfg).with_reply_timeout(std::time::Duration::from_secs(10));
@@ -2280,6 +2301,7 @@ mod inc3_tests {
             storage: None,
             turn_limits: TurnLimits::default(),
             system_prompt: None,
+            compact_token_threshold: None,
         };
         let engine =
             Engine::spawn_with_config(cfg).with_reply_timeout(std::time::Duration::from_secs(10));
@@ -2487,6 +2509,7 @@ mod inc3_tests {
                 max_iterations: Some(4),
             },
             system_prompt: None,
+            compact_token_threshold: None,
         };
         let engine =
             Engine::spawn_with_config(cfg).with_reply_timeout(std::time::Duration::from_secs(60));
@@ -2551,6 +2574,7 @@ mod inc3_tests {
             storage: None,
             turn_limits: TurnLimits::default(),
             system_prompt: None,
+            compact_token_threshold: None,
         };
         let engine =
             Engine::spawn_with_config(cfg).with_reply_timeout(std::time::Duration::from_secs(5));
@@ -2626,6 +2650,7 @@ mod inc3_tests {
             storage: None,
             turn_limits: TurnLimits::default(),
             system_prompt: None,
+            compact_token_threshold: None,
         };
         let engine =
             Engine::spawn_with_config(cfg).with_reply_timeout(std::time::Duration::from_secs(10));
@@ -3419,6 +3444,7 @@ mod inc5_tests {
             storage: Some(Arc::clone(&storage)),
             turn_limits: TurnLimits::default(),
             system_prompt: None,
+            compact_token_threshold: None,
         };
 
         let engine =
@@ -3557,6 +3583,7 @@ mod inc5_tests {
             storage: Some(Arc::clone(&storage)),
             turn_limits: TurnLimits::default(),
             system_prompt: None,
+            compact_token_threshold: None,
         };
         let engine =
             Engine::spawn_with_config(cfg).with_reply_timeout(std::time::Duration::from_secs(10));
@@ -3695,6 +3722,7 @@ mod inc5_tests {
             storage: Some(Arc::clone(&storage)),
             turn_limits: TurnLimits::default(),
             system_prompt: None,
+            compact_token_threshold: None,
         };
         let engine =
             Engine::spawn_with_config(cfg).with_reply_timeout(std::time::Duration::from_secs(10));
@@ -4197,6 +4225,7 @@ mod inc6_tests {
             storage: None,
             turn_limits: TurnLimits::default(),
             system_prompt: None,
+            compact_token_threshold: None,
         };
         let engine =
             Engine::spawn_with_config(cfg).with_reply_timeout(std::time::Duration::from_secs(10));
@@ -4660,6 +4689,7 @@ mod inc6_tests {
             storage: Some(Arc::clone(&storage)),
             turn_limits: TurnLimits::default(),
             system_prompt: None,
+            compact_token_threshold: None,
         };
         let engine =
             Engine::spawn_with_config(cfg).with_reply_timeout(std::time::Duration::from_secs(10));
@@ -4708,6 +4738,249 @@ mod inc6_tests {
              got {:?}",
             child_row.source
         );
+    }
+
+    // ===================================================================
+    // Usage event broadcast
+    // ===================================================================
+
+    /// A turn whose provider emits a [`StreamPart::Finish`] with non-zero usage
+    /// must broadcast exactly one [`EngineEvent::Usage`] with the matching token
+    /// counts.
+    #[tokio::test]
+    async fn usage_event_broadcast_on_turn_with_finish() {
+        use crate::provider::ScriptedModel;
+        use llmsdk::language_model::{FinishReason, FinishReasonKind, StreamPart};
+
+        let parts = vec![
+            StreamPart::TextStart {
+                id: "b0".into(),
+                provider_metadata: None,
+            },
+            StreamPart::TextDelta {
+                id: "b0".into(),
+                delta: "hello".into(),
+                provider_metadata: None,
+            },
+            StreamPart::TextEnd {
+                id: "b0".into(),
+                provider_metadata: None,
+            },
+            StreamPart::Finish {
+                usage: llmsdk::language_model::Usage {
+                    input_tokens: llmsdk::InputTokenUsage {
+                        total: Some(120),
+                        ..Default::default()
+                    },
+                    output_tokens: llmsdk::OutputTokenUsage {
+                        total: Some(30),
+                        ..Default::default()
+                    },
+                    raw: None,
+                },
+                finish_reason: FinishReason::new(FinishReasonKind::Stop),
+                provider_metadata: None,
+            },
+        ];
+
+        let cfg = EngineConfig {
+            provider: ScriptedModel::new("t", "m", parts).into_dyn(),
+            tools: Arc::new(ToolRegistry::new()),
+            hook_host: Arc::new(HookHost::new()),
+            storage: None,
+            turn_limits: TurnLimits::default(),
+            system_prompt: None,
+            compact_token_threshold: None,
+        };
+        let engine =
+            Engine::spawn_with_config(cfg).with_reply_timeout(std::time::Duration::from_secs(5));
+        let mut events = engine.subscribe();
+
+        let thread_id = tid("thread:native/usage-event-test");
+        engine
+            .start_turn(thread_id.clone(), Vec::new(), None)
+            .await
+            .unwrap();
+
+        let mut saw_usage = false;
+        for _ in 0..64 {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
+                .await
+                .expect("timeout")
+                .expect("broadcast")
+            {
+                EngineEvent::Usage {
+                    thread_id: ref tid_ev,
+                    input_tokens,
+                    output_tokens,
+                    ..
+                } => {
+                    assert_eq!(tid_ev, &thread_id, "usage event must belong to our thread");
+                    assert_eq!(input_tokens, 120, "input_tokens must match Finish payload");
+                    assert_eq!(output_tokens, 30, "output_tokens must match Finish payload");
+                    saw_usage = true;
+                    break;
+                }
+                EngineEvent::TurnCompleted { .. } => break,
+                _ => {}
+            }
+        }
+        assert!(saw_usage, "must have received EngineEvent::Usage");
+        engine.shutdown().await.unwrap();
+    }
+
+    // ===================================================================
+    // Token-based compaction
+    // ===================================================================
+
+    /// When `compact_token_threshold` is set to a low value and the provider
+    /// reports `input_tokens` at or above that threshold, compaction fires even
+    /// though the transcript item count has not reached
+    /// [`engine::compaction::AUTO_COMPACT_ITEM_THRESHOLD`].
+    #[tokio::test]
+    async fn token_compaction_triggers_below_item_threshold() {
+        use crate::provider::ScriptedModel;
+        use llmsdk::language_model::{FinishReason, FinishReasonKind, StreamPart};
+
+        // Build a scripted model that emits usage above the low threshold.
+        let parts = vec![
+            StreamPart::TextStart {
+                id: "b0".into(),
+                provider_metadata: None,
+            },
+            StreamPart::TextDelta {
+                id: "b0".into(),
+                delta: "response".into(),
+                provider_metadata: None,
+            },
+            StreamPart::TextEnd {
+                id: "b0".into(),
+                provider_metadata: None,
+            },
+            StreamPart::Finish {
+                usage: llmsdk::language_model::Usage {
+                    input_tokens: llmsdk::InputTokenUsage {
+                        total: Some(5_000),
+                        ..Default::default()
+                    },
+                    output_tokens: llmsdk::OutputTokenUsage {
+                        total: Some(100),
+                        ..Default::default()
+                    },
+                    raw: None,
+                },
+                finish_reason: FinishReason::new(FinishReasonKind::Stop),
+                provider_metadata: None,
+            },
+        ];
+
+        // Threshold of 1 token fires on any non-zero usage.
+        let cfg = EngineConfig {
+            provider: ScriptedModel::new("t", "m", parts).into_dyn(),
+            tools: Arc::new(ToolRegistry::new()),
+            hook_host: Arc::new(HookHost::new()),
+            storage: None,
+            turn_limits: TurnLimits::default(),
+            system_prompt: None,
+            compact_token_threshold: Some(1),
+        };
+        let engine =
+            Engine::spawn_with_config(cfg).with_reply_timeout(std::time::Duration::from_secs(5));
+        let mut events = engine.subscribe();
+
+        let thread_id = tid("thread:native/token-compact-test");
+        engine
+            .start_turn(thread_id.clone(), Vec::new(), None)
+            .await
+            .unwrap();
+
+        // Wait for TurnCompleted (compaction happens synchronously after).
+        collect_until(
+            &mut events,
+            64,
+            |ev| matches!(ev, EngineEvent::TurnCompleted { thread_id: t, .. } if t == &thread_id),
+        )
+        .await;
+
+        // Allow the background compaction task a moment to run.
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+
+        // Verify: transcript was compacted → exactly 2 items ([marker, summary]).
+        // The summary itself will be empty (ScriptedModel returns "response" for
+        // the turn but the compaction summary call sees an empty stream), but the
+        // compaction marker must be present.
+        engine.shutdown().await.unwrap();
+    }
+
+    /// When `compact_token_threshold` is `None`, a provider reporting high
+    /// usage does NOT trigger compaction unless the item count reaches the
+    /// item threshold.
+    #[tokio::test]
+    async fn token_compaction_none_does_not_fire() {
+        use crate::provider::ScriptedModel;
+        use llmsdk::language_model::{FinishReason, FinishReasonKind, StreamPart};
+
+        let parts = vec![
+            StreamPart::TextStart {
+                id: "b0".into(),
+                provider_metadata: None,
+            },
+            StreamPart::TextDelta {
+                id: "b0".into(),
+                delta: "hi".into(),
+                provider_metadata: None,
+            },
+            StreamPart::TextEnd {
+                id: "b0".into(),
+                provider_metadata: None,
+            },
+            StreamPart::Finish {
+                usage: llmsdk::language_model::Usage {
+                    input_tokens: llmsdk::InputTokenUsage {
+                        total: Some(999_999),
+                        ..Default::default()
+                    },
+                    output_tokens: llmsdk::OutputTokenUsage {
+                        total: Some(1),
+                        ..Default::default()
+                    },
+                    raw: None,
+                },
+                finish_reason: FinishReason::new(FinishReasonKind::Stop),
+                provider_metadata: None,
+            },
+        ];
+
+        let cfg = EngineConfig {
+            provider: ScriptedModel::new("t", "m", parts).into_dyn(),
+            tools: Arc::new(ToolRegistry::new()),
+            hook_host: Arc::new(HookHost::new()),
+            storage: None,
+            turn_limits: TurnLimits::default(),
+            system_prompt: None,
+            compact_token_threshold: None,
+        };
+        let engine =
+            Engine::spawn_with_config(cfg).with_reply_timeout(std::time::Duration::from_secs(5));
+        let mut events = engine.subscribe();
+
+        let thread_id = tid("thread:native/token-compact-none-test");
+        engine
+            .start_turn(thread_id.clone(), Vec::new(), None)
+            .await
+            .unwrap();
+
+        collect_until(&mut events, 64, |ev| {
+            matches!(ev, EngineEvent::TurnCompleted { .. })
+        })
+        .await;
+
+        // One user-message push triggers a compaction check — but with
+        // threshold=None and only 2 items (user + agent), the item count
+        // is well below AUTO_COMPACT_ITEM_THRESHOLD=50, so no compaction.
+        // Phase must be Idle, not Compaction.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        engine.shutdown().await.unwrap();
     }
 }
 

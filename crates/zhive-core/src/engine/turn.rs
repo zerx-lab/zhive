@@ -355,6 +355,17 @@ async fn run_turn_inner(
                 output_tokens,
                 "token usage: {{input_tokens}} in / {{output_tokens}} out"
             );
+            // Broadcast a wire-visible Usage event so clients and observers
+            // can track per-turn token consumption without parsing tracing
+            // events. Also stashes the latest input_tokens in the engine
+            // inner for token-based auto-compaction decisions.
+            let _ = inner.events_tx().send(EngineEvent::Usage {
+                thread_id: thread_id.clone(),
+                turn_id: turn_id.clone(),
+                input_tokens,
+                output_tokens,
+            });
+            inner.set_last_input_tokens(input_tokens);
         }
 
         // Drain any open fold buffers (partial items before cancel/error).
@@ -667,12 +678,18 @@ async fn run_turn_inner(
     //    they do NOT own the global EnginePhase slot (the parent turn does), so
     //    driving Idle→Compaction here would fight the parent's phase ownership.
     //    Child-thread compaction, if ever wanted, must be parent-coordinated.
-    if handle.parent_thread_id.is_none()
-        && handle.items_tail.read().await.len() >= super::compaction::AUTO_COMPACT_ITEM_THRESHOLD
-    {
-        let _ = inner
-            .run_compaction(&handle, thread_id, CompactTrigger::Auto)
-            .await;
+    if handle.parent_thread_id.is_none() {
+        let item_count = handle.items_tail.read().await.len();
+        let last_input = inner.last_input_tokens();
+        let token_threshold_hit = inner
+            .compact_token_threshold()
+            .is_some_and(|t| last_input >= t);
+        let item_threshold_hit = item_count >= super::compaction::AUTO_COMPACT_ITEM_THRESHOLD;
+        if token_threshold_hit || item_threshold_hit {
+            let _ = inner
+                .run_compaction(&handle, thread_id, CompactTrigger::Auto)
+                .await;
+        }
     }
     None
 }
