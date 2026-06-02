@@ -308,9 +308,9 @@ impl EngineInner {
             Submission::StartTurn {
                 thread_id,
                 user_input,
-                scope: _,
+                scope,
             } => {
-                let outcome = self.start_turn(thread_id, user_input).await;
+                let outcome = self.start_turn(thread_id, user_input, scope).await;
                 if let Some(tx) = reply {
                     let _ = tx.send(SubmissionReply::StartTurn(outcome));
                 }

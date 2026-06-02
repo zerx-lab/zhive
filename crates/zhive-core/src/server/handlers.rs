@@ -27,11 +27,11 @@ use serde_json::Value;
 use zhive_proto::ErrorObject;
 use zhive_proto::domain::{Item, ThreadId, TurnId};
 use zhive_proto::hook::CompactTrigger;
-use zhive_proto::permission::{PermissionOutcome, PermissionScope};
+use zhive_proto::permission::{PermissionOutcome, PermissionScope, StreamingBehavior};
 
 use crate::engine::{
     Engine, EngineError, PermissionRequestId,
-    submission::{CompactError, CompactReply, ResumePermissionReply},
+    submission::{CompactError, CompactReply, ResumePermissionReply, Submission},
 };
 
 use super::router::{Handler, JsonRpcCode, Router};
@@ -69,6 +69,28 @@ pub fn register_engine_handlers(router: &mut Router, engine: Engine) {
     router.register(
         "engine/compact",
         Arc::new(CompactHandler {
+            engine: Arc::clone(&engine),
+        }),
+    );
+    // Injection-queue methods (Pi `streamingBehavior` model). These back the
+    // `streaming.{steer,followUp,nextTurn}` capability advertised in
+    // `server::initialize`; without them a client reading the capability would
+    // get -32601 (method not found) — a silent contract violation.
+    router.register(
+        "session/enqueue_steer",
+        Arc::new(EnqueueSteerHandler {
+            engine: Arc::clone(&engine),
+        }),
+    );
+    router.register(
+        "session/enqueue_follow_up",
+        Arc::new(EnqueueFollowUpHandler {
+            engine: Arc::clone(&engine),
+        }),
+    );
+    router.register(
+        "session/enqueue_next_turn",
+        Arc::new(EnqueueNextTurnHandler {
             engine: Arc::clone(&engine),
         }),
     );
@@ -293,6 +315,95 @@ impl Handler for ShutdownHandler {
 }
 
 // ============================================================
+// Injection-queue handlers (Pi `streamingBehavior` model)
+// ============================================================
+
+/// Wire payload for the injection-queue methods: a thread id plus the items
+/// to enqueue. Shared by steer / follow-up / next-turn since their shape is
+/// identical; the queue is selected by the method name, not a payload field.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct InjectionParams {
+    thread_id: ThreadId,
+    #[serde(default)]
+    items: Vec<Item>,
+}
+
+/// A fixed `{ "accepted": true }` ack for the fire-and-forget injection
+/// submissions, which return no typed reply from the engine actor.
+fn injection_ack() -> Value {
+    serde_json::json!({ "accepted": true })
+}
+
+struct EnqueueSteerHandler {
+    engine: Arc<Engine>,
+}
+
+#[async_trait]
+impl Handler for EnqueueSteerHandler {
+    async fn handle(&self, params: Option<Value>) -> Result<Value, ErrorObject> {
+        let p: InjectionParams = decode_params(params)?;
+        match self
+            .engine
+            .submit(Submission::EnqueueInjection {
+                thread_id: p.thread_id,
+                behavior: StreamingBehavior::Steer,
+                items: p.items,
+            })
+            .await
+        {
+            Ok(()) => Ok(injection_ack()),
+            Err(err) => Err(engine_error(&err)),
+        }
+    }
+}
+
+struct EnqueueFollowUpHandler {
+    engine: Arc<Engine>,
+}
+
+#[async_trait]
+impl Handler for EnqueueFollowUpHandler {
+    async fn handle(&self, params: Option<Value>) -> Result<Value, ErrorObject> {
+        let p: InjectionParams = decode_params(params)?;
+        match self
+            .engine
+            .submit(Submission::EnqueueInjection {
+                thread_id: p.thread_id,
+                behavior: StreamingBehavior::FollowUp,
+                items: p.items,
+            })
+            .await
+        {
+            Ok(()) => Ok(injection_ack()),
+            Err(err) => Err(engine_error(&err)),
+        }
+    }
+}
+
+struct EnqueueNextTurnHandler {
+    engine: Arc<Engine>,
+}
+
+#[async_trait]
+impl Handler for EnqueueNextTurnHandler {
+    async fn handle(&self, params: Option<Value>) -> Result<Value, ErrorObject> {
+        let p: InjectionParams = decode_params(params)?;
+        match self
+            .engine
+            .submit(Submission::EnqueueNextTurn {
+                thread_id: p.thread_id,
+                items: p.items,
+            })
+            .await
+        {
+            Ok(()) => Ok(injection_ack()),
+            Err(err) => Err(engine_error(&err)),
+        }
+    }
+}
+
+// ============================================================
 // Helpers
 // ============================================================
 
@@ -374,6 +485,34 @@ mod tests {
             .await
             .expect("dispatch ok");
         assert!(v.get("turnId").is_some());
+
+        engine.shutdown().await.unwrap();
+    }
+
+    /// The injection-queue methods backing the advertised
+    /// `streaming.{steer,followUp,nextTurn}` capability must be registered:
+    /// a missing handler would surface as -32601 (a silent contract breach).
+    #[tokio::test]
+    async fn injection_handlers_are_registered_and_ack() {
+        let engine = Engine::spawn();
+        let mut router = Router::new();
+        register_engine_handlers(&mut router, engine.clone());
+
+        for method in [
+            "session/enqueue_steer",
+            "session/enqueue_follow_up",
+            "session/enqueue_next_turn",
+        ] {
+            let params = serde_json::json!({
+                "threadId": "thread:native/inject",
+                "items": [],
+            });
+            let v = router
+                .dispatch(method, Some(params))
+                .await
+                .unwrap_or_else(|e| panic!("{method} must be registered, got {e:?}"));
+            assert_eq!(v["accepted"], true, "{method} must acknowledge");
+        }
 
         engine.shutdown().await.unwrap();
     }

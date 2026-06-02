@@ -41,6 +41,7 @@ impl EngineInner {
         self: &Arc<Self>,
         thread_id: ThreadId,
         user_input: Vec<zhive_proto::domain::Item>,
+        scope: Option<zhive_proto::permission::PermissionScope>,
     ) -> Result<StartTurnReply, StartTurnError> {
         // Attempt the engine-wide Idle → Turn transition. A refusal
         // here means the engine is already busy; surface it as both a
@@ -94,7 +95,19 @@ impl EngineInner {
         let cancel = {
             let mut active = handle.active_turn.lock().await;
             let turn_cancel = self.cancel_tree().child_for_turn();
-            let active_turn = ActiveTurn::new_with_cancel(turn_id.clone(), started_at, turn_cancel);
+            // An explicit scope on the submission (e.g. a client constraining a
+            // top-level turn) is honoured; `None` falls back to the default
+            // turn scope. Previously the scope was dropped, so every top-level
+            // turn silently ran with the default scope.
+            let active_turn = match scope {
+                Some(scope) => ActiveTurn::new_with_cancel_and_scope(
+                    turn_id.clone(),
+                    started_at,
+                    turn_cancel,
+                    scope,
+                ),
+                None => ActiveTurn::new_with_cancel(turn_id.clone(), started_at, turn_cancel),
+            };
             let cancel = active_turn.cancel.clone();
             *active = Some(active_turn);
             cancel
