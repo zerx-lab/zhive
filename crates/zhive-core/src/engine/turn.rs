@@ -336,6 +336,26 @@ async fn run_turn_inner(
             }
         }
 
+        // Emit this provider call's token usage for observability (D-014).
+        // Runs once per loop iteration, so a multi-call (tool-using) turn logs
+        // each call's usage. Field names follow OTel GenAI semantic conventions
+        // so an OTLP exporter surfaces them without a rename. `total` is `None`
+        // when the provider reported no usage (e.g. the scripted test model).
+        if let Some(usage) = fold.usage() {
+            // `input_tokens` / `output_tokens` map to the OTel GenAI semconv
+            // attributes `gen_ai.usage.input_tokens` / `output_tokens`; the
+            // dotted names are kept flat here only to satisfy the `tracing`
+            // macro's field-name grammar.
+            let input_tokens = usage.input_tokens.total.unwrap_or(0);
+            let output_tokens = usage.output_tokens.total.unwrap_or(0);
+            tracing::info!(
+                name: "zhive.turn.usage",
+                input_tokens,
+                output_tokens,
+                "token usage: {{input_tokens}} in / {{output_tokens}} out"
+            );
+        }
+
         // Drain any open fold buffers (partial items before cancel/error).
         for item in fold.finish() {
             if matches!(&item, Item::ToolCall { .. }) {
