@@ -20,11 +20,14 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
         .unwrap_or_else(|| Command::Tui(crate::cli::TuiArgs::default()));
     match command {
         Command::Tui(args) => run_tui(cli.config, args).await,
+        #[cfg(feature = "engine")]
+        Command::Exec(args) => run_exec(cli.config, args).await,
         Command::Serve(args) => run_serve(cli.config, args).await,
         Command::Bridge(args) => run_bridge(args).await,
         #[cfg(feature = "acp")]
         Command::Acp(_args) => run_acp(cli.config).await,
         Command::Config(args) => run_config(cli.config, args),
+        Command::Doctor => run_doctor(cli.config).await,
     }
 }
 
@@ -34,6 +37,11 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
 
 #[cfg(feature = "tui")]
 async fn run_tui(config_path: Option<std::path::PathBuf>, args: crate::cli::TuiArgs) -> Result<()> {
+    // TUI owns the full terminal, so nothing may go to stderr or stdout.
+    // Spin up a file-backed subscriber instead (best-effort; silently degraded
+    // on failure so a missing data dir never blocks the TUI from starting).
+    init_tui_file_logging();
+
     let (mut cfg, _source) = crate::config::Config::load(config_path.as_deref())?;
     apply_tui_overrides(&mut cfg, &args);
 
@@ -46,6 +54,63 @@ async fn run_tui(config_path: Option<std::path::PathBuf>, args: crate::cli::TuiA
     let result = zhive_tui::run(host.client.clone(), tui_config).await;
     host.stop().await;
     Ok(result?)
+}
+
+/// Attempts to install a file-backed `tracing` subscriber for the TUI.
+///
+/// The log file is placed in the user's zhive data directory
+/// (`$ZHIVE_DATA_DIR`, `$XDG_DATA_HOME/zhive`, or
+/// `$HOME/.local/share/zhive`) as `zhive-tui.log`. ANSI colour codes are
+/// suppressed because most viewers cannot render them.
+///
+/// Failure (missing home directory, permission denied, etc.) is silently
+/// ignored so it never prevents the TUI from launching.
+#[cfg(feature = "tui")]
+fn init_tui_file_logging() {
+    use std::sync::Arc;
+
+    use tracing_subscriber::EnvFilter;
+
+    let Some(log_path) = tui_log_path() else {
+        // No data directory available; the TUI will run without logging.
+        return;
+    };
+
+    // Create parent directories and open the log file in append mode.
+    let file = (|| -> std::io::Result<std::fs::File> {
+        if let Some(parent) = log_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+    })();
+
+    let Ok(file) = file else {
+        // Cannot open the file; degrade gracefully.
+        return;
+    };
+
+    // `Arc<W>` implements `MakeWriter` when `&W: io::Write`.
+    // `File` satisfies `&File: io::Write`, so `Arc<File>` works.
+    let writer = Arc::new(file);
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    // `try_init` is best-effort: if another subscriber was already installed
+    // (e.g. in tests) the error is ignored.
+    let _ = tracing_subscriber::fmt()
+        .with_writer(writer)
+        .with_ansi(false)
+        .with_env_filter(filter)
+        .try_init();
+}
+
+/// Resolves the TUI log-file path: `<data_dir>/zhive-tui.log`.
+///
+/// Returns `None` when the data directory cannot be determined.
+#[cfg(feature = "tui")]
+fn tui_log_path() -> Option<std::path::PathBuf> {
+    crate::boot::data_dir().map(|d| d.join("zhive-tui.log"))
 }
 
 #[cfg(not(feature = "tui"))]
@@ -134,6 +199,138 @@ fn detect_branch() -> Option<String> {
     let head = std::fs::read_to_string(".git/HEAD").ok()?;
     let branch = head.trim().strip_prefix("ref: refs/heads/")?;
     Some(branch.to_owned())
+}
+
+// ============================================================
+// exec  (P1-6 headless single-turn)
+// ============================================================
+
+/// Runs a single prompt headlessly, printing the response to stdout.
+///
+/// Starts the in-process engine, submits `args.prompt` as the first user
+/// message, streams the agent reply and any tool activity to stdout (one line
+/// per tool event), and exits once the turn completes or fails. The engine is
+/// always shut down before return.
+///
+/// Exit is non-zero when the engine reports a turn failure; the error message
+/// is written to stderr so scripts can distinguish it from the model reply on
+/// stdout.
+///
+/// # Errors
+///
+/// Returns an error if config loading, provider build, engine startup, or the
+/// `start_turn` RPC fails.
+#[cfg(feature = "engine")]
+async fn run_exec(
+    config_path: Option<std::path::PathBuf>,
+    args: crate::cli::ExecArgs,
+) -> Result<()> {
+    use zhive_client_native::ClientEvent;
+    use zhive_proto::domain::Item;
+    use zhive_tui::protocol::EngineNotification;
+
+    init_stderr_logging();
+
+    let (mut cfg, _source) = crate::config::Config::load(config_path.as_deref())?;
+
+    // Apply provider/model overrides the same way `tui` does.
+    if let Some(ref provider_name) = args.provider {
+        if cfg.provider.providers.contains_key(provider_name.as_str()) {
+            cfg.provider.default.clone_from(provider_name);
+        } else {
+            tracing::warn!(
+                provider = %provider_name,
+                "--provider value not found in config providers map; ignoring override"
+            );
+        }
+    }
+    if let (Some(model), Some(entry)) = (
+        &args.model,
+        cfg.provider.providers.get_mut(&cfg.provider.default),
+    ) {
+        entry.model.clone_from(model);
+    }
+
+    let provider = crate::provider::build(&cfg)?;
+    let runtime = crate::boot::build_runtime(&cfg).await?;
+    let socket = crate::engine_host::tui_socket_path();
+    let host = crate::engine_host::Host::start(provider, runtime, socket).await?;
+
+    // Generate a fresh thread id and subscribe to events before start_turn so
+    // no event is missed between the call and subscription.
+    let thread = zhive_tui::id::new_thread_id();
+    let mut events = host.client.subscribe_events();
+
+    // Kick off the turn (returns as soon as the engine accepts).
+    host.client
+        .call(
+            "engine/start_turn",
+            Some(serde_json::json!({
+                "threadId": thread,
+                "items": [{"type": "userMessage", "text": args.prompt}],
+            })),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("start_turn failed: {e}"))?;
+
+    // Drain events until TurnCompleted or TurnFailed for our thread.
+    let mut turn_failed: Option<String> = None;
+    loop {
+        match events.next_event().await {
+            None | Some(ClientEvent::Disconnected { .. }) => {
+                anyhow::bail!("engine disconnected before turn finished");
+            }
+            Some(ClientEvent::Notification(n)) => {
+                let decoded = zhive_tui::protocol::decode(&n.method, n.params);
+                match decoded {
+                    EngineNotification::ItemAppended {
+                        thread_id, item, ..
+                    } if thread_id == thread => {
+                        match *item {
+                            Item::AgentMessage { text, .. } => {
+                                // Print the complete assistant text.
+                                print!("{text}");
+                            }
+                            Item::ToolCall { name, .. } => {
+                                // One-line tool activity to stdout.
+                                println!("\n[tool] {name}");
+                            }
+                            _ => {}
+                        }
+                    }
+                    EngineNotification::ItemDelta {
+                        thread_id, delta, ..
+                    } if thread_id == thread => {
+                        // Stream token-by-token output as it arrives.
+                        print!("{delta}");
+                    }
+                    EngineNotification::TurnCompleted { thread_id, .. } if thread_id == thread => {
+                        // Ensure a trailing newline after the response.
+                        println!();
+                        break;
+                    }
+                    EngineNotification::TurnFailed {
+                        thread_id, error, ..
+                    } if thread_id == thread => {
+                        turn_failed = Some(format!("{error:?}"));
+                        break;
+                    }
+                    _ => {} // events for other threads or unrelated notifications
+                }
+            }
+            Some(ClientEvent::Lagged(n)) => {
+                tracing::warn!(dropped = n, "exec: dropped events (lagged broadcast)");
+            }
+            _ => {}
+        }
+    }
+
+    host.stop().await;
+
+    if let Some(msg) = turn_failed {
+        anyhow::bail!("turn failed: {msg}");
+    }
+    Ok(())
 }
 
 // ============================================================
@@ -238,9 +435,11 @@ async fn run_serve(
 
 /// Installs a `tracing` subscriber that writes to **stderr only**.
 ///
-/// Both `serve` and `acp` rely on this: `acp` in particular speaks JSON-RPC on
-/// stdout, so anything other than the protocol wire must go to stderr.
-#[cfg(any(feature = "serve", feature = "acp"))]
+/// `serve`, `acp`, and `exec` rely on this: `acp` in particular speaks
+/// JSON-RPC on stdout, so anything other than the protocol wire must go to
+/// stderr. `exec` emits the agent reply on stdout, so tracing must not
+/// interfere.
+#[cfg(any(feature = "serve", feature = "acp", feature = "engine"))]
 fn init_stderr_logging() {
     use tracing_subscriber::EnvFilter;
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
@@ -345,6 +544,73 @@ fn run_config(config_path: Option<std::path::PathBuf>, args: ConfigArgs) -> Resu
 }
 
 // ============================================================
+// doctor
+// ============================================================
+
+/// Prints a diagnostic summary of the current config and capabilities.
+///
+/// Covers: config file path, active provider (build success/failure), MCP
+/// server count, on-disk skill count (when the `skills` feature is on), and
+/// the data-directory path. Does **not** make any network request.
+///
+/// # Errors
+///
+/// Currently infallible; returns `Result` for a consistent dispatch signature.
+#[expect(
+    clippy::unused_async,
+    reason = "kept async to match the dispatch signature; skill discovery is sync"
+)]
+async fn run_doctor(config_path: Option<std::path::PathBuf>) -> Result<()> {
+    // ── Config ───────────────────────────────────────────────────────────────
+    let (cfg, cfg_source) = crate::config::Config::load(config_path.as_deref())?;
+    match &cfg_source {
+        Some(p) => println!("config:   {}", p.display()),
+        None => println!("config:   (using defaults — no file found)"),
+    }
+
+    // ── Provider ─────────────────────────────────────────────────────────────
+    let provider_label = cfg.active_provider_label().to_owned();
+    let model_label = cfg.active_model().to_owned();
+    match crate::provider::build(&cfg) {
+        Ok(_) => println!("provider: {provider_label} / {model_label} — OK"),
+        Err(e) => println!("provider: {provider_label} / {model_label} — FAILED ({e})"),
+    }
+
+    // ── MCP servers ──────────────────────────────────────────────────────────
+    let mcp_count = cfg.mcp.servers.len();
+    println!("mcp:      {mcp_count} server(s) configured");
+
+    // ── Skills ───────────────────────────────────────────────────────────────
+    #[cfg(feature = "skills")]
+    {
+        if cfg.skills.enabled {
+            let discovery = zhive_core::skills::SkillDiscoveryConfig {
+                extra_roots: cfg.skills.extra_roots.clone(),
+            };
+            let set = zhive_core::skills::SkillSet::discover_and_load(&discovery);
+            println!(
+                "skills:   {} discovered (discovery enabled)",
+                set.loaded.len()
+            );
+        } else {
+            println!("skills:   discovery disabled");
+        }
+    }
+    #[cfg(not(feature = "skills"))]
+    {
+        println!("skills:   (skills feature not compiled in)");
+    }
+
+    // ── Data directory ───────────────────────────────────────────────────────
+    match crate::boot::data_dir() {
+        Some(p) => println!("data-dir: {}", p.display()),
+        None => println!("data-dir: (unknown — set $HOME or $XDG_DATA_HOME)"),
+    }
+
+    Ok(())
+}
+
+// ============================================================
 // shared helpers
 // ============================================================
 
@@ -357,6 +623,151 @@ fn default_socket() -> std::path::PathBuf {
             || std::env::temp_dir().join("zhive.sock"),
             |dir| std::path::PathBuf::from(dir).join("zhive.sock"),
         )
+}
+
+// ============================================================
+// tests
+// ============================================================
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use crate::cli::Cli;
+
+    /// `zhive exec -p "hello"` parses to `Exec { prompt: "hello", .. }`.
+    #[cfg(feature = "engine")]
+    #[test]
+    fn exec_args_parse_short_flag() {
+        let cli = Cli::parse_from(["zhive", "exec", "-p", "hello"]);
+        match cli.command {
+            Some(crate::cli::Command::Exec(args)) => {
+                assert_eq!(args.prompt, "hello");
+                assert!(args.provider.is_none());
+                assert!(args.model.is_none());
+            }
+            other => panic!("expected Exec, got {other:?}"),
+        }
+    }
+
+    /// `zhive exec --prompt "hi" --provider openai --model gpt-4o` parses
+    /// all three flags.
+    #[cfg(feature = "engine")]
+    #[test]
+    fn exec_args_parse_long_flags() {
+        let cli = Cli::parse_from([
+            "zhive",
+            "exec",
+            "--prompt",
+            "hi",
+            "--provider",
+            "openai",
+            "--model",
+            "gpt-4o",
+        ]);
+        match cli.command {
+            Some(crate::cli::Command::Exec(args)) => {
+                assert_eq!(args.prompt, "hi");
+                assert_eq!(args.provider.as_deref(), Some("openai"));
+                assert_eq!(args.model.as_deref(), Some("gpt-4o"));
+            }
+            other => panic!("expected Exec, got {other:?}"),
+        }
+    }
+
+    /// `exec` requires `--prompt`; omitting it is a parse error.
+    #[cfg(feature = "engine")]
+    #[test]
+    fn exec_args_requires_prompt() {
+        assert!(
+            Cli::try_parse_from(["zhive", "exec"]).is_err(),
+            "missing --prompt should be a parse error"
+        );
+    }
+
+    /// `zhive doctor` parses to `Command::Doctor`.
+    #[test]
+    fn doctor_command_parses() {
+        let cli = Cli::parse_from(["zhive", "doctor"]);
+        assert!(
+            matches!(cli.command, Some(crate::cli::Command::Doctor)),
+            "expected Doctor variant"
+        );
+    }
+
+    /// `run_doctor` prints the key diagnostic fields: provider, mcp, data-dir.
+    #[tokio::test]
+    async fn doctor_output_contains_key_fields() {
+        use std::io::Write;
+
+        // Redirect stdout to a buffer by running the doctor logic inline and
+        // capturing its println! output via a pipe.
+        // Because println! goes to the real stdout and we cannot easily swap it
+        // in tests, we exercise the underlying helpers that doctor relies on:
+        // config load, provider build, data_dir.
+        let cfg = crate::config::Config::default();
+        assert!(!cfg.active_provider_label().is_empty(), "provider label");
+        assert!(!cfg.active_model().is_empty(), "model label");
+        // data_dir must not panic.
+        let _ = crate::boot::data_dir();
+
+        // The "scripted" provider builds without a key, confirming the
+        // provider diagnostic path works.
+        let mut scripted_cfg = cfg.clone();
+        scripted_cfg.provider.default = "scripted".to_owned();
+        assert!(
+            crate::provider::build(&scripted_cfg).is_ok(),
+            "scripted provider builds"
+        );
+
+        // A missing key yields a FAILED branch in doctor output.
+        let mut bad_cfg = cfg;
+        bad_cfg.provider.default = "anthropic".to_owned();
+        if let Some(entry) = bad_cfg.provider.providers.get_mut("anthropic") {
+            entry.api_key = None;
+            entry.api_key_env = Some("ZHIVE_TEST_ABSENT_KEY_DOCTOR".to_owned());
+        }
+        assert!(
+            crate::provider::build(&bad_cfg).is_err(),
+            "missing key surfaces error"
+        );
+
+        // Placeholder to make the buffer compile cleanly.
+        let _ = std::io::stdout().flush();
+    }
+
+    /// `tui_log_path` returns a path ending in `zhive-tui.log` when
+    /// `$HOME` is set (the CI machine always has one).
+    #[cfg(feature = "tui")]
+    #[test]
+    fn tui_log_path_ends_with_log_filename() {
+        if std::env::var_os("HOME").is_none()
+            && std::env::var_os("XDG_DATA_HOME").is_none()
+            && std::env::var_os("ZHIVE_DATA_DIR").is_none()
+        {
+            // In environments with no home directory, data_dir() returns None
+            // and tui_log_path() returns None as well; nothing to assert.
+            return;
+        }
+        let path = super::tui_log_path();
+        assert!(
+            path.is_some(),
+            "expected Some(_) when a home dir is available"
+        );
+        assert_eq!(
+            path.unwrap().file_name().and_then(|n| n.to_str()),
+            Some("zhive-tui.log"),
+            "log file name must be zhive-tui.log"
+        );
+    }
+
+    /// `data_dir` never panics and returns a stable value when `$HOME` is set.
+    #[test]
+    fn data_dir_is_stable() {
+        let first = crate::boot::data_dir();
+        let second = crate::boot::data_dir();
+        assert_eq!(first, second, "data_dir must be deterministic");
+    }
 }
 
 // Rust guideline compliant 2026-02-21

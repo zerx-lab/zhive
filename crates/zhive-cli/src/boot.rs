@@ -37,6 +37,19 @@ pub struct RuntimeTools {
     /// Persistent storage for the engine, or `None` when it could not be
     /// opened (the engine then runs purely in-memory). See [`open_storage`].
     pub storage: Option<Arc<zhive_core::persistence::Storage>>,
+    /// Slash-only skill names discovered during boot (skills with
+    /// `disable-model-invocation: true`).  These cannot be called by the LLM
+    /// but can be surfaced in the TUI command palette.  Empty when the
+    /// `skills` feature is absent or `skills.enabled` is false.
+    ///
+    /// Currently unused inside `zhive-cli`; callers (e.g. a future TUI
+    /// injection point) can read the list via this public field.
+    #[expect(
+        dead_code,
+        reason = "public field reserved for future TUI slash-command injection; \
+                  zhive-tui does not yet expose an API to pass extra commands into run()"
+    )]
+    pub slash_commands: Vec<String>,
     /// Live MCP manager whose tools were registered, if any.
     #[cfg(feature = "mcp")]
     pub mcp: Option<zhive_mcp::McpManager>,
@@ -117,7 +130,9 @@ pub async fn build_runtime(cfg: &Config) -> anyhow::Result<RuntimeTools> {
     let mcp = build_mcp(cfg, &mut registry).await;
 
     #[cfg(feature = "skills")]
-    register_skills(cfg, &mut registry);
+    let slash_commands = register_skills(cfg, &mut registry);
+    #[cfg(not(feature = "skills"))]
+    let slash_commands: Vec<String> = Vec::new();
 
     // The system prompt is a host (process) concern: it folds in the working
     // directory and the project's instruction file. A failed `current_dir`
@@ -134,6 +149,7 @@ pub async fn build_runtime(cfg: &Config) -> anyhow::Result<RuntimeTools> {
         turn_limits: turn_limits_from(cfg),
         system_prompt,
         storage,
+        slash_commands,
         #[cfg(feature = "mcp")]
         mcp,
     })
@@ -177,7 +193,14 @@ async fn open_storage() -> Option<Arc<zhive_core::persistence::Storage>> {
 ///
 /// Honours `$ZHIVE_DATA_DIR`, then `$XDG_DATA_HOME/zhive`, then
 /// `$HOME/.local/share/zhive`. Returns `None` when none can be resolved.
-fn data_dir() -> Option<std::path::PathBuf> {
+///
+/// # Examples
+///
+/// ```
+/// // Returns None when HOME and XDG_DATA_HOME are unset; otherwise a PathBuf.
+/// let _ = zhive_cli::boot::data_dir();
+/// ```
+pub fn data_dir() -> Option<std::path::PathBuf> {
     use std::path::PathBuf;
     if let Some(explicit) = std::env::var_os("ZHIVE_DATA_DIR") {
         return Some(PathBuf::from(explicit));
@@ -237,11 +260,14 @@ async fn build_mcp(cfg: &Config, registry: &mut ToolRegistry) -> Option<zhive_mc
     Some(manager)
 }
 
-/// Discovers on-disk skills and registers the model-invocable ones.
+/// Discovers on-disk skills, registers the model-invocable ones, and returns
+/// the names of slash-only skills (those with `disable-model-invocation: true`).
+///
+/// Returns an empty `Vec` when `cfg.skills.enabled` is false.
 #[cfg(feature = "skills")]
-fn register_skills(cfg: &Config, registry: &mut ToolRegistry) {
+fn register_skills(cfg: &Config, registry: &mut ToolRegistry) -> Vec<String> {
     if !cfg.skills.enabled {
-        return;
+        return Vec::new();
     }
     let discovery = zhive_core::skills::SkillDiscoveryConfig {
         extra_roots: cfg.skills.extra_roots.clone(),
@@ -253,6 +279,7 @@ fn register_skills(cfg: &Config, registry: &mut ToolRegistry) {
         skill.slash_only = slash_only.len(),
         "skills.registered: {{skill.loaded}} skills loaded, {{skill.slash_only}} slash-only",
     );
+    slash_only
 }
 
 // Rust guideline compliant 2026-02-21

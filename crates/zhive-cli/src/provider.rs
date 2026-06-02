@@ -336,13 +336,16 @@ pub fn builtin_registry() -> ProviderRegistry {
             }
         }
 
-        // GoogleVertex::build() is async; spin up a one-shot runtime.
-        let provider = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .context("building tokio runtime for google-vertex")?
-            .block_on(builder.build())
-            .context("building Google Vertex provider")?;
+        // GoogleVertex::build() is async.  Constructing a *new* Tokio runtime
+        // inside an existing async context panics ("Cannot start a runtime
+        // from within a runtime").  Instead we re-use the current multi-thread
+        // runtime via `block_in_place`, which is safe because the default
+        // `#[tokio::main]` entry point uses a multi-thread scheduler.
+        let provider = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(builder.build())
+        })
+        .context("building Google Vertex provider")?;
         Ok(DynLanguageModel::new(provider.language_model(&entry.model)))
     });
 

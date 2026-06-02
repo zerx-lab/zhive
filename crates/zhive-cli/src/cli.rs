@@ -2,7 +2,9 @@
 //!
 //! Subcommands map to Phase 1 features: `tui` (the default) launches the UI,
 //! `serve` runs the engine as a UDS daemon, `bridge` pipes stdio to a running
-//! daemon for editor/ACP/MCP hosts, and `config` manages the config file.
+//! daemon for editor/ACP/MCP hosts, `exec` runs the engine headlessly (useful
+//! in scripts and CI), `doctor` prints a diagnostic health summary, and
+//! `config` manages the config file.
 //! Argument types stay free of the optional engine/UI crates so the parser
 //! compiles regardless of which features are enabled.
 
@@ -28,6 +30,16 @@ pub struct Cli {
 pub enum Command {
     /// Launch the interactive terminal UI (default).
     Tui(TuiArgs),
+    /// Run a single prompt non-interactively and print the result to stdout.
+    ///
+    /// Starts the engine, submits the prompt, streams the response to stdout,
+    /// and exits. Suitable for scripts and CI pipelines:
+    ///
+    /// ```text
+    /// zhive exec -p "summarize the README"
+    /// ```
+    #[cfg(feature = "engine")]
+    Exec(ExecArgs),
     /// Run the engine as a daemon serving JSON-RPC over a Unix socket.
     Serve(ServeArgs),
     /// Pipe stdio to a running engine socket (editor / ACP / MCP hosts).
@@ -37,6 +49,8 @@ pub enum Command {
     Acp(AcpArgs),
     /// Inspect or initialize the configuration file.
     Config(ConfigArgs),
+    /// Print a diagnostic summary of the current configuration and capabilities.
+    Doctor,
 }
 
 /// Arguments for `zhive tui` (all override `config.toml`).
@@ -84,6 +98,28 @@ pub struct BridgeArgs {
 #[cfg(feature = "acp")]
 #[derive(Args, Debug, Default)]
 pub struct AcpArgs;
+
+/// Arguments for `zhive exec`.
+///
+/// All provider/model flags are identical to `tui` so the same config
+/// overrides work in headless mode.
+#[cfg(feature = "engine")]
+#[derive(Args, Debug)]
+pub struct ExecArgs {
+    /// The prompt to send to the engine.
+    ///
+    /// The engine runs the prompt to completion and prints the agent's reply
+    /// to stdout. Tool activity is printed to stdout as well, one line per
+    /// tool call/result.
+    #[arg(short, long)]
+    pub prompt: String,
+    /// Provider override (name from `[provider.<name>]` in config.toml).
+    #[arg(long)]
+    pub provider: Option<String>,
+    /// Model id override.
+    #[arg(long)]
+    pub model: Option<String>,
+}
 
 /// Arguments for `zhive config`.
 #[derive(Args, Debug)]
