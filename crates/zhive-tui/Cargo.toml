@@ -29,4 +29,7 @@ thiserror   = { workspace = true }
 tracing     = { workspace = true }
 
 ratatui    = { workspace = true }
-crossterm  = { workspace = true }
+crossterm  = { workspace = true, features = ["event-stream"] }
+serde       = { workspace = true, features = ["derive"] }
+serde_json  = { workspace = true }
+unicode-width = { workspace = true }

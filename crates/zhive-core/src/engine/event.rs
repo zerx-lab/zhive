@@ -62,6 +62,20 @@ pub enum EngineEvent {
         /// The new item (boxed because [`Item`] is large).
         item: Box<Item>,
     },
+    /// A streamed text fragment for the active turn's agent message.
+    ///
+    /// Emitted once per provider `TextDelta` so clients can render output
+    /// token-by-token. The block still finalises as a single
+    /// [`EngineEvent::ItemAppended`] carrying the complete
+    /// [`Item::AgentMessage`], so a client that ignores deltas loses nothing.
+    ItemDelta {
+        /// Owning thread.
+        thread_id: ThreadId,
+        /// Active turn id.
+        turn_id: TurnId,
+        /// The incremental text fragment.
+        delta: String,
+    },
     /// A turn reached
     /// [`zhive_proto::domain::TurnStatus::Completed`].
     TurnCompleted {

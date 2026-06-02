@@ -1,17 +1,29 @@
-//! Entry point for the `zhive` binary.
+//! The `zhive` binary: a dispatcher for the `tui`, `serve`, `bridge`, and
+//! `config` subcommands.
 //!
-//! Subcommand layout (target shape per D-010, R3+R4 终版):
-//!   * `zhive`              -> spawn engine + attach TUI
-//!   * `zhive serve`        -> JSON-RPC daemon over UDS + stdio (D-003, D-004)
-//!   * `zhive tui`          -> attach TUI to a running engine
-//!   * `zhive bridge-stdio` -> stdio <-> UDS pass-through (Phase 1 必含)
-//!
-//! Phase 1 placeholder: prints a banner; real dispatch lands once the
-//! first turn end-to-end works.
+//! Process concerns (config files, provider credentials, spawning and serving
+//! the engine) live here and in [`run`]; the TUI and engine crates stay free of
+//! them. See [`cli`] for the command surface and [`config`] for the file format.
 
-fn main() {
-    println!("zhive {} (skeleton)", env!("CARGO_PKG_VERSION"));
-    println!("subcommand wiring lands with the v1 protocol implementation.");
+#![forbid(unsafe_code)]
+
+mod cli;
+mod config;
+mod run;
+
+// The provider builders and in-process engine host need `zhive-core` + `llmsdk`,
+// which only the `engine` feature pulls in (via `tui` / `serve`).
+#[cfg(feature = "engine")]
+mod engine_host;
+#[cfg(feature = "engine")]
+mod provider;
+
+use clap::Parser;
+
+use crate::cli::Cli;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
+    run::dispatch(cli).await
 }
-
-// Rust guideline compliant 2026-02-21

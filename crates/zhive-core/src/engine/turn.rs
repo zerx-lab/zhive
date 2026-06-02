@@ -33,6 +33,7 @@
 use std::sync::Arc;
 
 use futures::StreamExt as _;
+use llmsdk::language_model::StreamPart;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
 use zhive_proto::domain::{Item, ItemId, NoticeLevel, ThreadId, TurnError, TurnId};
@@ -254,6 +255,18 @@ async fn run_turn_inner(
                     match maybe_part {
                         None => break,
                         Some(Ok(part)) => {
+                            // Stream text fragments live so clients can render
+                            // token-by-token; the block still finalises as one
+                            // AgentMessage via fold below.
+                            if let StreamPart::TextDelta { delta, .. } = &part
+                                && !delta.is_empty()
+                            {
+                                let _ = inner.events_tx().send(EngineEvent::ItemDelta {
+                                    thread_id: thread_id.clone(),
+                                    turn_id: turn_id.clone(),
+                                    delta: delta.clone(),
+                                });
+                            }
                             for item in fold.fold(part) {
                                 if matches!(&item, Item::ToolCall { .. }) {
                                     // Accumulate tool-call items for post-stream dispatch.

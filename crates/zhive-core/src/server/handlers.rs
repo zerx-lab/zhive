@@ -12,6 +12,7 @@
 //! * `engine/cancel_turn` — calls [`crate::engine::Engine::cancel_turn`]
 //! * `engine/resume_permission` — calls
 //!   [`crate::engine::Engine::resume_permission`]
+//! * `engine/compact` — calls [`crate::engine::Engine::compact`]
 //! * `engine/shutdown` — calls [`crate::engine::Engine::shutdown`]
 //!
 //! Method names are intentionally namespaced under `engine/` so the
@@ -25,9 +26,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use zhive_proto::ErrorObject;
 use zhive_proto::domain::{Item, ThreadId, TurnId};
+use zhive_proto::hook::CompactTrigger;
 use zhive_proto::permission::{PermissionOutcome, PermissionScope};
 
-use crate::engine::{Engine, EngineError, PermissionRequestId, submission::ResumePermissionReply};
+use crate::engine::{
+    Engine, EngineError, PermissionRequestId,
+    submission::{CompactError, CompactReply, ResumePermissionReply},
+};
 
 use super::router::{Handler, JsonRpcCode, Router};
 
@@ -58,6 +63,12 @@ pub fn register_engine_handlers(router: &mut Router, engine: Engine) {
     router.register(
         "engine/resume_permission",
         Arc::new(ResumePermissionHandler {
+            engine: Arc::clone(&engine),
+        }),
+    );
+    router.register(
+        "engine/compact",
+        Arc::new(CompactHandler {
             engine: Arc::clone(&engine),
         }),
     );
@@ -124,6 +135,39 @@ enum ResumePermissionStatus {
 struct ResumePermissionResult {
     /// Wire-form copy of the reducer's typed reply.
     status: ResumePermissionStatus,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CompactParams {
+    thread_id: ThreadId,
+    /// Defaults to [`CompactTrigger::Manual`]: a client-driven compaction is
+    /// manual by definition. The auto trigger is reserved for the engine's
+    /// own threshold-driven compaction and is not expected over the wire.
+    #[serde(default = "manual_trigger")]
+    trigger: CompactTrigger,
+}
+
+/// Default `trigger` for [`CompactParams`]: client compaction is manual.
+fn manual_trigger() -> CompactTrigger {
+    CompactTrigger::Manual
+}
+
+/// Wire-form classifier mirroring the successful [`CompactReply`] cases.
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum CompactStatus {
+    Compacted,
+    NothingToCompact,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CompactResult {
+    /// Whether a summary replaced transcript items or there was nothing to do.
+    status: CompactStatus,
+    /// Count of transcript items folded into the summary (0 when nothing ran).
+    entries_compacted: u32,
 }
 
 // ============================================================
@@ -204,6 +248,36 @@ impl Handler for ResumePermissionHandler {
     }
 }
 
+struct CompactHandler {
+    engine: Arc<Engine>,
+}
+
+#[async_trait]
+impl Handler for CompactHandler {
+    async fn handle(&self, params: Option<Value>) -> Result<Value, ErrorObject> {
+        let params: CompactParams = decode_params(params)?;
+        match self.engine.compact(params.thread_id, params.trigger).await {
+            Ok(Ok(reply)) => {
+                let result = match reply {
+                    CompactReply::Compacted { entries_compacted } => CompactResult {
+                        status: CompactStatus::Compacted,
+                        entries_compacted,
+                    },
+                    CompactReply::NothingToCompact => CompactResult {
+                        status: CompactStatus::NothingToCompact,
+                        entries_compacted: 0,
+                    },
+                };
+                // A fully-typed struct cannot fail to serialise; fall back to
+                // Null rather than `.expect()` (CLAUDE.md no-expect rule).
+                Ok(serde_json::to_value(result).unwrap_or(Value::Null))
+            }
+            Ok(Err(domain)) => Err(compact_error(&domain)),
+            Err(err) => Err(engine_error(&err)),
+        }
+    }
+}
+
 struct ShutdownHandler {
     engine: Arc<Engine>,
 }
@@ -247,6 +321,30 @@ fn engine_error(err: &EngineError) -> ErrorObject {
         EngineError::SubagentSpawnFailed(reason) => Some(serde_json::json!({
             "kind": "subagent_spawn_failed",
             "reason": reason.to_string(),
+        })),
+    };
+    ErrorObject {
+        code: ENGINE_ERROR_CODE,
+        message,
+        data,
+    }
+}
+
+/// Maps a [`CompactError`] to a wire error carrying a `kind` discriminator.
+///
+/// Uses the same [`ENGINE_ERROR_CODE`] and `data.kind` convention as
+/// [`engine_error`] so clients fold both into one handler.
+fn compact_error(err: &CompactError) -> ErrorObject {
+    let message = err.to_string();
+    let data = match err {
+        CompactError::ThreadNotFound => Some(serde_json::json!({ "kind": "thread_not_found" })),
+        CompactError::EngineBusy { current } => Some(serde_json::json!({
+            "kind": "engine_busy",
+            "currentPhase": current,
+        })),
+        CompactError::SummarizationFailed { message } => Some(serde_json::json!({
+            "kind": "summarization_failed",
+            "reason": message,
         })),
     };
     ErrorObject {
@@ -343,6 +441,27 @@ mod tests {
         assert_eq!(err.code, ENGINE_ERROR_CODE);
         assert_eq!(err.data.as_ref().unwrap()["kind"], "engine_busy");
         assert_eq!(err.data.as_ref().unwrap()["currentPhase"], "compaction");
+    }
+
+    /// Compacting a thread that never ran a turn surfaces the
+    /// `thread_not_found` engine error rather than a success result.
+    #[tokio::test]
+    async fn compact_handler_unknown_thread_reports_thread_not_found() {
+        let engine = Engine::spawn();
+        let mut router = Router::new();
+        register_engine_handlers(&mut router, engine.clone());
+
+        let err = router
+            .dispatch(
+                "engine/compact",
+                Some(serde_json::json!({"threadId": "thread:native/never"})),
+            )
+            .await
+            .expect_err("compact on missing thread is an error");
+        assert_eq!(err.code, ENGINE_ERROR_CODE);
+        assert_eq!(err.data.as_ref().unwrap()["kind"], "thread_not_found");
+
+        engine.shutdown().await.unwrap();
     }
 
     /// Confirms a missing handler still returns `MethodNotFound` (sanity

@@ -53,12 +53,18 @@ tracing            = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt"] }
 serde              = { version = "1", default-features = false, features = ["derive"] }
 serde_json         = "1"
+# TOML config parsing for zhive-cli's layered config. `parse` + `serde`
+# read config.toml; `display` lets `zhive config init` emit a sample file.
+toml               = { version = "1", default-features = false, features = ["parse", "serde", "display"] }
 
 # ---- CLI ----
 clap = { version = "4", default-features = false, features = ["derive", "std", "help", "usage", "error-context"] }
 
 # ---- TUI ----
 ratatui    = { version = "0.30", default-features = false, features = ["crossterm"] }
+# `event-stream` exposes the async `EventStream` the TUI selects on; `cjk`
+# makes display-width math correct for the mandated Simplified-Chinese UI.
+unicode-width = { version = "0.2", default-features = false, features = ["cjk"] }
 crossterm  = "0.29"
 
 # ---- JSON-RPC 2.0 schema (D-003 R3+R4 终版) ----

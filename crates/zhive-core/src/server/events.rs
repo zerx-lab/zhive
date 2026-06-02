@@ -16,6 +16,7 @@
 //! | `TurnCompleted`            | `events/turn_completed`        |
 //! | `TurnFailed`               | `events/turn_failed`           |
 //! | `ItemAppended`             | `events/item_appended`         |
+//! | `ItemDelta`                | `events/item_delta`            |
 //! | `PhaseChanged`             | `events/phase_changed`         |
 //! | `SessionAborted`           | `events/session_aborted`       |
 //! | `PermissionRequested`      | `events/permission_requested`  |
@@ -215,6 +216,14 @@ struct ItemAppendedPayload<'a> {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+struct ItemDeltaPayload<'a> {
+    thread_id: &'a ThreadId,
+    turn_id: &'a TurnId,
+    delta: &'a str,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct PhaseChangedPayload<'a> {
     /// Optional thread id; `None` for engine-global transitions.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -284,6 +293,19 @@ pub fn engine_event_to_notification(event: &EngineEvent) -> Option<Notification>
                 turn_id,
                 item_id: item.id(),
                 item,
+            })
+            .ok()?,
+        ),
+        EngineEvent::ItemDelta {
+            thread_id,
+            turn_id,
+            delta,
+        } => (
+            "events/item_delta",
+            serde_json::to_value(ItemDeltaPayload {
+                thread_id,
+                turn_id,
+                delta,
             })
             .ok()?,
         ),
