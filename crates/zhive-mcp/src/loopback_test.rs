@@ -98,6 +98,7 @@ fn test_ctx() -> ToolContext {
         thread_id: ThreadId(Arc::from("thread:native/loopback")),
         turn_id: TurnId(Arc::from("turn:thread:native/loopback/0")),
         cancel: CancellationToken::new(),
+        spawner: None,
     }
 }
 

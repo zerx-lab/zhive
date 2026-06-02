@@ -3885,6 +3885,196 @@ mod inc6_tests {
     }
 
     // ===================================================================
+    // Test 4b: model-callable `agent` tool spawns a child and gets its result
+    // ===================================================================
+
+    /// End-to-end: the model emits a `ToolCall("agent")`; the `AgentTool`
+    /// spawns a subagent via the wired `EngineSubagentSpawner`, awaits the
+    /// child's final message, and feeds it back as the tool result. Asserts the
+    /// finalized `ToolCall` item carries the child's text and the parent turn
+    /// completes.
+    ///
+    /// Routing is deterministic (no shared counter race): the model in
+    /// [`agent_routing_provider`] inspects the reconstructed prompt rather than
+    /// a call index, so concurrency between the parent's second iteration and
+    /// the child turn cannot reorder the scripted responses.
+    #[tokio::test]
+    async fn agent_tool_spawns_child_and_returns_result() {
+        let mut tools = crate::tools::ToolRegistry::new();
+        tools.register(Arc::new(crate::tools::builtin::AgentTool));
+
+        let cfg = EngineConfig {
+            provider: agent_routing_provider(),
+            tools: Arc::new(tools),
+            hook_host: Arc::new(crate::hooks::HookHost::new()),
+            storage: None,
+            turn_limits: TurnLimits::default(),
+            system_prompt: None,
+        };
+        let engine =
+            Engine::spawn_with_config(cfg).with_reply_timeout(std::time::Duration::from_secs(10));
+        let mut events = engine.subscribe();
+
+        let parent_id = tid("thread:native/agent-tool-parent");
+        engine
+            .start_turn(parent_id.clone(), Vec::new(), None)
+            .await
+            .unwrap();
+
+        // The finalized `agent` ToolCall item must carry the child's text.
+        let mut agent_tool_result: Option<String> = None;
+        let mut saw_turn_completed = false;
+        for _ in 0..128 {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
+                .await
+                .expect("event timeout")
+                .expect("broadcast recv")
+            {
+                EngineEvent::ItemAppended { item, .. } => {
+                    if let Some(text) = agent_tool_result_text(&item) {
+                        agent_tool_result = Some(text);
+                    }
+                }
+                EngineEvent::TurnCompleted { thread_id, .. } if thread_id == parent_id => {
+                    saw_turn_completed = true;
+                }
+                _ => {}
+            }
+            if agent_tool_result.is_some() && saw_turn_completed {
+                break;
+            }
+        }
+
+        assert_eq!(
+            agent_tool_result.as_deref(),
+            Some("subagent finding"),
+            "the agent tool result must carry the child's final message text"
+        );
+        assert!(
+            saw_turn_completed,
+            "parent turn must complete after the agent tool returns"
+        );
+
+        engine.shutdown().await.unwrap();
+    }
+
+    /// Marker carried in the subagent prompt so [`agent_routing_provider`] can
+    /// recognise the child turn from the reconstructed `CallOptions.prompt`.
+    const AGENT_CHILD_MARKER: &str = "ZHIVE_CHILD_TASK_MARKER";
+
+    /// Extracts the text of a completed `agent` `ToolCall` item, if `item` is one.
+    fn agent_tool_result_text(item: &zhive_proto::domain::Item) -> Option<String> {
+        let zhive_proto::domain::Item::ToolCall {
+            name,
+            status: zhive_proto::domain::ToolCallStatus::Completed,
+            content,
+            ..
+        } = item
+        else {
+            return None;
+        };
+        if name != "agent" {
+            return None;
+        }
+        match content.first() {
+            Some(zhive_proto::domain::ItemToolCallContent::Content {
+                content: zhive_proto::domain::ItemContent::Text { text, .. },
+            }) => Some(text.clone()),
+            _ => None,
+        }
+    }
+
+    /// Returns a model that routes by prompt content for the `agent`-tool test.
+    ///
+    /// - A `Message::Tool` present → parent iteration 2 (tool result already
+    ///   injected) → emit an empty stream so the loop ends.
+    /// - Else a `Message::User` containing [`AGENT_CHILD_MARKER`] → child turn →
+    ///   emit the child's text answer.
+    /// - Else (first parent call) → emit the `agent` tool call.
+    fn agent_routing_provider() -> DynLanguageModel {
+        use llmsdk::ToolCallPart;
+        use llmsdk::language_model::{Message, UserPart};
+
+        #[derive(Debug)]
+        struct AgentRoutingModel;
+
+        #[async_trait]
+        impl LanguageModel for AgentRoutingModel {
+            fn provider(&self) -> &'static str {
+                "test"
+            }
+            fn model_id(&self) -> &'static str {
+                "agent-routing"
+            }
+            async fn do_generate(&self, _: CallOptions) -> llmsdk::error::Result<GenerateResult> {
+                Ok(GenerateResult {
+                    content: vec![],
+                    finish_reason: FinishReason::new(FinishReasonKind::Stop),
+                    usage: llmsdk::language_model::Usage::default(),
+                    provider_metadata: None,
+                    request: None,
+                    response: None,
+                    warnings: vec![],
+                })
+            }
+            async fn do_stream(&self, opts: CallOptions) -> llmsdk::error::Result<StreamResult> {
+                let has_tool_result = opts
+                    .prompt
+                    .iter()
+                    .any(|m| matches!(m, Message::Tool { .. }));
+                let is_child_turn = opts.prompt.iter().any(|m| match m {
+                    Message::User { content, .. } => content.iter().any(
+                        |p| matches!(p, UserPart::Text(t) if t.text.contains(AGENT_CHILD_MARKER)),
+                    ),
+                    _ => false,
+                });
+
+                let parts: Vec<llmsdk::error::Result<StreamPart>> = if has_tool_result {
+                    vec![]
+                } else if is_child_turn {
+                    vec![
+                        Ok(StreamPart::TextStart {
+                            id: "c0".into(),
+                            provider_metadata: None,
+                        }),
+                        Ok(StreamPart::TextDelta {
+                            id: "c0".into(),
+                            delta: "subagent finding".into(),
+                            provider_metadata: None,
+                        }),
+                        Ok(StreamPart::TextEnd {
+                            id: "c0".into(),
+                            provider_metadata: None,
+                        }),
+                    ]
+                } else {
+                    vec![Ok(StreamPart::ToolCall(ToolCallPart {
+                        tool_call_id: "tc-agent-0".into(),
+                        tool_name: "agent".into(),
+                        input: serde_json::json!({
+                            "prompt": AGENT_CHILD_MARKER,
+                            "name": "scout",
+                            "description": "delegated probe"
+                        }),
+                        provider_executed: None,
+                        dynamic: None,
+                        provider_options: None,
+                    }))]
+                };
+
+                let s: BoxStream<llmsdk::error::Result<StreamPart>> = Box::pin(stream::iter(parts));
+                Ok(StreamResult {
+                    stream: s,
+                    request: None,
+                    response: None,
+                })
+            }
+        }
+
+        DynLanguageModel::new(AgentRoutingModel)
+    }
+
+    // ===================================================================
     // Test 5: subagent spawned while parent turn is still in-flight
     // ===================================================================
 

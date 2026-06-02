@@ -15,6 +15,7 @@
 //! | `glob`  | Read    | Expand a glob pattern to file paths    |
 //! | `ls`    | Read    | List directory entries                 |
 //! | `bash`  | Execute | Run a shell command with a timeout     |
+//! | `agent` | Other   | Delegate a sub-task to a child agent   |
 //!
 //! ## Sandbox seam
 //!
@@ -35,11 +36,14 @@ use std::sync::Arc;
 
 use crate::tools::ToolRegistry;
 
+pub mod agent;
 pub mod bash;
 pub mod read;
 pub mod search;
 pub mod write;
 
+#[doc(inline)]
+pub use agent::AgentTool;
 #[doc(inline)]
 pub use bash::BashTool;
 #[doc(inline)]
@@ -181,8 +185,11 @@ impl Default for BuiltinToolsConfig {
 
 /// Registers the built-in tools into `registry` according to `config`.
 ///
-/// Read, write, edit, grep, glob, and ls are always registered. The `bash`
-/// tool is registered only when [`BuiltinToolsConfig::enable_bash`] is `true`.
+/// Read, write, edit, grep, glob, ls, and agent are always registered. The
+/// `bash` tool is registered only when [`BuiltinToolsConfig::enable_bash`] is
+/// `true`. The `agent` tool is registered unconditionally: when no subagent
+/// spawner is wired into the [`crate::tools::ToolContext`] (e.g. outside a real
+/// engine turn) it returns a graceful error rather than spawning.
 ///
 /// # Examples
 ///
@@ -199,6 +206,7 @@ impl Default for BuiltinToolsConfig {
 /// assert!(reg.get("glob").is_some());
 /// assert!(reg.get("ls").is_some());
 /// assert!(reg.get("bash").is_some());
+/// assert!(reg.get("agent").is_some());
 /// ```
 pub fn register_builtins(registry: &mut ToolRegistry, config: &BuiltinToolsConfig) {
     registry.register(Arc::new(ReadFileTool));
@@ -207,6 +215,7 @@ pub fn register_builtins(registry: &mut ToolRegistry, config: &BuiltinToolsConfi
     registry.register(Arc::new(GrepTool));
     registry.register(Arc::new(GlobTool));
     registry.register(Arc::new(ListDirTool));
+    registry.register(Arc::new(AgentTool));
     if config.enable_bash {
         registry.register(Arc::new(BashTool::with_sandbox(Arc::clone(
             &config.sandbox,

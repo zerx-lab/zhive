@@ -50,7 +50,7 @@ use crate::engine::event::EngineEvent;
 use crate::engine::inner::EngineInner;
 use crate::hooks::HookHost;
 use crate::permission::{PermissionReducer, evaluate};
-use crate::tools::{ToolContext, ToolRegistry};
+use crate::tools::{SubagentSpawner, ToolContext, ToolRegistry};
 
 use helpers::{blocked_outcome, build_permission_request, cancelled_during_execution};
 
@@ -219,6 +219,7 @@ pub(super) async fn dispatch_tool_call(
     tool_use_id: &str,
     scope: &zhive_proto::permission::PermissionScope,
     cancel: &CancellationToken,
+    spawner: Option<Arc<dyn SubagentSpawner>>,
 ) -> DispatchOutcome {
     match resolve_tool_permission(
         inner,
@@ -248,6 +249,7 @@ pub(super) async fn dispatch_tool_call(
                 tool_use_id,
                 cancel,
                 stop_loop,
+                spawner,
             )
             .await
         }
@@ -700,6 +702,7 @@ pub(super) async fn execute_resolved_tool(
     tool_use_id: &str,
     cancel: &CancellationToken,
     stop_loop: bool,
+    spawner: Option<Arc<dyn SubagentSpawner>>,
 ) -> DispatchOutcome {
     let span = tracing::info_span!(
         "zhive.tool_call",
@@ -718,6 +721,7 @@ pub(super) async fn execute_resolved_tool(
         tool_use_id,
         cancel,
         stop_loop,
+        spawner,
     )
     .instrument(span)
     .await
@@ -757,6 +761,7 @@ async fn execute_resolved_tool_inner(
     tool_use_id: &str,
     cancel: &CancellationToken,
     mut stop_loop: bool,
+    spawner: Option<Arc<dyn SubagentSpawner>>,
 ) -> DispatchOutcome {
     // Re-derive the engine provenance + cwd locally so this function owns no
     // state from the resolve phase (it must be safe to run concurrently).
@@ -794,6 +799,7 @@ async fn execute_resolved_tool_inner(
         thread_id,
         turn_id: turn_id.clone(),
         cancel: tool_cancel.clone(),
+        spawner,
     };
 
     // Race the tool body against turn cancellation.  Without this, a

@@ -393,6 +393,7 @@ mod tests {
             thread_id: ThreadId(Arc::from("thread:native/test")),
             turn_id: TurnId(Arc::from("turn:0")),
             cancel: CancellationToken::new(),
+            spawner: None,
         }
     }
 

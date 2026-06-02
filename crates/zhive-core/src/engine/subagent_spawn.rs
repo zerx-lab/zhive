@@ -31,7 +31,7 @@ use zhive_proto::permission::{PermissionScope, SubagentDefinition};
 
 use crate::persistence::writer::StorageWriteOp;
 use crate::state::{ActiveTurn, ThreadHandle};
-use crate::subagent::{SubagentError, prepare_child_scope};
+use crate::subagent::{SubagentError, SubagentFinalEvent, prepare_child_scope};
 
 use super::event::EngineEvent;
 use super::inner::EngineInner;
@@ -52,6 +52,13 @@ impl EngineInner {
     /// spawns a turn task for the child, and returns the new [`ThreadId`].
     /// The child transcript starts empty (fresh context window).
     ///
+    /// This is the actor-dispatch entry point: it delegates to
+    /// [`Self::spawn_subagent_awaitable`] and then drops the in-process
+    /// [`SubagentFinalEvent`] receiver, so external observers rely on the
+    /// broadcast [`EngineEvent::SubagentCompleted`] for the outcome. The
+    /// model-callable `agent` tool uses `spawn_subagent_awaitable` directly so
+    /// it can `await` the child result.
+    ///
     /// The child thread participates fully in persistence (if storage is
     /// configured): `start_child_turn` enqueues `ThreadUpserted` +
     /// `TurnStarted` under the child's own thread id so the JSONL rollout
@@ -65,6 +72,33 @@ impl EngineInner {
         parent_thread_id: ThreadId,
         definition: SubagentDefinition,
     ) -> Result<ThreadId, SubagentSpawnError> {
+        let (child_thread_id, _subagent_rx) = self
+            .spawn_subagent_awaitable(parent_thread_id, definition)
+            .await?;
+        // The actor-dispatch path does not await the child result; external
+        // observers consume the broadcast `SubagentCompleted` event instead.
+        Ok(child_thread_id)
+    }
+
+    /// Spawns a subagent and returns its id plus the in-process result channel.
+    ///
+    /// Identical to [`Self::spawn_subagent`] but hands the
+    /// [`SubagentFinalEvent`] receiver back to the caller so a model-callable
+    /// tool can `await` the child's final message directly, without
+    /// subscribing to the broadcast bus. The receiver yields exactly one event
+    /// (`Completed` or `Errored`) when the child turn finishes.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same [`SubagentSpawnError`] variants as
+    /// [`Self::spawn_subagent`] (`ParentNotFound`, `RecursionForbidden`,
+    /// `ChildSpawnRequested`, `ScopeWideningRejected`).
+    pub(crate) async fn spawn_subagent_awaitable(
+        self: &Arc<Self>,
+        parent_thread_id: ThreadId,
+        definition: SubagentDefinition,
+    ) -> Result<(ThreadId, tokio::sync::mpsc::Receiver<SubagentFinalEvent>), SubagentSpawnError>
+    {
         // (a) Look up the parent thread.
         let parent_handle = self
             .threads()
@@ -120,13 +154,12 @@ impl EngineInner {
         //
         // `new_child` returns `(handle, rx)`: the `Sender` is stored on the
         // handle so `run_child_turn_and_deliver` can fire the in-process
-        // channel; the `Receiver` (`_subagent_rx`) is returned to the
-        // spawner so it can `await` the child result directly from within a
-        // parent tool-call handler.  For now the spawner at this call-site
-        // drops it — the broadcast bus remains the delivery path for external
-        // observers, and a future increment will wire `_subagent_rx` into the
-        // Agent-tool handler.
-        let (child_handle_inner, _subagent_rx) =
+        // channel; the `Receiver` (`subagent_rx`) is returned to the caller so
+        // it can `await` the child result directly from within a parent
+        // tool-call handler (the `agent` tool). Callers that only care about
+        // the broadcast bus (the actor-dispatch `spawn_subagent`) simply drop
+        // it.
+        let (child_handle_inner, subagent_rx) =
             ThreadHandle::new_child(child_thread_id.clone(), parent_thread_id.clone());
         let child_handle = Arc::new(child_handle_inner);
         self.threads()
@@ -173,7 +206,7 @@ impl EngineInner {
             "subagent child thread spawned"
         );
 
-        Ok(child_thread_id)
+        Ok((child_thread_id, subagent_rx))
     }
 
     /// Installs an active turn on the child handle, pushes the initial
@@ -398,8 +431,6 @@ impl EngineInner {
         final_msg: Option<std::sync::Arc<zhive_proto::domain::Item>>,
         child_error: Option<zhive_proto::domain::TurnError>,
     ) {
-        use crate::subagent::SubagentFinalEvent;
-
         // In-process delivery: fire the mpsc channel stored on the child
         // handle so the spawner can `await` the result directly.
         if let Some(tx) = &child_handle.subagent_final_tx {
@@ -426,6 +457,94 @@ impl EngineInner {
             child_thread_id: child_tid,
             final_message: final_msg,
         });
+    }
+}
+
+// ============================================================
+// EngineSubagentSpawner
+// ============================================================
+
+/// Bridges the model-callable `agent` tool to [`EngineInner`] subagent spawns.
+///
+/// Holds a handle to the engine and the parent thread id so the tool can
+/// delegate a sub-task to a child agent and `await` its final message. One
+/// instance is created per tool execution in the dispatch loop; cloning the
+/// `Arc<EngineInner>` is cheap (shared-ownership handle).
+pub(crate) struct EngineSubagentSpawner {
+    /// Shared engine handle used to drive the child turn.
+    inner: Arc<EngineInner>,
+    /// Thread that owns the tool call requesting the spawn.
+    parent_thread_id: ThreadId,
+}
+
+// `EngineInner` does not implement `Debug` (it holds non-Debug runtime
+// handles), so derive cannot be used. The `SubagentSpawner` trait requires
+// `Debug`; render only the parent thread id, which is the useful identifier.
+impl std::fmt::Debug for EngineSubagentSpawner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EngineSubagentSpawner")
+            .field("parent_thread_id", &self.parent_thread_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl EngineSubagentSpawner {
+    /// Builds a spawner bound to `inner` and `parent_thread_id`.
+    pub(crate) fn new(inner: Arc<EngineInner>, parent_thread_id: ThreadId) -> Self {
+        Self {
+            inner,
+            parent_thread_id,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::tools::SubagentSpawner for EngineSubagentSpawner {
+    async fn spawn_and_await(
+        &self,
+        name: String,
+        description: String,
+        prompt: String,
+    ) -> Result<String, String> {
+        // Inherit the parent's tool allowlist and permission mode: `tools`,
+        // `disallowed_tools`, and `permission_mode` are left at their defaults
+        // so `prepare_child_scope` resolves them against the parent scope.
+        let definition: SubagentDefinition = serde_json::from_value(serde_json::json!({
+            "name": name,
+            "description": description,
+            "prompt": prompt,
+        }))
+        .map_err(|err| format!("failed to build subagent definition: {err}"))?;
+
+        let (_child_thread_id, mut rx) = self
+            .inner
+            .spawn_subagent_awaitable(self.parent_thread_id.clone(), definition)
+            .await
+            .map_err(|err| err.to_string())?;
+
+        match rx.recv().await {
+            Some(SubagentFinalEvent::Completed { final_message, .. }) => {
+                Ok(final_message_text(final_message.as_deref()))
+            }
+            Some(SubagentFinalEvent::Errored { error, .. }) => Err(error.message),
+            // The sender is dropped only if the child task panicked or the
+            // engine shut down before delivering the outcome.
+            None => Err("subagent channel closed without result".to_owned()),
+        }
+    }
+}
+
+/// Extracts the displayable text of a subagent's final message.
+///
+/// The final item is the child's last [`zhive_proto::domain::Item::AgentMessage`]
+/// (or [`Item::SystemNotice`] fallback). Returns an empty string when there is
+/// no final message or it carries no text, matching the Claude Code contract
+/// that an empty subagent result is delivered verbatim rather than as an error.
+fn final_message_text(final_message: Option<&zhive_proto::domain::Item>) -> String {
+    match final_message {
+        Some(zhive_proto::domain::Item::AgentMessage { text, .. }) => text.clone(),
+        Some(zhive_proto::domain::Item::SystemNotice { message, .. }) => message.clone(),
+        _ => String::new(),
     }
 }
 
@@ -515,6 +634,74 @@ mod tests {
                 Err(crate::engine::submission::SubagentSpawnError::RecursionForbidden)
             ),
             "expected RecursionForbidden, got {result:?}"
+        );
+    }
+
+    /// `spawn_subagent_awaitable` (the path the `agent` tool uses) must apply
+    /// the same recursion ban as `spawn_subagent`.
+    #[tokio::test]
+    async fn spawn_awaitable_rejects_recursion() {
+        let inner = new_inner();
+
+        let fake_parent_id = tid("thread:subagent/native/root/0");
+        let (child_handle_inner, _rx) = crate::state::ThreadHandle::new_child(
+            fake_parent_id.clone(),
+            tid("thread:native/root"),
+        );
+        inner
+            .threads()
+            .write_guard()
+            .await
+            .insert(fake_parent_id.clone(), Arc::new(child_handle_inner));
+
+        let definition: zhive_proto::permission::SubagentDefinition =
+            serde_json::from_value(serde_json::json!({
+                "name": "scout",
+                "description": "test",
+                "prompt": "Hello.",
+            }))
+            .expect("fixture");
+
+        let result = inner
+            .spawn_subagent_awaitable(fake_parent_id, definition)
+            .await;
+        assert!(
+            matches!(
+                result,
+                Err(crate::engine::submission::SubagentSpawnError::RecursionForbidden)
+            ),
+            "spawn_subagent_awaitable must reject recursion, got {:?}",
+            result.as_ref().map(|(id, _)| id.clone())
+        );
+    }
+
+    /// `EngineSubagentSpawner::spawn_and_await` (the tool-facing bridge) must
+    /// surface the recursion ban as an `Err(String)` when invoked from a
+    /// subagent context, so the `agent` tool reports a clean failure.
+    #[tokio::test]
+    async fn spawner_bridge_reports_recursion_error_string() {
+        use crate::tools::SubagentSpawner as _;
+
+        let inner = new_inner();
+        let fake_parent_id = tid("thread:subagent/native/root/0");
+        let (child_handle_inner, _rx) = crate::state::ThreadHandle::new_child(
+            fake_parent_id.clone(),
+            tid("thread:native/root"),
+        );
+        inner
+            .threads()
+            .write_guard()
+            .await
+            .insert(fake_parent_id.clone(), Arc::new(child_handle_inner));
+
+        let spawner = super::EngineSubagentSpawner::new(Arc::clone(&inner), fake_parent_id);
+        let err = spawner
+            .spawn_and_await("scout".to_owned(), "probe".to_owned(), "do work".to_owned())
+            .await
+            .expect_err("recursion from a subagent context must fail");
+        assert!(
+            err.contains("recursion forbidden"),
+            "error string must mention recursion, got {err:?}"
         );
     }
 

@@ -3,7 +3,7 @@
 //! This sub-module contains the pure (no async, no I/O) fold state machine
 //! used by the engine to convert provider stream parts into finalized items.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use tracing::warn;
@@ -131,6 +131,16 @@ pub struct StreamFold {
     text_bufs: HashMap<String, BlockBuf>,
     /// Per-block tool-input accumulator.
     tool_bufs: HashMap<String, BlockBuf>,
+    /// Provider tool-call ids already finalized via [`StreamPart::ToolInputEnd`].
+    ///
+    /// Providers (Anthropic, `OpenAI` Chat + Responses) emit a streamed input
+    /// block (`ToolInputStart`/`Delta`/`End`) *and* a trailing atomic
+    /// [`StreamPart::ToolCall`] sharing the same `tool_call_id`. The streamed
+    /// `End` already emitted the item with the fully accumulated arguments; the
+    /// atomic frame often carries an empty `{}` input. Tracking finalized ids
+    /// lets the atomic branch suppress that duplicate instead of emitting a
+    /// second `Item::ToolCall` with empty arguments.
+    finalized_tool_ids: HashSet<String>,
     /// Final token usage, populated on [`StreamPart::Finish`].
     usage: Option<llmsdk::language_model::Usage>,
 }
@@ -147,6 +157,7 @@ impl StreamFold {
             seq: 0,
             text_bufs: HashMap::new(),
             tool_bufs: HashMap::new(),
+            finalized_tool_ids: HashSet::new(),
             usage: None,
         }
     }
@@ -307,6 +318,10 @@ impl StreamFold {
             StreamPart::ToolInputEnd { id, .. } => {
                 if let Some(buf) = self.tool_bufs.remove(&id) {
                     let raw_input = parse_tool_input(&buf.text);
+                    // Remember this id so a trailing atomic ToolCall frame for
+                    // the same logical call is suppressed instead of emitting a
+                    // duplicate item with empty arguments.
+                    self.finalized_tool_ids.insert(id.clone());
                     // Preserve the provider block id as `provider_tool_call_id`
                     // so the engine can round-trip it in Message::Tool without
                     // minting a synthetic replacement.
@@ -330,12 +345,20 @@ impl StreamFold {
             // ---- atomic tool call (non-streamed input) ----------------------
             //
             // Spec invariant (inc1b): emit ONE Item::ToolCall per logical tool
-            // call. If a buffer already exists for `call_part.tool_call_id`
-            // (i.e. the provider sent ToolInputStart before this atomic frame),
-            // reuse its ItemId and remove the buffer so that `finish()` cannot
-            // flush it a second time. Only mint a fresh ItemId when no prior
-            // buffer exists (pure-atomic path).
+            // call. Providers emit a streamed input block AND a trailing atomic
+            // frame for the same `tool_call_id`. Three cases:
+            //
+            //   1. Already finalized via ToolInputEnd → suppress this atomic
+            //      frame; the streamed item already carries the full arguments
+            //      (the atomic `input` is frequently an empty `{}`).
+            //   2. A buffer still exists (ToolInputStart seen, no End) → reuse
+            //      its ItemId and consume the buffer so `finish()` can't flush
+            //      it again.
+            //   3. No prior buffer (pure-atomic path) → mint a fresh ItemId.
             StreamPart::ToolCall(call_part) => {
+                if self.finalized_tool_ids.contains(&call_part.tool_call_id) {
+                    return vec![];
+                }
                 let item_id = self
                     .tool_bufs
                     .remove(&call_part.tool_call_id)
@@ -745,6 +768,65 @@ mod tests {
             tool_calls.len(),
             0,
             "finish() must not emit a second ToolCall after the buffer was consumed"
+        );
+    }
+
+    /// Regression: the real provider sequence is
+    /// `ToolInputStart → ToolInputDelta → ToolInputEnd → ToolCall(input={})`.
+    /// Anthropic and `OpenAI` both stream the input *and* send a trailing atomic
+    /// `ToolCall` whose `input` is an empty object. The streamed `End` already
+    /// emitted the item with the full arguments, so the atomic frame must be
+    /// suppressed — otherwise a second `Item::ToolCall` with empty arguments is
+    /// dispatched and tools like `grep` fail with "`pattern` must be a string".
+    #[test]
+    fn fold_streamed_then_atomic_tool_call_does_not_duplicate_with_empty_args() {
+        use llmsdk::ToolCallPart;
+        let mut fold = StreamFold::new(&turn_id("turn:t/13/0"));
+
+        let _ = fold.fold(StreamPart::ToolInputStart {
+            id: "tc1".into(),
+            tool_name: "grep".into(),
+            provider_executed: None,
+            dynamic: None,
+            title: None,
+            provider_metadata: None,
+        });
+        let _ = fold.fold(StreamPart::ToolInputDelta {
+            id: "tc1".into(),
+            delta: r#"{"pattern":"hello"}"#.into(),
+            provider_metadata: None,
+        });
+        let end_items = fold.fold(StreamPart::ToolInputEnd {
+            id: "tc1".into(),
+            provider_metadata: None,
+        });
+        assert_eq!(end_items.len(), 1, "ToolInputEnd emits the single item");
+
+        // Trailing atomic frame for the same id, carrying empty input.
+        let call = ToolCallPart {
+            tool_call_id: "tc1".into(),
+            tool_name: "grep".into(),
+            input: serde_json::json!({}),
+            provider_executed: None,
+            dynamic: None,
+            provider_options: None,
+        };
+        let call_items = fold.fold(StreamPart::ToolCall(call));
+        assert!(
+            call_items.is_empty(),
+            "atomic frame for an already-finalized id must be suppressed"
+        );
+
+        // The single emitted item carries the streamed arguments, not `{}`.
+        if let Item::ToolCall { raw_input, .. } = &end_items[0] {
+            assert_eq!(raw_input.as_ref().unwrap()["pattern"], "hello");
+        } else {
+            panic!("expected ToolCall item from ToolInputEnd");
+        }
+
+        assert!(
+            fold.finish().is_empty(),
+            "finish() must not flush anything for a finalized id"
         );
     }
 

@@ -137,6 +137,69 @@ pub enum ToolError {
 }
 
 // ============================================================
+// SubagentSpawner
+// ============================================================
+
+/// Lets a model-invocable tool delegate a sub-task to a child agent.
+///
+/// The engine wires a concrete implementation into [`ToolContext::spawner`]
+/// for every real turn; test and non-engine contexts leave it `None`. A tool
+/// (e.g. the built-in `agent` tool) calls [`SubagentSpawner::spawn_and_await`]
+/// to spawn a child agent and block until the child produces its final
+/// message.
+///
+/// This is a `dyn`-friendly trait (object-safe, `Send + Sync + Debug`) so it
+/// can live behind an `Arc<dyn SubagentSpawner>` inside the `Clone` +
+/// `Debug` [`ToolContext`].
+///
+/// # Examples
+///
+/// ```
+/// use std::sync::Arc;
+/// use async_trait::async_trait;
+/// use zhive_core::tools::SubagentSpawner;
+///
+/// #[derive(Debug)]
+/// struct FixedSpawner;
+///
+/// #[async_trait]
+/// impl SubagentSpawner for FixedSpawner {
+///     async fn spawn_and_await(
+///         &self,
+///         _name: String,
+///         _description: String,
+///         _prompt: String,
+///     ) -> Result<String, String> {
+///         Ok("child result".to_owned())
+///     }
+/// }
+///
+/// // The trait is object-safe: it can be erased behind `Arc<dyn ...>`.
+/// let _erased: Arc<dyn SubagentSpawner> = Arc::new(FixedSpawner);
+/// ```
+#[async_trait]
+pub trait SubagentSpawner: Send + Sync + std::fmt::Debug {
+    /// Spawns a subagent and awaits its final message.
+    ///
+    /// The child inherits the parent's tool allowlist and permission mode; only
+    /// `name`, `description`, and `prompt` are supplied per call. The returned
+    /// `String` is the child's final message text (empty when the child
+    /// produced no textual output).
+    ///
+    /// # Errors
+    ///
+    /// Returns the failure reason as a `String`: recursion is forbidden, the
+    /// spawn was rejected (scope widening, missing parent), or the child turn
+    /// itself errored.
+    async fn spawn_and_await(
+        &self,
+        name: String,
+        description: String,
+        prompt: String,
+    ) -> Result<String, String>;
+}
+
+// ============================================================
 // ToolContext
 // ============================================================
 
@@ -153,6 +216,12 @@ pub struct ToolContext {
     /// Fires when the turn is cancelled; a well-behaved tool should check
     /// this before performing expensive or irreversible operations.
     pub cancel: CancellationToken,
+    /// Optional hook for spawning child agents from inside a tool.
+    ///
+    /// `Some` only during real engine turns (wired by the dispatch loop);
+    /// `None` in tests and other non-engine contexts, in which case a tool
+    /// that needs it must return an error rather than spawning.
+    pub spawner: Option<Arc<dyn SubagentSpawner>>,
 }
 
 // ============================================================
@@ -394,6 +463,7 @@ impl ToolRegistry {
 ///     thread_id: ThreadId(Arc::from("thread:native/test")),
 ///     turn_id:   TurnId(Arc::from("turn:thread:native/test/0")),
 ///     cancel:    CancellationToken::new(),
+///     spawner:   None,
 /// };
 /// let out = EchoTool.execute(serde_json::json!({"msg": "hello"}), &ctx).await.unwrap();
 /// assert!(out.text.contains("hello"));
@@ -451,6 +521,7 @@ mod tests {
             thread_id: ThreadId(Arc::from("thread:native/t")),
             turn_id: TurnId(Arc::from("turn:thread:native/t/0")),
             cancel: CancellationToken::new(),
+            spawner: None,
         }
     }
 

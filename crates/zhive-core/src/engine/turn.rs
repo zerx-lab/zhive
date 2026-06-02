@@ -51,6 +51,7 @@ use crate::state::ThreadHandle;
 use super::event::EngineEvent;
 use super::inner::EngineInner;
 use super::prompt::build_call_options;
+use super::subagent_spawn::EngineSubagentSpawner;
 use super::tool_dispatch::{
     DispatchOutcome, ToolResolution, execute_resolved_tool, resolve_tool_permission,
 };
@@ -544,6 +545,9 @@ async fn run_turn_inner(
             let hook_host = &hook_host;
             let cancel = &cancel;
             let turn_id = &turn_id;
+            // Borrow (do not move) the parent thread id so `thread_id_str`,
+            // which borrows `thread_id.0`, stays valid for the other closures.
+            let parent_thread_id = &thread_id;
             async move {
                 match r {
                     Resolved::Blocked(outcome) => outcome,
@@ -554,6 +558,16 @@ async fn run_turn_inner(
                         tool_use_id,
                         stop_loop,
                     } => {
+                        // Build a fresh spawner handle per approved call so the
+                        // `agent` tool can delegate to a child agent. Cloning
+                        // the engine handle is cheap (shared-ownership Arc). The
+                        // child cannot recurse: `prepare_child_scope` rejects a
+                        // spawn whose parent is itself a subagent.
+                        let spawner: Option<Arc<dyn crate::tools::SubagentSpawner>> =
+                            Some(Arc::new(EngineSubagentSpawner::new(
+                                Arc::clone(inner),
+                                parent_thread_id.clone(),
+                            )));
                         execute_resolved_tool(
                             tools,
                             hook_host,
@@ -565,6 +579,7 @@ async fn run_turn_inner(
                             &tool_use_id,
                             cancel,
                             stop_loop,
+                            spawner,
                         )
                         .await
                     }
