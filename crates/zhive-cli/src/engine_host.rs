@@ -13,13 +13,20 @@ use std::time::{Duration, Instant};
 use anyhow::Context;
 use tokio_util::sync::CancellationToken;
 use zhive_client_native::Client;
-use zhive_core::engine::Engine;
+use zhive_core::engine::{Engine, EngineConfig};
+use zhive_core::hooks::HookHost;
 use zhive_core::provider::DynLanguageModel;
 use zhive_core::server::{
     DEFAULT_MAX_CONNECTIONS, Router, register_engine_handlers, serve_uds_with_events,
 };
 
+use crate::boot::RuntimeTools;
+
 /// A running engine plus the connected client and its lifecycle handles.
+///
+/// The owned [`RuntimeTools`] keeps the MCP manager (and thus its tool
+/// connections) alive for as long as the engine runs; [`Host::stop`] shuts it
+/// down before the engine.
 #[derive(Debug)]
 pub struct Host {
     /// The connected, handshaked client the TUI drives.
@@ -27,20 +34,36 @@ pub struct Host {
     engine: Engine,
     shutdown: CancellationToken,
     socket: PathBuf,
+    /// Tool registry plus capability handles (e.g. the live MCP manager).
+    runtime: Option<RuntimeTools>,
 }
 
 impl Host {
-    /// Spawns the engine with `provider`, serves it on `socket`, and connects.
+    /// Spawns the engine with `provider` + `runtime`, serves it, and connects.
+    ///
+    /// `runtime` carries the tool registry (handed to the engine) and any live
+    /// capability handles such as the MCP manager, which the `Host` keeps alive
+    /// for the engine's lifetime and shuts down in [`Host::stop`].
     ///
     /// # Errors
     ///
     /// Returns an error if the socket never appears or the client cannot
     /// complete the initialize handshake.
-    pub async fn start(provider: DynLanguageModel, socket: PathBuf) -> anyhow::Result<Self> {
+    pub async fn start(
+        provider: DynLanguageModel,
+        runtime: RuntimeTools,
+        socket: PathBuf,
+    ) -> anyhow::Result<Self> {
         // A stale socket from a crashed run would block binding.
         let _ = std::fs::remove_file(&socket);
 
-        let engine = Engine::spawn_with_provider(provider);
+        let engine = Engine::spawn_with_config(EngineConfig {
+            provider,
+            tools: std::sync::Arc::clone(&runtime.registry),
+            hook_host: std::sync::Arc::new(HookHost::new()),
+            storage: None,
+            turn_limits: runtime.turn_limits,
+        });
         let mut router = Router::new();
         register_engine_handlers(&mut router, engine.clone());
         let router = std::sync::Arc::new(router);
@@ -63,14 +86,24 @@ impl Host {
             }
         });
 
-        wait_for_socket(&socket).await?;
+        if let Err(err) = wait_for_socket(&socket).await {
+            // `Host` is not constructed here; tear the half-started engine and
+            // capability handles down so MCP connections do not leak.
+            shutdown.cancel();
+            let _ = engine.shutdown().await;
+            runtime.shutdown().await;
+            let _ = std::fs::remove_file(&socket);
+            return Err(err);
+        }
         let client = match Client::connect_uds(&socket).await {
             Ok(client) => client,
             Err(err) => {
                 // `Host` is never constructed on this path, so its `Drop` will
-                // not fire; tear the half-started engine down and remove the
-                // socket here to avoid leaking it.
+                // not fire; tear the half-started engine and capability handles
+                // down and remove the socket here to avoid leaking them.
                 shutdown.cancel();
+                let _ = engine.shutdown().await;
+                runtime.shutdown().await;
                 let _ = std::fs::remove_file(&socket);
                 return Err(err)
                     .with_context(|| format!("connecting to engine at {}", socket.display()));
@@ -82,14 +115,22 @@ impl Host {
             engine,
             shutdown,
             socket,
+            runtime: Some(runtime),
         })
     }
 
     /// Shuts the engine down, stops serving, and removes the socket file.
-    pub async fn stop(self) {
+    ///
+    /// Capability handles (the MCP manager) are shut down *before* the engine,
+    /// since their tools may still be referenced until the engine stops.
+    pub async fn stop(mut self) {
         // `Host` implements `Drop`, so fields cannot be moved out of `self`;
         // a clone of the cheap `Arc`-backed client carries the shutdown signal.
         self.client.clone().shutdown();
+        // Close MCP connections before the engine that dispatches through them.
+        if let Some(runtime) = self.runtime.take() {
+            runtime.shutdown().await;
+        }
         let _ = self.engine.shutdown().await;
         self.shutdown.cancel();
         let _ = std::fs::remove_file(&self.socket);

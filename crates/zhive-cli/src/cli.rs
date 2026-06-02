@@ -32,6 +32,9 @@ pub enum Command {
     Serve(ServeArgs),
     /// Pipe stdio to a running engine socket (editor / ACP / MCP hosts).
     Bridge(BridgeArgs),
+    /// Serve the engine over the ACP protocol on stdio (for ACP editor hosts).
+    #[cfg(feature = "acp")]
+    Acp(AcpArgs),
     /// Inspect or initialize the configuration file.
     Config(ConfigArgs),
 }
@@ -39,7 +42,11 @@ pub enum Command {
 /// Arguments for `zhive tui` (all override `config.toml`).
 #[derive(Args, Debug, Default)]
 pub struct TuiArgs {
-    /// Provider override: `anthropic`, `openai`, or `scripted`.
+    /// Provider override: any named entry from `[provider.<name>]` in config.toml.
+    ///
+    /// E.g. `anthropic`, `openai`, `xai`, `scripted`, or any custom name.
+    /// Must match a key already present in the providers map; unknown names are
+    /// ignored with a warning.
     #[arg(long)]
     pub provider: Option<String>,
     /// Model id override.
@@ -68,6 +75,15 @@ pub struct BridgeArgs {
     #[arg(long, value_name = "PATH")]
     pub socket: Option<PathBuf>,
 }
+
+/// Arguments for `zhive acp`.
+///
+/// The ACP transport is stdio (stdout is the JSON-RPC wire), so the only input
+/// is the global `--config`; this struct exists for clap symmetry and future
+/// options.
+#[cfg(feature = "acp")]
+#[derive(Args, Debug, Default)]
+pub struct AcpArgs;
 
 /// Arguments for `zhive config`.
 #[derive(Args, Debug)]

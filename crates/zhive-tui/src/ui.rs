@@ -151,14 +151,17 @@ fn transcript_lines(app: &App, inner_width: u16) -> Vec<Line<'static>> {
             out.push(Line::raw(""));
         }
         if let TurnLifecycle::Failed { message } = &turn.status {
+            // Wrap the (often long) provider error to the content width so the
+            // full message is visible across rows instead of being clipped.
             push_message(
                 &mut out,
                 "sys",
                 p.error,
-                vec![Line::styled(
-                    format!("turn failed: {message}"),
+                wrap_plain(
+                    &format!("turn failed: {message}"),
                     Style::new().fg(p.error),
-                )],
+                    content_width,
+                ),
             );
             out.push(Line::raw(""));
         }

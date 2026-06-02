@@ -18,10 +18,11 @@ path = "src/main.rs"
 
 # Bin crates are leaf nodes: no other crate may depend on `zhive-cli`.
 # Subcommands turn on via Cargo features so non-default ones do not pay
-# the compile cost. Phase 1 ships `tui + serve + bridge-stdio`; exec /
-# bridge-mcp / bridge-acp land in Phase 2 alongside their crates.
+# the compile cost. The default build ships the in-process engine (tui +
+# serve), the stdio bridge, and the three capability layers (mcp / acp /
+# skills); each can be dropped independently for a slimmer binary.
 [features]
-default      = ["tui", "serve", "bridge-stdio"]
+default      = ["tui", "serve", "bridge-stdio", "mcp", "acp", "skills"]
 # The in-process engine plus the Anthropic/OpenAI provider builders. Pulled
 # in by both `tui` and `serve`; `bridge-stdio` deliberately omits it because
 # it only pipes bytes to an already-running engine socket (D-002 / D-004).
@@ -29,12 +30,22 @@ engine       = ["dep:zhive-core", "dep:llmsdk"]
 tui          = ["engine", "dep:zhive-tui"]
 serve        = ["engine"]
 bridge-stdio = ["dep:zhive-bridge-stdio"]
-full         = ["tui", "serve", "bridge-stdio"]
+# Capability layers wired into the engine's tool registry / serving path.
+# `mcp` connects to MCP servers and registers their tools; `skills` discovers
+# on-disk Agent-Skills (needs the engine's `zhive-core/skills` module); `acp`
+# adds the `zhive acp` subcommand that serves the engine over the ACP stdio
+# protocol. All three need the in-process engine, so they imply `engine`.
+mcp          = ["engine", "dep:zhive-mcp"]
+acp          = ["engine", "dep:zhive-bridge-acp"]
+skills       = ["engine", "zhive-core/skills"]
+full         = ["tui", "serve", "bridge-stdio", "mcp", "acp", "skills"]
 
 [dependencies]
 zhive-tui           = { workspace = true, optional = true }
 zhive-core          = { workspace = true, optional = true }
 zhive-bridge-stdio  = { workspace = true, optional = true }
+zhive-mcp           = { workspace = true, optional = true }
+zhive-bridge-acp    = { workspace = true, optional = true }
 zhive-client-native = { workspace = true }
 zhive-proto         = { workspace = true }
 
@@ -46,7 +57,7 @@ tracing-subscriber = { workspace = true }
 clap               = { workspace = true }
 serde              = { workspace = true }
 toml               = { workspace = true }
-llmsdk             = { workspace = true, features = ["anthropic", "openai"], optional = true }
+llmsdk = { workspace = true, features = ["amazon-bedrock", "anthropic", "anthropic-aws", "azure", "cohere", "google", "google-vertex", "mistral", "openai", "xai"], optional = true }
 async-trait.workspace = true
 futures.workspace = true
 

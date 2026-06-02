@@ -11,8 +11,11 @@ mod cli;
 mod config;
 mod run;
 
-// The provider builders and in-process engine host need `zhive-core` + `llmsdk`,
-// which only the `engine` feature pulls in (via `tui` / `serve`).
+// The provider builders, the in-process engine host, and the shared runtime
+// boot path need `zhive-core` + `llmsdk`, which only the `engine` feature pulls
+// in (via `tui` / `serve` / `mcp` / `acp` / `skills`).
+#[cfg(feature = "engine")]
+mod boot;
 #[cfg(feature = "engine")]
 mod engine_host;
 #[cfg(feature = "engine")]
@@ -27,3 +30,5 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     run::dispatch(cli).await
 }
+
+// Rust guideline compliant 2026-02-21
