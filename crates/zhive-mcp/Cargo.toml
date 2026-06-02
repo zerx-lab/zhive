@@ -1,0 +1,31 @@
+[package]
+name        = "zhive-mcp"
+description = "MCP (Model Context Protocol) client: connects to MCP servers and adapts their tools into zhive engine tools."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+homepage.workspace     = true
+authors.workspace      = true
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait.workspace = true
+futures.workspace = true
+http = "1.4.1"
+rmcp = { version = "1.6", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+zhive-core = { workspace = true }
+
+[dev-dependencies]
+rmcp = { version = "1.6", default-features = false, features = ["server", "macros"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+zhive-proto = { workspace = true }
