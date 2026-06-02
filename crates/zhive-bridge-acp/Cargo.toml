@@ -1,0 +1,30 @@
+[package]
+name        = "zhive-bridge-acp"
+description = "ACP (Agent Client Protocol) agent: serves zhive over ACP by embedding the engine in-process."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+homepage.workspace     = true
+authors.workspace      = true
+
+[lints]
+workspace = true
+
+[dependencies]
+agent-client-protocol = "0.13"
+async-trait.workspace = true
+futures.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+zhive-core  = { workspace = true }
+zhive-proto = { workspace = true }
+
+[dev-dependencies]
+async-trait.workspace = true
+llmsdk.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio-util = { workspace = true, features = ["compat"] }
