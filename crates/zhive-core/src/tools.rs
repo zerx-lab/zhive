@@ -179,7 +179,11 @@ pub struct ToolContext {
 #[async_trait]
 pub trait Tool: Send + Sync {
     /// Stable, unique name used to look up this tool in the registry.
-    fn name(&self) -> &'static str;
+    ///
+    /// Returns a borrow tied to `&self` (not `&'static`) so dynamically
+    /// sourced tools — MCP-server tools, skills — can return a runtime
+    /// `String` field they own rather than leaking a `&'static str`.
+    fn name(&self) -> &str;
 
     /// Coarse classification used for UI grouping.
     fn kind(&self) -> ToolKind {

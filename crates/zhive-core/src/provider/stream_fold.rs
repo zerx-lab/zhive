@@ -13,6 +13,25 @@ use llmsdk::language_model::StreamPart;
 use zhive_proto::domain::{Item, ItemId, NoticeLevel, ToolCallStatus, ToolKind, TurnId};
 
 // ============================================================
+// Tool-input parsing
+// ============================================================
+
+/// Parses accumulated tool-input JSON into a value for a `tool_use` block.
+///
+/// Tool inputs are JSON **objects** by contract. Empty text (a tool called with
+/// no arguments), malformed JSON, or a non-object value all fall back to the
+/// empty object `{}` — never a string or null, both of which providers (e.g.
+/// the Anthropic Messages API) reject with `tool_use.input: Input should be an
+/// object`. Returning `{}` keeps prompt reconstruction round-trippable for
+/// argument-less tool calls.
+fn parse_tool_input(text: &str) -> serde_json::Value {
+    match serde_json::from_str::<serde_json::Value>(text) {
+        Ok(value @ serde_json::Value::Object(_)) => value,
+        _ => serde_json::json!({}),
+    }
+}
+
+// ============================================================
 // BlockKind
 // ============================================================
 
@@ -287,11 +306,7 @@ impl StreamFold {
             }
             StreamPart::ToolInputEnd { id, .. } => {
                 if let Some(buf) = self.tool_bufs.remove(&id) {
-                    let raw_input = serde_json::from_str::<serde_json::Value>(&buf.text)
-                        .unwrap_or_else(|_| {
-                            // Malformed JSON: surface as raw string, never panic.
-                            serde_json::Value::String(buf.text.clone())
-                        });
+                    let raw_input = parse_tool_input(&buf.text);
                     // Preserve the provider block id as `provider_tool_call_id`
                     // so the engine can round-trip it in Message::Tool without
                     // minting a synthetic replacement.
@@ -420,8 +435,7 @@ impl StreamFold {
 
         // Flush open tool-input blocks with parsed-so-far arguments.
         for (block_id, buf) in self.tool_bufs.drain() {
-            let raw_input = serde_json::from_str::<serde_json::Value>(&buf.text)
-                .unwrap_or_else(|_| serde_json::Value::String(buf.text.clone()));
+            let raw_input = parse_tool_input(&buf.text);
             // Preserve the provider block id as `provider_tool_call_id` so
             // the engine can use it when building the tool-result prompt.
             items.push(Item::ToolCall {
@@ -754,17 +768,49 @@ mod tests {
             id: "tc2".into(),
             provider_metadata: None,
         });
-        // Must not panic; raw_input is a fallback String value.
+        // Must not panic; malformed tool input falls back to an empty object
+        // `{}` (NOT a string) so providers that require an object accept it.
         assert!(
             !items.is_empty(),
             "should still emit a ToolCall with fallback input"
         );
         if let Item::ToolCall { raw_input, .. } = &items[0] {
-            assert!(
-                raw_input.is_some(),
-                "raw_input should be Some (string fallback)"
+            assert_eq!(
+                raw_input.as_ref(),
+                Some(&serde_json::json!({})),
+                "malformed tool input must fall back to an empty object, not a string"
             );
         }
+    }
+
+    /// A tool called with NO arguments (empty streamed input) must finalize
+    /// with `raw_input = {}` — an object — not an empty string. This is the
+    /// real-world Anthropic case: `tool_use.input: Input should be an object`.
+    #[test]
+    fn fold_empty_tool_input_falls_back_to_empty_object() {
+        let turn_id = TurnId(Arc::from("turn:test/empty-input"));
+        let mut fold = StreamFold::new(&turn_id);
+        let _ = fold.fold(StreamPart::ToolInputStart {
+            id: "tc-empty".into(),
+            tool_name: "echo".into(),
+            provider_executed: None,
+            dynamic: None,
+            title: None,
+            provider_metadata: None,
+        });
+        // No ToolInputDelta at all (argument-less call) → buffer text is "".
+        let items = fold.fold(StreamPart::ToolInputEnd {
+            id: "tc-empty".into(),
+            provider_metadata: None,
+        });
+        let Some(Item::ToolCall { raw_input, .. }) = items.first() else {
+            panic!("expected a ToolCall item");
+        };
+        assert_eq!(
+            raw_input.as_ref(),
+            Some(&serde_json::json!({})),
+            "argument-less tool call must reconstruct as an empty object"
+        );
     }
 
     // ---- StreamFold error → SystemNotice ----

@@ -21,10 +21,13 @@
 //! 3. Stream loop: `tokio::select!` on `cancel.cancelled()` vs next part.
 //!    On each part: fold → push items → emit `ItemAppended`.
 //!    On inner stream error: `TurnFailed` + finish.
-//! 4. After the stream: if the model emitted `ToolCall` items, run
-//!    [`super::tool_dispatch::dispatch_tool_call`] for each, push the finalized
-//!    `ToolCall` item (which carries `provider_tool_call_id`) to the tail, and
-//!    loop. The next iteration's prompt is rebuilt from that updated tail.
+//! 4. After the stream: if the model emitted `ToolCall` items, dispatch them in
+//!    three phases — serial permission resolution
+//!    ([`super::tool_dispatch::resolve_tool_permission`]), parallel execution
+//!    ([`super::tool_dispatch::execute_resolved_tool`]), then serial item
+//!    commit — pushing each finalized `ToolCall` item (which carries
+//!    `provider_tool_call_id`) to the tail in model-emit order, and loop. The
+//!    next iteration's prompt is rebuilt from that updated tail.
 //! 5. If no tool calls, or if a hook requested `stop_loop`, or if the
 //!    iteration cap fires: call `fold.finish()` then `finish_turn`.
 //!    Cancel does *not* emit `TurnCompleted` — that is handled by
@@ -48,7 +51,36 @@ use crate::state::ThreadHandle;
 use super::event::EngineEvent;
 use super::inner::EngineInner;
 use super::prompt::build_call_options;
-use super::tool_dispatch::dispatch_tool_call;
+use super::tool_dispatch::{
+    DispatchOutcome, ToolResolution, execute_resolved_tool, resolve_tool_permission,
+};
+
+// ============================================================
+// Tool-dispatch phasing
+// ============================================================
+
+/// Outcome of PHASE 1 (serial permission resolution) for one tool call.
+///
+/// Pairs a per-call's owned dispatch data with its resolution so PHASE 2 can
+/// execute approved calls concurrently and PHASE 3 can commit results in the
+/// original model-emit order.
+enum Resolved {
+    /// Permission denied / schema-failed / cancelled: the item is already final.
+    Blocked(DispatchOutcome),
+    /// Approved: carries the data the execute phase needs.
+    Approved {
+        /// Item id of the originating `ToolCall`.
+        item_id: ItemId,
+        /// Tool name to look up and execute.
+        tool_name: String,
+        /// Effective (possibly hook-mutated) input arguments.
+        args: serde_json::Value,
+        /// Provider tool-call id round-tripped onto the finalized item.
+        tool_use_id: String,
+        /// Whether a hook already requested loop termination.
+        stop_loop: bool,
+    },
+}
 
 // ============================================================
 // Turn execution
@@ -77,9 +109,10 @@ use super::tool_dispatch::dispatch_tool_call;
 /// 3. Stream loop: `tokio::select!` on `cancel.cancelled()` vs next part.
 ///    On each part: fold → push items → emit `ItemAppended`.
 ///    On inner stream error: `TurnFailed` + finish.
-/// 4. After the stream ends: if tool-call items were produced, dispatch each
-///    via `dispatch_tool_call`.  If a hook requested `stop_loop`, finish early.
-///    If no tool calls, the turn is complete.
+/// 4. After the stream ends: if tool-call items were produced, dispatch them in
+///    three phases (serial resolve → parallel execute → serial commit). If a
+///    hook requested `stop_loop`, finish early. If no tool calls, the turn is
+///    complete.
 /// 5. After the loop (including on cancel): call `fold.finish()` then
 ///    `finish_turn`.  Cancel suppresses `TurnCompleted`.
 #[must_use = "a returned TurnError carries the real failure cause; subagent callers must surface it"]
@@ -403,6 +436,15 @@ async fn run_turn_inner(
         let reducer = inner.permission_reducer();
         let thread_id_str = thread_id.0.as_ref();
 
+        // Tool dispatch runs in three phases so that several tool calls in one
+        // model turn execute CONCURRENTLY without firing multiple interactive
+        // permission prompts at once:
+        //   PHASE 1 (serial)   — resolve permission for each call in emit order.
+        //   PHASE 2 (parallel) — execute every approved call concurrently.
+        //   PHASE 3 (serial)   — push the finalized items in emit order.
+
+        // ── PHASE 1: serial permission resolution (original emit order) ──────
+        let mut resolved: Vec<Resolved> = Vec::with_capacity(new_tool_call_items.len());
         let mut stop_requested = false;
         for tool_item in &new_tool_call_items {
             let Item::ToolCall {
@@ -427,10 +469,9 @@ async fn run_turn_inner(
                 }
             };
 
-            let outcome = dispatch_tool_call(
+            let resolution = resolve_tool_permission(
                 inner,
                 &hook_host,
-                &tools,
                 &reducer,
                 thread_id_str,
                 &turn_id,
@@ -443,25 +484,91 @@ async fn run_turn_inner(
             )
             .await;
 
-            if outcome.stop_loop() {
-                stop_requested = true;
-            }
-
-            // If the turn was cancelled during this dispatch (the tool body or
-            // PostToolUse lost its select! race), the outcome item is an
-            // abandoned result. Do NOT push or broadcast it — emitting an
-            // ItemAppended for a result the engine has rolled back from would
-            // be an orphan event. Just finish and exit.
+            // A cancel observed during the (serial) permission wait means the
+            // turn is being torn down. Finish without pushing any items.
             if cancel.is_cancelled() {
                 inner.finish_turn(&handle, thread_id, turn_id, false).await;
                 return None;
             }
 
-            // The finalized item already carries `provider_tool_call_id`
-            // (set by `dispatch_tool_call` from `tool_use_id`), so pushing it
-            // to the tail is all that prompt reconstruction needs — no side
-            // accumulator. `tool_use_id` itself is consumed only as the
-            // dispatch argument above.
+            match resolution {
+                ToolResolution::Blocked(outcome) => {
+                    if outcome.stop_loop() {
+                        stop_requested = true;
+                    }
+                    resolved.push(Resolved::Blocked(outcome));
+                }
+                ToolResolution::Approved { args, stop_loop } => {
+                    if stop_loop {
+                        stop_requested = true;
+                    }
+                    resolved.push(Resolved::Approved {
+                        item_id: item_id.clone(),
+                        tool_name: tool_name.clone(),
+                        args,
+                        tool_use_id,
+                        stop_loop,
+                    });
+                }
+            }
+        }
+
+        // ── PHASE 2: parallel execution of every approved call ───────────────
+        //
+        // Build one execute future per resolution (Blocked entries resolve
+        // immediately to their already-final outcome), then await them all
+        // concurrently via `join_all` over an ORDERED Vec so PHASE 3 can
+        // reassemble results in the original model-emit order.
+        let exec_futures = resolved.into_iter().map(|r| {
+            let tools = &tools;
+            let hook_host = &hook_host;
+            let cancel = &cancel;
+            let turn_id = &turn_id;
+            async move {
+                match r {
+                    Resolved::Blocked(outcome) => outcome,
+                    Resolved::Approved {
+                        item_id,
+                        tool_name,
+                        args,
+                        tool_use_id,
+                        stop_loop,
+                    } => {
+                        execute_resolved_tool(
+                            tools,
+                            hook_host,
+                            thread_id_str,
+                            turn_id,
+                            item_id,
+                            &tool_name,
+                            args,
+                            &tool_use_id,
+                            cancel,
+                            stop_loop,
+                        )
+                        .await
+                    }
+                }
+            }
+        });
+        let outcomes: Vec<DispatchOutcome> = futures::future::join_all(exec_futures).await;
+
+        // If the turn was cancelled while the tools were executing (a tool body
+        // or PostToolUse lost its select! race), every outcome is an abandoned
+        // result. Do NOT push or broadcast any of them — finish and exit.
+        if cancel.is_cancelled() {
+            inner.finish_turn(&handle, thread_id, turn_id, false).await;
+            return None;
+        }
+
+        // ── PHASE 3: serial item commit (original emit order) ────────────────
+        for outcome in outcomes {
+            if outcome.stop_loop() {
+                stop_requested = true;
+            }
+
+            // The finalized item already carries `provider_tool_call_id`, so
+            // pushing it to the tail is all prompt reconstruction needs.
             let final_item = outcome.item().clone();
 
             // Push the finalized ToolCall item (replaces the InProgress one).

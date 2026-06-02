@@ -15,9 +15,12 @@ workspace = true
 # Feature topology (per D-009 build-optimization plan):
 #   * `default`     -> minimal usable engine
 #   * `sandbox`     -> Landlock / Seatbelt / Job Object adapters (Phase 3)
+#   * `skills`      -> on-disk Agent-Skills discovery (SKILL.md loader). Gated
+#                      so pure-engine consumers do not compile the YAML parser.
 [features]
 default = []
 sandbox = []
+skills  = ["dep:serde_norway"]
 
 [dependencies]
 zhive-proto = { workspace = true }
@@ -50,6 +53,7 @@ llmsdk = { workspace = true }
 tracing-opentelemetry = { workspace = true }
 opentelemetry         = { workspace = true }
 opentelemetry_sdk     = { workspace = true }
+serde_norway = { version = "0.9.42", optional = true }
 
 # Safe syscall wrappers; only the UDS fallback path uses
 # `rustix::process::getuid` to compose `/tmp/zhive-<uid>.sock` without

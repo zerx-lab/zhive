@@ -17,17 +17,21 @@
 //! 5. Build a `PostToolUse` [`HookEvent`]; dispatch it and apply any
 //!    `updated_tool_output`.
 //!
-//! ## Phase-1 limitation: `Defer`
+//! ## Two-phase split (serial resolve, parallel execute)
 //!
-//! Full suspend / resume for `Defer` outcomes requires a later increment.
-//! For now, `Defer` is treated as a block: a `SystemNotice` is appended
-//! explaining the limitation and the tool call is marked `Failed`.
+//! The pipeline is split into [`resolve_tool_permission`] (steps a–d) and
+//! [`execute_resolved_tool`] (steps e–f). `run_turn` resolves every tool call
+//! in a turn **serially** (so an interactive `Ask` / `Defer` prompt is raised
+//! for at most one call at a time), then executes all approved calls
+//! **concurrently**. The thin [`dispatch_tool_call`] wrapper runs both phases
+//! for one call and preserves the original single-call behaviour for direct
+//! callers and tests.
 //!
 //! ## Outcome model
 //!
-//! The function returns a [`DispatchOutcome`] so `run_turn` can decide whether
-//! to continue the loop (`Executed` / `Blocked`) or terminate it early
-//! (`Stop`, from a `continue_loop == false` hook output).
+//! Execution returns a [`DispatchOutcome`] so `run_turn` can decide whether to
+//! continue the loop (`Executed` / `Blocked`) or terminate it early (a
+//! `continue_loop == false` hook output sets `stop_loop`).
 
 mod helpers;
 
@@ -97,6 +101,30 @@ impl DispatchOutcome {
 }
 
 // ============================================================
+// ToolResolution
+// ============================================================
+
+/// Outcome of the serial permission phase for one tool call.
+///
+/// Produced by [`resolve_tool_permission`] (the steps that must run serially
+/// because they may raise an interactive permission prompt). An `Approved`
+/// resolution can then be executed concurrently with other approved calls via
+/// [`execute_resolved_tool`].
+#[derive(Debug)]
+pub(super) enum ToolResolution {
+    /// The call was blocked before execution (denied, schema failure, cancel,
+    /// or a build error); the carried [`DispatchOutcome`] is already final.
+    Blocked(DispatchOutcome),
+    /// The call is permitted; execution should proceed with `args`.
+    Approved {
+        /// Effective input arguments (possibly hook-mutated, post red-line-11).
+        args: serde_json::Value,
+        /// If `true`, a hook requested loop termination.
+        stop_loop: bool,
+    },
+}
+
+// ============================================================
 // Synthetic ExtensionRef for engine-internal hook events
 // ============================================================
 
@@ -139,7 +167,7 @@ fn engine_ext_ref() -> Option<ExtensionRef> {
 /// Outcome of the async select! inside the `Ask` permission sub-flow.
 ///
 /// Defined at module level so it can be named before any statements inside
-/// `dispatch_tool_call_inner` (clippy `items_after_statements` lint).
+/// `resolve_tool_permission_inner` (clippy `items_after_statements` lint).
 enum PermResult {
     /// The reducer returned an outcome (allow / deny / cancelled / timed out).
     Outcome(Result<PermissionOutcome, crate::permission::ReducerError>),
@@ -148,7 +176,7 @@ enum PermResult {
 }
 
 // ============================================================
-// dispatch_tool_call
+// dispatch_tool_call (thin one-call wrapper)
 // ============================================================
 
 /// Dispatches one tool call through the full hook → permission → execute
@@ -158,9 +186,11 @@ enum PermResult {
 /// that appears in the original `ToolCall` item's `raw_input` if the
 /// provider emitted it, or a synthetic id otherwise).
 ///
-/// Opens a `zhive.tool_call` span with `session.id`, `zhive.turn.id`, and
-/// `gen_ai.tool.name` fields.  The permission sub-flow additionally opens a
-/// nested `zhive.permission` span when the decision is `Ask`.
+/// Resolves permission then, if approved, executes — the same single-call
+/// behaviour as before the two-phase split. The `zhive.tool_call` span is
+/// opened by each phase ([`resolve_tool_permission`] / [`execute_resolved_tool`]).
+/// The permission sub-flow additionally opens a nested `zhive.permission` span
+/// when the decision is `Ask` / `Defer`.
 ///
 /// # Errors
 ///
@@ -170,6 +200,11 @@ enum PermResult {
 #[allow(
     clippy::too_many_arguments,
     reason = "All args are required context; no good grouping"
+)]
+#[expect(
+    dead_code,
+    reason = "thin single-call wrapper retained for direct callers/tests; \
+              run_turn now uses the two-phase resolve/execute split directly"
 )]
 pub(super) async fn dispatch_tool_call(
     inner: &Arc<EngineInner>,
@@ -185,6 +220,67 @@ pub(super) async fn dispatch_tool_call(
     scope: &zhive_proto::permission::PermissionScope,
     cancel: &CancellationToken,
 ) -> DispatchOutcome {
+    match resolve_tool_permission(
+        inner,
+        hook_host,
+        reducer,
+        thread_id_str,
+        turn_id,
+        item_id.clone(),
+        tool_name,
+        raw_args,
+        tool_use_id,
+        scope,
+        cancel,
+    )
+    .await
+    {
+        ToolResolution::Blocked(outcome) => outcome,
+        ToolResolution::Approved { args, stop_loop } => {
+            execute_resolved_tool(
+                tools,
+                hook_host,
+                thread_id_str,
+                turn_id,
+                item_id,
+                tool_name,
+                args,
+                tool_use_id,
+                cancel,
+                stop_loop,
+            )
+            .await
+        }
+    }
+}
+
+// ============================================================
+// resolve_tool_permission (serial phase, steps a–d)
+// ============================================================
+
+/// Span-wrapping entry to the serial permission phase (steps a–d).
+///
+/// Opens the `zhive.tool_call` span and delegates to
+/// [`resolve_tool_permission_inner`]. `run_turn` calls this once per tool call
+/// in the model-emit order so an interactive `Ask` / `Defer` prompt is raised
+/// for at most one call at a time.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "All args are required context; no good grouping"
+)]
+pub(super) async fn resolve_tool_permission(
+    inner: &Arc<EngineInner>,
+    hook_host: &Arc<HookHost>,
+    reducer: &PermissionReducer,
+    thread_id_str: &str,
+    turn_id: &TurnId,
+    item_id: ItemId,
+    tool_name: &str,
+    raw_args: serde_json::Value,
+    tool_use_id: &str,
+    scope: &zhive_proto::permission::PermissionScope,
+    cancel: &CancellationToken,
+) -> ToolResolution {
     // Span name and field names are string literals (tracing macro
     // requirement).  The constants spans::TOOL_CALL, fields::THREAD_ID,
     // fields::TURN_ID, and fields::TOOL_NAME are the single source of
@@ -195,13 +291,11 @@ pub(super) async fn dispatch_tool_call(
         "zhive.turn.id"    = %turn_id.0,
         "gen_ai.tool.name" = tool_name,
     );
-    dispatch_tool_call_inner(
+    resolve_tool_permission_inner(
         inner,
         hook_host,
-        tools,
         reducer,
         thread_id_str,
-        turn_id,
         item_id,
         tool_name,
         raw_args,
@@ -213,11 +307,19 @@ pub(super) async fn dispatch_tool_call(
     .await
 }
 
-/// Inner body of [`dispatch_tool_call`], instrumented by the caller
+/// Inner body of [`resolve_tool_permission`], instrumented by the caller
 /// with the `zhive.tool_call` span.
+///
+/// Runs steps a–d: `PreToolUse` hook dispatch, hook output folding, red-line-11
+/// revalidation of any `updated_input`, and permission evaluation (including
+/// the `Ask` / `Defer` reverse-RPC enroll → emit → await flow raced against
+/// turn cancellation). Returns [`ToolResolution::Blocked`] (carrying an
+/// already-final [`DispatchOutcome`]) when the call is denied, fails
+/// revalidation, or is cancelled mid-wait; otherwise
+/// [`ToolResolution::Approved`].
 #[expect(
     clippy::too_many_lines,
-    reason = "dispatch_tool_call_inner spans all six hook/permission/execute steps as one \
+    reason = "resolve_tool_permission_inner spans the hook + permission steps as one \
               conceptual unit; extracting sub-functions would hurt readability without \
               reducing complexity"
 )]
@@ -225,20 +327,18 @@ pub(super) async fn dispatch_tool_call(
     clippy::too_many_arguments,
     reason = "All args are required context; no good grouping"
 )]
-async fn dispatch_tool_call_inner(
+async fn resolve_tool_permission_inner(
     inner: &Arc<EngineInner>,
     hook_host: &Arc<HookHost>,
-    tools: &Arc<ToolRegistry>,
     reducer: &PermissionReducer,
     thread_id_str: &str,
-    turn_id: &TurnId,
     item_id: ItemId,
     tool_name: &str,
     raw_args: serde_json::Value,
     tool_use_id: &str,
     scope: &zhive_proto::permission::PermissionScope,
     cancel: &CancellationToken,
-) -> DispatchOutcome {
+) -> ToolResolution {
     let cwd = std::env::current_dir()
         .unwrap_or_else(|_| std::path::PathBuf::from("/"))
         .to_string_lossy()
@@ -276,14 +376,14 @@ async fn dispatch_tool_call_inner(
                 error = %err,
                 "failed to build PreToolUse HookEvent; blocking tool call"
             );
-            return blocked_outcome(
+            return ToolResolution::Blocked(blocked_outcome(
                 item_id,
                 tool_name,
                 raw_args,
                 tool_use_id,
                 format!("failed to build PreToolUse hook event: {err}"),
                 false,
-            );
+            ));
         }
     };
 
@@ -296,14 +396,14 @@ async fn dispatch_tool_call_inner(
                 error = %err,
                 "PreToolUse hook dispatch failed; treating as Deny"
             );
-            return blocked_outcome(
+            return ToolResolution::Blocked(blocked_outcome(
                 item_id,
                 tool_name,
                 raw_args,
                 tool_use_id,
                 format!("PreToolUse hook error: {err}"),
                 false,
-            );
+            ));
         }
     };
 
@@ -347,14 +447,14 @@ async fn dispatch_tool_call_inner(
                     error = %err,
                     "red line 11: updated_input failed schema re-validation; blocking tool"
                 );
-                return blocked_outcome(
+                return ToolResolution::Blocked(blocked_outcome(
                     item_id,
                     tool_name,
                     raw_args,
                     tool_use_id,
                     format!("schema re-validation failed: {err}"),
                     stop_loop,
-                );
+                ));
             }
         }
     } else {
@@ -365,17 +465,17 @@ async fn dispatch_tool_call_inner(
     let decision = evaluate(scope, &decisions);
     match decision {
         PermissionDecision::Allow => {
-            // Continue to execution below.
+            // Continue to the approval below.
         }
         PermissionDecision::Deny => {
-            return blocked_outcome(
+            return ToolResolution::Blocked(blocked_outcome(
                 item_id,
                 tool_name,
                 raw_args,
                 tool_use_id,
                 "permission denied".to_owned(),
                 stop_loop,
-            );
+            ));
         }
         PermissionDecision::Ask | PermissionDecision::Defer => {
             // `Ask` and `Defer` share the same reverse-RPC flow (enroll → emit
@@ -414,14 +514,14 @@ async fn dispatch_tool_call_inner(
                         error = %err,
                         "failed to build RequestPermissionRequest; treating as Deny"
                     );
-                    return blocked_outcome(
+                    return ToolResolution::Blocked(blocked_outcome(
                         item_id,
                         tool_name,
                         raw_args,
                         tool_use_id,
                         format!("failed to build permission request: {err}"),
                         stop_loop,
-                    );
+                    ));
                 }
             };
             let (key, req, rx) = reducer.enroll(request);
@@ -473,20 +573,20 @@ async fn dispatch_tool_call_inner(
             let outcome = match perm_result {
                 PermResult::Outcome(o) => o,
                 PermResult::Cancelled => {
-                    return blocked_outcome(
+                    return ToolResolution::Blocked(blocked_outcome(
                         item_id,
                         tool_name,
                         raw_args,
                         tool_use_id,
                         "permission wait cancelled".to_owned(),
                         stop_loop,
-                    );
+                    ));
                 }
             };
 
             match outcome {
                 Ok(PermissionOutcome::Selected { option_id }) if option_id.starts_with("allow") => {
-                    // Allowed by the user — proceed to execution.
+                    // Allowed by the user — proceed to approval.
                     perm_span.in_scope(|| {
                         tracing::debug!(
                             name: "zhive.permission.allowed",
@@ -526,58 +626,156 @@ async fn dispatch_tool_call_inner(
                             );
                         });
                     }
-                    return blocked_outcome(
+                    return ToolResolution::Blocked(blocked_outcome(
                         item_id,
                         tool_name,
                         raw_args,
                         tool_use_id,
                         "permission request cancelled or timed out".to_owned(),
                         stop_loop,
-                    );
+                    ));
                 }
                 Ok(PermissionOutcome::Selected { option_id }) => {
-                    return blocked_outcome(
+                    return ToolResolution::Blocked(blocked_outcome(
                         item_id,
                         tool_name,
                         raw_args,
                         tool_use_id,
                         format!("permission denied by user (option: {option_id})"),
                         stop_loop,
-                    );
+                    ));
                 }
                 // PermissionOutcome is #[non_exhaustive]; unknown variants → deny.
                 Ok(_) => {
-                    return blocked_outcome(
+                    return ToolResolution::Blocked(blocked_outcome(
                         item_id,
                         tool_name,
                         raw_args,
                         tool_use_id,
                         "permission denied (unrecognised decision variant)".to_owned(),
                         stop_loop,
-                    );
+                    ));
                 }
             }
         }
         // PermissionDecision is #[non_exhaustive]; future variants are treated
         // as Deny to stay on the safe side.
         _ => {
-            return blocked_outcome(
+            return ToolResolution::Blocked(blocked_outcome(
                 item_id,
                 tool_name,
                 raw_args,
                 tool_use_id,
                 "permission denied (unrecognised decision variant)".to_owned(),
                 stop_loop,
-            );
+            ));
         }
     }
+
+    // Permission granted; hand the effective args off to the execute phase.
+    ToolResolution::Approved { args, stop_loop }
+}
+
+// ============================================================
+// execute_resolved_tool (parallel-safe phase, steps e–f)
+// ============================================================
+
+/// Span-wrapping entry to the parallel-safe execute phase (steps e–f).
+///
+/// Opens the `zhive.tool_call` span and delegates to
+/// [`execute_resolved_tool_inner`]. Safe to run concurrently for distinct tool
+/// calls; `run_turn` joins many of these in its parallel phase.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "All args are required context; no good grouping"
+)]
+pub(super) async fn execute_resolved_tool(
+    tools: &Arc<ToolRegistry>,
+    hook_host: &Arc<HookHost>,
+    thread_id_str: &str,
+    turn_id: &TurnId,
+    item_id: ItemId,
+    tool_name: &str,
+    args: serde_json::Value,
+    tool_use_id: &str,
+    cancel: &CancellationToken,
+    stop_loop: bool,
+) -> DispatchOutcome {
+    let span = tracing::info_span!(
+        "zhive.tool_call",
+        "session.id"       = thread_id_str,
+        "zhive.turn.id"    = %turn_id.0,
+        "gen_ai.tool.name" = tool_name,
+    );
+    execute_resolved_tool_inner(
+        tools,
+        hook_host,
+        thread_id_str,
+        turn_id,
+        item_id,
+        tool_name,
+        args,
+        tool_use_id,
+        cancel,
+        stop_loop,
+    )
+    .instrument(span)
+    .await
+}
+
+/// Inner body of [`execute_resolved_tool`], instrumented by the caller with
+/// the `zhive.tool_call` span.
+///
+/// Runs steps e–f: tool lookup + `execute` raced against the turn cancel token,
+/// then `PostToolUse` hook dispatch (also raced against cancel), and finally
+/// builds the finalized `Item::ToolCall` carrying the `provider_tool_call_id`.
+/// Borrows only shared/immutable references and derives its own per-call child
+/// cancel token, so multiple invocations for distinct tool calls may run
+/// concurrently.
+///
+/// `stop_loop` is the flag computed during [`resolve_tool_permission_inner`];
+/// it may be promoted to `true` by a `PostToolUse` hook returning
+/// `continue_loop == false`.
+#[expect(
+    clippy::too_many_lines,
+    reason = "execute_resolved_tool_inner spans the execute + post-hook steps as one \
+              conceptual unit; extracting sub-functions would hurt readability without \
+              reducing complexity"
+)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "All args are required context; no good grouping"
+)]
+async fn execute_resolved_tool_inner(
+    tools: &Arc<ToolRegistry>,
+    hook_host: &Arc<HookHost>,
+    thread_id_str: &str,
+    turn_id: &TurnId,
+    item_id: ItemId,
+    tool_name: &str,
+    args: serde_json::Value,
+    tool_use_id: &str,
+    cancel: &CancellationToken,
+    mut stop_loop: bool,
+) -> DispatchOutcome {
+    // Re-derive the engine provenance + cwd locally so this function owns no
+    // state from the resolve phase (it must be safe to run concurrently).
+    let cwd = std::env::current_dir()
+        .unwrap_or_else(|_| std::path::PathBuf::from("/"))
+        .to_string_lossy()
+        .into_owned();
+    let ext_ref = engine_ext_ref();
+    let ext_id = ext_ref.as_ref().map_or("zhive.engine", |r| r.id.as_str());
+    let ext_ver = ext_ref
+        .as_ref()
+        .map_or(env!("CARGO_PKG_VERSION"), |r| r.version.as_str());
 
     // ---- Step e: Execute ----
     let Some(tool) = tools.get(tool_name) else {
         return blocked_outcome(
             item_id,
             tool_name,
-            raw_args,
+            args,
             tool_use_id,
             format!("unknown tool: {tool_name}"),
             stop_loop,

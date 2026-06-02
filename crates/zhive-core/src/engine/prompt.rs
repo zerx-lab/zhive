@@ -120,7 +120,14 @@ pub(in crate::engine) async fn build_call_options(
                     content: vec![AssistantPart::ToolCall(ToolCallPart {
                         tool_call_id: tool_call_id.clone(),
                         tool_name: name.clone(),
-                        input: raw_input.clone().unwrap_or(serde_json::Value::Null),
+                        // `tool_use.input` MUST be a JSON object: the Anthropic
+                        // Messages API rejects a string/null with
+                        // "tool_use.input: Input should be an object". An
+                        // argument-less or malformed call reconstructs as `{}`.
+                        input: match raw_input {
+                            Some(value @ serde_json::Value::Object(_)) => value.clone(),
+                            _ => serde_json::json!({}),
+                        },
                         provider_executed: None,
                         dynamic: None,
                         provider_options: None,
@@ -146,8 +153,39 @@ pub(in crate::engine) async fn build_call_options(
     }
     drop(tail);
 
-    // Advertise registered tools to the provider. An invalid schema for one
-    // tool is logged and that tool is skipped; it must never abort the turn.
+    // Advertise registered tools (if any). An empty result leaves both fields
+    // `None` so an empty registry is a no-op (no behavior change).
+    let advertised = build_tool_advertisements(tools);
+    let (tools_opt, tool_choice) = if advertised.is_empty() {
+        (None, None)
+    } else {
+        (
+            Some(advertised),
+            Some(llmsdk::language_model::ToolChoice::Auto),
+        )
+    };
+
+    llmsdk::language_model::CallOptions {
+        prompt,
+        tools: tools_opt,
+        tool_choice,
+        ..Default::default()
+    }
+}
+
+// ============================================================
+// Private helpers
+// ============================================================
+
+/// Builds the provider `Tool::Function` list from the registry's specs.
+///
+/// Each spec's `input_schema` is converted to a provider `JsonSchema`; a tool
+/// whose schema is not a valid JSON schema is logged (`zhive.prompt.tool_schema_invalid`)
+/// and skipped so one bad tool never aborts the turn. Returns an empty vec when
+/// the registry is empty (or every schema is invalid).
+fn build_tool_advertisements(
+    tools: &crate::tools::ToolRegistry,
+) -> Vec<llmsdk::language_model::Tool> {
     let mut advertised: Vec<llmsdk::language_model::Tool> = Vec::new();
     for spec in tools.specs() {
         match serde_json::from_value::<llmsdk::json::JsonSchema>(spec.input_schema.clone()) {
@@ -173,28 +211,8 @@ pub(in crate::engine) async fn build_call_options(
             }
         }
     }
-
-    let (tools_opt, tool_choice) = if advertised.is_empty() {
-        // Empty registry (or every schema invalid) → no behavior change.
-        (None, None)
-    } else {
-        (
-            Some(advertised),
-            Some(llmsdk::language_model::ToolChoice::Auto),
-        )
-    };
-
-    llmsdk::language_model::CallOptions {
-        prompt,
-        tools: tools_opt,
-        tool_choice,
-        ..Default::default()
-    }
+    advertised
 }
-
-// ============================================================
-// Private helpers
-// ============================================================
 
 /// Extracts the tool-result text from a finalized `ToolCall` item.
 ///
@@ -479,7 +497,7 @@ mod tests {
         assert_eq!(tools.len(), 1, "exactly one tool advertised");
         match &tools[0] {
             Tool::Function(f) => assert_eq!(f.name, "echo", "echo tool advertised by name"),
-            other => panic!("expected Tool::Function, got {other:?}"),
+            Tool::Provider(p) => panic!("expected Tool::Function, got provider tool {p:?}"),
         }
         assert!(
             matches!(opts.tool_choice, Some(ToolChoice::Auto)),

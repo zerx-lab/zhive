@@ -1536,6 +1536,109 @@ mod inc3_tests {
     }
 
     // =========================================================================
+    // Test 1b: two tool calls in one turn → both execute (parallel dispatch)
+    // =========================================================================
+
+    /// A turn whose first model call emits TWO `ToolCall(echo)` parts: both must
+    /// run through the parallel execute phase and each yield a `ToolCall`
+    /// `Completed` item before the turn finishes on the second (text) call.
+    #[tokio::test]
+    async fn two_tool_calls_in_one_turn_both_complete() {
+        use llmsdk::ToolCallPart;
+
+        // First call: two tool calls in one model turn.
+        let script0 = vec![
+            StreamPart::ToolCall(ToolCallPart {
+                tool_call_id: "tc-a".into(),
+                tool_name: "echo".into(),
+                input: serde_json::json!({"msg": "first"}),
+                provider_executed: None,
+                dynamic: None,
+                provider_options: None,
+            }),
+            StreamPart::ToolCall(ToolCallPart {
+                tool_call_id: "tc-b".into(),
+                tool_name: "echo".into(),
+                input: serde_json::json!({"msg": "second"}),
+                provider_executed: None,
+                dynamic: None,
+                provider_options: None,
+            }),
+        ];
+        // Second call: a text response (no tool calls → loop ends).
+        let script1 = vec![
+            StreamPart::TextStart {
+                id: "b0".into(),
+                provider_metadata: None,
+            },
+            StreamPart::TextDelta {
+                id: "b0".into(),
+                delta: "done".into(),
+                provider_metadata: None,
+            },
+            StreamPart::TextEnd {
+                id: "b0".into(),
+                provider_metadata: None,
+            },
+        ];
+
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(EchoTool));
+
+        let cfg = EngineConfig {
+            provider: MultiScriptedModel::new(vec![script0, script1]).into_dyn(),
+            tools: Arc::new(tools),
+            hook_host: Arc::new(HookHost::new()),
+            storage: None,
+            turn_limits: TurnLimits::default(),
+        };
+        let engine =
+            Engine::spawn_with_config(cfg).with_reply_timeout(std::time::Duration::from_secs(5));
+        let mut events = engine.subscribe();
+
+        engine
+            .start_turn(tid("thread:native/two-tools"), Vec::new(), None)
+            .await
+            .unwrap();
+
+        let mut completed_ids: Vec<String> = Vec::new();
+        let mut saw_turn_completed = false;
+        for _ in 0..128 {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
+                .await
+                .expect("timeout")
+                .expect("broadcast")
+            {
+                EngineEvent::ItemAppended { item, .. } => {
+                    if let zhive_proto::domain::Item::ToolCall {
+                        status: zhive_proto::domain::ToolCallStatus::Completed,
+                        provider_tool_call_id: Some(id),
+                        ..
+                    } = *item
+                    {
+                        completed_ids.push(id);
+                    }
+                }
+                EngineEvent::TurnCompleted { .. } => {
+                    saw_turn_completed = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        assert_eq!(
+            completed_ids.len(),
+            2,
+            "both tool calls must produce a Completed ToolCall item, got {completed_ids:?}"
+        );
+        // Items must be committed in model-emit order.
+        assert_eq!(completed_ids, vec!["tc-a", "tc-b"], "emit order preserved");
+        assert!(saw_turn_completed, "expected TurnCompleted");
+        engine.shutdown().await.unwrap();
+    }
+
+    // =========================================================================
     // Test 2: PreToolUse hook returning Deny blocks execution
     // =========================================================================
 
