@@ -882,59 +882,122 @@ async fn execute_resolved_tool_inner(
         result = tool.execute(args.clone(), &ctx) => result,
     };
 
-    // ---- Step f: PostToolUse hook dispatch ----
-    let (raw_output, succeeded, mut result_text) = match exec_result {
+    // ---- Step f: PostToolUse / PostToolUseFailure hook dispatch ----
+    //
+    // Semantics (mirrors claude-code):
+    //   * Tool succeeded → dispatch PostToolUse
+    //   * Tool failed (Execution error or Cancelled) → dispatch PostToolUseFailure
+    //
+    // `ToolError::Cancelled` is an engine-level abort rather than a tool fault,
+    // but we still dispatch `PostToolUseFailure` so audit hooks see every
+    // non-success outcome. `ToolError::Execution` maps to `ExecutionError`;
+    // `ToolError::Cancelled` maps to `Cancelled`.
+    let (raw_output, succeeded, mut result_text, exec_error) = match exec_result {
         Ok(out) => {
             let json_out = out
                 .value
                 .clone()
                 .unwrap_or_else(|| serde_json::Value::String(out.text.clone()));
-            (json_out, true, out.text)
+            (json_out, true, out.text, None)
         }
         Err(err) => {
             let msg = err.to_string();
-            (serde_json::Value::String(msg.clone()), false, msg)
+            (
+                serde_json::Value::String(msg.clone()),
+                false,
+                msg,
+                Some(err),
+            )
         }
     };
 
     // Reuse the same engine ref values obtained at the top of the function.
     // If construction fails (practically impossible — engine controls the
     // template), skip post-hook dispatch rather than panicking.
-    let maybe_post_event: Result<HookEvent, _> = serde_json::from_value(serde_json::json!({
-        "hook_event_name": "PostToolUse",
-        "sessionId": thread_id_str,
-        "cwd": cwd,
-        "registeredBy": {
-            "id": ext_id,
-            "version": ext_ver,
-            "source": "builtin"
-        },
-        "toolName": tool_name,
-        "toolInput": args,
-        "toolResponse": raw_output,
-        "toolUseId": tool_use_id,
-    }));
+    let post_dispatch = if succeeded {
+        // ── success path ──────────────────────────────────────────────────
+        let maybe_post_event: Result<HookEvent, _> = serde_json::from_value(serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "sessionId": thread_id_str,
+            "cwd": cwd,
+            "registeredBy": {
+                "id": ext_id,
+                "version": ext_ver,
+                "source": "builtin"
+            },
+            "toolName": tool_name,
+            "toolInput": args,
+            "toolResponse": raw_output,
+            "toolUseId": tool_use_id,
+        }));
 
-    // Race the PostToolUse dispatch against cancellation as well: a hook can
-    // perform arbitrary I/O, so a cancelled turn must not wait on it before
-    // appending an item that will be discarded.
-    let post_dispatch = match maybe_post_event {
-        Ok(post_event) => {
-            tokio::select! {
-                biased;
-                () = cancel.cancelled() => {
-                    return cancelled_during_execution(item_id, tool_name, args, tool_use_id, stop_loop);
+        // Race the PostToolUse dispatch against cancellation: a hook can
+        // perform arbitrary I/O, so a cancelled turn must not block.
+        match maybe_post_event {
+            Ok(post_event) => {
+                tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => {
+                        return cancelled_during_execution(item_id, tool_name, args, tool_use_id, stop_loop);
+                    }
+                    outputs = hook_host.dispatch(&post_event) => outputs,
                 }
-                outputs = hook_host.dispatch(&post_event) => outputs,
+            }
+            Err(err) => {
+                tracing::warn!(
+                    name: "zhive.tool.post_hook_event_build_failed",
+                    error = %err,
+                    "failed to build PostToolUse HookEvent; skipping post-hook dispatch"
+                );
+                Ok(vec![])
             }
         }
-        Err(err) => {
-            tracing::warn!(
-                name: "zhive.tool.post_hook_event_build_failed",
-                error = %err,
-                "failed to build PostToolUse HookEvent; skipping post-hook dispatch"
-            );
-            Ok(vec![])
+    } else {
+        // ── failure path ──────────────────────────────────────────────────
+        use crate::tools::ToolError;
+        use zhive_proto::hook::ToolErrorKind;
+
+        let error_kind = match exec_error.as_ref() {
+            Some(ToolError::Cancelled) => ToolErrorKind::Cancelled,
+            _ => ToolErrorKind::ExecutionError,
+        };
+        let error_msg = result_text.clone();
+
+        let maybe_failure_event: Result<HookEvent, _> = serde_json::from_value(serde_json::json!({
+            "hook_event_name": "PostToolUseFailure",
+            "sessionId": thread_id_str,
+            "cwd": cwd,
+            "registeredBy": {
+                "id": ext_id,
+                "version": ext_ver,
+                "source": "builtin"
+            },
+            "toolName": tool_name,
+            "toolInput": args,
+            "toolUseId": tool_use_id,
+            "error": error_msg,
+            "errorKind": error_kind,
+        }));
+
+        // Race PostToolUseFailure dispatch against cancellation.
+        match maybe_failure_event {
+            Ok(failure_event) => {
+                tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => {
+                        return cancelled_during_execution(item_id, tool_name, args, tool_use_id, stop_loop);
+                    }
+                    outputs = hook_host.dispatch(&failure_event) => outputs,
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    name: "zhive.tool.post_failure_hook_event_build_failed",
+                    error = %err,
+                    "failed to build PostToolUseFailure HookEvent; skipping failure hook dispatch"
+                );
+                Ok(vec![])
+            }
         }
     };
 
@@ -948,7 +1011,8 @@ async fn execute_resolved_tool_inner(
                 ..
             }) = &out.hook_specific_output
             {
-                // Replace result text with the hook's override.
+                // Replace result text with the hook's override (success path
+                // only; PostToolUseFailure carries no `updated_tool_output`).
                 // `Value::to_string()` JSON-encodes string values (adding
                 // surrounding quotes), so unwrap `Value::String` directly;
                 // other JSON variants (object, array, …) fall back to their

@@ -138,6 +138,14 @@ impl Tool for SkillTool {
         &self.name
     }
 
+    /// Returns `false` when the manifest sets `disable_in_subagent`.
+    ///
+    /// When `false`, the engine excludes this skill from the child scope's
+    /// disallowed-tool override list, so subagent threads cannot invoke it.
+    fn available_in_subagent(&self) -> bool {
+        !self.disable_in_subagent
+    }
+
     /// Always [`ToolKind::Other`]; skills are not file-system operations.
     fn kind(&self) -> ToolKind {
         ToolKind::Other
@@ -314,6 +322,39 @@ mod tests {
         let loaded = make_loaded("schema-skill", "body", true, tmp.path());
         let tool = SkillTool::from_loaded(loaded);
         assert_eq!(tool.input_schema()["type"], "object");
+    }
+
+    /// A skill loaded without `disable_in_subagent: true` is available in
+    /// subagents; one with the flag set is excluded.
+    #[test]
+    fn available_in_subagent_reflects_manifest_flag() {
+        use crate::tools::Tool as _;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        // Without the flag → available_in_subagent() == true.
+        let loaded = make_loaded("normal-skill", "body", true, tmp.path());
+        let tool = SkillTool::from_loaded(loaded);
+        assert!(
+            tool.available_in_subagent(),
+            "skill without disable_in_subagent must be available in subagents"
+        );
+
+        // With the flag → available_in_subagent() == false.
+        // Write the SKILL.md manually so we can set `disable_in_subagent: true`.
+        let skill_dir = tmp.path().join("guarded-skill");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: guarded-skill\ndescription: x\ndisable-in-subagent: true\n---\n\nbody",
+        )
+        .unwrap();
+        let loaded2 = super::super::loader::load(&skill_dir.join("SKILL.md")).expect("should load");
+        let tool2 = SkillTool::from_loaded(loaded2);
+        assert!(
+            !tool2.available_in_subagent(),
+            "skill with disable_in_subagent must NOT be available in subagents"
+        );
     }
 
     #[tokio::test]

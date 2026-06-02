@@ -1529,6 +1529,7 @@ mod inc3_tests {
         tools.register(Arc::new(EchoTool));
 
         let model = MultiScriptedModel::new(vec![script0, script1]);
+
         let cfg = EngineConfig {
             provider: model.into_dyn(),
             tools: Arc::new(tools),
@@ -2714,6 +2715,320 @@ mod inc3_tests {
             !saw_turn_completed,
             "TurnCompleted must NOT fire for a cancelled turn"
         );
+        engine.shutdown().await.unwrap();
+    }
+}
+
+// ============================================================
+// PostToolUse / PostToolUseFailure hook dispatch tests
+// ============================================================
+
+/// Tests for success → `PostToolUse` / failure → `PostToolUseFailure` routing.
+///
+/// Each test wires a `CollectingHook`, drives one turn, and asserts which hook
+/// event variant was dispatched.
+#[cfg(test)]
+mod post_hook_dispatch_tests {
+    use std::sync::Mutex;
+
+    use async_trait::async_trait;
+    use llmsdk::language_model::{CallOptions, StreamPart};
+    use llmsdk::{LanguageModel, ToolCallPart};
+
+    use super::*;
+    use crate::hooks::{HookFilter, HookFn};
+    use crate::tools::{EchoTool, Tool, ToolContext, ToolError, ToolOutput};
+    use zhive_proto::hook::HookEvent;
+    use zhive_proto::permission::HookOutput;
+
+    fn tid(s: &str) -> ThreadId {
+        ThreadId(Arc::from(s))
+    }
+
+    /// A scripted model that replays successive scripts on each `do_stream`
+    /// call, mirroring the `MultiScriptedModel` in `inc3_tests`.
+    #[derive(Debug, Clone)]
+    struct TwoScriptModel {
+        scripts: Arc<Vec<Vec<StreamPart>>>,
+        call: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl TwoScriptModel {
+        fn new(scripts: Vec<Vec<StreamPart>>) -> Self {
+            Self {
+                scripts: Arc::new(scripts),
+                call: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }
+        }
+
+        fn into_dyn(self) -> DynLanguageModel {
+            DynLanguageModel::new(self)
+        }
+    }
+
+    #[async_trait]
+    impl LanguageModel for TwoScriptModel {
+        fn provider(&self) -> &'static str {
+            "test"
+        }
+
+        fn model_id(&self) -> &'static str {
+            "two-script"
+        }
+
+        async fn do_generate(
+            &self,
+            _opts: CallOptions,
+        ) -> llmsdk::error::Result<llmsdk::language_model::GenerateResult> {
+            unimplemented!("TwoScriptModel only supports do_stream")
+        }
+
+        async fn do_stream(
+            &self,
+            _opts: CallOptions,
+        ) -> llmsdk::error::Result<llmsdk::language_model::StreamResult> {
+            use futures::stream;
+            use llmsdk::language_model::{BoxStream, StreamResult};
+
+            let idx = self.call.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let parts = self
+                .scripts
+                .get(idx)
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .map(Ok)
+                .collect::<Vec<_>>();
+            let s: BoxStream<llmsdk::error::Result<StreamPart>> = Box::pin(stream::iter(parts));
+            Ok(StreamResult {
+                stream: s,
+                request: None,
+                response: None,
+            })
+        }
+    }
+
+    fn ext_ref_fixture(id: &str) -> zhive_proto::hook::ExtensionRef {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "version": "0.1.0",
+            "source": "builtin"
+        }))
+        .expect("fixture")
+    }
+
+    /// A hook that collects every event it receives into a shared `Vec`.
+    #[derive(Debug, Clone)]
+    struct CollectingHook {
+        events: Arc<Mutex<Vec<HookEvent>>>,
+    }
+
+    impl CollectingHook {
+        fn new() -> (Self, Arc<Mutex<Vec<HookEvent>>>) {
+            let bag = Arc::new(Mutex::new(Vec::new()));
+            (
+                Self {
+                    events: Arc::clone(&bag),
+                },
+                bag,
+            )
+        }
+    }
+
+    #[async_trait]
+    impl HookFn for CollectingHook {
+        async fn call(&self, event: &HookEvent) -> Option<HookOutput> {
+            self.events.lock().expect("mutex").push(event.clone());
+            None
+        }
+    }
+
+    /// A tool that always returns `Err(ToolError::Execution(...))`.
+    #[derive(Debug, Clone, Copy)]
+    struct AlwaysFailTool;
+
+    #[async_trait]
+    impl Tool for AlwaysFailTool {
+        fn name(&self) -> &'static str {
+            "always-fail"
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+            _ctx: &ToolContext,
+        ) -> Result<ToolOutput, ToolError> {
+            Err(ToolError::Execution("deliberate failure".to_owned()))
+        }
+    }
+
+    /// Waits up to 64 events for `TurnCompleted`.
+    async fn wait_for_turn_end(rx: &mut broadcast::Receiver<EngineEvent>) {
+        for _ in 0..64_usize {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await {
+                Ok(Ok(EngineEvent::TurnCompleted { .. })) => break,
+                Ok(Ok(_)) => {}
+                _ => break,
+            }
+        }
+    }
+
+    /// A failing tool must trigger `PostToolUseFailure`, not `PostToolUse`.
+    #[tokio::test]
+    async fn failing_tool_dispatches_post_tool_use_failure() {
+        // Script 0: emit one call to `always-fail`.
+        // Script 1: text answer so the loop can close cleanly.
+        let script0 = vec![StreamPart::ToolCall(ToolCallPart {
+            tool_call_id: "tc-fail".into(),
+            tool_name: "always-fail".into(),
+            input: serde_json::json!({}),
+            provider_executed: None,
+            dynamic: None,
+            provider_options: None,
+        })];
+        let script1 = vec![
+            StreamPart::TextStart {
+                id: "b0".into(),
+                provider_metadata: None,
+            },
+            StreamPart::TextEnd {
+                id: "b0".into(),
+                provider_metadata: None,
+            },
+        ];
+
+        let (hook, bag) = CollectingHook::new();
+
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(AlwaysFailTool));
+
+        let hook_host = Arc::new(HookHost::new());
+        let _scope = hook_host
+            .register(
+                ext_ref_fixture("collector"),
+                HookFilter::default(),
+                0,
+                Arc::new(hook),
+            )
+            .unwrap();
+
+        let cfg = EngineConfig {
+            provider: TwoScriptModel::new(vec![script0, script1]).into_dyn(),
+            tools: Arc::new(tools),
+            hook_host,
+            storage: None,
+            turn_limits: TurnLimits::default(),
+            system_prompt: None,
+            compact_token_threshold: None,
+        };
+        let engine =
+            Engine::spawn_with_config(cfg).with_reply_timeout(std::time::Duration::from_secs(5));
+        let mut events = engine.subscribe();
+
+        engine
+            .start_turn(tid("thread:native/ptuf"), Vec::new(), None)
+            .await
+            .unwrap();
+
+        wait_for_turn_end(&mut events).await;
+
+        let collected = bag.lock().expect("mutex").clone();
+
+        let has_failure_hook = collected
+            .iter()
+            .any(|e| matches!(e, HookEvent::PostToolUseFailure(_)));
+        let has_success_hook = collected
+            .iter()
+            .any(|e| matches!(e, HookEvent::PostToolUse(_)));
+
+        assert!(
+            has_failure_hook,
+            "failing tool must dispatch PostToolUseFailure; got: {collected:#?}"
+        );
+        assert!(
+            !has_success_hook,
+            "failing tool must NOT dispatch PostToolUse; got: {collected:#?}"
+        );
+
+        engine.shutdown().await.unwrap();
+    }
+
+    /// A succeeding tool (`EchoTool`) must trigger `PostToolUse`, not
+    /// `PostToolUseFailure`.
+    #[tokio::test]
+    async fn succeeding_tool_dispatches_post_tool_use_only() {
+        let script0 = vec![StreamPart::ToolCall(ToolCallPart {
+            tool_call_id: "tc-echo".into(),
+            tool_name: "echo".into(),
+            input: serde_json::json!({"msg": "hi"}),
+            provider_executed: None,
+            dynamic: None,
+            provider_options: None,
+        })];
+        let script1 = vec![
+            StreamPart::TextStart {
+                id: "b0".into(),
+                provider_metadata: None,
+            },
+            StreamPart::TextEnd {
+                id: "b0".into(),
+                provider_metadata: None,
+            },
+        ];
+
+        let (hook, bag) = CollectingHook::new();
+
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(EchoTool));
+
+        let hook_host = Arc::new(HookHost::new());
+        let _scope = hook_host
+            .register(
+                ext_ref_fixture("collector2"),
+                HookFilter::default(),
+                0,
+                Arc::new(hook),
+            )
+            .unwrap();
+
+        let cfg = EngineConfig {
+            provider: TwoScriptModel::new(vec![script0, script1]).into_dyn(),
+            tools: Arc::new(tools),
+            hook_host,
+            storage: None,
+            turn_limits: TurnLimits::default(),
+            system_prompt: None,
+            compact_token_threshold: None,
+        };
+        let engine =
+            Engine::spawn_with_config(cfg).with_reply_timeout(std::time::Duration::from_secs(5));
+        let mut events = engine.subscribe();
+
+        engine
+            .start_turn(tid("thread:native/ptu-ok"), Vec::new(), None)
+            .await
+            .unwrap();
+
+        wait_for_turn_end(&mut events).await;
+
+        let collected = bag.lock().expect("mutex").clone();
+
+        let has_success_hook = collected
+            .iter()
+            .any(|e| matches!(e, HookEvent::PostToolUse(_)));
+        let has_failure_hook = collected
+            .iter()
+            .any(|e| matches!(e, HookEvent::PostToolUseFailure(_)));
+
+        assert!(
+            has_success_hook,
+            "succeeding tool must dispatch PostToolUse; got: {collected:#?}"
+        );
+        assert!(
+            !has_failure_hook,
+            "succeeding tool must NOT dispatch PostToolUseFailure; got: {collected:#?}"
+        );
+
         engine.shutdown().await.unwrap();
     }
 }

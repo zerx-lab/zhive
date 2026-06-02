@@ -292,6 +292,26 @@ pub trait Tool: Send + Sync {
         serde_json::json!({ "type": "object" })
     }
 
+    /// Whether this tool is available inside subagent threads.
+    ///
+    /// Returns `false` to prevent the tool from appearing in the child scope
+    /// when a subagent is spawned. The default is `true` (all tools are
+    /// available in subagents unless an implementor opts out).
+    ///
+    /// Skill tools honour the `disable_in_subagent` manifest field by
+    /// overriding this method; see [`crate::skills::tool::SkillTool`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use zhive_core::tools::{EchoTool, Tool};
+    /// // Built-in tools are available in subagents by default.
+    /// assert!(EchoTool.available_in_subagent());
+    /// ```
+    fn available_in_subagent(&self) -> bool {
+        true
+    }
+
     /// Executes the tool with JSON `args` and a read-only [`ToolContext`].
     ///
     /// # Errors
@@ -404,6 +424,26 @@ impl ToolRegistry {
     #[must_use]
     pub fn len(&self) -> usize {
         self.tools.len()
+    }
+
+    /// Iterates over `(name, tool)` pairs for all registered tools.
+    ///
+    /// Iteration order is unspecified (`HashMap` order). Callers that need
+    /// deterministic ordering should sort the results themselves.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use zhive_core::tools::{EchoTool, ToolRegistry};
+    ///
+    /// let mut reg = ToolRegistry::new();
+    /// reg.register(Arc::new(EchoTool));
+    /// let names: Vec<&str> = reg.iter().map(|(n, _)| n.as_str()).collect();
+    /// assert_eq!(names, ["echo"]);
+    /// ```
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &Arc<dyn Tool>)> {
+        self.tools.iter()
     }
 
     /// Enumerates the model-facing [`ToolSpec`] of every registered tool.
@@ -571,6 +611,13 @@ mod tests {
         let schema = EchoTool.input_schema();
         assert_eq!(schema["type"], "object");
         assert!(schema["properties"]["msg"].is_object());
+    }
+
+    #[test]
+    fn echo_tool_available_in_subagent_default_is_true() {
+        // The default implementation must return `true` so existing tools are
+        // not inadvertently excluded when spawning child agents.
+        assert!(EchoTool.available_in_subagent());
     }
 
     #[test]

@@ -27,7 +27,7 @@ use std::sync::Arc;
 
 use tracing::Instrument as _;
 use zhive_proto::domain::ThreadId;
-use zhive_proto::permission::{PermissionScope, SubagentDefinition};
+use zhive_proto::permission::{PermissionScope, SubagentDefinition, ToolName};
 
 use crate::persistence::writer::StorageWriteOp;
 use crate::state::{ActiveTurn, ThreadHandle};
@@ -135,7 +135,7 @@ impl EngineInner {
         )));
 
         // (e) Validate constraints and compute the child scope.
-        let child_scope = prepare_child_scope(
+        let mut child_scope = prepare_child_scope(
             &parent_scope,
             parent_is_subagent,
             &definition,
@@ -148,6 +148,20 @@ impl EngineInner {
                 SubagentSpawnError::ScopeWideningRejected
             }
         })?;
+
+        // (e2) Exclude tools that are flagged as subagent-unavailable from the
+        // child scope. This enforces the `disable_in_subagent` contract for
+        // skill tools (and any future implementors) without touching the parent
+        // turn's tool set. Tools already in `disallowed_tools` are not
+        // re-inserted to keep the list deduplicated.
+        for (name, tool) in self.tools().iter() {
+            if !tool.available_in_subagent() {
+                let tool_name = ToolName(Arc::from(name.as_str()));
+                if !child_scope.scope.disallowed_tools.contains(&tool_name) {
+                    child_scope.scope.disallowed_tools.push(tool_name);
+                }
+            }
+        }
 
         // (f) Build a child ThreadHandle with a fresh context window and
         //     register it in the thread store.
@@ -559,6 +573,7 @@ mod tests {
     use tokio::sync::broadcast;
     use zhive_proto::domain::ThreadId;
     use zhive_proto::hook::EnginePhase;
+    use zhive_proto::permission::ToolName;
 
     use crate::engine::event::EngineEvent;
     use crate::engine::inner::EngineInner;
@@ -826,6 +841,111 @@ mod tests {
             }
             other => panic!("no error must map to Completed, got {other:?}"),
         }
+    }
+
+    /// A tool whose `available_in_subagent()` returns `false` must appear in
+    /// the child scope's `disallowed_tools` after `spawn_subagent_awaitable`.
+    ///
+    /// Concretely: build an engine with a `SubagentBlockedTool` pre-registered,
+    /// spawn a child scope, and assert the child's `disallowed_tools` contains
+    /// the tool name.  The parent's `disallowed_tools` must remain unchanged.
+    #[tokio::test]
+    async fn spawn_subagent_excludes_subagent_unavailable_tools() {
+        use async_trait::async_trait;
+
+        use crate::tools::{Tool, ToolContext, ToolError, ToolOutput, ToolRegistry};
+
+        /// Toy tool that declares itself subagent-unavailable.
+        #[derive(Debug)]
+        struct SubagentBlockedTool;
+
+        #[async_trait]
+        impl Tool for SubagentBlockedTool {
+            fn name(&self) -> &'static str {
+                "blocked-in-subagent"
+            }
+
+            fn available_in_subagent(&self) -> bool {
+                false
+            }
+
+            async fn execute(
+                &self,
+                _args: serde_json::Value,
+                _ctx: &ToolContext,
+            ) -> Result<ToolOutput, ToolError> {
+                Ok(ToolOutput::text("never"))
+            }
+        }
+
+        // Build the engine with the blocked tool pre-registered.
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(SubagentBlockedTool));
+        let (events_tx, _) = broadcast::channel::<EngineEvent>(16);
+        let inner = Arc::new(EngineInner::new_with_hooks_tools_storage(
+            events_tx,
+            noop_provider(),
+            Arc::new(crate::hooks::HookHost::new()),
+            Arc::new(reg),
+            crate::engine::TurnLimits::default(),
+            None,
+            None,
+            None,
+            None,
+        ));
+
+        let parent_id = tid("thread:native/parent-tool-filter");
+        let _parent_handle = inner.threads().get_or_init(&parent_id).await;
+
+        let definition: zhive_proto::permission::SubagentDefinition =
+            serde_json::from_value(serde_json::json!({
+                "name": "worker",
+                "description": "test",
+                "prompt": "go",
+            }))
+            .expect("fixture");
+
+        let (child_id, _rx) = inner
+            .spawn_subagent_awaitable(parent_id.clone(), definition)
+            .await
+            .expect("spawn must succeed");
+
+        let child_handle = inner
+            .threads()
+            .get(&child_id)
+            .await
+            .expect("child handle must be registered");
+
+        let child_scope = child_handle
+            .active_turn
+            .lock()
+            .await
+            .as_ref()
+            .map(|t| t.scope.disallowed_tools.clone())
+            .unwrap_or_default();
+
+        let blocked_name = ToolName(Arc::from("blocked-in-subagent"));
+        assert!(
+            child_scope.contains(&blocked_name),
+            "child scope must disallow the subagent-blocked tool; got {child_scope:?}"
+        );
+
+        // Parent scope must remain pristine (not mutated by the spawn logic).
+        let parent_handle = inner
+            .threads()
+            .get(&parent_id)
+            .await
+            .expect("parent handle");
+        let parent_disallowed = parent_handle
+            .active_turn
+            .lock()
+            .await
+            .as_ref()
+            .map_or_else(Vec::new, |t| t.scope.disallowed_tools.clone());
+        assert!(
+            !parent_disallowed.contains(&blocked_name),
+            "parent disallowed_tools must NOT be modified by spawn"
+        );
     }
 }
 
