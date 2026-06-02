@@ -239,9 +239,19 @@ fn on_prompt(
             .respond_with_internal_error(format!("unknown session: {}", req.session_id.0));
     };
     let engine = engine.clone();
+    let state = state.clone();
     let cx = cx.clone();
     cx.clone().spawn(async move {
-        run_prompt_turn(engine, cx, req.session_id, thread_id, req.prompt, responder).await;
+        run_prompt_turn(
+            state,
+            engine,
+            cx,
+            req.session_id,
+            thread_id,
+            req.prompt,
+            responder,
+        )
+        .await;
         Ok(())
     })
 }
@@ -278,7 +288,12 @@ fn on_cancel(
 /// missed), starts the turn, then streams matching [`EngineEvent`]s as
 /// `session/update` notifications until a terminal event, finally responding to
 /// the original `session/prompt` request with the mapped [`StopReason`].
+///
+/// When the turn resolves with [`StopReason::Cancelled`] due to a
+/// `SessionAborted` engine event, the session entry is removed from `state` so
+/// the bridge does not hold a stale reference to a dead thread.
 async fn run_prompt_turn(
+    state: AgentState,
     engine: Engine,
     cx: ConnectionTo<Client>,
     session_id: SessionId,
@@ -307,7 +322,16 @@ async fn run_prompt_turn(
         }
     };
 
-    let stop = stream_turn(&engine, &cx, &session_id, &thread_id, &turn_id, &mut events).await;
+    let stop = stream_turn(
+        &state,
+        &engine,
+        &cx,
+        &session_id,
+        &thread_id,
+        &turn_id,
+        &mut events,
+    )
+    .await;
     respond_stop(responder, stop);
 }
 
@@ -326,7 +350,12 @@ fn respond_stop(responder: Responder<PromptResponse>, stop: StopReason) {
 ///
 /// Filters the broadcast to events for `(thread_id, turn_id)`, handles the
 /// permission reverse request inline, and returns on the first terminal event.
+///
+/// On `SessionAborted` the session is removed from `state` because the engine
+/// thread is gone and the session can never receive another turn. This is the
+/// primary lifecycle-event cleanup path described in [`crate::state`].
 async fn stream_turn(
+    state: &AgentState,
     engine: &Engine,
     cx: &ConnectionTo<Client>,
     session_id: &SessionId,
@@ -381,7 +410,17 @@ async fn stream_turn(
                     // The session was aborted while we were waiting for the
                     // client's permission answer. The engine already released
                     // the pending permission and emitted `SessionAborted`, so
-                    // settle the turn as cancelled without looping further.
+                    // settle the turn as cancelled. The `SessionAborted` arm
+                    // below handles removal; if we return early here the abort
+                    // event was already consumed by `handle_permission`'s inner
+                    // subscriber, so remove explicitly to avoid leaving a stale
+                    // entry.
+                    state.remove_session(session_id);
+                    tracing::info!(
+                        name: "zhive.acp.session.removed",
+                        session = %session_id.0,
+                        "session removed after abort during permission wait"
+                    );
                     return StopReason::Cancelled;
                 }
             }
@@ -409,6 +448,15 @@ async fn stream_turn(
                 return StopReason::EndTurn;
             }
             EngineEvent::SessionAborted(notif) if notif.thread_id == *thread_id => {
+                // The engine thread is gone; the session can never accept
+                // another turn. Remove it from the bridge state now so the
+                // entry does not accumulate in long-running daemons.
+                state.remove_session(session_id);
+                tracing::info!(
+                    name: "zhive.acp.session.removed",
+                    session = %session_id.0,
+                    "session removed on SessionAborted"
+                );
                 return StopReason::Cancelled;
             }
             _ => {}

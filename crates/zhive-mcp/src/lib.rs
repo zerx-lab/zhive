@@ -55,7 +55,9 @@ pub use config::{McpConnectOptions, McpServerConfig, McpTransport};
 #[doc(inline)]
 pub use error::McpError;
 #[doc(inline)]
-pub use manager::{DiscoveredPrompt, DiscoveredResource, McpManager};
+pub use manager::{
+    DiscoveredPrompt, DiscoveredResource, McpManager, PromptMessage, ResourceContent,
+};
 #[doc(inline)]
 pub use tool::McpTool;
 

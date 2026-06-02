@@ -9,13 +9,44 @@
 //! one editor session maps to exactly one engine thread for the lifetime of the
 //! connection. The reverse map (thread → session) lets the prompt loop label
 //! outbound `session/update` notifications without re-deriving the id.
+//!
+//! ## Session lifetime and cleanup
+//!
+//! ACP has no `session/close` message; a session is implicitly alive for the
+//! duration of the connection. The primary cleanup path is
+//! [`AgentState::remove_session`], called when the engine emits
+//! [`EngineEvent::SessionAborted`] — at that point the underlying thread is
+//! gone and the session can never receive another turn.
+//!
+//! As a safety net against clients that disconnect without triggering an abort,
+//! [`MAX_SESSIONS`] caps the total number of live entries: inserting a new
+//! session beyond the cap evicts the oldest entry (insertion-order LRU via a
+//! [`VecDeque`] shadow queue). Active in-flight sessions are not protected from
+//! eviction by the cap alone; the evicted entry simply becomes unknown to the
+//! bridge, which returns a JSON-RPC error for any subsequent prompt — a safe
+//! degradation.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use agent_client_protocol::schema::{ClientCapabilities, SessionId};
 use zhive_proto::domain::ThreadId;
+
+/// Maximum number of concurrent ACP sessions tracked in the bridge.
+///
+/// A single `zhive acp` process serves one editor connection. Editors
+/// typically open one session per workspace window, so 1 024 provides a
+/// generous upper bound while guaranteeing the session map never grows
+/// without limit. When the cap is reached the oldest (by insertion order)
+/// entry is evicted before a new one is inserted. Any subsequent prompt
+/// for an evicted session receives a JSON-RPC "unknown session" error,
+/// which is the same response as for any other unknown id.
+///
+/// Raise this constant if a use-case is found that legitimately requires
+/// more concurrent sessions per connection; lower it to tighten memory
+/// guarantees. Changing it does not affect the protocol wire format.
+pub const MAX_SESSIONS: usize = 1_024;
 
 /// Per-session bookkeeping held by the bridge.
 #[derive(Debug, Clone)]
@@ -26,15 +57,31 @@ struct SessionEntry {
 }
 
 /// Inner, lock-guarded state.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Inner {
     sessions: HashMap<SessionId, SessionEntry>,
+    /// Insertion-order queue used to evict the oldest session when
+    /// [`MAX_SESSIONS`] is reached. Always kept in sync with `sessions`.
+    eviction_queue: VecDeque<SessionId>,
     client_capabilities: ClientCapabilities,
+}
+
+impl Default for Inner {
+    fn default() -> Self {
+        Self {
+            sessions: HashMap::with_capacity(MAX_SESSIONS),
+            eviction_queue: VecDeque::with_capacity(MAX_SESSIONS),
+            client_capabilities: ClientCapabilities::default(),
+        }
+    }
 }
 
 /// Cloneable handle to the bridge's session map and negotiated capabilities.
 ///
 /// Clones share one underlying map (`Arc`). Cheap to pass into every callback.
+/// Sessions are bounded by [`MAX_SESSIONS`]; older entries are evicted when the
+/// cap is exceeded. Use [`remove_session`](AgentState::remove_session) to clean
+/// up a session when its engine thread terminates.
 ///
 /// # Examples
 ///
@@ -87,6 +134,9 @@ impl AgentState {
     /// `thread:acp/<uuid-like>` so logs filter bridge-origin threads at a
     /// glance (matching [`zhive_proto::domain::Provenance::Acp`]).
     ///
+    /// If inserting this session would exceed [`MAX_SESSIONS`], the oldest
+    /// session (by insertion order) is evicted first to keep the map bounded.
+    ///
     /// # Examples
     ///
     /// ```
@@ -102,6 +152,22 @@ impl AgentState {
         let session_id = SessionId::new(Arc::<str>::from(format!("acp-{unique}").as_str()));
         let thread_id = ThreadId(Arc::from(format!("thread:acp/{unique}").as_str()));
         let mut inner = self.lock();
+
+        // Evict the oldest session when the cap is reached so the map stays
+        // bounded. The evicted session becomes unknown to the bridge; any
+        // subsequent prompt for it receives a "unknown session" error.
+        if inner.sessions.len() >= MAX_SESSIONS
+            && let Some(oldest) = inner.eviction_queue.pop_front()
+        {
+            inner.sessions.remove(&oldest);
+            tracing::warn!(
+                name: "zhive.acp.session.evicted",
+                session = %oldest.0,
+                cap = MAX_SESSIONS,
+                "session evicted; MAX_SESSIONS cap reached"
+            );
+        }
+
         inner.sessions.insert(
             session_id.clone(),
             SessionEntry {
@@ -109,7 +175,39 @@ impl AgentState {
                 cwd: cwd.into(),
             },
         );
+        inner.eviction_queue.push_back(session_id.clone());
         session_id
+    }
+
+    /// Removes a session from the bridge state.
+    ///
+    /// Cleans up the map entry and the eviction-queue slot for `session_id`.
+    /// This is the primary cleanup path: call it whenever the engine emits
+    /// [`EngineEvent::SessionAborted`] for the bound thread, at which point
+    /// the session can never receive another turn.
+    ///
+    /// If `session_id` is unknown (already removed or never inserted) the call
+    /// is a no-op.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use zhive_bridge_acp::state::AgentState;
+    /// let state = AgentState::new();
+    /// let s = state.new_session("/work");
+    /// assert!(state.thread_for_session(&s).is_some());
+    /// state.remove_session(&s);
+    /// assert!(state.thread_for_session(&s).is_none());
+    /// ```
+    pub fn remove_session(&self, session_id: &SessionId) {
+        let mut inner = self.lock();
+        if inner.sessions.remove(session_id).is_some() {
+            // Keep the eviction queue in sync. Linear scan is acceptable here:
+            // `remove_session` is called at most once per session lifetime
+            // (on abort), not in a hot loop. The queue is bounded by
+            // MAX_SESSIONS so the scan is O(MAX_SESSIONS) at worst.
+            inner.eviction_queue.retain(|id| id != session_id);
+        }
     }
 
     /// Returns the zhive [`ThreadId`] bound to `session`, if any.
@@ -179,6 +277,97 @@ mod tests {
         state.set_client_capabilities(ClientCapabilities::default());
         // Round-trips without panicking; the default has no fs/terminal flags.
         let _ = state.client_capabilities();
+    }
+
+    // --- removal tests ---
+
+    #[test]
+    fn remove_session_clears_entry() {
+        let state = AgentState::new();
+        let a = state.new_session("/w");
+        let b = state.new_session("/w");
+        let c = state.new_session("/w");
+
+        // Remove the middle entry; the others must remain intact.
+        state.remove_session(&b);
+
+        assert!(
+            state.thread_for_session(&b).is_none(),
+            "removed session must be gone"
+        );
+        assert!(
+            state.thread_for_session(&a).is_some(),
+            "sibling session a must still be present"
+        );
+        assert!(
+            state.thread_for_session(&c).is_some(),
+            "sibling session c must still be present"
+        );
+    }
+
+    #[test]
+    fn remove_unknown_session_is_noop() {
+        let state = AgentState::new();
+        let session = state.new_session("/w");
+        // Removing an unknown id must not panic or disturb existing entries.
+        state.remove_session(&SessionId::new("ghost"));
+        assert!(
+            state.thread_for_session(&session).is_some(),
+            "existing session must be unaffected"
+        );
+    }
+
+    #[test]
+    fn remove_session_twice_is_noop() {
+        let state = AgentState::new();
+        let s = state.new_session("/w");
+        state.remove_session(&s);
+        // Second call must be a no-op (no panic).
+        state.remove_session(&s);
+        assert!(state.thread_for_session(&s).is_none());
+    }
+
+    // --- LRU cap tests ---
+
+    /// Inserts `MAX_SESSIONS + 1` sessions and verifies the oldest is evicted.
+    #[test]
+    fn lru_cap_evicts_oldest() {
+        let state = AgentState::new();
+        // Fill the map to capacity.
+        let first = state.new_session("/w");
+        for _ in 1..MAX_SESSIONS {
+            let _ = state.new_session("/w");
+        }
+        // The map is now full; the very next insert must evict `first`.
+        let extra = state.new_session("/w");
+        assert!(
+            state.thread_for_session(&first).is_none(),
+            "oldest session must be evicted when cap is reached"
+        );
+        assert!(
+            state.thread_for_session(&extra).is_some(),
+            "newly inserted session must be present"
+        );
+    }
+
+    /// Active recent sessions are not evicted when only the very oldest is
+    /// pushed out by one new insert.
+    #[test]
+    fn lru_cap_preserves_recent_sessions() {
+        // Start fresh so we can track the second inserted.
+        let state2 = AgentState::new();
+        let _first2 = state2.new_session("/w");
+        let second2 = state2.new_session("/w");
+        for _ in 2..MAX_SESSIONS {
+            let _ = state2.new_session("/w");
+        }
+        // Trigger eviction of _first2.
+        let _ = state2.new_session("/w");
+        // second2 must still be alive after _first2 was evicted.
+        assert!(
+            state2.thread_for_session(&second2).is_some(),
+            "second-oldest session must survive a single eviction"
+        );
     }
 }
 

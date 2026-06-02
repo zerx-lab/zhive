@@ -7,17 +7,25 @@
 //! [`McpManager::tools`] hold cheap [`rmcp::service::Peer`] handles into those
 //! connections; dropping the manager (or calling [`McpManager::shutdown`])
 //! tears every connection down.
+//!
+//! # Resource and prompt access
+//!
+//! After discovery, callers can retrieve resource content and prompt messages
+//! on demand via [`McpManager::read_resource`] and [`McpManager::get_prompt`].
+//! Both methods look up the named server, issue a single synchronous RPC, and
+//! return owned result types so no `rmcp` model types bleed into callers.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use rmcp::ServiceExt;
-use rmcp::model::ErrorCode;
+use rmcp::model::{ErrorCode, GetPromptRequestParams, ReadResourceRequestParams, ResourceContents};
 use rmcp::service::{RoleClient, RunningService, ServiceError};
 use rmcp::transport::TokioChildProcess;
 use rmcp::transport::streamable_http_client::{
     StreamableHttpClientTransport, StreamableHttpClientTransportConfig,
 };
+use serde_json::Value;
 use tokio::process::Command;
 use zhive_core::tools::Tool;
 
@@ -57,6 +65,57 @@ pub struct DiscoveredPrompt {
     pub name: String,
     /// Optional prompt description.
     pub description: Option<String>,
+}
+
+/// The textual or binary content returned by a `resources/read` call.
+///
+/// Mirrors the MCP spec's `TextResourceContents` / `BlobResourceContents`
+/// union without exposing `rmcp` model types to callers.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ResourceContent {
+    /// UTF-8 text content.
+    Text {
+        /// Resource URI echo-ed back by the server.
+        uri: String,
+        /// Optional MIME type declared by the server (e.g. `"text/plain"`).
+        mime_type: Option<String>,
+        /// The resource's text body.
+        text: String,
+    },
+    /// Base-64-encoded binary content.
+    Blob {
+        /// Resource URI echo-ed back by the server.
+        uri: String,
+        /// Optional MIME type declared by the server.
+        mime_type: Option<String>,
+        /// Base-64-encoded blob body.
+        blob: String,
+    },
+}
+
+/// One message returned inside a `prompts/get` response.
+///
+/// Each message carries a role (`"user"` or `"assistant"`) and a JSON value
+/// representing the content (text, image, or embedded resource) exactly as
+/// the server sent it. Callers that only need the text portion can use
+/// [`PromptMessage::text`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct PromptMessage {
+    /// The sender role (`"user"` or `"assistant"`).
+    pub role: String,
+    /// Full content blob serialized from the server's response.
+    pub content: Value,
+}
+
+impl PromptMessage {
+    /// Extracts the plain text from a `"text"` content block, if present.
+    ///
+    /// Returns `None` when the content is an image, embedded resource, or any
+    /// non-text variant.
+    #[must_use]
+    pub fn text(&self) -> Option<&str> {
+        self.content.get("text").and_then(|v| v.as_str())
+    }
 }
 
 /// One connected server plus the metadata discovered from it.
@@ -174,6 +233,110 @@ impl McpManager {
             .iter()
             .flat_map(|s| s.prompts.iter().cloned())
             .collect()
+    }
+
+    /// Reads a single resource from a named server via `resources/read`.
+    ///
+    /// Looks up the server whose name matches `server`, issues an rmcp
+    /// `resources/read` RPC for the given `uri`, and returns the resource
+    /// contents as a list of [`ResourceContent`] items (a single URI can
+    /// contain multiple content blocks per the MCP spec).
+    ///
+    /// # Errors
+    ///
+    /// - [`McpError::UnknownServer`] when no connected server has the given name.
+    /// - [`McpError::ReadResource`] when the rmcp call fails (transport error,
+    ///   server-side error, or unknown URI).
+    pub async fn read_resource(
+        &self,
+        server: impl AsRef<str>,
+        uri: impl AsRef<str>,
+    ) -> Result<Vec<ResourceContent>, McpError> {
+        let server = server.as_ref();
+        let uri = uri.as_ref();
+
+        let connected = self
+            .servers
+            .iter()
+            .find(|s| s.name.as_ref() == server)
+            .ok_or_else(|| McpError::UnknownServer(server.to_owned()))?;
+
+        let params = ReadResourceRequestParams::new(uri);
+        let result = connected
+            .client
+            .peer()
+            .read_resource(params)
+            .await
+            .map_err(|e| McpError::ReadResource {
+                uri: uri.to_owned(),
+                reason: e.to_string(),
+            })?;
+
+        let contents = result
+            .contents
+            .into_iter()
+            .map(resource_contents_to_owned)
+            .collect();
+
+        Ok(contents)
+    }
+
+    /// Retrieves a named prompt from a server via `prompts/get`.
+    ///
+    /// Looks up the server whose name matches `server`, issues an rmcp
+    /// `prompts/get` RPC for the given `name`, and returns the prompt
+    /// messages as a list of [`PromptMessage`] items.
+    ///
+    /// `arguments` is an optional JSON object whose keys and values fill the
+    /// prompt's declared template variables. Pass `None` when the prompt
+    /// requires no arguments, or when the server ignores them.
+    ///
+    /// # Errors
+    ///
+    /// - [`McpError::UnknownServer`] when no connected server has the given name.
+    /// - [`McpError::GetPrompt`] when the rmcp call fails (transport error,
+    ///   server-side error, or unknown prompt name).
+    pub async fn get_prompt(
+        &self,
+        server: impl AsRef<str>,
+        name: impl AsRef<str>,
+        arguments: Option<Value>,
+    ) -> Result<Vec<PromptMessage>, McpError> {
+        let server = server.as_ref();
+        let name = name.as_ref();
+
+        let connected = self
+            .servers
+            .iter()
+            .find(|s| s.name.as_ref() == server)
+            .ok_or_else(|| McpError::UnknownServer(server.to_owned()))?;
+
+        let mut params = GetPromptRequestParams::new(name);
+        // The rmcp SDK accepts a JsonObject (Map<String, Value>) for prompt
+        // arguments. The MCP spec § 5.6 recommends string-valued entries, but
+        // we pass the object as-is and let the server validate. Non-object
+        // values are silently ignored: the prompt still runs without arguments.
+        if let Some(Value::Object(map)) = arguments {
+            params = params.with_arguments(map);
+        }
+
+        let result = connected
+            .client
+            .peer()
+            .get_prompt(params)
+            .await
+            .map_err(|e| McpError::GetPrompt {
+                name: name.to_owned(),
+                reason: e.to_string(),
+            })?;
+
+        let messages = result
+            .messages
+            .iter()
+            .map(prompt_message_to_owned)
+            .collect();
+
+        Ok(messages)
     }
 
     /// Gracefully closes every connection, consuming the manager.
@@ -435,6 +598,49 @@ async fn discover(
     };
 
     Ok((tools, resources, prompts))
+}
+
+/// Converts one `rmcp` [`ResourceContents`] item to the crate-owned [`ResourceContent`].
+fn resource_contents_to_owned(rc: ResourceContents) -> ResourceContent {
+    match rc {
+        ResourceContents::TextResourceContents {
+            uri,
+            mime_type,
+            text,
+            ..
+        } => ResourceContent::Text {
+            uri,
+            mime_type,
+            text,
+        },
+        ResourceContents::BlobResourceContents {
+            uri,
+            mime_type,
+            blob,
+            ..
+        } => ResourceContent::Blob {
+            uri,
+            mime_type,
+            blob,
+        },
+    }
+}
+
+/// Converts one `rmcp` [`rmcp::model::PromptMessage`] item to the crate-owned [`PromptMessage`].
+///
+/// The content is serialized to a [`Value`] so callers never need to import
+/// `rmcp::model::PromptMessageContent`.
+fn prompt_message_to_owned(pm: &rmcp::model::PromptMessage) -> PromptMessage {
+    let role = match pm.role {
+        rmcp::model::PromptMessageRole::User => "user".to_owned(),
+        rmcp::model::PromptMessageRole::Assistant => "assistant".to_owned(),
+    };
+    // Serialize the content to a JSON Value; fall back to a plain error
+    // string rather than panicking if serialization fails (which is
+    // theoretically impossible for well-formed model types).
+    let content = serde_json::to_value(&pm.content)
+        .unwrap_or_else(|e| serde_json::json!({ "error": e.to_string() }));
+    PromptMessage { role, content }
 }
 
 #[cfg(test)]
