@@ -157,6 +157,7 @@ impl Conversation {
             }
             EngineNotification::PhaseChanged { .. }
             | EngineNotification::PermissionRequested { .. }
+            | EngineNotification::Usage { .. }
             | EngineNotification::Unhandled { .. } => {}
         }
     }

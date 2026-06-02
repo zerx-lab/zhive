@@ -194,7 +194,7 @@ pub(crate) fn render_palette(frame: &mut Frame, app: &App, composer: Rect) {
             let line = Line::from(vec![
                 Span::styled(if is_sel { "▸ " } else { "  " }, Style::new().fg(p.accent)),
                 Span::styled(format!("/{:<10}", cmd.name), name_style),
-                Span::styled(cmd.help.to_owned(), Style::new().fg(p.fg_dim)),
+                Span::styled(cmd.help.clone(), Style::new().fg(p.fg_dim)),
             ]);
             if is_sel {
                 line.style(Style::new().bg(p.sel_bg))

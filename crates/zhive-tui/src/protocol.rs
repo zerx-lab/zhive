@@ -82,6 +82,13 @@ pub enum EngineNotification {
         /// The permission prompt to render.
         request: Box<RequestPermissionRequest>,
     },
+    /// Token usage reported at the end of a provider call.
+    Usage {
+        /// Input tokens consumed by this provider call.
+        input_tokens: u64,
+        /// Output tokens produced by this provider call.
+        output_tokens: u64,
+    },
     /// A recognized-but-unmodeled or unknown notification method.
     Unhandled {
         /// The notification method string.
@@ -231,6 +238,21 @@ pub fn decode(method: &str, params: Option<Value>) -> EngineNotification {
                     request: Box::new(p.request),
                 },
                 Err(_) => unhandled(),
+            }
+        }
+        "events/usage" => {
+            // Route through the typed decode helper in zhive-client-native.
+            // We construct a temporary Notification to reuse that function
+            // rather than duplicating the field-extraction logic here.
+            use zhive_client_native::events::decode_usage;
+            use zhive_proto::Notification;
+            let notif = Notification::new(method, Some(params));
+            match decode_usage(&notif) {
+                Some(u) => EngineNotification::Usage {
+                    input_tokens: u.input_tokens,
+                    output_tokens: u.output_tokens,
+                },
+                None => unhandled(),
             }
         }
         _ => unhandled(),

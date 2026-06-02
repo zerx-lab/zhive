@@ -154,9 +154,9 @@ fn handle_engine(app: &mut App, event: Option<ClientEvent>) -> bool {
             true
         }
         Some(ClientEvent::Disconnected { reason }) => {
-            app.conversation.busy = false;
+            app.on_disconnected();
             app.conversation.last_error = Some(format!("engine disconnected: {reason}"));
-            app.flash = Some(format!("engine disconnected: {reason}"));
+            // No flash here: the persistent banner in the footer supersedes it.
             false
         }
         Some(ClientEvent::Lagged(n)) => {

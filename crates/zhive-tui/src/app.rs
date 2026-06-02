@@ -61,49 +61,56 @@ pub enum Overlay {
 }
 
 /// A slash command shown in the palette and dispatched on submit.
-#[derive(Debug, Clone, Copy)]
+///
+/// Owned strings allow both compile-time static commands and runtime-injected
+/// skill commands to be stored uniformly in the same list.
+#[derive(Debug, Clone)]
 pub struct SlashCommand {
     /// Command name without the leading slash.
-    pub name: &'static str,
+    pub name: String,
     /// One-line description for the palette.
-    pub help: &'static str,
+    pub help: String,
 }
 
-/// The slash commands the conversation screen understands.
-pub const COMMANDS: &[SlashCommand] = &[
-    SlashCommand {
-        name: "help",
-        help: "show keybindings and commands",
-    },
-    SlashCommand {
-        name: "model",
-        help: "show the current provider and model",
-    },
-    SlashCommand {
-        name: "settings",
-        help: "show theme, accent, and keys",
-    },
-    SlashCommand {
-        name: "theme",
-        help: "switch theme — dark | light | mono",
-    },
-    SlashCommand {
-        name: "accent",
-        help: "switch accent — cyan | amber | lime | magenta",
-    },
-    SlashCommand {
-        name: "compact",
-        help: "summarize and condense the conversation",
-    },
-    SlashCommand {
-        name: "clear",
-        help: "start a fresh thread",
-    },
-    SlashCommand {
-        name: "quit",
-        help: "exit zap",
-    },
-];
+impl SlashCommand {
+    /// Builds a [`SlashCommand`] from static string literals.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use zhive_tui::app::SlashCommand;
+    /// let cmd = SlashCommand::from_static("help", "show keybindings");
+    /// assert_eq!(cmd.name, "help");
+    /// ```
+    #[must_use]
+    pub fn from_static(name: &'static str, help: &'static str) -> Self {
+        Self {
+            name: name.to_owned(),
+            help: help.to_owned(),
+        }
+    }
+}
+
+/// The built-in slash commands the conversation screen always understands.
+///
+/// Extra runtime commands (e.g. skill slash-commands discovered at startup) are
+/// stored in [`App::extra_commands`] and merged at palette-match time.
+#[must_use]
+pub fn builtin_commands() -> Vec<SlashCommand> {
+    [
+        ("help", "show keybindings and commands"),
+        ("model", "show the current provider and model"),
+        ("settings", "show theme, accent, and keys"),
+        ("theme", "switch theme — dark | light | mono"),
+        ("accent", "switch accent — cyan | amber | lime | magenta"),
+        ("compact", "summarize and condense the conversation"),
+        ("clear", "start a fresh thread"),
+        ("quit", "exit zap"),
+    ]
+    .into_iter()
+    .map(|(n, h)| SlashCommand::from_static(n, h))
+    .collect()
+}
 
 /// The whole TUI state for the conversation experience.
 #[derive(Debug)]
@@ -132,10 +139,37 @@ pub struct App {
     pub palette_index: usize,
     /// Set once the user asks to quit.
     pub should_quit: bool,
+    /// Most recently received token usage `(input, output)`, if any.
+    ///
+    /// Updated on every `events/usage` notification; `None` until the first
+    /// such event is received.  Displayed in the top bar.
+    pub last_usage: Option<(u64, u64)>,
+    /// `true` once a [`crate::lib::ClientEvent::Disconnected`] event is seen.
+    ///
+    /// Triggers a persistent banner in the footer so the user is never left
+    /// looking at a frozen UI without explanation.
+    pub disconnected: bool,
+    /// Runtime-injected slash commands (e.g. skill slash-commands).
+    ///
+    /// These are merged with the built-in commands at palette-match time.
+    /// Populate via [`App::set_extra_commands`] or [`App::new_with_extra`].
+    pub extra_commands: Vec<SlashCommand>,
 }
 
 impl App {
     /// Builds an app bound to `thread`, themed from `config`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use zhive_tui::app::App;
+    /// use zhive_tui::TuiConfig;
+    /// use zhive_proto::domain::ThreadId;
+    /// let app = App::new(TuiConfig::default(), ThreadId(Arc::from("thread:native/t")));
+    /// assert!(app.last_usage.is_none());
+    /// assert!(!app.disconnected);
+    /// ```
     #[must_use]
     pub fn new(config: TuiConfig, thread: zhive_proto::domain::ThreadId) -> Self {
         let theme = config.theme;
@@ -152,8 +186,31 @@ impl App {
             scrollback: 0,
             palette_index: 0,
             should_quit: false,
+            last_usage: None,
+            disconnected: false,
+            extra_commands: Vec::new(),
             config,
         }
+    }
+
+    /// Registers runtime-injected slash commands (e.g. skill commands).
+    ///
+    /// Replaces any previously registered extra commands.  Built-in commands
+    /// are unaffected.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use zhive_tui::app::{App, SlashCommand};
+    /// use zhive_tui::TuiConfig;
+    /// use zhive_proto::domain::ThreadId;
+    /// let mut app = App::new(TuiConfig::default(), ThreadId(Arc::from("thread:native/t")));
+    /// app.set_extra_commands(vec![SlashCommand::from_static("deploy", "deploy to staging")]);
+    /// assert_eq!(app.extra_commands.len(), 1);
+    /// ```
+    pub fn set_extra_commands(&mut self, commands: Vec<SlashCommand>) {
+        self.extra_commands = commands;
     }
 
     /// The slash query (text after `/`) when the palette should be shown.
@@ -174,16 +231,18 @@ impl App {
     }
 
     /// Commands whose name prefixes the current palette query.
+    ///
+    /// Built-in commands are listed first, followed by extra runtime commands.
     #[must_use]
     pub fn palette_matches(&self) -> Vec<SlashCommand> {
-        match self.palette_query() {
-            Some(query) => COMMANDS
-                .iter()
-                .filter(|c| c.name.starts_with(query))
-                .copied()
-                .collect(),
-            None => Vec::new(),
-        }
+        let Some(query) = self.palette_query() else {
+            return Vec::new();
+        };
+        builtin_commands()
+            .into_iter()
+            .chain(self.extra_commands.iter().cloned())
+            .filter(|c| c.name.starts_with(query))
+            .collect()
     }
 
     /// Replaces the input with the highlighted palette command plus a space.
@@ -209,6 +268,15 @@ impl App {
         self.scrollback = 0;
     }
 
+    /// Records that the engine connection was lost.
+    ///
+    /// Sets the persistent [`Self::disconnected`] flag.  The footer renderer
+    /// will display a permanent "engine disconnected" banner until the process exits.
+    pub fn on_disconnected(&mut self) {
+        self.disconnected = true;
+        self.conversation.busy = false;
+    }
+
     /// Folds an engine notification into state, opening overlays as needed.
     pub fn on_engine(&mut self, event: &EngineNotification) {
         if let EngineNotification::PermissionRequested {
@@ -220,6 +288,14 @@ impl App {
                 request_id: request_id.clone(),
                 request: request.clone(),
             });
+        }
+        // Capture token usage whenever the engine reports it.
+        if let EngineNotification::Usage {
+            input_tokens,
+            output_tokens,
+        } = event
+        {
+            self.last_usage = Some((*input_tokens, *output_tokens));
         }
         self.conversation.apply(event);
         // Snap to the tail when new output lands so the user sees it.
@@ -640,6 +716,98 @@ mod tests {
         }
         app.on_key(key(KeyCode::Tab));
         assert_eq!(app.input.value(), "/compact ");
+    }
+
+    // ---- token usage ----
+
+    #[test]
+    fn usage_event_stores_last_usage() {
+        let mut app = app();
+        assert!(app.last_usage.is_none(), "no usage before first event");
+        app.on_engine(&EngineNotification::Usage {
+            input_tokens: 120,
+            output_tokens: 45,
+        });
+        assert_eq!(app.last_usage, Some((120, 45)));
+    }
+
+    #[test]
+    fn usage_event_updates_on_second_call() {
+        let mut app = app();
+        app.on_engine(&EngineNotification::Usage {
+            input_tokens: 10,
+            output_tokens: 5,
+        });
+        app.on_engine(&EngineNotification::Usage {
+            input_tokens: 200,
+            output_tokens: 80,
+        });
+        assert_eq!(app.last_usage, Some((200, 80)));
+    }
+
+    // ---- runtime slash commands ----
+
+    #[test]
+    fn extra_command_appears_in_palette_matches() {
+        let mut app = app();
+        app.set_extra_commands(vec![SlashCommand::from_static(
+            "deploy",
+            "deploy to staging",
+        )]);
+        // Simulate typing "/de"
+        for c in "/de".chars() {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+        let matches = app.palette_matches();
+        assert!(
+            matches.iter().any(|c| c.name == "deploy"),
+            "extra command must appear in palette"
+        );
+    }
+
+    #[test]
+    fn builtin_commands_still_work_with_extra_commands() {
+        let mut app = app();
+        app.set_extra_commands(vec![SlashCommand::from_static("xfoo", "extra foo")]);
+        for c in "/help".chars() {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+        assert_eq!(app.on_key(key(KeyCode::Enter)), Action::None);
+        assert!(
+            matches!(app.overlay, Some(Overlay::Help)),
+            "builtin /help must still open Help overlay"
+        );
+    }
+
+    #[test]
+    fn extra_command_does_not_shadow_builtin() {
+        let mut app = app();
+        // An extra command with a matching prefix must not hide the builtin.
+        app.set_extra_commands(vec![SlashCommand::from_static("helpx", "extended help")]);
+        for c in "/help".chars() {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+        let matches = app.palette_matches();
+        assert!(
+            matches.iter().any(|c| c.name == "help"),
+            "builtin help must still appear"
+        );
+        assert!(
+            matches.iter().any(|c| c.name == "helpx"),
+            "extra command must also appear"
+        );
+    }
+
+    // ---- disconnected handling ----
+
+    #[test]
+    fn on_disconnected_sets_flag_and_clears_busy() {
+        let mut app = app();
+        app.conversation.busy = true;
+        assert!(!app.disconnected);
+        app.on_disconnected();
+        assert!(app.disconnected, "disconnected flag must be set");
+        assert!(!app.conversation.busy, "busy must be cleared on disconnect");
     }
 }
 

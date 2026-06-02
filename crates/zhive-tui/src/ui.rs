@@ -113,14 +113,22 @@ fn render_top_bar(frame: &mut Frame, app: &App, area: Rect) {
         left.push(Span::styled(session.clone(), Style::new().fg(p.fg_dim)));
     }
 
-    let pill = Line::from(vec![Span::styled(
+    // Build the right-aligned section: optional token count then model pill.
+    let mut right_spans = Vec::new();
+    if let Some((input, output)) = app.last_usage {
+        right_spans.push(Span::styled(
+            format!("↑{input} ↓{output} tok  "),
+            Style::new().fg(p.fg_dim),
+        ));
+    }
+    right_spans.push(Span::styled(
         format!(
             " {} · {} ",
             app.config.provider_label, app.config.model_label
         ),
         Style::new().fg(p.accent).bg(p.bg_elev),
-    )])
-    .right_aligned();
+    ));
+    let pill = Line::from(right_spans).right_aligned();
 
     let bar_bg = Style::new().bg(p.bg_elev);
     frame.render_widget(Paragraph::new(Line::from(left)).style(bar_bg), area);
@@ -873,10 +881,23 @@ fn render_composer(frame: &mut Frame, app: &App, area: Rect) -> Rect {
     inner
 }
 
-/// Renders the bottom key-hint strip (plus any transient flash message).
+/// Renders the bottom key-hint strip (plus any transient flash or persistent disconnect banner).
 fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     let p = &app.palette;
     let bar_bg = Style::new().bg(p.bg_elev);
+    // Persistent disconnect banner takes highest priority; it is never cleared
+    // by flash so the user always sees it even after subsequent flash messages.
+    if app.disconnected {
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                "  engine disconnected — press Ctrl+C to exit",
+                Style::new().fg(p.error).add_modifier(Modifier::BOLD),
+            ))
+            .style(bar_bg),
+            area,
+        );
+        return;
+    }
     if let Some(flash) = &app.flash {
         frame.render_widget(
             Paragraph::new(Line::styled(flash.clone(), Style::new().fg(p.warn))).style(bar_bg),
@@ -984,6 +1005,101 @@ mod tests {
         // `…` is a 3-byte UTF-8 char appended to a TOOL_ARG_SUMMARY_MAX-byte prefix.
         assert!(s.len() <= TOOL_ARG_SUMMARY_MAX + 3, "len={}", s.len());
         assert!(s.ends_with('…'));
+    }
+
+    // ---- top bar token display ----
+
+    fn test_app_with_usage(usage: Option<(u64, u64)>) -> crate::app::App {
+        use std::sync::Arc;
+        use zhive_proto::domain::ThreadId;
+        let mut app = crate::app::App::new(crate::TuiConfig::default(), ThreadId(Arc::from("t")));
+        app.last_usage = usage;
+        app
+    }
+
+    /// Renders the top bar into a `TestBackend` and returns all text on that row.
+    fn render_top_bar_text(app: &crate::app::App) -> String {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let backend = TestBackend::new(80, 3);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                let area = ratatui::layout::Rect::new(0, 0, 80, 1);
+                render_top_bar(frame, app, area);
+            })
+            .expect("draw");
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol().to_owned())
+            .collect::<String>()
+    }
+
+    #[test]
+    fn top_bar_shows_token_count_when_usage_present() {
+        let app = test_app_with_usage(Some((120, 45)));
+        let text = render_top_bar_text(&app);
+        assert!(
+            text.contains("120") && text.contains("45"),
+            "top bar must include token counts; got: {text:?}"
+        );
+    }
+
+    #[test]
+    fn top_bar_hides_token_count_when_no_usage() {
+        let app = test_app_with_usage(None);
+        let text = render_top_bar_text(&app);
+        // Arrow symbols used only for token display.
+        assert!(
+            !text.contains("tok"),
+            "top bar must not show 'tok' without usage; got: {text:?}"
+        );
+    }
+
+    // ---- footer disconnected banner ----
+
+    fn render_footer_text(app: &crate::app::App) -> String {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let backend = TestBackend::new(60, 3);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                let area = ratatui::layout::Rect::new(0, 0, 60, 1);
+                render_footer(frame, app, area);
+            })
+            .expect("draw");
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol().to_owned())
+            .collect::<String>()
+    }
+
+    #[test]
+    fn footer_shows_disconnect_banner_when_disconnected() {
+        let mut app = test_app_with_usage(None);
+        app.disconnected = true;
+        let text = render_footer_text(&app);
+        assert!(
+            text.to_lowercase().contains("disconnected"),
+            "footer must show disconnect banner; got: {text:?}"
+        );
+    }
+
+    #[test]
+    fn footer_does_not_show_disconnect_banner_when_connected() {
+        let app = test_app_with_usage(None);
+        let text = render_footer_text(&app);
+        assert!(
+            !text.to_lowercase().contains("disconnected"),
+            "footer must not show disconnect banner when connected; got: {text:?}"
+        );
     }
 }
 
