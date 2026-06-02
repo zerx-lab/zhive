@@ -47,11 +47,18 @@ async fn run_tui(config_path: Option<std::path::PathBuf>, args: crate::cli::TuiA
 
     let provider = crate::provider::build(&cfg)?;
     let runtime = crate::boot::build_runtime(&cfg).await?;
+    // Surface slash-only skills (discovered at boot) in the TUI palette. Taken
+    // before `runtime` is moved into the host.
+    let slash_cmds: Vec<(String, String)> = runtime
+        .slash_commands
+        .iter()
+        .map(|name| (name.clone(), format!("skill: {name}")))
+        .collect();
     let socket = crate::engine_host::tui_socket_path();
     let host = crate::engine_host::Host::start(provider, runtime, socket).await?;
 
     let tui_config = build_tui_config(&cfg);
-    let result = zhive_tui::run(host.client.clone(), tui_config).await;
+    let result = zhive_tui::run(host.client.clone(), tui_config, slash_cmds).await;
     host.stop().await;
     Ok(result?)
 }
@@ -221,13 +228,17 @@ fn detect_branch() -> Option<String> {
 /// Returns an error if config loading, provider build, engine startup, or the
 /// `start_turn` RPC fails.
 #[cfg(feature = "engine")]
+#[expect(
+    clippy::too_many_lines,
+    reason = "run_exec is one cohesive headless driver: config/override → engine start → \
+              event-stream decode loop; splitting would scatter the linear flow"
+)]
 async fn run_exec(
     config_path: Option<std::path::PathBuf>,
     args: crate::cli::ExecArgs,
 ) -> Result<()> {
     use zhive_client_native::ClientEvent;
     use zhive_proto::domain::Item;
-    use zhive_tui::protocol::EngineNotification;
 
     init_stderr_logging();
 
@@ -257,8 +268,14 @@ async fn run_exec(
     let host = crate::engine_host::Host::start(provider, runtime, socket).await?;
 
     // Generate a fresh thread id and subscribe to events before start_turn so
-    // no event is missed between the call and subscription.
-    let thread = zhive_tui::id::new_thread_id();
+    // no event is missed between the call and subscription. Built locally (no
+    // TUI dependency) so headless `exec` works in non-tui builds.
+    let thread = format!(
+        "thread:native/exec-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos())
+    );
     let mut events = host.client.subscribe_events();
 
     // Kick off the turn (returns as soon as the engine accepts).
@@ -281,41 +298,60 @@ async fn run_exec(
                 anyhow::bail!("engine disconnected before turn finished");
             }
             Some(ClientEvent::Notification(n)) => {
-                let decoded = zhive_tui::protocol::decode(&n.method, n.params);
-                match decoded {
-                    EngineNotification::ItemAppended {
-                        thread_id, item, ..
-                    } if thread_id == thread => {
-                        match *item {
-                            Item::AgentMessage { text, .. } => {
+                // React only to notifications for our own thread. Decoding is
+                // done from the raw wire params (camelCase) so headless `exec`
+                // does not depend on the TUI crate's decoder.
+                let for_us = n
+                    .params
+                    .as_ref()
+                    .and_then(|p| p.get("threadId"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some(thread.as_str());
+                if !for_us {
+                    continue;
+                }
+                match n.method.as_str() {
+                    "events/item_appended" => {
+                        if let Some(item) = n
+                            .params
+                            .as_ref()
+                            .and_then(|p| p.get("item").cloned())
+                            .and_then(|v| serde_json::from_value::<Item>(v).ok())
+                        {
+                            match item {
                                 // Print the complete assistant text.
-                                print!("{text}");
-                            }
-                            Item::ToolCall { name, .. } => {
+                                Item::AgentMessage { text, .. } => print!("{text}"),
                                 // One-line tool activity to stdout.
-                                println!("\n[tool] {name}");
+                                Item::ToolCall { name, .. } => println!("\n[tool] {name}"),
+                                _ => {}
                             }
-                            _ => {}
                         }
                     }
-                    EngineNotification::ItemDelta {
-                        thread_id, delta, ..
-                    } if thread_id == thread => {
+                    "events/item_delta" => {
                         // Stream token-by-token output as it arrives.
-                        print!("{delta}");
+                        if let Some(delta) = n
+                            .params
+                            .as_ref()
+                            .and_then(|p| p.get("delta"))
+                            .and_then(serde_json::Value::as_str)
+                        {
+                            print!("{delta}");
+                        }
                     }
-                    EngineNotification::TurnCompleted { thread_id, .. } if thread_id == thread => {
+                    "events/turn_completed" => {
                         // Ensure a trailing newline after the response.
                         println!();
                         break;
                     }
-                    EngineNotification::TurnFailed {
-                        thread_id, error, ..
-                    } if thread_id == thread => {
-                        turn_failed = Some(format!("{error:?}"));
+                    "events/turn_failed" => {
+                        let err = n.params.as_ref().and_then(|p| p.get("error")).map_or_else(
+                            || "unknown error".to_owned(),
+                            std::string::ToString::to_string,
+                        );
+                        turn_failed = Some(err);
                         break;
                     }
-                    _ => {} // events for other threads or unrelated notifications
+                    _ => {} // unrelated notifications
                 }
             }
             Some(ClientEvent::Lagged(n)) => {
@@ -569,11 +605,20 @@ async fn run_doctor(config_path: Option<std::path::PathBuf>) -> Result<()> {
     }
 
     // ── Provider ─────────────────────────────────────────────────────────────
-    let provider_label = cfg.active_provider_label().to_owned();
-    let model_label = cfg.active_model().to_owned();
-    match crate::provider::build(&cfg) {
-        Ok(_) => println!("provider: {provider_label} / {model_label} — OK"),
-        Err(e) => println!("provider: {provider_label} / {model_label} — FAILED ({e})"),
+    // The provider builders live behind the `engine` feature; a bridge-only
+    // build cannot construct one, so report that rather than failing to compile.
+    #[cfg(feature = "engine")]
+    {
+        let provider_label = cfg.active_provider_label().to_owned();
+        let model_label = cfg.active_model().to_owned();
+        match crate::provider::build(&cfg) {
+            Ok(_) => println!("provider: {provider_label} / {model_label} — OK"),
+            Err(e) => println!("provider: {provider_label} / {model_label} — FAILED ({e})"),
+        }
+    }
+    #[cfg(not(feature = "engine"))]
+    {
+        println!("provider: (engine features not compiled in)");
     }
 
     // ── MCP servers ──────────────────────────────────────────────────────────
@@ -602,10 +647,14 @@ async fn run_doctor(config_path: Option<std::path::PathBuf>) -> Result<()> {
     }
 
     // ── Data directory ───────────────────────────────────────────────────────
+    // `boot` (and thus `data_dir`) is engine-gated.
+    #[cfg(feature = "engine")]
     match crate::boot::data_dir() {
         Some(p) => println!("data-dir: {}", p.display()),
         None => println!("data-dir: (unknown — set $HOME or $XDG_DATA_HOME)"),
     }
+    #[cfg(not(feature = "engine"))]
+    println!("data-dir: (engine features not compiled in)");
 
     Ok(())
 }

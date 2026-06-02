@@ -66,9 +66,27 @@ pub fn version() -> &'static str {
 ///
 /// Returns [`TuiError::Io`] on terminal failures or [`TuiError::Client`] if the
 /// initial subscription cannot be established.
-pub async fn run(client: Client, config: TuiConfig) -> Result<()> {
+///
+/// `extra_commands` are host-supplied palette entries (`(name, help)` pairs,
+/// e.g. slash-only skills discovered at boot) merged with the built-in slash
+/// commands.
+pub async fn run(
+    client: Client,
+    config: TuiConfig,
+    extra_commands: Vec<(String, String)>,
+) -> Result<()> {
     let thread = id::new_thread_id();
     let mut app = App::new(config, thread);
+    // Surface host-discovered slash commands (e.g. slash-only skills) in the
+    // palette alongside the built-ins.
+    if !extra_commands.is_empty() {
+        app.set_extra_commands(
+            extra_commands
+                .into_iter()
+                .map(|(name, help)| crate::app::SlashCommand { name, help })
+                .collect(),
+        );
+    }
 
     let mut term_events = EventStream::new();
     let mut engine_events = client.subscribe_events();

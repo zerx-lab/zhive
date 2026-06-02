@@ -42,12 +42,14 @@ pub struct RuntimeTools {
     /// but can be surfaced in the TUI command palette.  Empty when the
     /// `skills` feature is absent or `skills.enabled` is false.
     ///
-    /// Currently unused inside `zhive-cli`; callers (e.g. a future TUI
-    /// injection point) can read the list via this public field.
-    #[expect(
-        dead_code,
-        reason = "public field reserved for future TUI slash-command injection; \
-                  zhive-tui does not yet expose an API to pass extra commands into run()"
+    /// Consumed by `run_tui` to inject these into the TUI command palette
+    /// (via `zhive_tui::run`'s `extra_commands`). Unused in non-tui builds.
+    #[cfg_attr(
+        not(feature = "tui"),
+        expect(
+            dead_code,
+            reason = "only consumed by run_tui for the TUI palette; unused in non-tui builds"
+        )
     )]
     pub slash_commands: Vec<String>,
     /// Live MCP manager whose tools were registered, if any.
