@@ -1,0 +1,15 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "StartTurnResult",
+  "description": "Result of the `engine/start_turn` RPC.\n\n# Examples\n\n``` use std::sync::Arc; use zhive_proto::domain::TurnId; use zhive_proto::rpc::StartTurnResult; let r = StartTurnResult::new(TurnId(Arc::from(\"turn:t/0\"))); let v = serde_json::to_value(&r).unwrap(); assert_eq!(v[\"turnId\"], \"turn:t/0\"); let back: StartTurnResult = serde_json::from_value(v).unwrap(); assert_eq!(back, r); ```",
+  "type": "object",
+  "required": [
+    "turnId"
+  ],
+  "properties": {
+    "turnId": {
+      "description": "Newly created turn id.",
+      "type": "string"
+    }
+  }
+}

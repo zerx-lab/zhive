@@ -1,0 +1,15 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "SessionCancelParams",
+  "description": "Params of the `session/cancel` notification.\n\nSent by the client to cancel the current turn (or session) on a thread. On the notification channel the server discards the return value; an error is only logged.\n\n# Examples\n\n``` use zhive_proto::rpc::SessionCancelParams; let p: SessionCancelParams = serde_json::from_str(r#\"{\"threadId\":\"thread:native/x\"}\"#).unwrap(); assert_eq!(p.thread_id.0.as_ref(), \"thread:native/x\"); ```",
+  "type": "object",
+  "required": [
+    "threadId"
+  ],
+  "properties": {
+    "threadId": {
+      "description": "Thread whose active turn should be cancelled.",
+      "type": "string"
+    }
+  }
+}

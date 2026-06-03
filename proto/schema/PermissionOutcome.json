@@ -1,0 +1,64 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "PermissionOutcome",
+  "description": "Outcome the client returns for a `permission/request` reverse RPC.\n\nThe `Cancelled` variant is **mandatory** when a session is cancelled with a permission request still in flight (ACP 0.12 schema). The server must inject `Cancelled` itself if the client disconnects. The `Defer` variant is a zhive-private extension that lets a hook suspend the turn until follow-up user input arrives; clients resume it later via `session/resume_permission` (see [`ResumeOutcome`] and [`ResumePermissionParams`]).\n\n# Examples\n\n``` use zhive_proto::permission::PermissionOutcome; let v = serde_json::to_value(&PermissionOutcome::Defer { reason: Some(\"awaiting user\".into()), }) .unwrap(); assert_eq!(v[\"outcome\"], \"defer\"); assert_eq!(v[\"reason\"], \"awaiting user\"); let back: PermissionOutcome = serde_json::from_value(v).unwrap(); assert!(matches!(back, PermissionOutcome::Defer { .. })); ```",
+  "oneOf": [
+    {
+      "description": "User picked the option with the given id.",
+      "type": "object",
+      "required": [
+        "optionId",
+        "outcome"
+      ],
+      "properties": {
+        "optionId": {
+          "description": "Echoes [`PermissionOption::id`].",
+          "type": "string"
+        },
+        "outcome": {
+          "type": "string",
+          "enum": [
+            "selected"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Session was cancelled before the user answered.",
+      "type": "object",
+      "required": [
+        "outcome"
+      ],
+      "properties": {
+        "outcome": {
+          "type": "string",
+          "enum": [
+            "cancelled"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Hook suspended the turn pending follow-up user input.\n\nCarries an optional human-readable rationale surfaced to the user while the turn is parked. The turn is later unblocked by `session/resume_permission`; a [`ResumeOutcome`] is **structurally prevented** from deferring again, so a resumed request can never re-suspend.",
+      "type": "object",
+      "required": [
+        "outcome"
+      ],
+      "properties": {
+        "outcome": {
+          "type": "string",
+          "enum": [
+            "defer"
+          ]
+        },
+        "reason": {
+          "description": "Optional rationale shown while the turn is suspended.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    }
+  ]
+}

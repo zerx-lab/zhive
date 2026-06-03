@@ -1,0 +1,122 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "PermissionRequestedPayload",
+  "description": "Payload of the `events/permission_requested` notification.\n\n# Examples\n\n``` use zhive_proto::permission::RequestPermissionRequest; use zhive_proto::events::PermissionRequestedPayload; // Use deserialization to construct `#[non_exhaustive]` RequestPermissionRequest. let req: RequestPermissionRequest = serde_json::from_str(r#\"{ \"threadId\": \"thread:native/t\", \"resourceType\": \"tool\", \"name\": \"bash\", \"reason\": \"run test\", \"options\": [] }\"#).unwrap(); let p = PermissionRequestedPayload::new(\"perm:1\".into(), req); let v = serde_json::to_value(&p).unwrap(); assert_eq!(v[\"requestId\"], \"perm:1\"); assert_eq!(v[\"request\"][\"name\"], \"bash\"); let back: PermissionRequestedPayload = serde_json::from_value(v).unwrap(); assert_eq!(back.request_id, \"perm:1\"); ```",
+  "type": "object",
+  "required": [
+    "request",
+    "requestId"
+  ],
+  "properties": {
+    "request": {
+      "description": "The full permission request details.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/RequestPermissionRequest"
+        }
+      ]
+    },
+    "requestId": {
+      "description": "Opaque request id; the client echoes this to `session/resume_permission`.",
+      "type": "string"
+    }
+  },
+  "definitions": {
+    "PermissionOption": {
+      "description": "One choice surfaced by [`RequestPermissionRequest`].",
+      "type": "object",
+      "required": [
+        "description",
+        "id",
+        "kind"
+      ],
+      "properties": {
+        "description": {
+          "description": "Display label.",
+          "type": "string"
+        },
+        "id": {
+          "description": "Stable id echoed back in [`PermissionOutcome::Selected`].",
+          "type": "string"
+        },
+        "kind": {
+          "description": "Semantic classification of the option.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/PermissionOptionKind"
+            }
+          ]
+        }
+      }
+    },
+    "PermissionOptionKind": {
+      "description": "Semantic classification of a [`PermissionOption`].",
+      "oneOf": [
+        {
+          "description": "One-shot allow.",
+          "type": "string",
+          "enum": [
+            "AllowOnce"
+          ]
+        },
+        {
+          "description": "Persistent allow (caller stores).",
+          "type": "string",
+          "enum": [
+            "AllowAlways"
+          ]
+        },
+        {
+          "description": "One-shot reject.",
+          "type": "string",
+          "enum": [
+            "RejectOnce"
+          ]
+        },
+        {
+          "description": "Persistent reject (caller stores).",
+          "type": "string",
+          "enum": [
+            "RejectAlways"
+          ]
+        }
+      ]
+    },
+    "RequestPermissionRequest": {
+      "description": "Server-to-client `session/request_permission` request body.\n\nMirrors ACP 0.12 `RequestPermissionRequest`. The server uses this when a hook returns [`PermissionDecision::Ask`] and a user choice is required.",
+      "type": "object",
+      "required": [
+        "name",
+        "options",
+        "reason",
+        "resourceType",
+        "threadId"
+      ],
+      "properties": {
+        "name": {
+          "description": "Specific resource name (tool name, path, …).",
+          "type": "string"
+        },
+        "options": {
+          "description": "Available option set; order matters for UI rendering.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/PermissionOption"
+          }
+        },
+        "reason": {
+          "description": "Human-readable explanation shown to the user.",
+          "type": "string"
+        },
+        "resourceType": {
+          "description": "Resource class (e.g. `\"tool\"`, `\"file\"`).",
+          "type": "string"
+        },
+        "threadId": {
+          "description": "Thread the request applies to.",
+          "type": "string"
+        }
+      }
+    }
+  }
+}

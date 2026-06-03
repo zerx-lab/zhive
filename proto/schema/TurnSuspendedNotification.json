@@ -1,0 +1,38 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "TurnSuspendedNotification",
+  "description": "Payload of the `events/turn_suspended` server-to-client notification.\n\nReports that the named turn parked on a deferred permission request. The client unblocks it by calling `session/resume_permission` with the same `request_id`. Without a resume (or a `session/cancel`) the turn stays suspended indefinitely — the engine applies no timeout.\n\n# Examples\n\n``` use zhive_proto::domain::{ThreadId, TurnId}; use zhive_proto::permission::TurnSuspendedNotification; use std::sync::Arc; let n = TurnSuspendedNotification::new( ThreadId(Arc::from(\"thread:native/abc\")), TurnId(Arc::from(\"turn:thread:native/abc/0\")), \"perm:1\", Some(\"awaiting user\".into()), 1_700_000_000, ); let v = serde_json::to_value(&n).unwrap(); assert_eq!(v[\"threadId\"], \"thread:native/abc\"); assert_eq!(v[\"requestId\"], \"perm:1\"); assert_eq!(v[\"suspendedAt\"], 1_700_000_000_i64); let back: TurnSuspendedNotification = serde_json::from_value(v).unwrap(); assert_eq!(back, n); ```",
+  "type": "object",
+  "required": [
+    "requestId",
+    "suspendedAt",
+    "threadId",
+    "turnId"
+  ],
+  "properties": {
+    "reason": {
+      "description": "Optional rationale mirrored from [`PermissionOutcome::Defer`].",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "requestId": {
+      "description": "Pending request id the client passes back to resume.",
+      "type": "string"
+    },
+    "suspendedAt": {
+      "description": "Unix timestamp in seconds when the turn suspended.",
+      "type": "integer",
+      "format": "int64"
+    },
+    "threadId": {
+      "description": "Thread whose turn suspended.",
+      "type": "string"
+    },
+    "turnId": {
+      "description": "Suspended turn.",
+      "type": "string"
+    }
+  }
+}

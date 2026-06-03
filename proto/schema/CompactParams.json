@@ -1,0 +1,45 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "CompactParams",
+  "description": "Params of the `engine/compact` RPC.\n\n`trigger` defaults to [`CompactTrigger::Manual`] when omitted: a client-initiated compaction is always manual by definition.\n\n# Examples\n\n``` use zhive_proto::rpc::CompactParams; use zhive_proto::hook::CompactTrigger; let p: CompactParams = serde_json::from_str(r#\"{\"threadId\":\"thread:native/x\"}\"#).unwrap(); assert_eq!(p.trigger, CompactTrigger::Manual); ```",
+  "type": "object",
+  "required": [
+    "threadId"
+  ],
+  "properties": {
+    "threadId": {
+      "description": "Thread to compact.",
+      "type": "string"
+    },
+    "trigger": {
+      "description": "Why compaction was triggered; defaults to `manual` when omitted.",
+      "default": "manual",
+      "allOf": [
+        {
+          "$ref": "#/definitions/CompactTrigger"
+        }
+      ]
+    }
+  },
+  "definitions": {
+    "CompactTrigger": {
+      "description": "What triggered a [`HookEvent::PreCompact`].",
+      "oneOf": [
+        {
+          "description": "User-initiated via `/compact`.",
+          "type": "string",
+          "enum": [
+            "manual"
+          ]
+        },
+        {
+          "description": "Engine-initiated when the context window fills.",
+          "type": "string",
+          "enum": [
+            "auto"
+          ]
+        }
+      ]
+    }
+  }
+}

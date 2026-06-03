@@ -1,0 +1,95 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "TurnRejectedPayload",
+  "description": "Payload of the `events/turn_rejected` notification.\n\n# Examples\n\n``` use std::sync::Arc; use zhive_proto::domain::ThreadId; use zhive_proto::hook::EnginePhase; use zhive_proto::events::{TurnRejectedPayload, TurnRejectedReason}; let p = TurnRejectedPayload::new( ThreadId(Arc::from(\"thread:native/t\")), TurnRejectedReason::EngineBusy { current_phase: EnginePhase::Compaction }, ); let v = serde_json::to_value(&p).unwrap(); assert_eq!(v[\"reason\"][\"kind\"], \"engine_busy\"); assert_eq!(v[\"reason\"][\"currentPhase\"], \"compaction\"); let back: TurnRejectedPayload = serde_json::from_value(v).unwrap(); assert_eq!(back, p); ```",
+  "type": "object",
+  "required": [
+    "reason",
+    "threadId"
+  ],
+  "properties": {
+    "reason": {
+      "description": "Reason the turn was rejected.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/TurnRejectedReason"
+        }
+      ]
+    },
+    "threadId": {
+      "description": "Thread whose turn was rejected.",
+      "type": "string"
+    }
+  },
+  "definitions": {
+    "EnginePhase": {
+      "description": "Engine state used by [`HookEvent::PhaseTransition`].\n\nMirrors Pi `AgentHarnessPhase` plus a `Retry` lane that captures llmsdk retry behaviour. Kept here (not in `permission.rs`) because the hook wire is the only public consumer.",
+      "oneOf": [
+        {
+          "description": "No active turn.",
+          "type": "string",
+          "enum": [
+            "idle"
+          ]
+        },
+        {
+          "description": "Inside the agent loop.",
+          "type": "string",
+          "enum": [
+            "turn"
+          ]
+        },
+        {
+          "description": "Compacting transcript history.",
+          "type": "string",
+          "enum": [
+            "compaction"
+          ]
+        },
+        {
+          "description": "Running a branch summary.",
+          "type": "string",
+          "enum": [
+            "branch_summary"
+          ]
+        },
+        {
+          "description": "Retrying after a provider failure.",
+          "type": "string",
+          "enum": [
+            "retry"
+          ]
+        }
+      ]
+    },
+    "TurnRejectedReason": {
+      "description": "Wire mirror of the engine's `TurnRejectionReason`.\n\nThe three serde attributes (`tag`, `rename_all`, `rename_all_fields`) must be kept in sync with the original private definition in `zhive-core` so the JSON shape `{\"kind\":\"engine_busy\",\"currentPhase\":\"...\"}` is preserved.\n\n# Examples\n\n``` use zhive_proto::hook::EnginePhase; use zhive_proto::events::TurnRejectedReason; let r = TurnRejectedReason::EngineBusy { current_phase: EnginePhase::Compaction }; let v = serde_json::to_value(&r).unwrap(); assert_eq!(v[\"kind\"], \"engine_busy\"); assert_eq!(v[\"currentPhase\"], \"compaction\"); let back: TurnRejectedReason = serde_json::from_value(v).unwrap(); assert_eq!(back, r); ```",
+      "oneOf": [
+        {
+          "description": "The engine was busy with another phase when the turn was requested.",
+          "type": "object",
+          "required": [
+            "current_phase",
+            "kind"
+          ],
+          "properties": {
+            "current_phase": {
+              "description": "Phase the engine was in when it rejected the turn.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/EnginePhase"
+                }
+              ]
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "engine_busy"
+              ]
+            }
+          }
+        }
+      ]
+    }
+  }
+}

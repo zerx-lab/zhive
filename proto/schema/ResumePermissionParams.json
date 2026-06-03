@@ -1,0 +1,66 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ResumePermissionParams",
+  "description": "Body of the `session/resume_permission` request.\n\nPairs the in-flight request id with the user's [`ResumeOutcome`]. The `request_id` echoes the id the server surfaced when it suspended the turn (carried by [`TurnSuspendedNotification::request_id`]).\n\n# Examples\n\n``` use zhive_proto::permission::{ResumeOutcome, ResumePermissionParams}; let payload = r#\"{ \"requestId\": \"perm:1\", \"outcome\": { \"outcome\": \"selected\", \"optionId\": \"allow_once\" } }\"#; let params: ResumePermissionParams = serde_json::from_str(payload).unwrap(); assert_eq!(params.request_id, \"perm:1\"); assert!(matches!(params.outcome, ResumeOutcome::Selected { .. })); ```",
+  "type": "object",
+  "required": [
+    "outcome",
+    "requestId"
+  ],
+  "properties": {
+    "outcome": {
+      "description": "Client's resolution; cannot defer again (see [`ResumeOutcome`]).",
+      "allOf": [
+        {
+          "$ref": "#/definitions/ResumeOutcome"
+        }
+      ]
+    },
+    "requestId": {
+      "description": "Pending request id echoed from the suspend notification.",
+      "type": "string"
+    }
+  },
+  "definitions": {
+    "ResumeOutcome": {
+      "description": "Resolution a client supplies to `session/resume_permission`.\n\nDeliberately narrower than [`PermissionOutcome`]: it offers only `Selected` and `Cancelled`, so a resumed request can never defer again. This type-level restriction is the only guard against an infinite suspend loop; see the [`From`] conversion that lifts a `ResumeOutcome` back into a [`PermissionOutcome`].\n\n# Examples\n\n``` use zhive_proto::permission::ResumeOutcome; let v = serde_json::to_value(&ResumeOutcome::Selected { option_id: \"allow_once\".into(), }) .unwrap(); assert_eq!(v[\"outcome\"], \"selected\"); assert_eq!(v[\"optionId\"], \"allow_once\");\n\n// A `defer` payload is rejected — resume can never re-suspend. let deferred = serde_json::json!({ \"outcome\": \"defer\" }); assert!(serde_json::from_value::<ResumeOutcome>(deferred).is_err()); ```",
+      "oneOf": [
+        {
+          "description": "User picked the option with the given id.",
+          "type": "object",
+          "required": [
+            "optionId",
+            "outcome"
+          ],
+          "properties": {
+            "optionId": {
+              "description": "Echoes [`PermissionOption::id`].",
+              "type": "string"
+            },
+            "outcome": {
+              "type": "string",
+              "enum": [
+                "selected"
+              ]
+            }
+          }
+        },
+        {
+          "description": "User cancelled instead of choosing an option.",
+          "type": "object",
+          "required": [
+            "outcome"
+          ],
+          "properties": {
+            "outcome": {
+              "type": "string",
+              "enum": [
+                "cancelled"
+              ]
+            }
+          }
+        }
+      ]
+    }
+  }
+}

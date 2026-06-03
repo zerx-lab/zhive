@@ -26,13 +26,16 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::Value;
 use zhive_proto::ErrorObject;
-use zhive_proto::domain::{Item, ItemId, ThreadId, TurnId};
-use zhive_proto::hook::CompactTrigger;
-use zhive_proto::permission::{
-    PermissionOutcome, PermissionScope, ResumePermissionParams, StreamingBehavior,
+use zhive_proto::methods;
+use zhive_proto::permission::{PermissionOutcome, ResumePermissionParams};
+use zhive_proto::rpc::{
+    CancelTurnParams, CancelTurnResult, CompactParams, CompactResult, CompactStatus, ForkParams,
+    ForkResult, GetItemsParams, GetItemsResult, InjectionAck, InjectionParams, ListThreadsParams,
+    ListThreadsResult, ResumePermissionResult, ResumePermissionStatus, ResumeThreadParams,
+    ResumeThreadResult, SessionCancelParams, StartTurnParams, StartTurnResult,
 };
 
 use crate::engine::{
@@ -42,6 +45,7 @@ use crate::engine::{
         ResumePermissionReply, ResumeReply, Submission,
     },
 };
+use zhive_proto::permission::StreamingBehavior;
 
 use super::router::{Handler, JsonRpcCode, Router};
 
@@ -58,19 +62,19 @@ pub const ENGINE_ERROR_CODE: i64 = -32000;
 pub fn register_engine_handlers(router: &mut Router, engine: Engine) {
     let engine = Arc::new(engine);
     router.register(
-        "engine/start_turn",
+        methods::METHOD_START_TURN,
         Arc::new(StartTurnHandler {
             engine: Arc::clone(&engine),
         }),
     );
     router.register(
-        "engine/cancel_turn",
+        methods::METHOD_CANCEL_TURN,
         Arc::new(CancelTurnHandler {
             engine: Arc::clone(&engine),
         }),
     );
     router.register(
-        "engine/resume_permission",
+        methods::METHOD_RESUME_PERMISSION_LEGACY,
         Arc::new(ResumePermissionHandler {
             engine: Arc::clone(&engine),
         }),
@@ -81,38 +85,38 @@ pub fn register_engine_handlers(router: &mut Router, engine: Engine) {
     // `engine/resume_permission` is kept registered so existing clients keep
     // working. Both route to the same handler.
     router.register(
-        zhive_proto::permission::METHOD_RESUME_PERMISSION,
+        methods::METHOD_RESUME_PERMISSION,
         Arc::new(ResumePermissionHandler {
             engine: Arc::clone(&engine),
         }),
     );
     router.register(
-        "engine/compact",
+        methods::METHOD_COMPACT,
         Arc::new(CompactHandler {
             engine: Arc::clone(&engine),
         }),
     );
     router.register(
-        "thread/fork",
+        methods::METHOD_THREAD_FORK,
         Arc::new(ForkHandler {
             engine: Arc::clone(&engine),
         }),
     );
     // History / resume surface (recent-session list, resume, item fetch).
     router.register(
-        "thread/list",
+        methods::METHOD_THREAD_LIST,
         Arc::new(ListThreadsHandler {
             engine: Arc::clone(&engine),
         }),
     );
     router.register(
-        "engine/resume_thread",
+        methods::METHOD_RESUME_THREAD,
         Arc::new(ResumeThreadHandler {
             engine: Arc::clone(&engine),
         }),
     );
     router.register(
-        "thread/get_items",
+        methods::METHOD_THREAD_GET_ITEMS,
         Arc::new(GetItemsHandler {
             engine: Arc::clone(&engine),
         }),
@@ -122,25 +126,25 @@ pub fn register_engine_handlers(router: &mut Router, engine: Engine) {
     // `server::initialize`; without them a client reading the capability would
     // get -32601 (method not found) — a silent contract violation.
     router.register(
-        "session/enqueue_steer",
+        methods::METHOD_ENQUEUE_STEER,
         Arc::new(EnqueueSteerHandler {
             engine: Arc::clone(&engine),
         }),
     );
     router.register(
-        "session/enqueue_follow_up",
+        methods::METHOD_ENQUEUE_FOLLOW_UP,
         Arc::new(EnqueueFollowUpHandler {
             engine: Arc::clone(&engine),
         }),
     );
     router.register(
-        "session/enqueue_next_turn",
+        methods::METHOD_ENQUEUE_NEXT_TURN,
         Arc::new(EnqueueNextTurnHandler {
             engine: Arc::clone(&engine),
         }),
     );
     router.register(
-        "engine/shutdown",
+        methods::METHOD_SHUTDOWN,
         Arc::new(ShutdownHandler {
             engine: Arc::clone(&engine),
         }),
@@ -151,178 +155,10 @@ pub fn register_engine_handlers(router: &mut Router, engine: Engine) {
     // the server does not silently drop the notification once clients start
     // sending `Client::cancel_session`.  For notifications the router
     // dispatches but discards the returned value; an `Err` is only logged.
-    router.register("session/cancel", Arc::new(SessionCancelHandler { engine }));
-}
-
-// ============================================================
-// Wire payloads
-// ============================================================
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct StartTurnParams {
-    thread_id: ThreadId,
-    #[serde(default)]
-    user_input: Vec<Item>,
-    #[serde(default)]
-    scope: Option<PermissionScope>,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct StartTurnResult {
-    turn_id: TurnId,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct CancelTurnParams {
-    thread_id: ThreadId,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct CancelTurnResult {
-    /// `Some(id)` when the cancel hit an active turn, `None` otherwise.
-    turn_id: Option<TurnId>,
-}
-
-/// Wire-form classifier for the resume-permission outcome.
-///
-/// Mirrors [`ResumePermissionReply`] 1:1 so a future reducer variant
-/// has to be reflected here too (the match in
-/// [`ResumePermissionHandler::handle`] is exhaustive against this
-/// enum, not `#[non_exhaustive]`).
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-enum ResumePermissionStatus {
-    Resolved,
-    UnknownRequest,
-    InvalidRequestId,
-    Abandoned,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ResumePermissionResult {
-    /// Wire-form copy of the reducer's typed reply.
-    status: ResumePermissionStatus,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct CompactParams {
-    thread_id: ThreadId,
-    /// Defaults to [`CompactTrigger::Manual`]: a client-driven compaction is
-    /// manual by definition. The auto trigger is reserved for the engine's
-    /// own threshold-driven compaction and is not expected over the wire.
-    #[serde(default = "manual_trigger")]
-    trigger: CompactTrigger,
-}
-
-/// Default `trigger` for [`CompactParams`]: client compaction is manual.
-fn manual_trigger() -> CompactTrigger {
-    CompactTrigger::Manual
-}
-
-/// Wire-form classifier mirroring the successful [`CompactReply`] cases.
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-enum CompactStatus {
-    Compacted,
-    NothingToCompact,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct CompactResult {
-    /// Whether a summary replaced transcript items or there was nothing to do.
-    status: CompactStatus,
-    /// Count of transcript items folded into the summary (0 when nothing ran).
-    entries_compacted: u32,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ForkParams {
-    source_thread_id: ThreadId,
-    /// Inclusive item to fork at; absent / null forks the full history.
-    #[serde(default)]
-    up_to_item: Option<ItemId>,
-    /// Whether to generate an LLM branch summary as the new thread's opener.
-    #[serde(default)]
-    summarize: bool,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ForkResult {
-    /// Id of the newly created forked thread.
-    new_thread_id: ThreadId,
-    /// Number of source items replayed into the new thread.
-    items_replayed: u32,
-    /// Whether a branch summary was generated and prepended.
-    summarized: bool,
-}
-
-/// Result payload for `thread/list`: the persisted thread index.
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ListThreadsResult {
-    /// Threads ordered most-recently-updated first (empty `turns` field).
-    threads: Vec<zhive_proto::domain::Thread>,
-}
-
-/// Optional params for `thread/list`: a working-directory filter.
-///
-/// `{ "cwd": "/work/project" }` lists only threads created under that
-/// directory; omitting `cwd` (or passing no params) lists every thread.
-#[derive(Debug, Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ListThreadsParams {
-    #[serde(default)]
-    cwd: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ResumeThreadParams {
-    thread_id: ThreadId,
-}
-
-/// Result payload for `engine/resume_thread`.
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ResumeThreadResult {
-    /// Id of the resumed thread.
-    thread_id: ThreadId,
-    /// Number of history items restored into memory.
-    items_restored: u32,
-    /// Number of turns the restored items spanned.
-    turns_restored: u32,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct GetItemsParams {
-    thread_id: ThreadId,
-    /// Optional single turn to scope the read to; absent reads full history.
-    #[serde(default)]
-    turn_id: Option<TurnId>,
-    /// Optional page offset (only applied with `turnId`).
-    #[serde(default)]
-    offset: Option<i64>,
-    /// Optional page limit (only applied with `turnId`).
-    #[serde(default)]
-    limit: Option<i64>,
-}
-
-/// Result payload for `thread/get_items`.
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct GetItemsResult {
-    /// History items in conversation (or page) order.
-    items: Vec<Item>,
+    router.register(
+        methods::METHOD_SESSION_CANCEL,
+        Arc::new(SessionCancelHandler { engine }),
+    );
 }
 
 // ============================================================
@@ -346,7 +182,7 @@ impl Handler for StartTurnHandler {
                 // `serde_json::to_value` cannot fail at runtime on
                 // this fully-typed struct; fall back to `Null` to
                 // honour CLAUDE.md's no-`expect()` rule.
-                Ok(serde_json::to_value(StartTurnResult { turn_id }).unwrap_or(Value::Null))
+                Ok(serde_json::to_value(StartTurnResult::new(turn_id)).unwrap_or(Value::Null))
             }
             Err(err) => Err(engine_error(&err)),
         }
@@ -363,7 +199,7 @@ impl Handler for CancelTurnHandler {
         let params: CancelTurnParams = decode_params(params)?;
         match self.engine.cancel_turn(params.thread_id).await {
             Ok(turn_id) => {
-                Ok(serde_json::to_value(CancelTurnResult { turn_id }).unwrap_or(Value::Null))
+                Ok(serde_json::to_value(CancelTurnResult::new(turn_id)).unwrap_or(Value::Null))
             }
             Err(err) => Err(engine_error(&err)),
         }
@@ -398,7 +234,10 @@ impl Handler for ResumePermissionHandler {
                 // fail at runtime, but CLAUDE.md forbids `.expect()`
                 // in library code; fall back to a sentinel Null so
                 // the call still completes if the impossible occurs.
-                Ok(serde_json::to_value(ResumePermissionResult { status }).unwrap_or(Value::Null))
+                Ok(
+                    serde_json::to_value(ResumePermissionResult::new(status))
+                        .unwrap_or(Value::Null),
+                )
             }
             Err(err) => Err(engine_error(&err)),
         }
@@ -416,14 +255,12 @@ impl Handler for CompactHandler {
         match self.engine.compact(params.thread_id, params.trigger).await {
             Ok(Ok(reply)) => {
                 let result = match reply {
-                    CompactReply::Compacted { entries_compacted } => CompactResult {
-                        status: CompactStatus::Compacted,
-                        entries_compacted,
-                    },
-                    CompactReply::NothingToCompact => CompactResult {
-                        status: CompactStatus::NothingToCompact,
-                        entries_compacted: 0,
-                    },
+                    CompactReply::Compacted { entries_compacted } => {
+                        CompactResult::new(CompactStatus::Compacted, entries_compacted)
+                    }
+                    CompactReply::NothingToCompact => {
+                        CompactResult::new(CompactStatus::NothingToCompact, 0)
+                    }
                 };
                 // A fully-typed struct cannot fail to serialise; fall back to
                 // Null rather than `.expect()` (CLAUDE.md no-expect rule).
@@ -453,11 +290,7 @@ impl Handler for ForkHandler {
                 items_replayed,
                 summarized,
             })) => {
-                let result = ForkResult {
-                    new_thread_id,
-                    items_replayed,
-                    summarized,
-                };
+                let result = ForkResult::new(new_thread_id, items_replayed, summarized);
                 // A fully-typed struct cannot fail to serialise; fall back to
                 // Null rather than `.expect()` (CLAUDE.md no-expect rule).
                 Ok(serde_json::to_value(result).unwrap_or(Value::Null))
@@ -488,7 +321,7 @@ impl Handler for ListThreadsHandler {
             Ok(threads) => {
                 // A fully-typed struct cannot fail to serialise; fall back to
                 // Null rather than `.expect()` (CLAUDE.md no-expect rule).
-                Ok(serde_json::to_value(ListThreadsResult { threads }).unwrap_or(Value::Null))
+                Ok(serde_json::to_value(ListThreadsResult::new(threads)).unwrap_or(Value::Null))
             }
             Err(err) => Err(engine_error(&err)),
         }
@@ -509,11 +342,7 @@ impl Handler for ResumeThreadHandler {
                 items_restored,
                 turns_restored,
             })) => {
-                let result = ResumeThreadResult {
-                    thread_id,
-                    items_restored,
-                    turns_restored,
-                };
+                let result = ResumeThreadResult::new(thread_id, items_restored, turns_restored);
                 Ok(serde_json::to_value(result).unwrap_or(Value::Null))
             }
             Ok(Err(domain)) => Err(resume_error(&domain)),
@@ -541,7 +370,7 @@ impl Handler for GetItemsHandler {
             .await
         {
             Ok(Ok(items)) => {
-                Ok(serde_json::to_value(GetItemsResult { items }).unwrap_or(Value::Null))
+                Ok(serde_json::to_value(GetItemsResult::new(items)).unwrap_or(Value::Null))
             }
             Ok(Err(domain)) => Err(get_items_error(&domain)),
             Err(err) => Err(engine_error(&err)),
@@ -580,11 +409,6 @@ struct SessionCancelHandler {
 #[async_trait]
 impl Handler for SessionCancelHandler {
     async fn handle(&self, params: Option<Value>) -> Result<Value, ErrorObject> {
-        #[derive(serde::Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct SessionCancelParams {
-            thread_id: ThreadId,
-        }
         let p: SessionCancelParams = decode_params(params)?;
         // `cancel_turn` returns Option<TurnId>; both Some and None are
         // success cases for a notification (no active turn is idempotent).
@@ -598,23 +422,6 @@ impl Handler for SessionCancelHandler {
 // ============================================================
 // Injection-queue handlers (Pi `streamingBehavior` model)
 // ============================================================
-
-/// Wire payload for the injection-queue methods: a thread id plus the items
-/// to enqueue. Shared by steer / follow-up / next-turn since their shape is
-/// identical; the queue is selected by the method name, not a payload field.
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct InjectionParams {
-    thread_id: ThreadId,
-    #[serde(default)]
-    items: Vec<Item>,
-}
-
-/// A fixed `{ "accepted": true }` ack for the fire-and-forget injection
-/// submissions, which return no typed reply from the engine actor.
-fn injection_ack() -> Value {
-    serde_json::json!({ "accepted": true })
-}
 
 struct EnqueueSteerHandler {
     engine: Arc<Engine>,
@@ -695,6 +502,14 @@ fn decode_params<T: for<'de> Deserialize<'de>>(params: Option<Value>) -> Result<
         message: JsonRpcCode::InvalidParams.message().to_string(),
         data: Some(Value::String(e.to_string())),
     })
+}
+
+/// Emits the canonical `{ "accepted": true }` ack for fire-and-forget injection methods.
+///
+/// Uses [`InjectionAck::accepted`] so the wire shape is owned by proto and
+/// the `serde` round-trip is type-safe.
+fn injection_ack() -> Value {
+    serde_json::to_value(InjectionAck::accepted()).unwrap_or(Value::Null)
 }
 
 fn engine_error(err: &EngineError) -> ErrorObject {

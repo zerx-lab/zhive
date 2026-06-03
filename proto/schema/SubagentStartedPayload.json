@@ -1,0 +1,34 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "SubagentStartedPayload",
+  "description": "Payload of the `events/subagent_started` notification.\n\nOptional fields are omitted from the wire when absent.\n\n# Examples\n\n``` use std::sync::Arc; use zhive_proto::domain::ThreadId; use zhive_proto::events::SubagentStartedPayload; let p = SubagentStartedPayload::new( ThreadId(Arc::from(\"thread:native/parent\")), ThreadId(Arc::from(\"thread:native/child\")), Some(\"scout\".into()), Some(\"read-only scout\".into()), ); let v = serde_json::to_value(&p).unwrap(); assert_eq!(v[\"agentType\"], \"scout\"); // Without optional fields — they must be absent on the wire. let p2 = SubagentStartedPayload::new( ThreadId(Arc::from(\"p\")), ThreadId(Arc::from(\"c\")), None, None, ); let v2 = serde_json::to_value(&p2).unwrap(); assert!(v2.get(\"agentType\").is_none()); assert!(v2.get(\"description\").is_none()); let back: SubagentStartedPayload = serde_json::from_value(v).unwrap(); assert_eq!(back, p); ```",
+  "type": "object",
+  "required": [
+    "childThreadId",
+    "parentThreadId"
+  ],
+  "properties": {
+    "agentType": {
+      "description": "Subagent type label (e.g. `\"scout\"`); omitted when absent.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "childThreadId": {
+      "description": "Newly started child thread.",
+      "type": "string"
+    },
+    "description": {
+      "description": "Subagent human-readable description; omitted when absent.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "parentThreadId": {
+      "description": "Parent thread that spawned the subagent.",
+      "type": "string"
+    }
+  }
+}

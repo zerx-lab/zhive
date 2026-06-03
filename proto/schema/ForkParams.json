@@ -1,0 +1,28 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ForkParams",
+  "description": "Params of the `thread/fork` RPC.\n\n# Examples\n\n``` use zhive_proto::rpc::ForkParams; let p: ForkParams = serde_json::from_str(r#\"{\"sourceThreadId\":\"thread:native/src\"}\"#).unwrap(); assert_eq!(p.source_thread_id.0.as_ref(), \"thread:native/src\"); assert!(p.up_to_item.is_none()); assert!(!p.summarize); ```",
+  "type": "object",
+  "required": [
+    "sourceThreadId"
+  ],
+  "properties": {
+    "sourceThreadId": {
+      "description": "Thread to fork from.",
+      "type": "string"
+    },
+    "summarize": {
+      "description": "When `true`, generate an LLM branch summary as the new thread's opener.",
+      "default": false,
+      "type": "boolean"
+    },
+    "upToItem": {
+      "description": "Inclusive item boundary; `None` forks the full history.",
+      "default": null,
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  }
+}

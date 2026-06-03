@@ -1,0 +1,11 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Initialized",
+  "description": "Payload of the `initialized` notification (client to server).\n\nOptional but recommended; signals that the client has fully processed the `initialize` response and is ready to accept requests. Aligns with codex `ClientNotification::Initialized` and LSP's eponymous notification. ACP has no equivalent and silently ignores it.",
+  "type": "object",
+  "properties": {
+    "_meta": {
+      "description": "Free-form extension channel; aligns with ACP `_meta`."
+    }
+  }
+}

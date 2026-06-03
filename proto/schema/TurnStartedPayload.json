@@ -1,0 +1,20 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "TurnStartedPayload",
+  "description": "Payload of the `events/turn_started` notification.\n\nThe engine emits only `threadId` and `turnId` here; the full `Turn` snapshot is available via [`crate::domain::TurnStartedNotification`] which is synthesised at the bridge layer.\n\n# Examples\n\n``` use std::sync::Arc; use zhive_proto::domain::{ThreadId, TurnId}; use zhive_proto::events::TurnStartedPayload; let p = TurnStartedPayload::new( ThreadId(Arc::from(\"thread:native/a\")), TurnId(Arc::from(\"turn:thread:native/a/0\")), ); let v = serde_json::to_value(&p).unwrap(); assert_eq!(v[\"threadId\"], \"thread:native/a\"); assert_eq!(v[\"turnId\"], \"turn:thread:native/a/0\"); let back: TurnStartedPayload = serde_json::from_value(v).unwrap(); assert_eq!(back, p); ```",
+  "type": "object",
+  "required": [
+    "threadId",
+    "turnId"
+  ],
+  "properties": {
+    "threadId": {
+      "description": "Thread the turn started on.",
+      "type": "string"
+    },
+    "turnId": {
+      "description": "Newly started turn id.",
+      "type": "string"
+    }
+  }
+}

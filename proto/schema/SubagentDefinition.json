@@ -1,0 +1,93 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "SubagentDefinition",
+  "description": "Subagent declaration the client sends to define a child thread.\n\nInheritance happens entirely through `Option::None` semantics — there is **no** `inherited_permissions` field on the wire. Mirrors Claude Code `AgentDefinition`.",
+  "type": "object",
+  "required": [
+    "description",
+    "name",
+    "prompt"
+  ],
+  "properties": {
+    "allowSubagentSpawn": {
+      "description": "Forced to `false` by D-008 when spawning a subagent.",
+      "default": false,
+      "type": "boolean"
+    },
+    "description": {
+      "description": "Free-form description surfaced to the user.",
+      "type": "string"
+    },
+    "disallowedTools": {
+      "description": "Always union-merged with the parent denylist.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "name": {
+      "description": "Unique handle (used for routing log lines back to the subagent).",
+      "type": "string"
+    },
+    "permissionMode": {
+      "description": "`None` inherits the parent permission mode.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/PermissionMode"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "prompt": {
+      "description": "System prompt prepended to the subagent's fresh context.",
+      "type": "string"
+    },
+    "tools": {
+      "description": "`None` inherits the parent allowlist; `Some` is an explicit subset.",
+      "type": [
+        "array",
+        "null"
+      ],
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "definitions": {
+    "PermissionMode": {
+      "description": "Permission mode aligned with Claude Code `permissionMode`.\n\n`BypassPermissions` is the documented \"safety hazard\" mode: when the parent thread runs in this mode, every subagent inherits it without the ability to narrow.",
+      "oneOf": [
+        {
+          "description": "Every tool call goes through the reducer and may trigger reverse-RPC.",
+          "type": "string",
+          "enum": [
+            "default"
+          ]
+        },
+        {
+          "description": "Read-only checks still go through the reducer; edits are auto-allowed.",
+          "type": "string",
+          "enum": [
+            "acceptEdits"
+          ]
+        },
+        {
+          "description": "All tool calls are auto-allowed (subagents inherit unconditionally).",
+          "type": "string",
+          "enum": [
+            "bypassPermissions"
+          ]
+        },
+        {
+          "description": "Conservative mode that denies by default; used by `plan` skill.",
+          "type": "string",
+          "enum": [
+            "plan"
+          ]
+        }
+      ]
+    }
+  }
+}

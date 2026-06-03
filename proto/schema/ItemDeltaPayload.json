@@ -1,0 +1,25 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ItemDeltaPayload",
+  "description": "Payload of the `events/item_delta` notification.\n\n# Examples\n\n``` use std::sync::Arc; use zhive_proto::domain::{ThreadId, TurnId}; use zhive_proto::events::ItemDeltaPayload; let p = ItemDeltaPayload::new( ThreadId(Arc::from(\"thread:native/t\")), TurnId(Arc::from(\"turn:thread:native/t/0\")), \"Hello\".into(), ); let v = serde_json::to_value(&p).unwrap(); assert_eq!(v[\"delta\"], \"Hello\"); let back: ItemDeltaPayload = serde_json::from_value(v).unwrap(); assert_eq!(back, p); ```",
+  "type": "object",
+  "required": [
+    "delta",
+    "threadId",
+    "turnId"
+  ],
+  "properties": {
+    "delta": {
+      "description": "Streaming text fragment.",
+      "type": "string"
+    },
+    "threadId": {
+      "description": "Thread the delta belongs to.",
+      "type": "string"
+    },
+    "turnId": {
+      "description": "Turn the delta belongs to.",
+      "type": "string"
+    }
+  }
+}

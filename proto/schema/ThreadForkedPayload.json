@@ -1,0 +1,27 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ThreadForkedPayload",
+  "description": "Payload of the `events/thread_forked` notification.\n\n`forked_from_item` is `None` for a full-history fork and is omitted from the wire when absent.\n\n# Examples\n\n``` use std::sync::Arc; use zhive_proto::domain::{ItemId, ThreadId}; use zhive_proto::events::ThreadForkedPayload; // With item boundary. let p = ThreadForkedPayload::new( ThreadId(Arc::from(\"thread:native/src\")), ThreadId(Arc::from(\"thread:native/fork/0\")), Some(ItemId(Arc::from(\"item:src/1\"))), ); let v = serde_json::to_value(&p).unwrap(); assert_eq!(v[\"sourceThreadId\"], \"thread:native/src\"); assert_eq!(v[\"forkedFromItem\"], \"item:src/1\"); // Full-history fork — field absent. let p2 = ThreadForkedPayload::new( ThreadId(Arc::from(\"thread:native/src\")), ThreadId(Arc::from(\"thread:native/fork/1\")), None, ); let v2 = serde_json::to_value(&p2).unwrap(); assert!(v2.get(\"forkedFromItem\").is_none()); let back: ThreadForkedPayload = serde_json::from_value(v).unwrap(); assert_eq!(back, p); ```",
+  "type": "object",
+  "required": [
+    "newThreadId",
+    "sourceThreadId"
+  ],
+  "properties": {
+    "forkedFromItem": {
+      "description": "Inclusive item the fork was taken at; omitted for a full-history fork.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "newThreadId": {
+      "description": "Newly created fork thread.",
+      "type": "string"
+    },
+    "sourceThreadId": {
+      "description": "Source thread that was forked.",
+      "type": "string"
+    }
+  }
+}

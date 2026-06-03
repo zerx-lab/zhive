@@ -1,0 +1,77 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "PhaseChangedPayload",
+  "description": "Payload of the `events/phase_changed` notification.\n\n`thread_id` is `None` for engine-global phase transitions and is omitted from the wire (`skip_serializing_if`) when absent.\n\n# Examples\n\n``` use std::sync::Arc; use zhive_proto::domain::ThreadId; use zhive_proto::hook::EnginePhase; use zhive_proto::events::PhaseChangedPayload; // With thread id. let p = PhaseChangedPayload::new( Some(ThreadId(Arc::from(\"thread:native/t\"))), EnginePhase::Idle, EnginePhase::Turn, ); let v = serde_json::to_value(&p).unwrap(); assert_eq!(v[\"threadId\"], \"thread:native/t\"); assert_eq!(v[\"from\"], \"idle\"); assert_eq!(v[\"to\"], \"turn\"); // Without thread id — field is absent. let p2 = PhaseChangedPayload::new(None, EnginePhase::Idle, EnginePhase::Compaction); let v2 = serde_json::to_value(&p2).unwrap(); assert!(v2.get(\"threadId\").is_none()); assert_eq!(v2[\"to\"], \"compaction\"); let back: PhaseChangedPayload = serde_json::from_value(v).unwrap(); assert_eq!(back, p); ```",
+  "type": "object",
+  "required": [
+    "from",
+    "to"
+  ],
+  "properties": {
+    "from": {
+      "description": "Phase the engine left.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/EnginePhase"
+        }
+      ]
+    },
+    "threadId": {
+      "description": "Thread involved in the transition; `None` for engine-global events.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "to": {
+      "description": "Phase the engine entered.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/EnginePhase"
+        }
+      ]
+    }
+  },
+  "definitions": {
+    "EnginePhase": {
+      "description": "Engine state used by [`HookEvent::PhaseTransition`].\n\nMirrors Pi `AgentHarnessPhase` plus a `Retry` lane that captures llmsdk retry behaviour. Kept here (not in `permission.rs`) because the hook wire is the only public consumer.",
+      "oneOf": [
+        {
+          "description": "No active turn.",
+          "type": "string",
+          "enum": [
+            "idle"
+          ]
+        },
+        {
+          "description": "Inside the agent loop.",
+          "type": "string",
+          "enum": [
+            "turn"
+          ]
+        },
+        {
+          "description": "Compacting transcript history.",
+          "type": "string",
+          "enum": [
+            "compaction"
+          ]
+        },
+        {
+          "description": "Running a branch summary.",
+          "type": "string",
+          "enum": [
+            "branch_summary"
+          ]
+        },
+        {
+          "description": "Retrying after a provider failure.",
+          "type": "string",
+          "enum": [
+            "retry"
+          ]
+        }
+      ]
+    }
+  }
+}

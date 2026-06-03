@@ -1,0 +1,34 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "UsagePayload",
+  "description": "Payload of the `events/usage` notification.\n\nCarries the token counts reported by a single provider call, identified by the owning thread and turn.\n\n# Examples\n\n``` use std::sync::Arc; use zhive_proto::domain::{ThreadId, TurnId}; use zhive_proto::events::UsagePayload; let p = UsagePayload::new( ThreadId(Arc::from(\"thread:native/a\")), TurnId(Arc::from(\"turn:thread:native/a/0\")), 100, 50, ); let v = serde_json::to_value(&p).unwrap(); assert_eq!(v[\"threadId\"], \"thread:native/a\"); assert_eq!(v[\"inputTokens\"], 100u64); assert_eq!(v[\"outputTokens\"], 50u64); let back: UsagePayload = serde_json::from_value(v).unwrap(); assert_eq!(back, p); ```",
+  "type": "object",
+  "required": [
+    "inputTokens",
+    "outputTokens",
+    "threadId",
+    "turnId"
+  ],
+  "properties": {
+    "inputTokens": {
+      "description": "Input tokens consumed by the provider call.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0.0
+    },
+    "outputTokens": {
+      "description": "Output tokens produced by the provider call.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0.0
+    },
+    "threadId": {
+      "description": "Thread the token usage belongs to.",
+      "type": "string"
+    },
+    "turnId": {
+      "description": "Turn the token usage belongs to.",
+      "type": "string"
+    }
+  }
+}

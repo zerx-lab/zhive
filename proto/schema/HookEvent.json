@@ -1,0 +1,2011 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "HookEvent",
+  "description": "14 + 1 hook events emitted by the engine, plus an `Unknown` fallback.\n\nInternally tagged by `hook_event_name`. Every typed variant's payload flattens [`HookEventBase`] into the JSON root. A hand-written [`Deserialize`] impl downgrades any unrecognised tag (or a payload with no tag at all) to [`HookEvent::Unknown`] instead of erroring, so a future SDK event can never crash the dispatch loop.\n\n# Examples\n\n``` use zhive_proto::hook::HookEvent; let payload = r#\"{ \"hook_event_name\": \"Stop\", \"sessionId\": \"thread:native/abc\", \"cwd\": \"/tmp\", \"registeredBy\": {\"id\": \"test\", \"version\": \"0.1.0\", \"source\": \"builtin\"}, \"stopHookActive\": false }\"#; let ev: HookEvent = serde_json::from_str(payload).unwrap(); assert!(matches!(ev, HookEvent::Stop(_)));\n\n// An event the SDK adds in the future degrades to `Unknown`. let future = r#\"{ \"hook_event_name\": \"FutureEvent\", \"extra\": 42 }\"#; let ev: HookEvent = serde_json::from_str(future).unwrap(); assert!(matches!(ev, HookEvent::Unknown { .. })); ```",
+  "oneOf": [
+    {
+      "description": "Fired before a tool call is dispatched. `PreToolUse` hooks may mutate `tool_input`; the host re-validates the schema afterwards (red line 11).",
+      "type": "object",
+      "required": [
+        "cwd",
+        "hook_event_name",
+        "registeredBy",
+        "sessionId",
+        "toolInput",
+        "toolName",
+        "toolUseId"
+      ],
+      "properties": {
+        "agentId": {
+          "description": "Subagent id when the hook fires inside one; `None` at top level.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "agentType": {
+          "description": "Subagent type label, e.g. `\"explore\"`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cwd": {
+          "description": "Working directory of the agent process when the hook fires.",
+          "type": "string"
+        },
+        "hook_event_name": {
+          "type": "string",
+          "enum": [
+            "PreToolUse"
+          ]
+        },
+        "parentToolUseId": {
+          "description": "Parent tool-use id that spawned the subagent.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "permissionMode": {
+          "description": "Permission mode snapshot at fire time.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/PermissionMode"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "registeredBy": {
+          "description": "Manifest that registered the hook (red line 10, required).",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ExtensionRef"
+            }
+          ]
+        },
+        "sessionId": {
+          "description": "Owning thread / session id (aligns with [`crate::domain::ThreadId`] after URI prefix stripping).",
+          "type": "string"
+        },
+        "toolInput": {
+          "description": "Raw arguments handed to the tool; `PreToolUse` hooks may mutate this and the host will re-validate."
+        },
+        "toolName": {
+          "description": "Tool that is about to run.",
+          "type": "string"
+        },
+        "toolUseId": {
+          "description": "Stable id for this tool call.",
+          "type": "string"
+        },
+        "transcriptPath": {
+          "description": "Path to the JSONL rollout for the current thread.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Fired after a tool call returns successfully.",
+      "type": "object",
+      "required": [
+        "cwd",
+        "hook_event_name",
+        "registeredBy",
+        "sessionId",
+        "toolInput",
+        "toolName",
+        "toolResponse",
+        "toolUseId"
+      ],
+      "properties": {
+        "agentId": {
+          "description": "Subagent id when the hook fires inside one; `None` at top level.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "agentType": {
+          "description": "Subagent type label, e.g. `\"explore\"`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cwd": {
+          "description": "Working directory of the agent process when the hook fires.",
+          "type": "string"
+        },
+        "hook_event_name": {
+          "type": "string",
+          "enum": [
+            "PostToolUse"
+          ]
+        },
+        "parentToolUseId": {
+          "description": "Parent tool-use id that spawned the subagent.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "permissionMode": {
+          "description": "Permission mode snapshot at fire time.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/PermissionMode"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "registeredBy": {
+          "description": "Manifest that registered the hook (red line 10, required).",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ExtensionRef"
+            }
+          ]
+        },
+        "sessionId": {
+          "description": "Owning thread / session id (aligns with [`crate::domain::ThreadId`] after URI prefix stripping).",
+          "type": "string"
+        },
+        "toolInput": {
+          "description": "Arguments the tool ran with (post-mutation)."
+        },
+        "toolName": {
+          "description": "Tool that produced the response.",
+          "type": "string"
+        },
+        "toolResponse": {
+          "description": "Raw output returned by the tool."
+        },
+        "toolUseId": {
+          "description": "Stable id for this tool call.",
+          "type": "string"
+        },
+        "transcriptPath": {
+          "description": "Path to the JSONL rollout for the current thread.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Fired after a tool call fails or is cancelled.",
+      "type": "object",
+      "required": [
+        "cwd",
+        "error",
+        "errorKind",
+        "hook_event_name",
+        "registeredBy",
+        "sessionId",
+        "toolInput",
+        "toolName",
+        "toolUseId"
+      ],
+      "properties": {
+        "agentId": {
+          "description": "Subagent id when the hook fires inside one; `None` at top level.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "agentType": {
+          "description": "Subagent type label, e.g. `\"explore\"`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cwd": {
+          "description": "Working directory of the agent process when the hook fires.",
+          "type": "string"
+        },
+        "error": {
+          "description": "Human-readable error message.",
+          "type": "string"
+        },
+        "errorKind": {
+          "description": "Coarse error class.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ToolErrorKind"
+            }
+          ]
+        },
+        "hook_event_name": {
+          "type": "string",
+          "enum": [
+            "PostToolUseFailure"
+          ]
+        },
+        "parentToolUseId": {
+          "description": "Parent tool-use id that spawned the subagent.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "permissionMode": {
+          "description": "Permission mode snapshot at fire time.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/PermissionMode"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "registeredBy": {
+          "description": "Manifest that registered the hook (red line 10, required).",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ExtensionRef"
+            }
+          ]
+        },
+        "sessionId": {
+          "description": "Owning thread / session id (aligns with [`crate::domain::ThreadId`] after URI prefix stripping).",
+          "type": "string"
+        },
+        "toolInput": {
+          "description": "Arguments the tool ran with."
+        },
+        "toolName": {
+          "description": "Tool that failed.",
+          "type": "string"
+        },
+        "toolUseId": {
+          "description": "Stable id for this tool call.",
+          "type": "string"
+        },
+        "transcriptPath": {
+          "description": "Path to the JSONL rollout for the current thread.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Fired when the user submits a new prompt.",
+      "type": "object",
+      "required": [
+        "cwd",
+        "hook_event_name",
+        "prompt",
+        "registeredBy",
+        "sessionId"
+      ],
+      "properties": {
+        "agentId": {
+          "description": "Subagent id when the hook fires inside one; `None` at top level.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "agentType": {
+          "description": "Subagent type label, e.g. `\"explore\"`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cwd": {
+          "description": "Working directory of the agent process when the hook fires.",
+          "type": "string"
+        },
+        "hook_event_name": {
+          "type": "string",
+          "enum": [
+            "UserPromptSubmit"
+          ]
+        },
+        "parentToolUseId": {
+          "description": "Parent tool-use id that spawned the subagent.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "permissionMode": {
+          "description": "Permission mode snapshot at fire time.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/PermissionMode"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "prompt": {
+          "description": "User-supplied text after slash-command expansion.",
+          "type": "string"
+        },
+        "registeredBy": {
+          "description": "Manifest that registered the hook (red line 10, required).",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ExtensionRef"
+            }
+          ]
+        },
+        "sessionId": {
+          "description": "Owning thread / session id (aligns with [`crate::domain::ThreadId`] after URI prefix stripping).",
+          "type": "string"
+        },
+        "transcriptPath": {
+          "description": "Path to the JSONL rollout for the current thread.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Fired when a new thread is opened.",
+      "type": "object",
+      "required": [
+        "cwd",
+        "hook_event_name",
+        "registeredBy",
+        "sessionId",
+        "source"
+      ],
+      "properties": {
+        "agentId": {
+          "description": "Subagent id when the hook fires inside one; `None` at top level.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "agentType": {
+          "description": "Subagent type label, e.g. `\"explore\"`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cwd": {
+          "description": "Working directory of the agent process when the hook fires.",
+          "type": "string"
+        },
+        "hook_event_name": {
+          "type": "string",
+          "enum": [
+            "SessionStart"
+          ]
+        },
+        "model": {
+          "description": "Provider model identifier (`None` until B10 lands).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "parentToolUseId": {
+          "description": "Parent tool-use id that spawned the subagent.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "permissionMode": {
+          "description": "Permission mode snapshot at fire time.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/PermissionMode"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "registeredBy": {
+          "description": "Manifest that registered the hook (red line 10, required).",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ExtensionRef"
+            }
+          ]
+        },
+        "sessionId": {
+          "description": "Owning thread / session id (aligns with [`crate::domain::ThreadId`] after URI prefix stripping).",
+          "type": "string"
+        },
+        "source": {
+          "description": "Reason the thread was created.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/SessionStartSource"
+            }
+          ]
+        },
+        "transcriptPath": {
+          "description": "Path to the JSONL rollout for the current thread.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Fired when a thread closes.",
+      "type": "object",
+      "required": [
+        "cwd",
+        "hook_event_name",
+        "reason",
+        "registeredBy",
+        "sessionId"
+      ],
+      "properties": {
+        "agentId": {
+          "description": "Subagent id when the hook fires inside one; `None` at top level.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "agentType": {
+          "description": "Subagent type label, e.g. `\"explore\"`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cwd": {
+          "description": "Working directory of the agent process when the hook fires.",
+          "type": "string"
+        },
+        "hook_event_name": {
+          "type": "string",
+          "enum": [
+            "SessionEnd"
+          ]
+        },
+        "parentToolUseId": {
+          "description": "Parent tool-use id that spawned the subagent.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "permissionMode": {
+          "description": "Permission mode snapshot at fire time.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/PermissionMode"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "reason": {
+          "description": "Why the thread was closed.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/SessionEndReason"
+            }
+          ]
+        },
+        "registeredBy": {
+          "description": "Manifest that registered the hook (red line 10, required).",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ExtensionRef"
+            }
+          ]
+        },
+        "sessionId": {
+          "description": "Owning thread / session id (aligns with [`crate::domain::ThreadId`] after URI prefix stripping).",
+          "type": "string"
+        },
+        "transcriptPath": {
+          "description": "Path to the JSONL rollout for the current thread.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Fired when a subagent thread starts.",
+      "type": "object",
+      "required": [
+        "cwd",
+        "hook_event_name",
+        "inheritedScope",
+        "registeredBy",
+        "sessionId"
+      ],
+      "properties": {
+        "agentId": {
+          "description": "Subagent id when the hook fires inside one; `None` at top level.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "agentType": {
+          "description": "Subagent type label, e.g. `\"explore\"`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cwd": {
+          "description": "Working directory of the agent process when the hook fires.",
+          "type": "string"
+        },
+        "hook_event_name": {
+          "type": "string",
+          "enum": [
+            "SubagentStart"
+          ]
+        },
+        "inheritedScope": {
+          "description": "Inherited permission scope (typed handle pending A3 wire stub)."
+        },
+        "parentToolUseId": {
+          "description": "Parent tool-use id that spawned the subagent.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "permissionMode": {
+          "description": "Permission mode snapshot at fire time.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/PermissionMode"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "registeredBy": {
+          "description": "Manifest that registered the hook (red line 10, required).",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ExtensionRef"
+            }
+          ]
+        },
+        "sessionId": {
+          "description": "Owning thread / session id (aligns with [`crate::domain::ThreadId`] after URI prefix stripping).",
+          "type": "string"
+        },
+        "transcriptPath": {
+          "description": "Path to the JSONL rollout for the current thread.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Fired when a subagent thread stops.",
+      "type": "object",
+      "required": [
+        "agentTranscriptPath",
+        "cwd",
+        "hook_event_name",
+        "registeredBy",
+        "sessionId"
+      ],
+      "properties": {
+        "agentId": {
+          "description": "Subagent id when the hook fires inside one; `None` at top level.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "agentTranscriptPath": {
+          "description": "Rollout path scoped to the subagent.",
+          "type": "string"
+        },
+        "agentType": {
+          "description": "Subagent type label, e.g. `\"explore\"`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cwd": {
+          "description": "Working directory of the agent process when the hook fires.",
+          "type": "string"
+        },
+        "hook_event_name": {
+          "type": "string",
+          "enum": [
+            "SubagentStop"
+          ]
+        },
+        "parentToolUseId": {
+          "description": "Parent tool-use id that spawned the subagent.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "permissionMode": {
+          "description": "Permission mode snapshot at fire time.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/PermissionMode"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "registeredBy": {
+          "description": "Manifest that registered the hook (red line 10, required).",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ExtensionRef"
+            }
+          ]
+        },
+        "sessionId": {
+          "description": "Owning thread / session id (aligns with [`crate::domain::ThreadId`] after URI prefix stripping).",
+          "type": "string"
+        },
+        "stopHookActive": {
+          "description": "`true` while a parent Stop hook caused this stop (prevents loops).",
+          "default": false,
+          "type": "boolean"
+        },
+        "transcriptPath": {
+          "description": "Path to the JSONL rollout for the current thread.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Fired immediately before context compaction.",
+      "type": "object",
+      "required": [
+        "cwd",
+        "entriesCount",
+        "hook_event_name",
+        "registeredBy",
+        "sessionId",
+        "trigger"
+      ],
+      "properties": {
+        "agentId": {
+          "description": "Subagent id when the hook fires inside one; `None` at top level.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "agentType": {
+          "description": "Subagent type label, e.g. `\"explore\"`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "customInstructions": {
+          "description": "Optional user-supplied summarisation guidance.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cwd": {
+          "description": "Working directory of the agent process when the hook fires.",
+          "type": "string"
+        },
+        "entriesCount": {
+          "description": "Number of items about to be compacted.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "hook_event_name": {
+          "type": "string",
+          "enum": [
+            "PreCompact"
+          ]
+        },
+        "parentToolUseId": {
+          "description": "Parent tool-use id that spawned the subagent.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "permissionMode": {
+          "description": "Permission mode snapshot at fire time.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/PermissionMode"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "registeredBy": {
+          "description": "Manifest that registered the hook (red line 10, required).",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ExtensionRef"
+            }
+          ]
+        },
+        "sessionId": {
+          "description": "Owning thread / session id (aligns with [`crate::domain::ThreadId`] after URI prefix stripping).",
+          "type": "string"
+        },
+        "transcriptPath": {
+          "description": "Path to the JSONL rollout for the current thread.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "trigger": {
+          "description": "Why compaction fires.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/CompactTrigger"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "description": "Fired immediately after context compaction completes.",
+      "type": "object",
+      "required": [
+        "cwd",
+        "entriesCompacted",
+        "hook_event_name",
+        "registeredBy",
+        "sessionId",
+        "trigger"
+      ],
+      "properties": {
+        "agentId": {
+          "description": "Subagent id when the hook fires inside one; `None` at top level.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "agentType": {
+          "description": "Subagent type label, e.g. `\"explore\"`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cwd": {
+          "description": "Working directory of the agent process when the hook fires.",
+          "type": "string"
+        },
+        "entriesCompacted": {
+          "description": "Number of items that were compacted away.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "hook_event_name": {
+          "type": "string",
+          "enum": [
+            "PostCompact"
+          ]
+        },
+        "parentToolUseId": {
+          "description": "Parent tool-use id that spawned the subagent.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "permissionMode": {
+          "description": "Permission mode snapshot at fire time.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/PermissionMode"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "registeredBy": {
+          "description": "Manifest that registered the hook (red line 10, required).",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ExtensionRef"
+            }
+          ]
+        },
+        "sessionId": {
+          "description": "Owning thread / session id (aligns with [`crate::domain::ThreadId`] after URI prefix stripping).",
+          "type": "string"
+        },
+        "transcriptPath": {
+          "description": "Path to the JSONL rollout for the current thread.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "trigger": {
+          "description": "Why compaction fired (mirrors the originating `PreCompact`).",
+          "allOf": [
+            {
+              "$ref": "#/definitions/CompactTrigger"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "description": "Reserved: fired immediately before a branch summary runs.\n\nType reserved for the fork/branch-summary feature; dispatch wiring is deferred. Aligns with decision-diffs §1.7.",
+      "type": "object",
+      "required": [
+        "cwd",
+        "entriesCount",
+        "hook_event_name",
+        "registeredBy",
+        "sessionId",
+        "sourceThreadId"
+      ],
+      "properties": {
+        "agentId": {
+          "description": "Subagent id when the hook fires inside one; `None` at top level.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "agentType": {
+          "description": "Subagent type label, e.g. `\"explore\"`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cwd": {
+          "description": "Working directory of the agent process when the hook fires.",
+          "type": "string"
+        },
+        "entriesCount": {
+          "description": "Number of transcript entries the branch summary will cover.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "hook_event_name": {
+          "type": "string",
+          "enum": [
+            "PreBranchSummary"
+          ]
+        },
+        "parentToolUseId": {
+          "description": "Parent tool-use id that spawned the subagent.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "permissionMode": {
+          "description": "Permission mode snapshot at fire time.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/PermissionMode"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "registeredBy": {
+          "description": "Manifest that registered the hook (red line 10, required).",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ExtensionRef"
+            }
+          ]
+        },
+        "sessionId": {
+          "description": "Owning thread / session id (aligns with [`crate::domain::ThreadId`] after URI prefix stripping).",
+          "type": "string"
+        },
+        "sourceThreadId": {
+          "description": "Thread the branch was forked from.",
+          "type": "string"
+        },
+        "transcriptPath": {
+          "description": "Path to the JSONL rollout for the current thread.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Reserved: fired immediately after a branch summary completes.\n\nType reserved for the fork/branch-summary feature; dispatch wiring is deferred. Aligns with decision-diffs §1.7.",
+      "type": "object",
+      "required": [
+        "cwd",
+        "entriesSummarized",
+        "hook_event_name",
+        "registeredBy",
+        "sessionId",
+        "sourceThreadId"
+      ],
+      "properties": {
+        "agentId": {
+          "description": "Subagent id when the hook fires inside one; `None` at top level.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "agentType": {
+          "description": "Subagent type label, e.g. `\"explore\"`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cwd": {
+          "description": "Working directory of the agent process when the hook fires.",
+          "type": "string"
+        },
+        "entriesSummarized": {
+          "description": "Number of transcript entries the branch summary covered.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "hook_event_name": {
+          "type": "string",
+          "enum": [
+            "PostBranchSummary"
+          ]
+        },
+        "parentToolUseId": {
+          "description": "Parent tool-use id that spawned the subagent.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "permissionMode": {
+          "description": "Permission mode snapshot at fire time.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/PermissionMode"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "registeredBy": {
+          "description": "Manifest that registered the hook (red line 10, required).",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ExtensionRef"
+            }
+          ]
+        },
+        "sessionId": {
+          "description": "Owning thread / session id (aligns with [`crate::domain::ThreadId`] after URI prefix stripping).",
+          "type": "string"
+        },
+        "sourceThreadId": {
+          "description": "Thread the branch was forked from.",
+          "type": "string"
+        },
+        "transcriptPath": {
+          "description": "Path to the JSONL rollout for the current thread.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Fired when a permission/request reverse RPC is about to ship.",
+      "type": "object",
+      "required": [
+        "cwd",
+        "hook_event_name",
+        "registeredBy",
+        "requestedScope",
+        "sessionId",
+        "toolInput",
+        "toolName",
+        "toolUseId"
+      ],
+      "properties": {
+        "agentId": {
+          "description": "Subagent id when the hook fires inside one; `None` at top level.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "agentType": {
+          "description": "Subagent type label, e.g. `\"explore\"`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cwd": {
+          "description": "Working directory of the agent process when the hook fires.",
+          "type": "string"
+        },
+        "hook_event_name": {
+          "type": "string",
+          "enum": [
+            "PermissionRequest"
+          ]
+        },
+        "parentToolUseId": {
+          "description": "Parent tool-use id that spawned the subagent.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "permissionMode": {
+          "description": "Permission mode snapshot at fire time.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/PermissionMode"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "registeredBy": {
+          "description": "Manifest that registered the hook (red line 10, required).",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ExtensionRef"
+            }
+          ]
+        },
+        "requestedScope": {
+          "description": "Requested scope (typed handle pending A3 wire stub)."
+        },
+        "sessionId": {
+          "description": "Owning thread / session id (aligns with [`crate::domain::ThreadId`] after URI prefix stripping).",
+          "type": "string"
+        },
+        "toolInput": {
+          "description": "Arguments the tool would run with."
+        },
+        "toolName": {
+          "description": "Tool the user is being asked about.",
+          "type": "string"
+        },
+        "toolUseId": {
+          "description": "Stable id for the pending tool call.",
+          "type": "string"
+        },
+        "transcriptPath": {
+          "description": "Path to the JSONL rollout for the current thread.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Fired when the agent decides to stop.",
+      "type": "object",
+      "required": [
+        "cwd",
+        "hook_event_name",
+        "registeredBy",
+        "sessionId"
+      ],
+      "properties": {
+        "agentId": {
+          "description": "Subagent id when the hook fires inside one; `None` at top level.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "agentType": {
+          "description": "Subagent type label, e.g. `\"explore\"`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cwd": {
+          "description": "Working directory of the agent process when the hook fires.",
+          "type": "string"
+        },
+        "hook_event_name": {
+          "type": "string",
+          "enum": [
+            "Stop"
+          ]
+        },
+        "parentToolUseId": {
+          "description": "Parent tool-use id that spawned the subagent.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "permissionMode": {
+          "description": "Permission mode snapshot at fire time.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/PermissionMode"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "registeredBy": {
+          "description": "Manifest that registered the hook (red line 10, required).",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ExtensionRef"
+            }
+          ]
+        },
+        "sessionId": {
+          "description": "Owning thread / session id (aligns with [`crate::domain::ThreadId`] after URI prefix stripping).",
+          "type": "string"
+        },
+        "stopHookActive": {
+          "description": "`true` when the engine is already inside a Stop hook chain.",
+          "default": false,
+          "type": "boolean"
+        },
+        "transcriptPath": {
+          "description": "Path to the JSONL rollout for the current thread.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Generic notification surface (permission prompts, etc.).",
+      "type": "object",
+      "required": [
+        "category",
+        "cwd",
+        "hook_event_name",
+        "message",
+        "registeredBy",
+        "sessionId"
+      ],
+      "properties": {
+        "agentId": {
+          "description": "Subagent id when the hook fires inside one; `None` at top level.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "agentType": {
+          "description": "Subagent type label, e.g. `\"explore\"`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "category": {
+          "description": "Notification class.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/NotificationCategory"
+            }
+          ]
+        },
+        "cwd": {
+          "description": "Working directory of the agent process when the hook fires.",
+          "type": "string"
+        },
+        "hook_event_name": {
+          "type": "string",
+          "enum": [
+            "Notification"
+          ]
+        },
+        "message": {
+          "description": "Body text.",
+          "type": "string"
+        },
+        "parentToolUseId": {
+          "description": "Parent tool-use id that spawned the subagent.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "permissionMode": {
+          "description": "Permission mode snapshot at fire time.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/PermissionMode"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "registeredBy": {
+          "description": "Manifest that registered the hook (red line 10, required).",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ExtensionRef"
+            }
+          ]
+        },
+        "sessionId": {
+          "description": "Owning thread / session id (aligns with [`crate::domain::ThreadId`] after URI prefix stripping).",
+          "type": "string"
+        },
+        "title": {
+          "description": "Optional title for UIs that show it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "transcriptPath": {
+          "description": "Path to the JSONL rollout for the current thread.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    {
+      "description": "First-run / maintenance hook (Claude Code TS-only equivalent).",
+      "type": "object",
+      "required": [
+        "cwd",
+        "hook_event_name",
+        "registeredBy",
+        "sessionId",
+        "trigger"
+      ],
+      "properties": {
+        "agentId": {
+          "description": "Subagent id when the hook fires inside one; `None` at top level.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "agentType": {
+          "description": "Subagent type label, e.g. `\"explore\"`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cwd": {
+          "description": "Working directory of the agent process when the hook fires.",
+          "type": "string"
+        },
+        "hook_event_name": {
+          "type": "string",
+          "enum": [
+            "Setup"
+          ]
+        },
+        "parentToolUseId": {
+          "description": "Parent tool-use id that spawned the subagent.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "permissionMode": {
+          "description": "Permission mode snapshot at fire time.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/PermissionMode"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "registeredBy": {
+          "description": "Manifest that registered the hook (red line 10, required).",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ExtensionRef"
+            }
+          ]
+        },
+        "sessionId": {
+          "description": "Owning thread / session id (aligns with [`crate::domain::ThreadId`] after URI prefix stripping).",
+          "type": "string"
+        },
+        "transcriptPath": {
+          "description": "Path to the JSONL rollout for the current thread.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "trigger": {
+          "description": "Why setup fires.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/SetupTrigger"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "description": "Fired when a tool's approval state changes.",
+      "type": "object",
+      "required": [
+        "current",
+        "cwd",
+        "hook_event_name",
+        "origin",
+        "previous",
+        "registeredBy",
+        "sessionId",
+        "toolName"
+      ],
+      "properties": {
+        "agentId": {
+          "description": "Subagent id when the hook fires inside one; `None` at top level.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "agentType": {
+          "description": "Subagent type label, e.g. `\"explore\"`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "current": {
+          "description": "New state.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ToolApprovalState"
+            }
+          ]
+        },
+        "cwd": {
+          "description": "Working directory of the agent process when the hook fires.",
+          "type": "string"
+        },
+        "hook_event_name": {
+          "type": "string",
+          "enum": [
+            "ToolApprovalChange"
+          ]
+        },
+        "origin": {
+          "description": "What caused the change.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ToolApprovalOrigin"
+            }
+          ]
+        },
+        "parentToolUseId": {
+          "description": "Parent tool-use id that spawned the subagent.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "permissionMode": {
+          "description": "Permission mode snapshot at fire time.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/PermissionMode"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "previous": {
+          "description": "Previous state.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ToolApprovalState"
+            }
+          ]
+        },
+        "registeredBy": {
+          "description": "Manifest that registered the hook (red line 10, required).",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ExtensionRef"
+            }
+          ]
+        },
+        "sessionId": {
+          "description": "Owning thread / session id (aligns with [`crate::domain::ThreadId`] after URI prefix stripping).",
+          "type": "string"
+        },
+        "toolName": {
+          "description": "Tool whose approval changed.",
+          "type": "string"
+        },
+        "transcriptPath": {
+          "description": "Path to the JSONL rollout for the current thread.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Fired when the engine moves between phases (15th event).",
+      "type": "object",
+      "required": [
+        "cwd",
+        "from",
+        "hook_event_name",
+        "registeredBy",
+        "sessionId",
+        "to"
+      ],
+      "properties": {
+        "agentId": {
+          "description": "Subagent id when the hook fires inside one; `None` at top level.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "agentType": {
+          "description": "Subagent type label, e.g. `\"explore\"`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cwd": {
+          "description": "Working directory of the agent process when the hook fires.",
+          "type": "string"
+        },
+        "from": {
+          "description": "Phase the engine left.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/EnginePhase"
+            }
+          ]
+        },
+        "hook_event_name": {
+          "type": "string",
+          "enum": [
+            "PhaseTransition"
+          ]
+        },
+        "parentToolUseId": {
+          "description": "Parent tool-use id that spawned the subagent.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "permissionMode": {
+          "description": "Permission mode snapshot at fire time.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/PermissionMode"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "registeredBy": {
+          "description": "Manifest that registered the hook (red line 10, required).",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ExtensionRef"
+            }
+          ]
+        },
+        "sessionId": {
+          "description": "Owning thread / session id (aligns with [`crate::domain::ThreadId`] after URI prefix stripping).",
+          "type": "string"
+        },
+        "to": {
+          "description": "Phase the engine entered.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/EnginePhase"
+            }
+          ]
+        },
+        "transcriptPath": {
+          "description": "Path to the JSONL rollout for the current thread.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    }
+  ],
+  "definitions": {
+    "CompactTrigger": {
+      "description": "What triggered a [`HookEvent::PreCompact`].",
+      "oneOf": [
+        {
+          "description": "User-initiated via `/compact`.",
+          "type": "string",
+          "enum": [
+            "manual"
+          ]
+        },
+        {
+          "description": "Engine-initiated when the context window fills.",
+          "type": "string",
+          "enum": [
+            "auto"
+          ]
+        }
+      ]
+    },
+    "EnginePhase": {
+      "description": "Engine state used by [`HookEvent::PhaseTransition`].\n\nMirrors Pi `AgentHarnessPhase` plus a `Retry` lane that captures llmsdk retry behaviour. Kept here (not in `permission.rs`) because the hook wire is the only public consumer.",
+      "oneOf": [
+        {
+          "description": "No active turn.",
+          "type": "string",
+          "enum": [
+            "idle"
+          ]
+        },
+        {
+          "description": "Inside the agent loop.",
+          "type": "string",
+          "enum": [
+            "turn"
+          ]
+        },
+        {
+          "description": "Compacting transcript history.",
+          "type": "string",
+          "enum": [
+            "compaction"
+          ]
+        },
+        {
+          "description": "Running a branch summary.",
+          "type": "string",
+          "enum": [
+            "branch_summary"
+          ]
+        },
+        {
+          "description": "Retrying after a provider failure.",
+          "type": "string",
+          "enum": [
+            "retry"
+          ]
+        }
+      ]
+    },
+    "ExtensionRef": {
+      "description": "Provenance record attached to every hook invocation.\n\nAlways present on [`HookEventBase::registered_by`]; the host emits the value from the manifest that owned the registration.\n\n# Examples\n\n``` use zhive_proto::hook::ExtensionRef; let r: ExtensionRef = serde_json::from_str( r#\"{\"id\": \"git-helper\", \"version\": \"0.1.0\", \"source\": \"project\"}\"#, ) .unwrap(); assert_eq!(r.to_string(), \"git-helper@0.1.0\"); ```",
+      "type": "object",
+      "required": [
+        "id",
+        "source",
+        "version"
+      ],
+      "properties": {
+        "id": {
+          "description": "Stable id (e.g. `\"git-helper\"`).",
+          "type": "string"
+        },
+        "source": {
+          "description": "Discovery source of the manifest.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ExtensionSource"
+            }
+          ]
+        },
+        "version": {
+          "description": "Semver string of the manifest that registered the hook.",
+          "type": "string"
+        }
+      }
+    },
+    "ExtensionSource": {
+      "description": "Discovery source of an [`ExtensionRef`].",
+      "oneOf": [
+        {
+          "description": "Bundled with the zhive binary.",
+          "type": "string",
+          "enum": [
+            "builtin"
+          ]
+        },
+        {
+          "description": "`~/.zhive/` (per-user).",
+          "type": "string",
+          "enum": [
+            "user"
+          ]
+        },
+        {
+          "description": "`<repo>/.zhive/` (per-project, committed).",
+          "type": "string",
+          "enum": [
+            "project"
+          ]
+        },
+        {
+          "description": "`<repo>/.zhive.local/` (per-project, gitignored).",
+          "type": "string",
+          "enum": [
+            "local"
+          ]
+        },
+        {
+          "description": "Sourced from an MCP server's `resources/list`.",
+          "type": "string",
+          "enum": [
+            "mcp"
+          ]
+        }
+      ]
+    },
+    "NotificationCategory": {
+      "description": "Category of a generic [`HookEvent::Notification`].",
+      "oneOf": [
+        {
+          "description": "Permission prompt surfaced to the user.",
+          "type": "string",
+          "enum": [
+            "permission_prompt"
+          ]
+        },
+        {
+          "description": "Idle reminder.",
+          "type": "string",
+          "enum": [
+            "idle_prompt"
+          ]
+        },
+        {
+          "description": "Authentication completed.",
+          "type": "string",
+          "enum": [
+            "auth_success"
+          ]
+        },
+        {
+          "description": "Elicitation: dialog opened.",
+          "type": "string",
+          "enum": [
+            "elicitation_dialog"
+          ]
+        },
+        {
+          "description": "Elicitation: user responded.",
+          "type": "string",
+          "enum": [
+            "elicitation_response"
+          ]
+        },
+        {
+          "description": "Elicitation: flow complete.",
+          "type": "string",
+          "enum": [
+            "elicitation_complete"
+          ]
+        }
+      ]
+    },
+    "PermissionMode": {
+      "description": "Permission mode aligned with Claude Code `permissionMode`.\n\n`BypassPermissions` is the documented \"safety hazard\" mode: when the parent thread runs in this mode, every subagent inherits it without the ability to narrow.",
+      "oneOf": [
+        {
+          "description": "Every tool call goes through the reducer and may trigger reverse-RPC.",
+          "type": "string",
+          "enum": [
+            "default"
+          ]
+        },
+        {
+          "description": "Read-only checks still go through the reducer; edits are auto-allowed.",
+          "type": "string",
+          "enum": [
+            "acceptEdits"
+          ]
+        },
+        {
+          "description": "All tool calls are auto-allowed (subagents inherit unconditionally).",
+          "type": "string",
+          "enum": [
+            "bypassPermissions"
+          ]
+        },
+        {
+          "description": "Conservative mode that denies by default; used by `plan` skill.",
+          "type": "string",
+          "enum": [
+            "plan"
+          ]
+        }
+      ]
+    },
+    "SessionEndReason": {
+      "description": "Reason a [`HookEvent::SessionEnd`] fires.",
+      "oneOf": [
+        {
+          "description": "`/clear` slash command.",
+          "type": "string",
+          "enum": [
+            "clear"
+          ]
+        },
+        {
+          "description": "Closed to resume a different thread.",
+          "type": "string",
+          "enum": [
+            "resume"
+          ]
+        },
+        {
+          "description": "User logged out.",
+          "type": "string",
+          "enum": [
+            "logout"
+          ]
+        },
+        {
+          "description": "User exited the prompt input loop.",
+          "type": "string",
+          "enum": [
+            "prompt_input_exit"
+          ]
+        },
+        {
+          "description": "`BypassPermissions` mode was forcibly disabled.",
+          "type": "string",
+          "enum": [
+            "bypass_permissions_disabled"
+          ]
+        },
+        {
+          "description": "Anything else.",
+          "type": "string",
+          "enum": [
+            "other"
+          ]
+        }
+      ]
+    },
+    "SessionStartSource": {
+      "description": "Reason a [`HookEvent::SessionStart`] fires.",
+      "oneOf": [
+        {
+          "description": "Cold start.",
+          "type": "string",
+          "enum": [
+            "startup"
+          ]
+        },
+        {
+          "description": "Resumed from rollout.",
+          "type": "string",
+          "enum": [
+            "resume"
+          ]
+        },
+        {
+          "description": "Cleared and restarted.",
+          "type": "string",
+          "enum": [
+            "clear"
+          ]
+        },
+        {
+          "description": "Created by a compaction.",
+          "type": "string",
+          "enum": [
+            "compact"
+          ]
+        },
+        {
+          "description": "Forked from another thread.",
+          "type": "string",
+          "enum": [
+            "fork"
+          ]
+        }
+      ]
+    },
+    "SetupTrigger": {
+      "description": "Reason a [`HookEvent::Setup`] fires.",
+      "oneOf": [
+        {
+          "description": "First-time bootstrap.",
+          "type": "string",
+          "enum": [
+            "init"
+          ]
+        },
+        {
+          "description": "Periodic maintenance.",
+          "type": "string",
+          "enum": [
+            "maintenance"
+          ]
+        }
+      ]
+    },
+    "ToolApprovalOrigin": {
+      "description": "Source of the change in [`HookEvent::ToolApprovalChange`].",
+      "oneOf": [
+        {
+          "description": "User toggled the permission UI.",
+          "type": "string",
+          "enum": [
+            "user_decision"
+          ]
+        },
+        {
+          "description": "A hook callback updated the approval state.",
+          "type": "string",
+          "enum": [
+            "hook_decision"
+          ]
+        },
+        {
+          "description": "Permission scope changed (e.g. subagent narrowing).",
+          "type": "string",
+          "enum": [
+            "scope_change"
+          ]
+        }
+      ]
+    },
+    "ToolApprovalState": {
+      "description": "Persistent approval state of a tool.",
+      "oneOf": [
+        {
+          "description": "Persistent allow.",
+          "type": "string",
+          "enum": [
+            "allow"
+          ]
+        },
+        {
+          "description": "One-shot allow.",
+          "type": "string",
+          "enum": [
+            "allow_once"
+          ]
+        },
+        {
+          "description": "Ask before each call.",
+          "type": "string",
+          "enum": [
+            "ask"
+          ]
+        },
+        {
+          "description": "Persistent deny.",
+          "type": "string",
+          "enum": [
+            "deny"
+          ]
+        }
+      ]
+    },
+    "ToolErrorKind": {
+      "description": "Coarse classification of why a tool call failed.",
+      "oneOf": [
+        {
+          "description": "Exceeded the tool-specific deadline.",
+          "type": "string",
+          "enum": [
+            "timeout"
+          ]
+        },
+        {
+          "description": "Cancelled by `session/cancel` or shutdown.",
+          "type": "string",
+          "enum": [
+            "cancelled"
+          ]
+        },
+        {
+          "description": "Failed argument validation.",
+          "type": "string",
+          "enum": [
+            "invalid_input"
+          ]
+        },
+        {
+          "description": "Refused by the permission reducer.",
+          "type": "string",
+          "enum": [
+            "permission_denied"
+          ]
+        },
+        {
+          "description": "Runtime error inside the tool body.",
+          "type": "string",
+          "enum": [
+            "execution_error"
+          ]
+        },
+        {
+          "description": "Anything else.",
+          "type": "string",
+          "enum": [
+            "other"
+          ]
+        }
+      ]
+    }
+  }
+}

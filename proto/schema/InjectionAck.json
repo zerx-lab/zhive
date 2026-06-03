@@ -1,0 +1,15 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "InjectionAck",
+  "description": "Acknowledgement returned by the three injection-queue methods.\n\nThe wire shape is always `{\"accepted\":true}`; a `false` value is reserved for future use but currently cannot be emitted by the server.\n\n# Examples\n\n``` use zhive_proto::rpc::InjectionAck; let ack = InjectionAck::accepted(); let v = serde_json::to_value(&ack).unwrap(); assert_eq!(v[\"accepted\"], true); let back: InjectionAck = serde_json::from_value(v).unwrap(); assert_eq!(back, ack); ```",
+  "type": "object",
+  "required": [
+    "accepted"
+  ],
+  "properties": {
+    "accepted": {
+      "description": "`true` when the items were accepted into the queue.",
+      "type": "boolean"
+    }
+  }
+}

@@ -1,0 +1,54 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ResumePermissionResult",
+  "description": "Result of the `session/resume_permission` (and legacy `engine/resume_permission`) RPC.\n\n# Examples\n\n``` use zhive_proto::rpc::{ResumePermissionResult, ResumePermissionStatus}; let r = ResumePermissionResult::new(ResumePermissionStatus::Resolved); let v = serde_json::to_value(&r).unwrap(); assert_eq!(v[\"status\"], \"resolved\"); let back: ResumePermissionResult = serde_json::from_value(v).unwrap(); assert_eq!(back, r); ```",
+  "type": "object",
+  "required": [
+    "status"
+  ],
+  "properties": {
+    "status": {
+      "description": "Outcome of the deferred-permission resolution attempt.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/ResumePermissionStatus"
+        }
+      ]
+    }
+  },
+  "definitions": {
+    "ResumePermissionStatus": {
+      "description": "Wire classifier for the `session/resume_permission` reply.\n\nMirrors `ResumePermissionReply` in `zhive-core` one-to-one so the server's exhaustive match keeps all variants in sync.\n\n# Examples\n\n``` use zhive_proto::rpc::ResumePermissionStatus; let v = serde_json::to_value(ResumePermissionStatus::UnknownRequest).unwrap(); assert_eq!(v, \"unknown_request\"); let back: ResumePermissionStatus = serde_json::from_value(v).unwrap(); assert_eq!(back, ResumePermissionStatus::UnknownRequest); ```",
+      "oneOf": [
+        {
+          "description": "The deferred request was resolved successfully.",
+          "type": "string",
+          "enum": [
+            "resolved"
+          ]
+        },
+        {
+          "description": "No pending request matched the given id.",
+          "type": "string",
+          "enum": [
+            "unknown_request"
+          ]
+        },
+        {
+          "description": "The request id was syntactically invalid.",
+          "type": "string",
+          "enum": [
+            "invalid_request_id"
+          ]
+        },
+        {
+          "description": "The turn was abandoned before the request was resolved.",
+          "type": "string",
+          "enum": [
+            "abandoned"
+          ]
+        }
+      ]
+    }
+  }
+}

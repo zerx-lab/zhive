@@ -1,0 +1,160 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "InitializeResponse",
+  "description": "Payload of the `initialize` response returned by the server.\n\n`protocol_version` is the version the server selected (always `≤` the client's requested version). Any optional features the client asked for but the server cannot honour will be absent from [`server_capabilities`].\n\n[`server_capabilities`]: Self::server_capabilities",
+  "type": "object",
+  "required": [
+    "protocolVersion",
+    "serverInfo"
+  ],
+  "properties": {
+    "_meta": {
+      "description": "Free-form extension channel; aligns with ACP `_meta`."
+    },
+    "protocolVersion": {
+      "description": "Wire version chosen by the server, never above the request.",
+      "type": "integer",
+      "format": "uint16",
+      "minimum": 0.0
+    },
+    "serverCapabilities": {
+      "description": "Optional feature flags the server implements; defaults to an empty capability set when omitted.",
+      "default": {
+        "cancellation": true,
+        "experimentalApi": false,
+        "extension": false,
+        "hooks": false,
+        "permission": false,
+        "streaming": {
+          "followUp": false,
+          "nextTurn": false,
+          "steer": false
+        },
+        "subagents": false
+      },
+      "allOf": [
+        {
+          "$ref": "#/definitions/Capabilities"
+        }
+      ]
+    },
+    "serverInfo": {
+      "description": "Server identity card. Required by D-007.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/Implementation"
+        }
+      ]
+    }
+  },
+  "definitions": {
+    "Capabilities": {
+      "description": "Optional features the peer claims to implement.\n\nSent twice during the handshake: the client emits its set in [`InitializeRequest::client_capabilities`] and the server replies with its set in [`InitializeResponse::server_capabilities`]. Both sides converge on the intersection.\n\nAll flags default to `false` except [`cancellation`], which defaults to `true` because cancellation is treated as a baseline transport feature (matching LSP and ACP conventions).\n\n[`cancellation`]: Self::cancellation\n\n# Examples\n\n``` use zhive_proto::initialize::Capabilities; let caps = Capabilities::default(); assert!(caps.cancellation, \"cancellation defaults to true\"); assert!(!caps.hooks); ```",
+      "type": "object",
+      "properties": {
+        "_meta": {
+          "description": "Free-form extension channel; aligns with ACP `_meta`."
+        },
+        "cancellation": {
+          "description": "Implements `session/cancel` and respects in-flight cancellation signals. Defaults to `true` because cancellation is baseline.",
+          "default": true,
+          "type": "boolean"
+        },
+        "experimentalApi": {
+          "description": "Permits methods marked `#[experimental]` in the source. Field name matches codex so a bridge does not have to rename the flag.",
+          "default": false,
+          "type": "boolean"
+        },
+        "extension": {
+          "description": "Implements `extension/list` and `extension/load`, including SDK Skills discovery.",
+          "default": false,
+          "type": "boolean"
+        },
+        "hooks": {
+          "description": "Implements Claude Code-shaped `hook/run` callbacks and `permission/request` reverse RPC.",
+          "default": false,
+          "type": "boolean"
+        },
+        "optOutNotificationMethods": {
+          "description": "Optional list of notification methods the peer wants the other side to suppress (codex bandwidth/noise control).",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "permission": {
+          "description": "Implements bare `permission/request` reverse RPC (distinct from the [`hooks`](Self::hooks) flag which carries the Claude Code payload shape).",
+          "default": false,
+          "type": "boolean"
+        },
+        "streaming": {
+          "description": "Pi three-queue streaming flags.",
+          "default": {
+            "followUp": false,
+            "nextTurn": false,
+            "steer": false
+          },
+          "allOf": [
+            {
+              "$ref": "#/definitions/StreamingCapability"
+            }
+          ]
+        },
+        "subagents": {
+          "description": "Can host subagent fanout and `PermissionScope` inheritance.",
+          "default": false,
+          "type": "boolean"
+        }
+      }
+    },
+    "Implementation": {
+      "description": "Implementation identity card exchanged at handshake.\n\nMirrors ACP `Implementation` (and codex `ClientInfo`). Both [`name`] and [`version`] are required; [`title`] is an optional human-friendly label for UIs.\n\n[`name`]: Self::name [`version`]: Self::version [`title`]: Self::title\n\n# Examples\n\n``` use zhive_proto::initialize::Implementation; let me: Implementation = serde_json::from_str( r#\"{\"name\":\"zhive-cli\",\"title\":\"Zhive CLI\",\"version\":\"0.1.0\"}\"#, ) .unwrap(); assert_eq!(me.name, \"zhive-cli\"); assert_eq!(me.version, \"0.1.0\"); ```",
+      "type": "object",
+      "required": [
+        "name",
+        "version"
+      ],
+      "properties": {
+        "name": {
+          "description": "Machine-readable identifier (`\"zhive-cli\"`, `\"zed\"`, `\"codex_vscode\"`).",
+          "type": "string"
+        },
+        "title": {
+          "description": "Optional human-friendly display name; omitted from the wire when `None`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "version": {
+          "description": "Implementation version (free-form, typically semver).",
+          "type": "string"
+        }
+      }
+    },
+    "StreamingCapability": {
+      "description": "Three-queue streaming capability flags (Pi-style).\n\nThe only nested capability object. Each flag covers one of the three injection queues; absent flags default to `false`. The `next_turn` queue is driven by an out-of-band RPC method, so callers that only negotiate `steer` and `follow_up` will not lose any features.\n\n# Examples\n\n``` use zhive_proto::initialize::StreamingCapability; let s: StreamingCapability = serde_json::from_str(r#\"{\"steer\":true}\"#).unwrap(); assert!(s.steer); assert!(!s.follow_up); ```",
+      "type": "object",
+      "properties": {
+        "followUp": {
+          "description": "Implementation honours `session/enqueue_follow_up` post-turn.",
+          "default": false,
+          "type": "boolean"
+        },
+        "nextTurn": {
+          "description": "Implementation honours `session/next_turn` queueing across aborts.",
+          "default": false,
+          "type": "boolean"
+        },
+        "steer": {
+          "description": "Implementation honours `session/enqueue_steer` mid-turn.",
+          "default": false,
+          "type": "boolean"
+        }
+      }
+    }
+  }
+}

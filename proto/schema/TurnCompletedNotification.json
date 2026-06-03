@@ -1,0 +1,1227 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "TurnCompletedNotification",
+  "description": "Bridge-synthesised `turn/completed` payload carrying the final [`Turn`] snapshot.\n\nThe final turn status is one of `Completed`, `Interrupted`, or `Failed`. This type is produced **by the bridge**, not by the engine directly.\n\n> **Disambiguation**: the engine itself emits > [`crate::events::TurnCompletedPayload`] (`{threadId, turnId}`) on the > `events/turn_completed` wire method. Bridges reframe that leaner payload as > a `TurnCompletedNotification` with the full `Turn` embedded. The two types > coexist intentionally.",
+  "type": "object",
+  "required": [
+    "threadId",
+    "turn"
+  ],
+  "properties": {
+    "threadId": {
+      "description": "Thread the turn belongs to.",
+      "type": "string"
+    },
+    "turn": {
+      "description": "Final turn snapshot; `status` is one of `Completed` / `Interrupted` / `Failed`.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/Turn"
+        }
+      ]
+    }
+  },
+  "definitions": {
+    "AvailableCommand": {
+      "description": "Advertised slash command or callable tool.",
+      "type": "object",
+      "required": [
+        "name"
+      ],
+      "properties": {
+        "description": {
+          "description": "Short human-readable description.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "description": "Command name (e.g. `commit`, `pr`).",
+          "type": "string"
+        }
+      }
+    },
+    "CommandExecutionStatus": {
+      "description": "Lifecycle of a [`Item::CommandExecution`].",
+      "oneOf": [
+        {
+          "description": "Spawned, still running.",
+          "type": "string",
+          "enum": [
+            "in_progress"
+          ]
+        },
+        {
+          "description": "Exited with status 0.",
+          "type": "string",
+          "enum": [
+            "completed"
+          ]
+        },
+        {
+          "description": "Exited non-zero or killed.",
+          "type": "string",
+          "enum": [
+            "failed"
+          ]
+        }
+      ]
+    },
+    "FileUpdateChange": {
+      "description": "One file's change within a [`Item::FileEdit`].",
+      "type": "object",
+      "required": [
+        "kind",
+        "path"
+      ],
+      "properties": {
+        "kind": {
+          "description": "Kind of change applied.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/PatchChangeKind"
+            }
+          ]
+        },
+        "newText": {
+          "description": "Post-edit text; absent for deleted files.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "oldText": {
+          "description": "Pre-edit text; absent for created files.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "path": {
+          "description": "Affected path.",
+          "type": "string"
+        }
+      }
+    },
+    "Item": {
+      "description": "Leaf content primitive of a [`Turn`]; 14 variants covering all observable events.\n\n`#[non_exhaustive]` lets the schema evolve without breaking downstream match arms. Bridge crates must downgrade unknown wire variants to [`Item::SystemNotice`] with [`NoticeLevel::Warn`] rather than panic.\n\nThe discriminator is `itemKind` (not `kind`) so that the [`Item::ToolCall::kind`] inner field can keep its ACP-aligned name; serde disallows a tag and a variant field sharing one name.",
+      "oneOf": [
+        {
+          "description": "Direct user input.",
+          "type": "object",
+          "required": [
+            "content",
+            "id",
+            "itemKind"
+          ],
+          "properties": {
+            "content": {
+              "description": "Multi-part content (text / image / audio / resource).",
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/ItemContent"
+              }
+            },
+            "id": {
+              "description": "Per-turn item id.",
+              "type": "string"
+            },
+            "itemKind": {
+              "type": "string",
+              "enum": [
+                "user_message"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Final or interim assistant message.",
+          "type": "object",
+          "required": [
+            "id",
+            "itemKind",
+            "text"
+          ],
+          "properties": {
+            "id": {
+              "description": "Per-turn item id.",
+              "type": "string"
+            },
+            "itemKind": {
+              "type": "string",
+              "enum": [
+                "agent_message"
+              ]
+            },
+            "text": {
+              "description": "Plain-text body.",
+              "type": "string"
+            }
+          }
+        },
+        {
+          "description": "Streaming thought chunk surfaced by the model.",
+          "type": "object",
+          "required": [
+            "id",
+            "itemKind",
+            "text"
+          ],
+          "properties": {
+            "id": {
+              "description": "Per-turn item id.",
+              "type": "string"
+            },
+            "itemKind": {
+              "type": "string",
+              "enum": [
+                "agent_thought"
+              ]
+            },
+            "text": {
+              "description": "Plain-text body.",
+              "type": "string"
+            }
+          }
+        },
+        {
+          "description": "Structured reasoning trace (codex-only; ACP bridges write `AgentThought`).",
+          "type": "object",
+          "required": [
+            "id",
+            "itemKind"
+          ],
+          "properties": {
+            "id": {
+              "description": "Per-turn item id.",
+              "type": "string"
+            },
+            "itemKind": {
+              "type": "string",
+              "enum": [
+                "reasoning"
+              ]
+            },
+            "summary": {
+              "description": "Ordered summary fragments.",
+              "default": [],
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        {
+          "description": "Tool call dispatched by the agent (provider or extension tools).",
+          "type": "object",
+          "required": [
+            "id",
+            "itemKind",
+            "name"
+          ],
+          "properties": {
+            "content": {
+              "description": "Tool call output / progress content.",
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/ItemToolCallContent"
+              }
+            },
+            "id": {
+              "description": "Per-turn item id.",
+              "type": "string"
+            },
+            "itemKind": {
+              "type": "string",
+              "enum": [
+                "tool_call"
+              ]
+            },
+            "kind": {
+              "description": "Coarse classification, useful for UI grouping.",
+              "default": "other",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/ToolKind"
+                }
+              ]
+            },
+            "locations": {
+              "description": "File / location hints surfaced to UI.",
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/ToolCallLocation"
+              }
+            },
+            "name": {
+              "description": "Tool name (e.g. `read_file`, `bash`).",
+              "type": "string"
+            },
+            "provider_tool_call_id": {
+              "description": "Provider-assigned tool call id (e.g. `toolu_01...` from Anthropic).\n\nPreserved from the [`StreamPart::ToolCall`] or `ToolInputStart` frame so the engine can round-trip it back in `Message::Tool` `tool_call_id` without minting a synthetic replacement.\n\n`None` for items that pre-date this field or originate outside the provider stream (e.g. synthetic items in tests).",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "raw_input": {
+              "description": "Raw JSON arguments handed to the tool."
+            },
+            "raw_output": {
+              "description": "Raw JSON output returned by the tool."
+            },
+            "status": {
+              "description": "Tool call lifecycle status.",
+              "default": "pending",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/ToolCallStatus"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "description": "Shell command execution.",
+          "type": "object",
+          "required": [
+            "command",
+            "cwd",
+            "id",
+            "itemKind",
+            "status"
+          ],
+          "properties": {
+            "aggregated_output": {
+              "description": "Merged stdout + stderr capture.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "command": {
+              "description": "Command line as provided to the shell.",
+              "type": "string"
+            },
+            "cwd": {
+              "description": "Working directory the command ran in.",
+              "type": "string"
+            },
+            "duration_ms": {
+              "description": "Wall-clock duration in milliseconds.",
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int64"
+            },
+            "exit_code": {
+              "description": "Process exit code, populated when complete.",
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int32"
+            },
+            "id": {
+              "description": "Per-turn item id.",
+              "type": "string"
+            },
+            "itemKind": {
+              "type": "string",
+              "enum": [
+                "command_execution"
+              ]
+            },
+            "status": {
+              "description": "Command lifecycle status.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/CommandExecutionStatus"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "description": "File edit applied as a multi-file patch.",
+          "type": "object",
+          "required": [
+            "changes",
+            "id",
+            "itemKind",
+            "status"
+          ],
+          "properties": {
+            "changes": {
+              "description": "One entry per file touched.",
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/FileUpdateChange"
+              }
+            },
+            "id": {
+              "description": "Per-turn item id.",
+              "type": "string"
+            },
+            "itemKind": {
+              "type": "string",
+              "enum": [
+                "file_edit"
+              ]
+            },
+            "status": {
+              "description": "Overall patch application status.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/PatchApplyStatus"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "description": "Standalone diff entry (used when a diff is surfaced outside a `ToolCall`).",
+          "type": "object",
+          "required": [
+            "id",
+            "itemKind",
+            "new_text",
+            "path"
+          ],
+          "properties": {
+            "id": {
+              "description": "Per-turn item id.",
+              "type": "string"
+            },
+            "itemKind": {
+              "type": "string",
+              "enum": [
+                "diff"
+              ]
+            },
+            "new_text": {
+              "description": "Post-edit text.",
+              "type": "string"
+            },
+            "old_text": {
+              "description": "Pre-edit text; absent for created files.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "path": {
+              "description": "Affected file.",
+              "type": "string"
+            }
+          }
+        },
+        {
+          "description": "Embedded terminal handle referenced by the UI.",
+          "type": "object",
+          "required": [
+            "id",
+            "itemKind",
+            "terminal_id"
+          ],
+          "properties": {
+            "id": {
+              "description": "Per-turn item id.",
+              "type": "string"
+            },
+            "itemKind": {
+              "type": "string",
+              "enum": [
+                "terminal"
+              ]
+            },
+            "terminal_id": {
+              "description": "Opaque terminal handle issued by the engine.",
+              "type": "string"
+            }
+          }
+        },
+        {
+          "description": "Agent-authored plan step list.",
+          "type": "object",
+          "required": [
+            "id",
+            "itemKind",
+            "steps"
+          ],
+          "properties": {
+            "id": {
+              "description": "Per-turn item id.",
+              "type": "string"
+            },
+            "itemKind": {
+              "type": "string",
+              "enum": [
+                "plan"
+              ]
+            },
+            "steps": {
+              "description": "Ordered steps.",
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/PlanStep"
+              }
+            }
+          }
+        },
+        {
+          "description": "Refreshed list of slash commands or callable tools.",
+          "type": "object",
+          "required": [
+            "commands",
+            "id",
+            "itemKind"
+          ],
+          "properties": {
+            "commands": {
+              "description": "Currently advertised commands.",
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/AvailableCommand"
+              }
+            },
+            "id": {
+              "description": "Per-turn item id.",
+              "type": "string"
+            },
+            "itemKind": {
+              "type": "string",
+              "enum": [
+                "available_commands"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Mode switch (e.g. plan mode toggle).",
+          "type": "object",
+          "required": [
+            "id",
+            "itemKind",
+            "mode_id"
+          ],
+          "properties": {
+            "id": {
+              "description": "Per-turn item id.",
+              "type": "string"
+            },
+            "itemKind": {
+              "type": "string",
+              "enum": [
+                "mode_change"
+              ]
+            },
+            "mode_id": {
+              "description": "New mode identifier.",
+              "type": "string"
+            }
+          }
+        },
+        {
+          "description": "Context compaction marker; corresponds to `PreCompact` / `PostCompact` hooks.",
+          "type": "object",
+          "required": [
+            "id",
+            "itemKind"
+          ],
+          "properties": {
+            "id": {
+              "description": "Per-turn item id.",
+              "type": "string"
+            },
+            "itemKind": {
+              "type": "string",
+              "enum": [
+                "context_compaction"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Engine-emitted notice (info, warning, error) surfaced into the transcript.",
+          "type": "object",
+          "required": [
+            "id",
+            "itemKind",
+            "level",
+            "message"
+          ],
+          "properties": {
+            "id": {
+              "description": "Per-turn item id.",
+              "type": "string"
+            },
+            "itemKind": {
+              "type": "string",
+              "enum": [
+                "system_notice"
+              ]
+            },
+            "level": {
+              "description": "Severity classification.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/NoticeLevel"
+                }
+              ]
+            },
+            "message": {
+              "description": "Human-readable message.",
+              "type": "string"
+            }
+          }
+        }
+      ]
+    },
+    "ItemContent": {
+      "description": "Multi-part content block, 1:1 isomorphic with ACP `ContentBlock`.",
+      "oneOf": [
+        {
+          "description": "Plain text.",
+          "type": "object",
+          "required": [
+            "text",
+            "type"
+          ],
+          "properties": {
+            "annotations": {
+              "description": "Optional ACP-defined annotations payload."
+            },
+            "text": {
+              "description": "Text body.",
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "text"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Base64-encoded image.",
+          "type": "object",
+          "required": [
+            "data",
+            "mime_type",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "description": "Base64 data.",
+              "type": "string"
+            },
+            "mime_type": {
+              "description": "MIME type (e.g. `image/png`).",
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "image"
+              ]
+            },
+            "uri": {
+              "description": "Optional source URI.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Base64-encoded audio.",
+          "type": "object",
+          "required": [
+            "data",
+            "mime_type",
+            "type"
+          ],
+          "properties": {
+            "data": {
+              "description": "Base64 data.",
+              "type": "string"
+            },
+            "mime_type": {
+              "description": "MIME type (e.g. `audio/wav`).",
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "audio"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Reference to an external resource by URI.",
+          "type": "object",
+          "required": [
+            "type",
+            "uri"
+          ],
+          "properties": {
+            "description": {
+              "description": "Optional long description.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "mime_type": {
+              "description": "Optional MIME type hint.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "name": {
+              "description": "Optional short label.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "resource_link"
+              ]
+            },
+            "uri": {
+              "description": "Resource URI.",
+              "type": "string"
+            }
+          }
+        },
+        {
+          "description": "Embedded resource payload.",
+          "type": "object",
+          "required": [
+            "resource",
+            "type"
+          ],
+          "properties": {
+            "resource": {
+              "description": "`ResourceContents` payload; strong typing deferred to a follow-up."
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "resource"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "ItemToolCallContent": {
+      "description": "Tool-call output content, 1:1 isomorphic with ACP `ToolCallContent`.",
+      "oneOf": [
+        {
+          "description": "Generic content block (text / image / etc.).",
+          "type": "object",
+          "required": [
+            "content",
+            "type"
+          ],
+          "properties": {
+            "content": {
+              "description": "Inner content block.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/ItemContent"
+                }
+              ]
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "content"
+              ]
+            }
+          }
+        },
+        {
+          "description": "File diff produced by the tool call.",
+          "type": "object",
+          "required": [
+            "new_text",
+            "path",
+            "type"
+          ],
+          "properties": {
+            "new_text": {
+              "description": "Post-edit text.",
+              "type": "string"
+            },
+            "old_text": {
+              "description": "Pre-edit text; absent for created files.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "path": {
+              "description": "Affected path.",
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "diff"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Reference to an embedded terminal.",
+          "type": "object",
+          "required": [
+            "terminal_id",
+            "type"
+          ],
+          "properties": {
+            "terminal_id": {
+              "description": "Engine-issued terminal handle.",
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "terminal"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "NoticeLevel": {
+      "description": "Severity of an [`Item::SystemNotice`].",
+      "oneOf": [
+        {
+          "description": "Informational.",
+          "type": "string",
+          "enum": [
+            "info"
+          ]
+        },
+        {
+          "description": "Warning; the engine kept running.",
+          "type": "string",
+          "enum": [
+            "warn"
+          ]
+        },
+        {
+          "description": "Recoverable error surfaced to the transcript.",
+          "type": "string",
+          "enum": [
+            "error"
+          ]
+        }
+      ]
+    },
+    "PatchApplyStatus": {
+      "description": "Patch apply outcome for [`Item::FileEdit`].",
+      "oneOf": [
+        {
+          "description": "Patch built but not yet applied.",
+          "type": "string",
+          "enum": [
+            "pending"
+          ]
+        },
+        {
+          "description": "All hunks applied cleanly.",
+          "type": "string",
+          "enum": [
+            "applied"
+          ]
+        },
+        {
+          "description": "At least one hunk rejected.",
+          "type": "string",
+          "enum": [
+            "failed"
+          ]
+        }
+      ]
+    },
+    "PatchChangeKind": {
+      "description": "Kind of [`FileUpdateChange`] applied to a file.",
+      "oneOf": [
+        {
+          "description": "File created.",
+          "type": "string",
+          "enum": [
+            "create"
+          ]
+        },
+        {
+          "description": "Existing file modified.",
+          "type": "string",
+          "enum": [
+            "update"
+          ]
+        },
+        {
+          "description": "File deleted.",
+          "type": "string",
+          "enum": [
+            "delete"
+          ]
+        },
+        {
+          "description": "File moved or renamed.",
+          "type": "string",
+          "enum": [
+            "rename"
+          ]
+        }
+      ]
+    },
+    "PlanStep": {
+      "description": "One step within an agent-authored plan.",
+      "type": "object",
+      "required": [
+        "status",
+        "step"
+      ],
+      "properties": {
+        "status": {
+          "description": "Step lifecycle status.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/PlanStepStatus"
+            }
+          ]
+        },
+        "step": {
+          "description": "Step description.",
+          "type": "string"
+        }
+      }
+    },
+    "PlanStepStatus": {
+      "description": "Lifecycle of a [`PlanStep`].",
+      "oneOf": [
+        {
+          "description": "Not yet started.",
+          "type": "string",
+          "enum": [
+            "pending"
+          ]
+        },
+        {
+          "description": "In progress.",
+          "type": "string",
+          "enum": [
+            "inProgress"
+          ]
+        },
+        {
+          "description": "Done.",
+          "type": "string",
+          "enum": [
+            "completed"
+          ]
+        }
+      ]
+    },
+    "ToolCallLocation": {
+      "description": "File / line hint surfaced to UI alongside a tool call.",
+      "type": "object",
+      "required": [
+        "path"
+      ],
+      "properties": {
+        "line": {
+          "description": "Optional line number (1-based).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "path": {
+          "description": "File path.",
+          "type": "string"
+        }
+      }
+    },
+    "ToolCallStatus": {
+      "description": "Lifecycle of a tool call (mirrors ACP `ToolCallStatus`).",
+      "oneOf": [
+        {
+          "description": "Queued, not yet dispatched.",
+          "type": "string",
+          "enum": [
+            "pending"
+          ]
+        },
+        {
+          "description": "Dispatched and running.",
+          "type": "string",
+          "enum": [
+            "in_progress"
+          ]
+        },
+        {
+          "description": "Finished successfully.",
+          "type": "string",
+          "enum": [
+            "completed"
+          ]
+        },
+        {
+          "description": "Errored out.",
+          "type": "string",
+          "enum": [
+            "failed"
+          ]
+        }
+      ]
+    },
+    "ToolKind": {
+      "description": "Coarse tool classification (mirrors ACP `ToolKind`).",
+      "oneOf": [
+        {
+          "description": "Read-only file or resource access.",
+          "type": "string",
+          "enum": [
+            "read"
+          ]
+        },
+        {
+          "description": "Modify a file or resource in place.",
+          "type": "string",
+          "enum": [
+            "edit"
+          ]
+        },
+        {
+          "description": "Delete a file or resource.",
+          "type": "string",
+          "enum": [
+            "delete"
+          ]
+        },
+        {
+          "description": "Move or rename a file or resource.",
+          "type": "string",
+          "enum": [
+            "move"
+          ]
+        },
+        {
+          "description": "Search a corpus.",
+          "type": "string",
+          "enum": [
+            "search"
+          ]
+        },
+        {
+          "description": "Execute a shell command or script.",
+          "type": "string",
+          "enum": [
+            "execute"
+          ]
+        },
+        {
+          "description": "Internal reasoning (no side effects).",
+          "type": "string",
+          "enum": [
+            "think"
+          ]
+        },
+        {
+          "description": "Fetch a remote resource.",
+          "type": "string",
+          "enum": [
+            "fetch"
+          ]
+        },
+        {
+          "description": "Switch the agent mode.",
+          "type": "string",
+          "enum": [
+            "switch_mode"
+          ]
+        },
+        {
+          "description": "Anything else.",
+          "type": "string",
+          "enum": [
+            "other"
+          ]
+        }
+      ]
+    },
+    "Turn": {
+      "description": "One user-input-to-final-answer cycle within a [`Thread`].\n\nFor MCP, the bridge synthesises a turn boundary around each `tools/call` sequence by listening to the [`TurnStartedNotification`] / [`TurnCompletedNotification`] notifications emitted by the engine.",
+      "type": "object",
+      "required": [
+        "id",
+        "status"
+      ],
+      "properties": {
+        "completedAt": {
+          "description": "Unix timestamp in seconds when the turn ended.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "durationMs": {
+          "description": "`completed_at - started_at`, expressed in milliseconds.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "error": {
+          "description": "Failure details; populated only when `status == Failed`.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/TurnError"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "id": {
+          "description": "Stable turn id, see [`TurnId`].",
+          "type": "string"
+        },
+        "items": {
+          "description": "Ordered, append-only item list.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/Item"
+          }
+        },
+        "itemsView": {
+          "description": "Whether `items` is fully populated, summarised, or unloaded.",
+          "default": "full",
+          "allOf": [
+            {
+              "$ref": "#/definitions/TurnItemsView"
+            }
+          ]
+        },
+        "startedAt": {
+          "description": "Unix timestamp in seconds when the turn started.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "status": {
+          "description": "Lifecycle status of the turn.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/TurnStatus"
+            }
+          ]
+        }
+      }
+    },
+    "TurnError": {
+      "description": "Failure details attached to a [`Turn`] with `status == Failed`.",
+      "type": "object",
+      "required": [
+        "message"
+      ],
+      "properties": {
+        "additionalDetails": {
+          "description": "Free-form diagnostic payload (provider response, exit code, etc.).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "message": {
+          "description": "Short human-readable summary of the failure.",
+          "type": "string"
+        }
+      }
+    },
+    "TurnItemsView": {
+      "description": "Whether [`Turn::items`] has been loaded from the JSONL rollout.",
+      "oneOf": [
+        {
+          "description": "Items not yet read from persistence; the field is intentionally empty.",
+          "type": "string",
+          "enum": [
+            "notLoaded"
+          ]
+        },
+        {
+          "description": "Items collapsed to a single summary entry (history compaction).",
+          "type": "string",
+          "enum": [
+            "summary"
+          ]
+        },
+        {
+          "description": "Fully loaded items.",
+          "type": "string",
+          "enum": [
+            "full"
+          ]
+        }
+      ]
+    },
+    "TurnStatus": {
+      "description": "Lifecycle state of a [`Turn`].",
+      "oneOf": [
+        {
+          "description": "Active; never appears in `turn/completed` notifications.",
+          "type": "string",
+          "enum": [
+            "inProgress"
+          ]
+        },
+        {
+          "description": "Reached a final agent message without errors.",
+          "type": "string",
+          "enum": [
+            "completed"
+          ]
+        },
+        {
+          "description": "Cancelled by `session/cancel` or user abort.",
+          "type": "string",
+          "enum": [
+            "interrupted"
+          ]
+        },
+        {
+          "description": "Engine or provider raised a fatal error.",
+          "type": "string",
+          "enum": [
+            "failed"
+          ]
+        }
+      ]
+    }
+  }
+}

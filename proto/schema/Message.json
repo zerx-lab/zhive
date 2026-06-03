@@ -1,0 +1,188 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Message",
+  "description": "Top-level JSON-RPC 2.0 envelope.\n\nEither side of a session may send any of the three variants; the `client` and `server` labels are application-level roles and impose no wire-layer restriction (this is how LSP `$/`reverse requests and ACP `permission/request` work, see D-008).\n\n# Examples ``` use zhive_proto::{Message, Notification}; let n = Notification::new(\"session/cancel\", None); let bytes = serde_json::to_vec(&Message::Notification(n)).unwrap(); assert!(bytes.starts_with(b\"{\")); ```",
+  "anyOf": [
+    {
+      "description": "Carries a method invocation expecting a paired [`Response`].",
+      "allOf": [
+        {
+          "$ref": "#/definitions/Request"
+        }
+      ]
+    },
+    {
+      "description": "Carries the outcome of a previously sent [`Request`].",
+      "allOf": [
+        {
+          "$ref": "#/definitions/Response"
+        }
+      ]
+    },
+    {
+      "description": "Fire-and-forget event, no response is sent or expected.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/Notification"
+        }
+      ]
+    }
+  ],
+  "definitions": {
+    "ErrorObject": {
+      "description": "Structured error payload (JSON-RPC 2.0 spec [section 5.1][err]).\n\n[err]: https://www.jsonrpc.org/specification#error_object",
+      "type": "object",
+      "required": [
+        "code",
+        "message"
+      ],
+      "properties": {
+        "code": {
+          "description": "Numeric error code; -32700 to -32600 are reserved by spec.",
+          "type": "integer",
+          "format": "int64"
+        },
+        "data": {
+          "description": "Optional free-form diagnostic payload."
+        },
+        "message": {
+          "description": "Short human-readable error string.",
+          "type": "string"
+        }
+      }
+    },
+    "Id": {
+      "description": "JSON-RPC `id` field; numbers, strings and `null` are all valid per spec.",
+      "anyOf": [
+        {
+          "description": "64-bit signed integer; covers all real-world client counters.",
+          "type": "integer",
+          "format": "int64"
+        },
+        {
+          "description": "Opaque string; used by clients that prefer UUIDs.",
+          "type": "string"
+        },
+        {
+          "description": "JSON `null`; permitted by spec but discouraged.",
+          "type": "null"
+        }
+      ]
+    },
+    "JsonRpcVersion": {
+      "type": "string",
+      "const": "2.0"
+    },
+    "Notification": {
+      "description": "JSON-RPC notification: method + params, no id, no response.",
+      "type": "object",
+      "required": [
+        "jsonrpc",
+        "method"
+      ],
+      "properties": {
+        "jsonrpc": {
+          "description": "Always `\"2.0\"`.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/JsonRpcVersion"
+            }
+          ]
+        },
+        "method": {
+          "description": "Method name, e.g. `\"session/update\"`.",
+          "type": "string"
+        },
+        "params": {
+          "description": "Method parameters; serde omits the field when `None`."
+        }
+      }
+    },
+    "Request": {
+      "description": "JSON-RPC request: method + params + correlatable id.\n\n`id` is required by spec; use [`Notification`] instead for fire-and-forget calls.",
+      "type": "object",
+      "required": [
+        "id",
+        "jsonrpc",
+        "method"
+      ],
+      "properties": {
+        "id": {
+          "description": "Correlation id; the [`Response`] echoes the same value.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/Id"
+            }
+          ]
+        },
+        "jsonrpc": {
+          "description": "Always the literal string `\"2.0\"`. Enforced on deserialize.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/JsonRpcVersion"
+            }
+          ]
+        },
+        "method": {
+          "description": "Method name, e.g. `\"session/prompt\"`.",
+          "type": "string"
+        },
+        "params": {
+          "description": "Method parameters; serde omits the field when `None`."
+        }
+      }
+    },
+    "Response": {
+      "description": "JSON-RPC response: either `result` or `error`, never both.",
+      "type": "object",
+      "oneOf": [
+        {
+          "description": "Successful outcome with a free-form JSON payload.",
+          "type": "object",
+          "required": [
+            "result"
+          ],
+          "properties": {
+            "result": true
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Failure outcome carrying a structured error object.",
+          "type": "object",
+          "required": [
+            "error"
+          ],
+          "properties": {
+            "error": {
+              "$ref": "#/definitions/ErrorObject"
+            }
+          },
+          "additionalProperties": false
+        }
+      ],
+      "required": [
+        "id",
+        "jsonrpc"
+      ],
+      "properties": {
+        "id": {
+          "description": "Correlation id echoed from the matching [`Request`].",
+          "allOf": [
+            {
+              "$ref": "#/definitions/Id"
+            }
+          ]
+        },
+        "jsonrpc": {
+          "description": "Always `\"2.0\"`.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/JsonRpcVersion"
+            }
+          ]
+        }
+      }
+    }
+  }
+}

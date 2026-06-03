@@ -7,12 +7,20 @@
 //! `events/turn_started` is `{threadId, turnId}`, not the proto
 //! `TurnStartedNotification` which embeds a whole `Turn`), so this module
 //! deserializes the *actual* wire shapes into [`EngineNotification`].
+//!
+//! All payload types are imported from [`zhive_proto::events`]; no local
+//! hand-copy structs remain in this module.
 
-use serde::Deserialize;
 use serde_json::Value;
 use zhive_proto::domain::{Item, ThreadId, TurnError, TurnId};
+use zhive_proto::events::{
+    ItemAppendedPayload, ItemDeltaPayload, PermissionRequestedPayload, PhaseChangedPayload,
+    SubagentCompletedPayload, SubagentStartedPayload, TurnCompletedPayload, TurnFailedPayload,
+    TurnStartedPayload, UsagePayload,
+};
 use zhive_proto::hook::EnginePhase;
-use zhive_proto::permission::{RequestPermissionRequest, SessionAbortedNotification};
+use zhive_proto::methods as m;
+use zhive_proto::permission::SessionAbortedNotification;
 
 /// A decoded engine notification, ready for the conversation reducer.
 #[derive(Debug, Clone)]
@@ -80,7 +88,7 @@ pub enum EngineNotification {
         /// Opaque request id to echo back when resolving.
         request_id: String,
         /// The permission prompt to render.
-        request: Box<RequestPermissionRequest>,
+        request: Box<zhive_proto::permission::RequestPermissionRequest>,
     },
     /// Token usage reported at the end of a provider call.
     Usage {
@@ -120,73 +128,6 @@ pub enum EngineNotification {
     },
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ThreadTurn {
-    thread_id: ThreadId,
-    turn_id: TurnId,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct TurnFailedPayload {
-    thread_id: ThreadId,
-    turn_id: TurnId,
-    error: TurnError,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ItemAppendedPayload {
-    thread_id: ThreadId,
-    turn_id: TurnId,
-    item: Item,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ItemDeltaPayload {
-    thread_id: ThreadId,
-    turn_id: TurnId,
-    delta: String,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct PhaseChangedPayload {
-    #[serde(default)]
-    thread_id: Option<String>,
-    from: EnginePhase,
-    to: EnginePhase,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct PermissionRequestedPayload {
-    request_id: String,
-    request: RequestPermissionRequest,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct SubagentStartedPayload {
-    parent_thread_id: ThreadId,
-    child_thread_id: ThreadId,
-    #[serde(default)]
-    agent_type: Option<String>,
-    #[serde(default)]
-    description: Option<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct SubagentCompletedPayload {
-    parent_thread_id: ThreadId,
-    child_thread_id: ThreadId,
-    #[serde(default)]
-    has_final_message: bool,
-}
-
 /// Decodes a wire notification `(method, params)` into an [`EngineNotification`].
 ///
 /// Unknown methods and payloads that fail to deserialize both collapse to
@@ -207,101 +148,134 @@ pub fn decode(method: &str, params: Option<Value>) -> EngineNotification {
     let unhandled = || EngineNotification::Unhandled {
         method: method.to_owned(),
     };
-    match method {
-        "events/turn_started" => match serde_json::from_value::<ThreadTurn>(params) {
-            Ok(p) => EngineNotification::TurnStarted {
-                thread_id: p.thread_id,
-                turn_id: p.turn_id,
-            },
-            Err(_) => unhandled(),
-        },
-        "events/turn_completed" => match serde_json::from_value::<ThreadTurn>(params) {
-            Ok(p) => EngineNotification::TurnCompleted {
-                thread_id: p.thread_id,
-                turn_id: p.turn_id,
-            },
-            Err(_) => unhandled(),
-        },
-        "events/turn_failed" => match serde_json::from_value::<TurnFailedPayload>(params) {
-            Ok(p) => EngineNotification::TurnFailed {
-                thread_id: p.thread_id,
-                turn_id: p.turn_id,
-                error: p.error,
-            },
-            Err(_) => unhandled(),
-        },
-        "events/turn_rejected" => {
-            // The reason is a tagged enum; surface the phase it names. The TUI
-            // only needs the reason (to clear `busy` and flash it), so a missing
-            // field never drops this to Unhandled — which would otherwise wedge
-            // the busy spinner forever.
-            let reason = params
-                .get("reason")
-                .and_then(|r| r.get("currentPhase"))
-                .and_then(Value::as_str)
-                .map_or_else(
-                    || "engine busy".to_owned(),
-                    |phase| format!("engine busy (phase: {phase})"),
-                );
-            EngineNotification::TurnRejected { reason }
-        }
-        "events/item_appended" => match serde_json::from_value::<ItemAppendedPayload>(params) {
+
+    if matches!(
+        method,
+        m::EVENT_TURN_STARTED
+            | m::EVENT_TURN_COMPLETED
+            | m::EVENT_TURN_FAILED
+            | m::EVENT_TURN_REJECTED
+    ) {
+        return decode_turn(method, params);
+    }
+
+    if method == m::EVENT_ITEM_APPENDED {
+        return match serde_json::from_value::<ItemAppendedPayload>(params) {
             Ok(p) => EngineNotification::ItemAppended {
                 thread_id: p.thread_id,
                 turn_id: p.turn_id,
                 item: Box::new(p.item),
             },
             Err(_) => unhandled(),
-        },
-        "events/item_delta" => match serde_json::from_value::<ItemDeltaPayload>(params) {
+        };
+    }
+
+    if method == m::EVENT_ITEM_DELTA {
+        return match serde_json::from_value::<ItemDeltaPayload>(params) {
             Ok(p) => EngineNotification::ItemDelta {
                 thread_id: p.thread_id,
                 turn_id: p.turn_id,
                 delta: p.delta,
             },
             Err(_) => unhandled(),
-        },
-        "events/phase_changed" => match serde_json::from_value::<PhaseChangedPayload>(params) {
+        };
+    }
+
+    if method == m::EVENT_PHASE_CHANGED {
+        return match serde_json::from_value::<PhaseChangedPayload>(params) {
             Ok(p) => EngineNotification::PhaseChanged {
-                thread_id: p.thread_id,
+                // PhaseChangedPayload holds Option<ThreadId>; map to Option<String>
+                // so the EngineNotification variant stays wire-type-agnostic.
+                thread_id: p.thread_id.map(|t| t.0.to_string()),
                 from: p.from,
                 to: p.to,
             },
             Err(_) => unhandled(),
-        },
-        "events/session_aborted" => {
-            match serde_json::from_value::<SessionAbortedNotification>(params) {
-                Ok(p) => EngineNotification::SessionAborted(Box::new(p)),
-                Err(_) => unhandled(),
-            }
-        }
-        "events/permission_requested" => {
-            match serde_json::from_value::<PermissionRequestedPayload>(params) {
-                Ok(p) => EngineNotification::PermissionRequested {
-                    request_id: p.request_id,
-                    request: Box::new(p.request),
-                },
-                Err(_) => unhandled(),
-            }
-        }
-        "events/usage" => {
-            // Route through the typed decode helper in zhive-client-native.
-            // We construct a temporary Notification to reuse that function
-            // rather than duplicating the field-extraction logic here.
-            use zhive_client_native::events::decode_usage;
-            use zhive_proto::Notification;
-            let notif = Notification::new(method, Some(params));
-            match decode_usage(&notif) {
-                Some(u) => EngineNotification::Usage {
-                    input_tokens: u.input_tokens,
-                    output_tokens: u.output_tokens,
-                },
-                None => unhandled(),
-            }
-        }
-        "events/subagent_started" | "events/subagent_completed" => decode_subagent(method, params),
-        _ => unhandled(),
+        };
     }
+
+    if method == m::EVENT_SESSION_ABORTED {
+        return match serde_json::from_value::<SessionAbortedNotification>(params) {
+            Ok(p) => EngineNotification::SessionAborted(Box::new(p)),
+            Err(_) => unhandled(),
+        };
+    }
+
+    if method == m::EVENT_PERMISSION_REQUESTED {
+        return match serde_json::from_value::<PermissionRequestedPayload>(params) {
+            Ok(p) => EngineNotification::PermissionRequested {
+                request_id: p.request_id,
+                request: Box::new(p.request),
+            },
+            Err(_) => unhandled(),
+        };
+    }
+
+    if method == m::EVENT_USAGE {
+        return match serde_json::from_value::<UsagePayload>(params) {
+            Ok(p) => EngineNotification::Usage {
+                input_tokens: p.input_tokens,
+                output_tokens: p.output_tokens,
+            },
+            Err(_) => unhandled(),
+        };
+    }
+
+    if method == m::EVENT_SUBAGENT_STARTED || method == m::EVENT_SUBAGENT_COMPLETED {
+        return decode_subagent(method, params);
+    }
+
+    unhandled()
+}
+
+/// Decodes the four turn-lifecycle notifications into [`EngineNotification`].
+fn decode_turn(method: &str, params: Value) -> EngineNotification {
+    let unhandled = || EngineNotification::Unhandled {
+        method: method.to_owned(),
+    };
+
+    if method == m::EVENT_TURN_STARTED {
+        return match serde_json::from_value::<TurnStartedPayload>(params) {
+            Ok(p) => EngineNotification::TurnStarted {
+                thread_id: p.thread_id,
+                turn_id: p.turn_id,
+            },
+            Err(_) => unhandled(),
+        };
+    }
+
+    if method == m::EVENT_TURN_COMPLETED {
+        return match serde_json::from_value::<TurnCompletedPayload>(params) {
+            Ok(p) => EngineNotification::TurnCompleted {
+                thread_id: p.thread_id,
+                turn_id: p.turn_id,
+            },
+            Err(_) => unhandled(),
+        };
+    }
+
+    if method == m::EVENT_TURN_FAILED {
+        return match serde_json::from_value::<TurnFailedPayload>(params) {
+            Ok(p) => EngineNotification::TurnFailed {
+                thread_id: p.thread_id,
+                turn_id: p.turn_id,
+                error: p.error,
+            },
+            Err(_) => unhandled(),
+        };
+    }
+
+    // turn_rejected: the reason is a tagged enum; surface the phase it names.
+    // A missing field still yields a reason so the busy spinner never wedges.
+    let reason = params
+        .get("reason")
+        .and_then(|r| r.get("currentPhase"))
+        .and_then(Value::as_str)
+        .map_or_else(
+            || "engine busy".to_owned(),
+            |phase| format!("engine busy (phase: {phase})"),
+        );
+    EngineNotification::TurnRejected { reason }
 }
 
 /// Decodes the two subagent lifecycle notifications into [`EngineNotification`].
@@ -309,30 +283,33 @@ fn decode_subagent(method: &str, params: Value) -> EngineNotification {
     let unhandled = || EngineNotification::Unhandled {
         method: method.to_owned(),
     };
-    match method {
-        "events/subagent_started" => {
-            match serde_json::from_value::<SubagentStartedPayload>(params) {
-                Ok(p) => EngineNotification::SubagentStarted {
-                    parent_thread_id: p.parent_thread_id,
-                    child_thread_id: p.child_thread_id,
-                    agent_type: p.agent_type,
-                    description: p.description,
-                },
-                Err(_) => unhandled(),
-            }
-        }
-        "events/subagent_completed" => {
-            match serde_json::from_value::<SubagentCompletedPayload>(params) {
-                Ok(p) => EngineNotification::SubagentCompleted {
-                    parent_thread_id: p.parent_thread_id,
-                    child_thread_id: p.child_thread_id,
-                    has_final: p.has_final_message,
-                },
-                Err(_) => unhandled(),
-            }
-        }
-        _ => unhandled(),
+
+    if method == m::EVENT_SUBAGENT_STARTED {
+        return match serde_json::from_value::<SubagentStartedPayload>(params) {
+            Ok(p) => EngineNotification::SubagentStarted {
+                parent_thread_id: p.parent_thread_id,
+                child_thread_id: p.child_thread_id,
+                agent_type: p.agent_type,
+                description: p.description,
+            },
+            Err(_) => unhandled(),
+        };
     }
+
+    if method == m::EVENT_SUBAGENT_COMPLETED {
+        return match serde_json::from_value::<SubagentCompletedPayload>(params) {
+            Ok(p) => EngineNotification::SubagentCompleted {
+                parent_thread_id: p.parent_thread_id,
+                child_thread_id: p.child_thread_id,
+                // Proto payload field is `has_final_message`; TUI variant
+                // field is `has_final` (shorter, no redundancy with variant name).
+                has_final: p.has_final_message,
+            },
+            Err(_) => unhandled(),
+        };
+    }
+
+    unhandled()
 }
 
 #[cfg(test)]

@@ -1,0 +1,26 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "TurnResumedNotification",
+  "description": "Payload of the `events/turn_resumed` server-to-client notification.\n\nDual of [`TurnSuspendedNotification`]: reports that a previously suspended turn was unblocked and resumed execution.\n\n# Examples\n\n``` use zhive_proto::domain::{ThreadId, TurnId}; use zhive_proto::permission::TurnResumedNotification; use std::sync::Arc; let n = TurnResumedNotification::new( ThreadId(Arc::from(\"thread:native/abc\")), TurnId(Arc::from(\"turn:thread:native/abc/0\")), 1_700_000_005, ); let v = serde_json::to_value(&n).unwrap(); assert_eq!(v[\"threadId\"], \"thread:native/abc\"); assert_eq!(v[\"resumedAt\"], 1_700_000_005_i64); let back: TurnResumedNotification = serde_json::from_value(v).unwrap(); assert_eq!(back, n); ```",
+  "type": "object",
+  "required": [
+    "resumedAt",
+    "threadId",
+    "turnId"
+  ],
+  "properties": {
+    "resumedAt": {
+      "description": "Unix timestamp in seconds when the turn resumed.",
+      "type": "integer",
+      "format": "int64"
+    },
+    "threadId": {
+      "description": "Thread whose turn resumed.",
+      "type": "string"
+    },
+    "turnId": {
+      "description": "Resumed turn.",
+      "type": "string"
+    }
+  }
+}

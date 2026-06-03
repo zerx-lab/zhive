@@ -1,0 +1,148 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "HookOutput",
+  "description": "Top-level hook callback output, byte-aligned with Claude Code.\n\nEvery field is optional. The host treats `None` as *no opinion*.\n\n# Examples\n\n``` use zhive_proto::permission::{HookOutput, HookSpecificOutput, PermissionDecision}; let payload = r#\"{ \"hookSpecificOutput\": { \"hookEventName\": \"PreToolUse\", \"permissionDecision\": \"allow\" } }\"#; let out: HookOutput = serde_json::from_str(payload).unwrap(); assert!(out.system_message.is_none()); assert!(matches!( out.hook_specific_output, Some(HookSpecificOutput::PreToolUse { permission_decision: PermissionDecision::Allow, .. }) )); ```",
+  "type": "object",
+  "properties": {
+    "async": {
+      "description": "Run the hook in fire-and-forget mode.",
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "asyncTimeout": {
+      "description": "Async-mode timeout in milliseconds.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "minimum": 0.0
+    },
+    "continue": {
+      "description": "Whether the agent loop should continue after this hook.",
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "hookSpecificOutput": {
+      "description": "Event-specific payload.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/HookSpecificOutput"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "systemMessage": {
+      "description": "Free-form message surfaced to the user transcript.",
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "definitions": {
+    "HookSpecificOutput": {
+      "description": "Event-specific portion of a [`HookOutput`].\n\nThe discriminator key is `hookEventName`, matching Claude Code wire verbatim (the field is both the discriminator *and* a payload field on the JSON object).",
+      "oneOf": [
+        {
+          "description": "Decision and optional mutation for a pre-tool-use hook.",
+          "type": "object",
+          "required": [
+            "hookEventName",
+            "permissionDecision"
+          ],
+          "properties": {
+            "hookEventName": {
+              "type": "string",
+              "enum": [
+                "PreToolUse"
+              ]
+            },
+            "permissionDecision": {
+              "description": "Required four-state vote.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/PermissionDecision"
+                }
+              ]
+            },
+            "permissionDecisionReason": {
+              "description": "Optional rationale shown to the user.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "updatedInput": {
+              "description": "Optional replacement input. Ignored when `permission_decision == Defer`; the host re-validates the schema before dispatching."
+            }
+          }
+        },
+        {
+          "description": "Optional context / output rewrite for a post-tool-use hook.",
+          "type": "object",
+          "required": [
+            "hookEventName"
+          ],
+          "properties": {
+            "additionalContext": {
+              "description": "Extra context to splice into the transcript.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "hookEventName": {
+              "type": "string",
+              "enum": [
+                "PostToolUse"
+              ]
+            },
+            "updatedToolOutput": {
+              "description": "Replacement payload that the agent sees instead of the raw tool output."
+            }
+          }
+        }
+      ]
+    },
+    "PermissionDecision": {
+      "description": "Four-state outcome of a permission check.\n\nAligned verbatim with Claude Code Agent SDK `hookSpecificOutput.permissionDecision`. The folding order is `Deny > Defer > Ask > Allow`: any `Deny` short-circuits, otherwise the most restrictive remaining vote wins.\n\n# Examples\n\n``` use zhive_proto::permission::{reduce, PermissionDecision}; let r = reduce(&[ PermissionDecision::Allow, PermissionDecision::Ask, ]); assert_eq!(r, PermissionDecision::Ask);\n\nlet r = reduce(&[ PermissionDecision::Allow, PermissionDecision::Deny, PermissionDecision::Defer, ]); assert_eq!(r, PermissionDecision::Deny); ```",
+      "oneOf": [
+        {
+          "description": "Hard refusal; the tool call must not execute. Highest priority.",
+          "type": "string",
+          "enum": [
+            "deny"
+          ]
+        },
+        {
+          "description": "Suspend the turn pending follow-up user input.",
+          "type": "string",
+          "enum": [
+            "defer"
+          ]
+        },
+        {
+          "description": "Ask the user via reverse RPC before proceeding.",
+          "type": "string",
+          "enum": [
+            "ask"
+          ]
+        },
+        {
+          "description": "Allow the tool call. Lowest priority.",
+          "type": "string",
+          "enum": [
+            "allow"
+          ]
+        }
+      ]
+    }
+  }
+}

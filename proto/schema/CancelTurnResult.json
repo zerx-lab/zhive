@@ -1,0 +1,15 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "CancelTurnResult",
+  "description": "Result of the `engine/cancel_turn` RPC.\n\n`turn_id` is `Some` when a turn was active and cancelled; `None` when no active turn was found. **Note**: the field is always present on the wire (`\"turnId\": null` when `None`); do not add `skip_serializing_if` here — existing clients assert that the field exists even when null.\n\n# Examples\n\n``` use zhive_proto::rpc::CancelTurnResult; let r = CancelTurnResult::new(None); let v = serde_json::to_value(&r).unwrap(); assert!(v[\"turnId\"].is_null()); let back: CancelTurnResult = serde_json::from_value(v).unwrap(); assert_eq!(back.turn_id, None); ```",
+  "type": "object",
+  "properties": {
+    "turnId": {
+      "description": "Id of the cancelled turn, or `null` when no turn was active.",
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  }
+}

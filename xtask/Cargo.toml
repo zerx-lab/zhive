@@ -20,3 +20,6 @@ path = "src/main.rs"
 [dependencies]
 anyhow = { workspace = true }
 clap   = { workspace = true }
+schemars.workspace = true
+serde_json.workspace = true
+zhive-proto = { workspace = true, features = ["schema"] }

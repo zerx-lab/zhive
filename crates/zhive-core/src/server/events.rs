@@ -39,13 +39,16 @@
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
-use serde::Serialize;
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 use zhive_proto::Message;
 use zhive_proto::Notification;
-use zhive_proto::domain::{ItemId, ThreadId, TurnError, TurnId};
-use zhive_proto::hook::EnginePhase;
+use zhive_proto::events::{
+    ItemAppendedPayload, ItemDeltaPayload, PermissionRequestedPayload, PhaseChangedPayload,
+    SubagentCompletedPayload, SubagentStartedPayload, ThreadForkedPayload, TurnCompletedPayload,
+    TurnFailedPayload, TurnRejectedPayload, TurnRejectedReason, TurnStartedPayload, UsagePayload,
+};
+use zhive_proto::methods;
 use zhive_proto::permission::{
     METHOD_TURN_RESUMED, METHOD_TURN_SUSPENDED, TurnResumedNotification, TurnSuspendedNotification,
 };
@@ -169,144 +172,6 @@ impl EventFilter {
 /// both the event-forwarder task and the `dispatch_message` handler.
 pub type SharedEventFilter = Arc<Mutex<EventFilter>>;
 
-/// Wire-form payload for [`EngineEvent::Usage`].
-///
-/// Carries the token counts reported by one provider call, identified by
-/// the owning thread and turn so clients can aggregate across iterations.
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct UsagePayload<'a> {
-    thread_id: &'a ThreadId,
-    turn_id: &'a TurnId,
-    input_tokens: u64,
-    output_tokens: u64,
-}
-
-/// Wire-form payload for [`EngineEvent::TurnStarted`].
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct TurnStartedPayload<'a> {
-    thread_id: &'a ThreadId,
-    turn_id: &'a TurnId,
-}
-
-/// Wire-form payload for [`EngineEvent::TurnRejected`].
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct TurnRejectedPayload<'a> {
-    thread_id: &'a ThreadId,
-    reason: TurnRejectedReason,
-}
-
-/// Mirrors [`TurnRejectionReason`] on the wire.
-#[derive(Debug, Serialize)]
-#[serde(
-    tag = "kind",
-    rename_all = "snake_case",
-    rename_all_fields = "camelCase"
-)]
-enum TurnRejectedReason {
-    EngineBusy { current_phase: EnginePhase },
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct TurnCompletedPayload<'a> {
-    thread_id: &'a ThreadId,
-    turn_id: &'a TurnId,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct TurnFailedPayload<'a> {
-    thread_id: &'a ThreadId,
-    turn_id: &'a TurnId,
-    error: &'a TurnError,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ItemAppendedPayload<'a> {
-    thread_id: &'a ThreadId,
-    turn_id: &'a TurnId,
-    /// Pulled out so subscribers can index by item id without
-    /// re-deriving it from the embedded item.
-    item_id: &'a ItemId,
-    /// The full item payload (serialised verbatim).
-    item: &'a zhive_proto::domain::Item,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ItemDeltaPayload<'a> {
-    thread_id: &'a ThreadId,
-    turn_id: &'a TurnId,
-    delta: &'a str,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct PhaseChangedPayload<'a> {
-    /// Optional thread id; `None` for engine-global transitions.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    thread_id: Option<&'a ThreadId>,
-    from: EnginePhase,
-    to: EnginePhase,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct PermissionRequestedPayload<'a> {
-    request_id: &'a str,
-    request: &'a zhive_proto::permission::RequestPermissionRequest,
-}
-
-/// JSON-RPC method name for the [`EngineEvent::SubagentStarted`] notification.
-pub const METHOD_SUBAGENT_STARTED: &str = "events/subagent_started";
-
-/// JSON-RPC method name for the [`EngineEvent::SubagentCompleted`] notification.
-pub const METHOD_SUBAGENT_COMPLETED: &str = "events/subagent_completed";
-
-/// Wire-form payload for [`EngineEvent::SubagentStarted`].
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct SubagentStartedPayload<'a> {
-    parent_thread_id: &'a ThreadId,
-    child_thread_id: &'a ThreadId,
-    /// The subagent's declared name / type; omitted when absent.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    agent_type: Option<&'a str>,
-    /// The subagent's declared description; omitted when absent.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    description: Option<&'a str>,
-}
-
-/// Wire-form payload for [`EngineEvent::SubagentCompleted`].
-///
-/// The child's `final_message` item is intentionally not serialised here:
-/// external clients observe the child's items through `events/item_appended`
-/// on the child thread. This notification carries only the parent ↔ child
-/// relationship plus a boolean telling whether a final message was produced.
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct SubagentCompletedPayload<'a> {
-    parent_thread_id: &'a ThreadId,
-    child_thread_id: &'a ThreadId,
-    /// Whether the child turn delivered a non-empty final message.
-    has_final_message: bool,
-}
-
-/// Wire-form payload for [`EngineEvent::ThreadForked`].
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ThreadForkedPayload<'a> {
-    source_thread_id: &'a ThreadId,
-    new_thread_id: &'a ThreadId,
-    /// Inclusive item the fork was taken at; omitted for a full-history fork.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    forked_from_item: Option<&'a ItemId>,
-}
-
 /// Returns the current time as seconds since the Unix epoch.
 ///
 /// Used to stamp `events/turn_suspended` / `events/turn_resumed` notifications,
@@ -332,37 +197,42 @@ fn unix_now_secs() -> i64 {
 pub fn engine_event_to_notification(event: &EngineEvent) -> Option<Notification> {
     let (method, params) = match event {
         EngineEvent::TurnStarted { thread_id, turn_id } => (
-            "events/turn_started",
-            serde_json::to_value(TurnStartedPayload { thread_id, turn_id }).ok()?,
+            methods::EVENT_TURN_STARTED,
+            serde_json::to_value(TurnStartedPayload::new(thread_id.clone(), turn_id.clone()))
+                .ok()?,
         ),
         EngineEvent::TurnRejected { thread_id, reason } => {
             let TurnRejectionReason::EngineBusy { current } = reason;
             (
-                "events/turn_rejected",
-                serde_json::to_value(TurnRejectedPayload {
-                    thread_id,
-                    reason: TurnRejectedReason::EngineBusy {
+                methods::EVENT_TURN_REJECTED,
+                serde_json::to_value(TurnRejectedPayload::new(
+                    thread_id.clone(),
+                    TurnRejectedReason::EngineBusy {
                         current_phase: *current,
                     },
-                })
+                ))
                 .ok()?,
             )
         }
         EngineEvent::TurnCompleted { thread_id, turn_id } => (
-            "events/turn_completed",
-            serde_json::to_value(TurnCompletedPayload { thread_id, turn_id }).ok()?,
+            methods::EVENT_TURN_COMPLETED,
+            serde_json::to_value(TurnCompletedPayload::new(
+                thread_id.clone(),
+                turn_id.clone(),
+            ))
+            .ok()?,
         ),
         EngineEvent::TurnFailed {
             thread_id,
             turn_id,
             error,
         } => (
-            "events/turn_failed",
-            serde_json::to_value(TurnFailedPayload {
-                thread_id,
-                turn_id,
-                error,
-            })
+            methods::EVENT_TURN_FAILED,
+            serde_json::to_value(TurnFailedPayload::new(
+                thread_id.clone(),
+                turn_id.clone(),
+                error.clone(),
+            ))
             .ok()?,
         ),
         EngineEvent::ItemAppended {
@@ -370,13 +240,13 @@ pub fn engine_event_to_notification(event: &EngineEvent) -> Option<Notification>
             turn_id,
             item,
         } => (
-            "events/item_appended",
-            serde_json::to_value(ItemAppendedPayload {
-                thread_id,
-                turn_id,
-                item_id: item.id(),
-                item,
-            })
+            methods::EVENT_ITEM_APPENDED,
+            serde_json::to_value(ItemAppendedPayload::new(
+                thread_id.clone(),
+                turn_id.clone(),
+                item.id().clone(),
+                (**item).clone(),
+            ))
             .ok()?,
         ),
         EngineEvent::ItemDelta {
@@ -384,12 +254,12 @@ pub fn engine_event_to_notification(event: &EngineEvent) -> Option<Notification>
             turn_id,
             delta,
         } => (
-            "events/item_delta",
-            serde_json::to_value(ItemDeltaPayload {
-                thread_id,
-                turn_id,
-                delta,
-            })
+            methods::EVENT_ITEM_DELTA,
+            serde_json::to_value(ItemDeltaPayload::new(
+                thread_id.clone(),
+                turn_id.clone(),
+                delta.clone(),
+            ))
             .ok()?,
         ),
         EngineEvent::PhaseChanged {
@@ -397,27 +267,22 @@ pub fn engine_event_to_notification(event: &EngineEvent) -> Option<Notification>
             from,
             to,
         } => (
-            "events/phase_changed",
-            serde_json::to_value(PhaseChangedPayload {
-                thread_id: thread_id.as_ref(),
-                from: *from,
-                to: *to,
-            })
-            .ok()?,
+            methods::EVENT_PHASE_CHANGED,
+            serde_json::to_value(PhaseChangedPayload::new(thread_id.clone(), *from, *to)).ok()?,
         ),
         EngineEvent::SessionAborted(notif) => (
-            "events/session_aborted",
+            methods::EVENT_SESSION_ABORTED,
             serde_json::to_value(notif.as_ref()).ok()?,
         ),
         EngineEvent::PermissionRequested {
             request_id,
             request,
         } => (
-            "events/permission_requested",
-            serde_json::to_value(PermissionRequestedPayload {
-                request_id: &request_id.0,
-                request: request.as_ref(),
-            })
+            methods::EVENT_PERMISSION_REQUESTED,
+            serde_json::to_value(PermissionRequestedPayload::new(
+                request_id.0.to_string(),
+                (**request).clone(),
+            ))
             .ok()?,
         ),
         EngineEvent::Usage {
@@ -426,13 +291,13 @@ pub fn engine_event_to_notification(event: &EngineEvent) -> Option<Notification>
             input_tokens,
             output_tokens,
         } => (
-            "events/usage",
-            serde_json::to_value(UsagePayload {
-                thread_id,
-                turn_id,
-                input_tokens: *input_tokens,
-                output_tokens: *output_tokens,
-            })
+            methods::EVENT_USAGE,
+            serde_json::to_value(UsagePayload::new(
+                thread_id.clone(),
+                turn_id.clone(),
+                *input_tokens,
+                *output_tokens,
+            ))
             .ok()?,
         ),
         EngineEvent::TurnSuspended {
@@ -465,12 +330,12 @@ pub fn engine_event_to_notification(event: &EngineEvent) -> Option<Notification>
             new_thread_id,
             forked_from_item,
         } => (
-            "events/thread_forked",
-            serde_json::to_value(ThreadForkedPayload {
-                source_thread_id,
-                new_thread_id,
-                forked_from_item: forked_from_item.as_ref(),
-            })
+            methods::EVENT_THREAD_FORKED,
+            serde_json::to_value(ThreadForkedPayload::new(
+                source_thread_id.clone(),
+                new_thread_id.clone(),
+                forked_from_item.clone(),
+            ))
             .ok()?,
         ),
         EngineEvent::SubagentStarted {
@@ -479,13 +344,13 @@ pub fn engine_event_to_notification(event: &EngineEvent) -> Option<Notification>
             agent_type,
             description,
         } => (
-            METHOD_SUBAGENT_STARTED,
-            serde_json::to_value(SubagentStartedPayload {
-                parent_thread_id,
-                child_thread_id,
-                agent_type: agent_type.as_deref(),
-                description: description.as_deref(),
-            })
+            methods::EVENT_SUBAGENT_STARTED,
+            serde_json::to_value(SubagentStartedPayload::new(
+                parent_thread_id.clone(),
+                child_thread_id.clone(),
+                agent_type.clone(),
+                description.clone(),
+            ))
             .ok()?,
         ),
         EngineEvent::SubagentCompleted {
@@ -493,12 +358,12 @@ pub fn engine_event_to_notification(event: &EngineEvent) -> Option<Notification>
             child_thread_id,
             final_message,
         } => (
-            METHOD_SUBAGENT_COMPLETED,
-            serde_json::to_value(SubagentCompletedPayload {
-                parent_thread_id,
-                child_thread_id,
-                has_final_message: final_message.is_some(),
-            })
+            methods::EVENT_SUBAGENT_COMPLETED,
+            serde_json::to_value(SubagentCompletedPayload::new(
+                parent_thread_id.clone(),
+                child_thread_id.clone(),
+                final_message.is_some(),
+            ))
             .ok()?,
         ),
         // Internal engine event suppressed from the wire stream in Phase 1.
@@ -583,14 +448,14 @@ pub fn spawn_event_forwarder(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zhive_proto::domain::Item;
+    use zhive_proto::domain::{Item, ThreadId};
 
     fn tid(s: &str) -> ThreadId {
         ThreadId(Arc::from(s))
     }
 
-    fn turn_id(s: &str) -> TurnId {
-        TurnId(Arc::from(s))
+    fn turn_id(s: &str) -> zhive_proto::domain::TurnId {
+        zhive_proto::domain::TurnId(Arc::from(s))
     }
 
     #[test]
@@ -608,6 +473,7 @@ mod tests {
 
     #[test]
     fn phase_changed_with_thread_includes_field() {
+        use zhive_proto::hook::EnginePhase;
         let ev = EngineEvent::PhaseChanged {
             thread_id: Some(tid("thread:native/p")),
             from: EnginePhase::Idle,
@@ -623,6 +489,7 @@ mod tests {
 
     #[test]
     fn phase_changed_without_thread_omits_field() {
+        use zhive_proto::hook::EnginePhase;
         let ev = EngineEvent::PhaseChanged {
             thread_id: None,
             from: EnginePhase::Idle,
@@ -636,6 +503,7 @@ mod tests {
 
     #[test]
     fn turn_rejected_carries_engine_busy_reason() {
+        use zhive_proto::hook::EnginePhase;
         let ev = EngineEvent::TurnRejected {
             thread_id: tid("t"),
             reason: TurnRejectionReason::EngineBusy {

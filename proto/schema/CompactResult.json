@@ -1,0 +1,47 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "CompactResult",
+  "description": "Result of the `engine/compact` RPC.\n\n# Examples\n\n``` use zhive_proto::rpc::{CompactResult, CompactStatus}; let r = CompactResult::new(CompactStatus::Compacted, 42); let v = serde_json::to_value(&r).unwrap(); assert_eq!(v[\"status\"], \"compacted\"); assert_eq!(v[\"entriesCompacted\"], 42u32); let back: CompactResult = serde_json::from_value(v).unwrap(); assert_eq!(back, r); ```",
+  "type": "object",
+  "required": [
+    "entriesCompacted",
+    "status"
+  ],
+  "properties": {
+    "entriesCompacted": {
+      "description": "Number of transcript items folded into the summary (0 if nothing ran).",
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0.0
+    },
+    "status": {
+      "description": "Whether items were actually compacted or the transcript was already clean.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/CompactStatus"
+        }
+      ]
+    }
+  },
+  "definitions": {
+    "CompactStatus": {
+      "description": "Wire classifier for the `engine/compact` reply.\n\n# Examples\n\n``` use zhive_proto::rpc::CompactStatus; let v = serde_json::to_value(CompactStatus::NothingToCompact).unwrap(); assert_eq!(v, \"nothing_to_compact\"); let back: CompactStatus = serde_json::from_value(v).unwrap(); assert_eq!(back, CompactStatus::NothingToCompact); ```",
+      "oneOf": [
+        {
+          "description": "Compaction ran and replaced transcript items with a summary.",
+          "type": "string",
+          "enum": [
+            "compacted"
+          ]
+        },
+        {
+          "description": "The transcript was already compact; nothing to do.",
+          "type": "string",
+          "enum": [
+            "nothing_to_compact"
+          ]
+        }
+      ]
+    }
+  }
+}

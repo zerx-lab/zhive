@@ -1,0 +1,27 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ForkResult",
+  "description": "Result of the `thread/fork` RPC.\n\n# Examples\n\n``` use std::sync::Arc; use zhive_proto::domain::ThreadId; use zhive_proto::rpc::ForkResult; let r = ForkResult::new(ThreadId(Arc::from(\"thread:native/fork/0\")), 5, false); let v = serde_json::to_value(&r).unwrap(); assert_eq!(v[\"newThreadId\"], \"thread:native/fork/0\"); assert_eq!(v[\"itemsReplayed\"], 5u32); assert_eq!(v[\"summarized\"], false); let back: ForkResult = serde_json::from_value(v).unwrap(); assert_eq!(back, r); ```",
+  "type": "object",
+  "required": [
+    "itemsReplayed",
+    "newThreadId",
+    "summarized"
+  ],
+  "properties": {
+    "itemsReplayed": {
+      "description": "Number of source items replayed into the new thread.",
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0.0
+    },
+    "newThreadId": {
+      "description": "Id of the newly created forked thread.",
+      "type": "string"
+    },
+    "summarized": {
+      "description": "Whether a branch summary was generated and prepended.",
+      "type": "boolean"
+    }
+  }
+}

@@ -749,10 +749,17 @@ pub enum NoticeLevel {
 // Turn lifecycle notification payloads
 // ============================================================
 
-/// Payload of the `turn/started` JSON-RPC notification emitted by the engine.
+/// Bridge-synthesised `turn/started` payload carrying the full [`Turn`] snapshot.
 ///
-/// Bridge crates subscribe to this notification to synthesise Turn boundaries
-/// for transports (ACP / MCP) whose native protocol has no Turn primitive.
+/// Bridge crates subscribe to `events/turn_started` to synthesise Turn
+/// boundaries for transports (ACP / MCP) whose native protocol has no Turn
+/// primitive. This type is produced **by the bridge**, not by the engine.
+///
+/// > **Disambiguation**: the engine itself emits
+/// > [`crate::events::TurnStartedPayload`] (`{threadId, turnId}`) on the
+/// > `events/turn_started` wire method. Bridges reframe that leaner payload as
+/// > a `TurnStartedNotification` with the full `Turn` embedded. The two types
+/// > coexist intentionally.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(rename_all = "camelCase")]
@@ -763,7 +770,16 @@ pub struct TurnStartedNotification {
     pub turn: Turn,
 }
 
-/// Payload of the `turn/completed` JSON-RPC notification emitted by the engine.
+/// Bridge-synthesised `turn/completed` payload carrying the final [`Turn`] snapshot.
+///
+/// The final turn status is one of `Completed`, `Interrupted`, or `Failed`.
+/// This type is produced **by the bridge**, not by the engine directly.
+///
+/// > **Disambiguation**: the engine itself emits
+/// > [`crate::events::TurnCompletedPayload`] (`{threadId, turnId}`) on the
+/// > `events/turn_completed` wire method. Bridges reframe that leaner payload as
+/// > a `TurnCompletedNotification` with the full `Turn` embedded. The two types
+/// > coexist intentionally.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(rename_all = "camelCase")]

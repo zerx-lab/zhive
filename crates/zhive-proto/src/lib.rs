@@ -24,11 +24,14 @@
 #![forbid(unsafe_code)]
 
 pub mod domain;
+pub mod events;
 pub mod framing;
 pub mod hook;
 pub mod initialize;
 pub mod manifest;
+pub mod methods;
 pub mod permission;
+pub mod rpc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

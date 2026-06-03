@@ -1,0 +1,41 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "GetItemsParams",
+  "description": "Params of the `thread/get_items` RPC.\n\n# Examples\n\n``` use zhive_proto::rpc::GetItemsParams; let p: GetItemsParams = serde_json::from_str(r#\"{\"threadId\":\"thread:native/x\"}\"#).unwrap(); assert!(p.turn_id.is_none()); assert!(p.offset.is_none()); assert!(p.limit.is_none()); ```",
+  "type": "object",
+  "required": [
+    "threadId"
+  ],
+  "properties": {
+    "limit": {
+      "description": "Page limit (applied only with `turn_id`).",
+      "default": null,
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "int64"
+    },
+    "offset": {
+      "description": "Page offset (applied only with `turn_id`).",
+      "default": null,
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "int64"
+    },
+    "threadId": {
+      "description": "Thread to read items from.",
+      "type": "string"
+    },
+    "turnId": {
+      "description": "Scope to a single turn; `None` returns full history.",
+      "default": null,
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  }
+}

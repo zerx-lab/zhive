@@ -1,0 +1,16 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ListThreadsParams",
+  "description": "Optional params for the `thread/list` RPC.\n\nOmitting params (or sending `null`) lists every thread. Sending `{ \"cwd\": \"/path\" }` restricts the result to threads created under that directory.\n\n# Examples\n\n``` use zhive_proto::rpc::ListThreadsParams; let p: ListThreadsParams = serde_json::from_str(\"{}\").unwrap(); assert!(p.cwd.is_none()); let p: ListThreadsParams = serde_json::from_str(r#\"{\"cwd\":\"/work\"}\"#).unwrap(); assert_eq!(p.cwd.as_deref(), Some(\"/work\")); ```",
+  "type": "object",
+  "properties": {
+    "cwd": {
+      "description": "Optional working-directory filter; `None` lists all threads.",
+      "default": null,
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  }
+}

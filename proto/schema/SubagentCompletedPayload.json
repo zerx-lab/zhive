@@ -1,0 +1,25 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "SubagentCompletedPayload",
+  "description": "Payload of the `events/subagent_completed` notification.\n\nThe child's `final_message` item is intentionally not serialised; external clients observe the child's items via `events/item_appended` on the child thread. This notification carries only the parent–child relationship and a boolean indicating whether a final message was produced.\n\n# Examples\n\n``` use std::sync::Arc; use zhive_proto::domain::ThreadId; use zhive_proto::events::SubagentCompletedPayload; let p = SubagentCompletedPayload::new( ThreadId(Arc::from(\"thread:native/parent\")), ThreadId(Arc::from(\"thread:native/child\")), true, ); let v = serde_json::to_value(&p).unwrap(); assert_eq!(v[\"hasFinalMessage\"], true); let back: SubagentCompletedPayload = serde_json::from_value(v).unwrap(); assert_eq!(back, p); ```",
+  "type": "object",
+  "required": [
+    "childThreadId",
+    "parentThreadId"
+  ],
+  "properties": {
+    "childThreadId": {
+      "description": "Completed child thread.",
+      "type": "string"
+    },
+    "hasFinalMessage": {
+      "description": "`true` when the child turn produced a non-empty final message.\n\nAbsent from the wire when `false`; deserialization defaults to `false`.",
+      "default": false,
+      "type": "boolean"
+    },
+    "parentThreadId": {
+      "description": "Parent thread that spawned the subagent.",
+      "type": "string"
+    }
+  }
+}

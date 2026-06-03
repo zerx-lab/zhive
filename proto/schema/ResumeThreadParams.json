@@ -1,0 +1,15 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ResumeThreadParams",
+  "description": "Params of the `engine/resume_thread` RPC.\n\n# Examples\n\n``` use zhive_proto::rpc::ResumeThreadParams; let p: ResumeThreadParams = serde_json::from_str(r#\"{\"threadId\":\"thread:native/abc\"}\"#).unwrap(); assert_eq!(p.thread_id.0.as_ref(), \"thread:native/abc\"); ```",
+  "type": "object",
+  "required": [
+    "threadId"
+  ],
+  "properties": {
+    "threadId": {
+      "description": "Thread to restore into engine memory.",
+      "type": "string"
+    }
+  }
+}

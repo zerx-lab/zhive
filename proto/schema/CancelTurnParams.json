@@ -1,0 +1,15 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "CancelTurnParams",
+  "description": "Params of the `engine/cancel_turn` RPC.\n\n# Examples\n\n``` use zhive_proto::rpc::CancelTurnParams; let p: CancelTurnParams = serde_json::from_str(r#\"{\"threadId\":\"thread:native/x\"}\"#).unwrap(); assert_eq!(p.thread_id.0.as_ref(), \"thread:native/x\"); ```",
+  "type": "object",
+  "required": [
+    "threadId"
+  ],
+  "properties": {
+    "threadId": {
+      "description": "Thread whose active turn should be cancelled.",
+      "type": "string"
+    }
+  }
+}

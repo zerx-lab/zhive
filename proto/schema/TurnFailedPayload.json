@@ -1,0 +1,51 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "TurnFailedPayload",
+  "description": "Payload of the `events/turn_failed` notification.\n\n# Examples\n\n``` use std::sync::Arc; use zhive_proto::domain::{ThreadId, TurnError, TurnId}; use zhive_proto::events::TurnFailedPayload; let err: TurnError = serde_json::from_str(r#\"{\"message\":\"oops\"}\"#).unwrap(); let p = TurnFailedPayload::new( ThreadId(Arc::from(\"thread:native/a\")), TurnId(Arc::from(\"turn:thread:native/a/0\")), err.clone(), ); let v = serde_json::to_value(&p).unwrap(); // TurnError is nested under the \"error\" field. assert_eq!(v[\"error\"][\"message\"], \"oops\"); let back: TurnFailedPayload = serde_json::from_value(v).unwrap(); assert_eq!(back.error, err); ```",
+  "type": "object",
+  "required": [
+    "error",
+    "threadId",
+    "turnId"
+  ],
+  "properties": {
+    "error": {
+      "description": "Failure details.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/TurnError"
+        }
+      ]
+    },
+    "threadId": {
+      "description": "Thread the turn failed on.",
+      "type": "string"
+    },
+    "turnId": {
+      "description": "Failed turn id.",
+      "type": "string"
+    }
+  },
+  "definitions": {
+    "TurnError": {
+      "description": "Failure details attached to a [`Turn`] with `status == Failed`.",
+      "type": "object",
+      "required": [
+        "message"
+      ],
+      "properties": {
+        "additionalDetails": {
+          "description": "Free-form diagnostic payload (provider response, exit code, etc.).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "message": {
+          "description": "Short human-readable summary of the failure.",
+          "type": "string"
+        }
+      }
+    }
+  }
+}

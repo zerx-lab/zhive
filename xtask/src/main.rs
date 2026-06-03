@@ -3,18 +3,38 @@
 //! Dispatch shape:
 //!   * `cargo xtask check-upstream` -- diff rmcp / acp pinned versions against latest.
 //!   * `cargo xtask dist` -- build the `dist` profile artefacts (Phase 3).
+//!   * `cargo xtask schema` -- emit JSON Schema files for all public proto wire types.
 //!
-//! Phase 1 placeholder so the binary compiles and the dispatch contract
-//! is visible. `gen-proto` from the `ConnectRPC` era has been removed
-//! (D-003 R3+R4 终版): the schema is now plain `serde + schemars`.
+//! `gen-proto` from the `ConnectRPC` era has been removed (D-003 R3+R4 终版):
+//! the schema is now plain `serde + schemars`.  Run `cargo xtask schema` to
+//! regenerate `proto/schema/*.json`.
+
+mod schema;
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    match args.next().as_deref() {
-        Some("check-upstream") => println!("xtask check-upstream: not yet implemented"),
-        Some("dist") => println!("xtask dist: not yet implemented"),
-        Some(other) => eprintln!("unknown xtask subcommand: {other}"),
-        None => eprintln!("usage: cargo xtask <check-upstream|dist>"),
+    let result = match args.next().as_deref() {
+        Some("check-upstream") => {
+            println!("xtask check-upstream: not yet implemented");
+            Ok(())
+        }
+        Some("dist") => {
+            println!("xtask dist: not yet implemented");
+            Ok(())
+        }
+        Some("schema") => schema::run(),
+        Some(other) => {
+            eprintln!("unknown xtask subcommand: {other}");
+            Ok(())
+        }
+        None => {
+            eprintln!("usage: cargo xtask <check-upstream|dist|schema>");
+            Ok(())
+        }
+    };
+    if let Err(e) = result {
+        eprintln!("error: {e:#}");
+        std::process::exit(1);
     }
 }
 

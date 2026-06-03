@@ -5055,6 +5055,9 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "clap",
+ "schemars 0.8.22",
+ "serde_json",
+ "zhive-proto",
 ]
 
 [[package]]
