@@ -34,7 +34,9 @@ use std::sync::Arc;
 
 use zhive_proto::domain::{Item, Thread, ThreadId, TurnId, TurnStatus};
 use zhive_proto::hook::EnginePhase;
+use zhive_proto::permission::RequestPermissionRequest;
 
+use crate::permission::{RequestContext, pending::RequestKey};
 use crate::persistence::RolloutEntry;
 use crate::persistence::writer::StorageWriteOp;
 use crate::state::ThreadHandle;
@@ -50,6 +52,29 @@ use super::submission::{GetItemsError, ResumeError, ResumeReply};
 /// shutting-down writer cannot stall resume. On timeout we read the current
 /// on-disk state (best-effort), matching fork's semantics.
 const RESUME_FLUSH_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// A pending permission request recovered from the rollout during resume (B6).
+///
+/// Holds the decoded [`RequestKey`] (so the engine can re-register it without
+/// re-issuing a new number) plus the turn context needed to emit `TurnResumed`
+/// and the payload needed to re-emit `PermissionRequested` to a reconnecting
+/// client.
+struct RestoredPending {
+    /// The numeric key that maps to the wire form `perm:<key>`.
+    key: RequestKey,
+    /// Turn context (thread + turn) for `TurnResumed` emission.
+    context: RequestContext,
+    /// The full permission request payload, re-emitted on resume.
+    request: Box<RequestPermissionRequest>,
+}
+
+/// Rollout items grouped by turn plus any unresolved pending permissions (B6).
+struct RestoredHistory {
+    /// Items per turn, in file order.
+    turns: Vec<(TurnId, Vec<Item>)>,
+    /// Pending permission requests not yet superseded by a `PermissionResolved`.
+    pending: Vec<RestoredPending>,
+}
 
 impl EngineInner {
     /// Returns persisted threads, most-recently-updated first.
@@ -99,6 +124,12 @@ impl EngineInner {
     /// * [`ResumeError::ThreadNotFound`] — no row for `thread_id` in the index.
     /// * [`ResumeError::EngineBusy`] — engine phase was not `Idle`.
     /// * [`ResumeError::ReplayFailed`] — reading the rollout failed.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "resume_thread spans the flush + rollout-read + seed + B6-pending restore \
+                  steps as one logical unit; splitting would require threading more \
+                  references without a readability gain"
+    )]
     pub(in crate::engine) async fn resume_thread(
         self: &Arc<Self>,
         thread_id: ThreadId,
@@ -153,20 +184,98 @@ impl EngineInner {
         //    flattens away turn ids; reading the entries directly keeps the
         //    original per-turn structure so the restored transcript faithfully
         //    mirrors the persisted one (and `turns_restored` is accurate).
+        //    Also recovers any unresolved pending permission requests (B6).
         let path = storage.rollout_path(&thread_id.0);
-        let grouped = read_rollout_turns(&path).await?;
+        let history = read_rollout_turns(&path).await?;
 
-        let items_restored: u32 = grouped
+        let items_restored: u32 = history
+            .turns
             .iter()
             .map(|(_, items)| u32::try_from(items.len()).unwrap_or(u32::MAX))
             .fold(0u32, u32::saturating_add);
-        let turns_restored = u32::try_from(grouped.len()).unwrap_or(u32::MAX);
+        let turns_restored = u32::try_from(history.turns.len()).unwrap_or(u32::MAX);
 
         // 6. Register the resident handle and seed each restored turn into the
         //    in-memory transcript. `get_or_init` reuses an already-resident
         //    handle (idempotent re-resume) or creates a fresh idle one.
         let handle = self.threads().get_or_init(&thread_id).await;
-        seed_history(&handle, grouped).await;
+        seed_history(&handle, history.turns).await;
+
+        // 7. Re-register any unresolved pending permission requests so a
+        //    reconnecting client can answer them via `session/resume_permission`
+        //    (B6).  For each pending entry we:
+        //      a) re-register the key in `PendingPermissions` (so the resolver can
+        //         find it by wire id) and get a fresh receiver,
+        //      b) re-emit `PermissionRequested` + `TurnSuspended` so the client sees
+        //         the approval prompt again,
+        //      c) spawn a lightweight "cleanup" task that awaits the outcome and
+        //         writes `PermissionResolved` to persist the answer.
+        //
+        //    **Scope of B6**: this restores the *visibility and answerability* of the
+        //    prompt; automatic turn-body replay after the permission is answered is
+        //    out of scope (see `RolloutEntry::PendingPermission` doc comment).
+        if !history.pending.is_empty() {
+            let reducer = self.permission_reducer();
+            let events_tx = self.events_tx().clone();
+            let inner_arc = Arc::clone(self);
+
+            for p in history.pending {
+                // a) Re-register the key and obtain a fresh receiver.
+                let rx = reducer.reinstate_for_resume(p.key, p.context.clone());
+
+                // b) Re-emit PermissionRequested + TurnSuspended.
+                let wire_id = p.key.to_wire();
+                let _ = events_tx.send(super::event::EngineEvent::PermissionRequested {
+                    request_id: wire_id.clone(),
+                    request: p.request,
+                });
+                let _ = events_tx.send(super::event::EngineEvent::TurnSuspended {
+                    thread_id: p.context.thread_id.clone(),
+                    turn_id: p.context.turn_id.clone(),
+                    request_id: wire_id.clone(),
+                    reason: Some("resumed: awaiting prior deferred permission decision".into()),
+                });
+
+                // c) Spawn a cleanup task that awaits the outcome and persists
+                //    `PermissionResolved`, plus optionally emits `TurnResumed`.
+                //    This task intentionally does NOT re-run the turn body — that
+                //    is a future enhancement (see B6 spec §4 scope note).
+                let inner_for_task = Arc::clone(&inner_arc);
+                let reducer_for_task = reducer.clone();
+                let wire_id_str = wire_id.0.to_string();
+                let p_thread_id = p.context.thread_id.clone();
+                let p_turn_id = p.context.turn_id.clone();
+                tokio::spawn(async move {
+                    match reducer_for_task.wait_unbounded(rx).await {
+                        Ok(_outcome) => {
+                            // Persist the resolution so a second resume does not
+                            // re-surface this prompt.
+                            inner_for_task.enqueue_storage_op(StorageWriteOp::PermissionResolved {
+                                thread_id: p_thread_id.clone(),
+                                request_id: wire_id_str.clone(),
+                                timestamp: super::lifecycle::unix_now_pub(),
+                            });
+                            // Emit TurnResumed so observers know the turn is no
+                            // longer suspended (even though it won't auto-continue).
+                            let _ = inner_for_task.events_tx().send(
+                                super::event::EngineEvent::TurnResumed {
+                                    thread_id: p_thread_id,
+                                    turn_id: p_turn_id,
+                                },
+                            );
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                name: "zhive.engine.resume.pending_perm_abandoned",
+                                request_id = %wire_id_str,
+                                error = %err,
+                                "reinstated pending permission was abandoned without resolution"
+                            );
+                        }
+                    }
+                });
+            }
+        }
 
         // 7. Ensure the thread is Idle (a freshly created handle already is;
         //    this normalises a possibly stale status on a re-resume).
@@ -243,19 +352,35 @@ impl EngineInner {
 
 /// Reads a rollout file and groups its items into turns, in file order.
 ///
-/// Returns one `(TurnId, Vec<Item>)` entry per distinct turn, ordered by the
-/// turn's first appearance in the rollout. A missing rollout file yields an
-/// empty list (a thread whose rollout was never written has no history to
-/// restore). `Session` / `Leaf` entries are ignored.
-async fn read_rollout_turns(
-    path: &std::path::Path,
-) -> Result<Vec<(TurnId, Vec<Item>)>, ResumeError> {
-    let entries = match crate::persistence::read_all(path).await {
+/// Returns a [`RestoredHistory`] containing:
+///
+/// - one `(TurnId, Vec<Item>)` entry per distinct turn (ordered by first
+///   appearance in the rollout), and
+/// - any [`RestoredPending`] entries for permission requests that were written
+///   as [`RolloutEntry::PendingPermission`] but never superseded by a matching
+///   [`RolloutEntry::PermissionResolved`].
+///
+/// A missing rollout file yields an empty history (a thread whose rollout was
+/// never written has no history to restore). `Session` / `Leaf` entries are
+/// ignored. The `Compaction` entry discards all prior accumulated turns.
+///
+/// Pending permission recovery (B6): the map is keyed by `request_id` (the
+/// wire string).  `PendingPermission` inserts; `PermissionResolved` removes.
+/// `Compaction` does **not** clear the pending map — pending requests are
+/// control-flow state independent of the item history.
+async fn read_rollout_turns(path: &std::path::Path) -> Result<RestoredHistory, ResumeError> {
+    // B8: use the tolerant reader so a crash-truncated trailing line does not
+    // abort the whole resume.  A corrupt mid-file line still surfaces as
+    // `ResumeError::ReplayFailed`.
+    let entries = match crate::persistence::rollout::read_all_tolerant(path).await {
         Ok(e) => e,
         Err(crate::persistence::StorageError::Io(io))
             if io.kind() == std::io::ErrorKind::NotFound =>
         {
-            return Ok(Vec::new());
+            return Ok(RestoredHistory {
+                turns: Vec::new(),
+                pending: Vec::new(),
+            });
         }
         Err(other) => {
             return Err(ResumeError::ReplayFailed {
@@ -273,6 +398,13 @@ async fn read_rollout_turns(
     // Any turns written after the compaction entry are then appended normally.
     let mut order: Vec<TurnId> = Vec::new();
     let mut by_turn: HashMap<TurnId, Vec<Item>> = HashMap::new();
+
+    // B6: collect pending permissions.  Keyed by wire request_id string.
+    // PendingPermission inserts; PermissionResolved removes.
+    // On decode failure of the numeric key we skip the entry with a warning
+    // (best-effort: a malformed key in the rollout should not abort resume).
+    let mut pending_map: HashMap<String, RestoredPending> = HashMap::new();
+
     for entry in entries {
         match entry {
             RolloutEntry::Item { turn_id, item, .. } => {
@@ -293,23 +425,68 @@ async fn read_rollout_turns(
                 // Discard all prior turns and replace with the compaction
                 // replacement transcript. Turns written after this entry in
                 // the rollout will be appended normally via the `Item` arm.
+                // The pending permission map is intentionally NOT cleared here:
+                // a permission request is control-flow state, not item history.
                 order.clear();
                 by_turn.clear();
                 let tid = TurnId(Arc::from(turn_id.as_str()));
                 order.push(tid.clone());
                 by_turn.insert(tid, replacement.into_iter().map(|b| *b).collect());
             }
+            RolloutEntry::PendingPermission {
+                thread_id,
+                turn_id,
+                request_id,
+                request,
+                ..
+            } => {
+                // Decode the numeric key from the wire form.
+                use crate::engine::submission::PermissionRequestId;
+                use crate::permission::pending::InvalidRequestId;
+                let wire = PermissionRequestId(Arc::from(request_id.as_str()));
+                match RequestKey::from_wire(&wire) {
+                    Ok(key) => {
+                        let context = RequestContext {
+                            thread_id: ThreadId(Arc::from(thread_id.as_str())),
+                            turn_id: TurnId(Arc::from(turn_id.as_str())),
+                        };
+                        pending_map.insert(
+                            request_id,
+                            RestoredPending {
+                                key,
+                                context,
+                                request,
+                            },
+                        );
+                    }
+                    Err(InvalidRequestId(bad)) => {
+                        tracing::warn!(
+                            name: "zhive.engine.resume.pending_perm_bad_key",
+                            request_id = %bad,
+                            "PendingPermission entry has unparseable request_id; skipping"
+                        );
+                    }
+                }
+            }
+            RolloutEntry::PermissionResolved { request_id, .. } => {
+                // Remove the matching pending entry; the request was answered.
+                pending_map.remove(&request_id);
+            }
             _ => {} // Session / Leaf: ignored for history reconstruction.
         }
     }
 
-    Ok(order
+    let turns = order
         .into_iter()
         .map(|tid| {
             let items = by_turn.remove(&tid).unwrap_or_default();
             (tid, items)
         })
-        .collect())
+        .collect();
+
+    let pending = pending_map.into_values().collect();
+
+    Ok(RestoredHistory { turns, pending })
 }
 
 /// Seeds restored turns into the handle's in-memory transcript.
@@ -420,6 +597,8 @@ mod tests {
             timestamp: 0,
             cwd: "/".into(),
             parent_session: None,
+            subagent_parent: None,
+            source: None,
         })
         .await
         .unwrap();
@@ -600,6 +779,8 @@ mod tests {
             timestamp: 0,
             cwd: "/".into(),
             parent_session: None,
+            subagent_parent: None,
+            source: None,
         })
         .await
         .unwrap();
@@ -712,6 +893,204 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ----------------------------------------------------------------
+    // B6: pending permission resume tests
+    // ----------------------------------------------------------------
+
+    /// Helpers shared by the B6 resume tests.
+    fn make_perm_request_entry(
+        tid: &str,
+        tool: &str,
+    ) -> zhive_proto::permission::RequestPermissionRequest {
+        serde_json::from_value(serde_json::json!({
+            "threadId": tid,
+            "resourceType": "tool",
+            "name": tool,
+            "reason": "test",
+            "options": []
+        }))
+        .expect("perm request fixture")
+    }
+
+    /// Seeds a thread with a `PendingPermission` entry but no matching
+    /// `PermissionResolved` → resume must re-register the pending request.
+    #[tokio::test]
+    async fn resume_restores_pending_permission() {
+        use crate::engine::submission::PermissionRequestId;
+        use crate::persistence::{RolloutEntry, RolloutWriter};
+        use std::path::PathBuf;
+        use zhive_proto::domain::{Thread, ThreadSource, ThreadStatus};
+
+        let (inner, _dir, storage) = inner_with_storage().await;
+        let thread = tid("thread:native/perm-resume");
+
+        // Seed SQL index row.
+        storage
+            .state
+            .upsert_thread(&Thread {
+                id: thread.clone(),
+                session_id: None,
+                forked_from: None,
+                subagent_parent: None,
+                preview: "perm test".into(),
+                ephemeral: false,
+                model_provider: "test".into(),
+                created_at: 1,
+                updated_at: 2,
+                status: ThreadStatus::Idle,
+                cwd: PathBuf::from("/"),
+                source: ThreadSource::User,
+                name: None,
+                turns: vec![],
+            })
+            .await
+            .unwrap();
+
+        // Write a rollout: Session + one Item + one PendingPermission (no Resolved).
+        let rollout_path = storage.rollout_path(&thread.0);
+        let mut w = RolloutWriter::open(rollout_path).await.unwrap();
+        w.append(&RolloutEntry::Session {
+            version: 4,
+            id: thread.0.to_string(),
+            timestamp: 0,
+            cwd: "/".into(),
+            parent_session: None,
+            subagent_parent: None,
+            source: None,
+        })
+        .await
+        .unwrap();
+        let turn0 = format!("turn:{}/0", thread.0);
+        w.append(&RolloutEntry::Item {
+            thread_id: thread.0.to_string(),
+            turn_id: turn0.clone(),
+            timestamp: 1,
+            item: Box::new(Item::AgentMessage {
+                id: ItemId(Arc::from("item:0")),
+                text: "hello".into(),
+            }),
+        })
+        .await
+        .unwrap();
+        w.append(&RolloutEntry::PendingPermission {
+            thread_id: thread.0.to_string(),
+            turn_id: turn0.clone(),
+            timestamp: 2,
+            request_id: "perm:3".into(),
+            request: Box::new(make_perm_request_entry(&thread.0, "bash")),
+        })
+        .await
+        .unwrap();
+        w.sync_all().await.unwrap();
+        drop(w);
+
+        // Resume the thread.
+        let reply = inner
+            .resume_thread(thread.clone())
+            .await
+            .expect("resume must succeed");
+        assert_eq!(reply.items_restored, 1, "one item restored");
+
+        // After resume, the pending permission map must have one entry for
+        // the reinstated key (perm:3 → key 3).
+        let reducer = inner.permission_reducer();
+        assert_eq!(
+            reducer.pending().len(),
+            1,
+            "reinstated pending permission must be registered"
+        );
+
+        // Resolving via wire id must succeed (key is re-registered).
+        let wire = PermissionRequestId(Arc::from("perm:3"));
+        reducer
+            .resolve_by_wire_id(
+                &wire,
+                zhive_proto::permission::PermissionOutcome::Selected {
+                    option_id: "allow-once".into(),
+                },
+            )
+            .expect("resolve of reinstated request must succeed");
+    }
+
+    /// If a rollout contains `PendingPermission` AND a matching
+    /// `PermissionResolved`, resume must NOT re-register the request.
+    #[tokio::test]
+    async fn resume_skips_resolved_pending_permission() {
+        use crate::persistence::{RolloutEntry, RolloutWriter};
+        use std::path::PathBuf;
+        use zhive_proto::domain::{Thread, ThreadSource, ThreadStatus};
+
+        let (inner, _dir, storage) = inner_with_storage().await;
+        let thread = tid("thread:native/perm-resolved");
+
+        storage
+            .state
+            .upsert_thread(&Thread {
+                id: thread.clone(),
+                session_id: None,
+                forked_from: None,
+                subagent_parent: None,
+                preview: "perm resolved".into(),
+                ephemeral: false,
+                model_provider: "test".into(),
+                created_at: 1,
+                updated_at: 2,
+                status: ThreadStatus::Idle,
+                cwd: PathBuf::from("/"),
+                source: ThreadSource::User,
+                name: None,
+                turns: vec![],
+            })
+            .await
+            .unwrap();
+
+        // Rollout: Session + PendingPermission + PermissionResolved.
+        let rollout_path = storage.rollout_path(&thread.0);
+        let mut w = RolloutWriter::open(rollout_path).await.unwrap();
+        w.append(&RolloutEntry::Session {
+            version: 4,
+            id: thread.0.to_string(),
+            timestamp: 0,
+            cwd: "/".into(),
+            parent_session: None,
+            subagent_parent: None,
+            source: None,
+        })
+        .await
+        .unwrap();
+        w.append(&RolloutEntry::PendingPermission {
+            thread_id: thread.0.to_string(),
+            turn_id: format!("turn:{}/0", thread.0),
+            timestamp: 1,
+            request_id: "perm:5".into(),
+            request: Box::new(make_perm_request_entry(&thread.0, "read_file")),
+        })
+        .await
+        .unwrap();
+        w.append(&RolloutEntry::PermissionResolved {
+            thread_id: thread.0.to_string(),
+            request_id: "perm:5".into(),
+            timestamp: 2,
+        })
+        .await
+        .unwrap();
+        w.sync_all().await.unwrap();
+        drop(w);
+
+        inner
+            .resume_thread(thread.clone())
+            .await
+            .expect("resume must succeed");
+
+        // No pending permission must be registered — the Resolved cancelled it.
+        let reducer = inner.permission_reducer();
+        assert_eq!(
+            reducer.pending().len(),
+            0,
+            "resolved permission must not be re-registered on resume"
+        );
     }
 
     /// After resume, the prompt the engine would build for the next turn

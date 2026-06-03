@@ -42,7 +42,7 @@ pub use memories_db::MemoriesDb;
 #[doc(inline)]
 pub use preview::{PREVIEW_MAX_CHARS, derive_preview_from_items, truncate_preview};
 #[doc(inline)]
-pub use rollout::{RolloutEntry, RolloutWriter, read_all};
+pub use rollout::{RolloutEntry, RolloutWriter, read_all, read_all_tolerant};
 #[doc(inline)]
 pub use session_index::SessionIndexEntry;
 #[doc(inline)]
@@ -160,6 +160,7 @@ impl Storage {
     /// w.append(&RolloutEntry::Session {
     ///     version: 3, id: source.0.to_string(), timestamp: 0,
     ///     cwd: "/".into(), parent_session: None,
+    ///     subagent_parent: None, source: None,
     /// }).await?;
     /// for n in 0..2 {
     ///     w.append(&RolloutEntry::Item {
@@ -460,6 +461,8 @@ mod tests {
             timestamp: 0,
             cwd: "/".into(),
             parent_session: None,
+            subagent_parent: None,
+            source: None,
         })
         .await
         .unwrap();
@@ -547,6 +550,8 @@ mod tests {
             timestamp: 0,
             cwd: "/work/project".into(),
             parent_session: None,
+            subagent_parent: None,
+            source: None,
         })
         .await
         .unwrap();
@@ -631,6 +636,8 @@ mod tests {
             timestamp: 0,
             cwd: "/legacy/dir".into(),
             parent_session: None,
+            subagent_parent: None,
+            source: None,
         })
         .await
         .unwrap();

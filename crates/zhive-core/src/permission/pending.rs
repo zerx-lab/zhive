@@ -159,6 +159,59 @@ impl PendingPermissions {
         guard.remove(&key).map(|entry| (entry.tx, entry.context))
     }
 
+    /// Re-registers a pending entry under an explicit key (resume path, B6).
+    ///
+    /// Used when restoring a suspended turn after a process restart: the
+    /// persisted `request_id` is decoded back into a [`RequestKey`] and
+    /// re-inserted here, paired with a fresh oneshot so the resume handler can
+    /// deliver the user's decision.
+    ///
+    /// Bumps the internal counter past `key.0` so future
+    /// [`Self::insert_with_context`] calls never collide with a reinstated id.
+    /// Calling this twice for the same key silently overwrites the prior entry
+    /// (set semantics; resume is idempotent).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use tokio::sync::oneshot;
+    /// use zhive_proto::permission::PermissionOutcome;
+    /// use zhive_proto::domain::{ThreadId, TurnId};
+    /// use zhive_core::permission::pending::{PendingPermissions, RequestKey, RequestContext};
+    ///
+    /// let pp = PendingPermissions::new();
+    /// let (tx, _rx) = oneshot::channel::<PermissionOutcome>();
+    /// let key = RequestKey(5);
+    /// let ctx = RequestContext {
+    ///     thread_id: ThreadId(Arc::from("t")),
+    ///     turn_id: TurnId(Arc::from("turn:0")),
+    /// };
+    /// pp.reinstate(key, tx, Some(ctx));
+    /// assert_eq!(pp.len(), 1);
+    ///
+    /// // The internal counter is now past 5 so a new insert gets id >= 6.
+    /// let (tx2, _rx2) = oneshot::channel::<PermissionOutcome>();
+    /// let new_key = pp.insert(tx2);
+    /// assert!(new_key.0 >= 6, "new key must not collide with reinstated key");
+    /// ```
+    pub fn reinstate(
+        &self,
+        key: RequestKey,
+        tx: oneshot::Sender<PermissionOutcome>,
+        context: Option<RequestContext>,
+    ) {
+        // Bump the counter so future inserts yield ids strictly after `key`.
+        // `fetch_max` is relaxed; all callers of `reinstate` are single-threaded
+        // within the engine actor, and subsequent `insert` calls only need to
+        // see a value ≥ key.0 + 1 (the monotonicity requirement, not ordering
+        // relative to other memory operations).
+        self.next
+            .fetch_max(key.0.saturating_add(1), Ordering::Relaxed);
+        let mut guard = self.lock();
+        guard.insert(key, PendingEntry { tx, context });
+    }
+
     /// Drains every pending sender (used during cancellation).
     pub fn drain(&self) -> Vec<oneshot::Sender<PermissionOutcome>> {
         let mut guard = self.lock();
@@ -215,6 +268,71 @@ mod tests {
     fn from_wire_rejects_non_numeric_suffix() {
         let id = PermissionRequestId(Arc::from("perm:not-a-number"));
         assert!(RequestKey::from_wire(&id).is_err());
+    }
+
+    // ----------------------------------------------------------------
+    // B6: reinstate tests
+    // ----------------------------------------------------------------
+
+    /// `reinstate` inserts the key into the map and bumps `next` past it so
+    /// future `insert` calls never collide.
+    #[test]
+    fn reinstate_bumps_next_past_reused_key() {
+        let pp = PendingPermissions::new();
+        let (tx, _rx) = oneshot::channel::<PermissionOutcome>();
+        let key = RequestKey(5);
+        let ctx = RequestContext {
+            thread_id: zhive_proto::domain::ThreadId(Arc::from("t")),
+            turn_id: zhive_proto::domain::TurnId(Arc::from("turn:0")),
+        };
+        pp.reinstate(key, tx, Some(ctx));
+        assert_eq!(pp.len(), 1);
+
+        // A subsequent insert must receive an id >= 6.
+        let (tx2, _rx2) = oneshot::channel::<PermissionOutcome>();
+        let new_key = pp.insert(tx2);
+        assert!(
+            new_key.0 >= 6,
+            "new key {new_key:?} must not collide with reinstated key 5"
+        );
+    }
+
+    /// Reinstating the same key twice replaces the prior entry (idempotent).
+    #[test]
+    fn reinstate_is_idempotent_for_same_key() {
+        let pp = PendingPermissions::new();
+        let (tx1, _rx1) = oneshot::channel::<PermissionOutcome>();
+        let (tx2, _rx2) = oneshot::channel::<PermissionOutcome>();
+        let key = RequestKey(3);
+        pp.reinstate(key, tx1, None);
+        pp.reinstate(key, tx2, None);
+        // Still only one entry.
+        assert_eq!(pp.len(), 1);
+    }
+
+    /// `reinstate` does not reset `next` below the reinstated key even when
+    /// `next` was already larger.
+    #[test]
+    fn reinstate_does_not_decrease_next() {
+        let pp = PendingPermissions::new();
+        // Drive `next` to 10 by inserting 10 entries and draining them.
+        for _ in 0..10 {
+            let (tx, _rx) = oneshot::channel::<PermissionOutcome>();
+            pp.insert(tx);
+        }
+        pp.drain();
+
+        // Reinstating key=2 must NOT lower `next` back to 3.
+        let (tx, _rx) = oneshot::channel::<PermissionOutcome>();
+        pp.reinstate(RequestKey(2), tx, None);
+
+        // The next insert should get id >= 10.
+        let (tx2, _rx2) = oneshot::channel::<PermissionOutcome>();
+        let new_key = pp.insert(tx2);
+        assert!(
+            new_key.0 >= 10,
+            "next must not decrease: new_key={new_key:?}"
+        );
     }
 }
 

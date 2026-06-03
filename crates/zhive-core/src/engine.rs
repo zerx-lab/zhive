@@ -1699,6 +1699,8 @@ mod tests {
             timestamp: 0,
             cwd: "/".into(),
             parent_session: None,
+            subagent_parent: None,
+            source: None,
         })
         .await
         .unwrap();
@@ -4987,38 +4989,22 @@ mod inc6_tests {
             "final_message must carry the child AgentMessage text"
         );
 
-        // Verify the child transcript is fresh: it must NOT contain the
-        // parent thread's items (empty parent input in this test, but the
-        // child history buffer is independent of the parent's).
-        let child_handle = engine
-            .threads()
-            .get(&child_id)
-            .await
-            .expect("child thread must exist in store");
+        // B11: after SubagentCompleted the child handle is removed from the
+        // store. The parent handle must still exist; history is readable via
+        // persistence (not the in-memory store).
+        assert!(
+            engine.threads().get(&child_id).await.is_none(),
+            "B11: child handle must be removed from store after SubagentCompleted"
+        );
         let parent_handle = engine
             .threads()
             .get(&parent_id)
             .await
-            .expect("parent thread must exist");
+            .expect("parent thread must still exist");
 
-        // Child handle must have parent_thread_id set.
-        assert_eq!(
-            child_handle.parent_thread_id.as_ref(),
-            Some(&parent_id),
-            "child must record its parent"
-        );
-
-        // Parent items must not appear in the child's transcript: the child
-        // owns an independent history buffer (B2). The parent ran no turn, so
-        // its transcript is empty; the child holds its prompt item plus the
-        // AgentMessage.
+        // The parent transcript must be empty (no input was given).
         let parent_item_count = parent_handle.item_count().await;
-        let child_item_count = child_handle.item_count().await;
         assert_eq!(parent_item_count, 0, "parent transcript must be empty");
-        assert!(
-            child_item_count > 0,
-            "child transcript must contain at least the agent message"
-        );
 
         engine.shutdown().await.unwrap();
     }

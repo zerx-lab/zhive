@@ -29,6 +29,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::Instrument as _;
 use zhive_proto::domain::{Item, Thread, ThreadId, TurnError, TurnId, TurnStatus};
+use zhive_proto::permission::RequestPermissionRequest;
 
 use super::error::StorageResult;
 use super::rollout::{RolloutEntry, RolloutWriter};
@@ -184,6 +185,43 @@ pub enum StorageWriteOp {
         replacement: Vec<Box<Item>>,
         /// Number of original items compacted away.
         entries_compacted: u32,
+    },
+    /// Record that a turn was suspended waiting for a deferred permission
+    /// decision (B6 pending-permission persistence).
+    ///
+    /// Appends a [`RolloutEntry::PendingPermission`] entry and calls
+    /// `sync_all` so the suspended state survives a crash.  Resume reads this
+    /// entry and re-registers the pending request in
+    /// [`crate::permission::PendingPermissions`] so a reconnecting client can
+    /// answer via `session/resume_permission`.
+    ///
+    /// Pair with [`Self::PermissionResolved`] once the client answers.
+    PermissionSuspended {
+        /// Thread that owns the suspended turn.
+        thread_id: ThreadId,
+        /// Suspended turn id.
+        turn_id: TurnId,
+        /// Unix-seconds timestamp of the suspension.
+        timestamp: i64,
+        /// Wire-form request id (e.g. `"perm:7"`) the client uses to answer.
+        request_id: String,
+        /// Full request payload stored so resume can re-emit the approval
+        /// prompt to the reconnecting client.
+        request: Box<RequestPermissionRequest>,
+    },
+    /// Record that a pending deferred permission request was resolved (B6).
+    ///
+    /// Appends a [`RolloutEntry::PermissionResolved`] entry and calls
+    /// `sync_all`.  Resume uses this to skip requests that were already
+    /// answered before the crash, preventing stale approval prompts from
+    /// re-surfacing.
+    PermissionResolved {
+        /// Thread the request belonged to.
+        thread_id: ThreadId,
+        /// Wire-form request id that was resolved.
+        request_id: String,
+        /// Unix-seconds timestamp of the resolution.
+        timestamp: i64,
     },
 }
 
@@ -398,6 +436,23 @@ async fn apply_op(state: &mut WriterState, op: StorageWriteOp) {
             )
             .await;
         }
+        StorageWriteOp::PermissionSuspended {
+            thread_id,
+            turn_id,
+            timestamp,
+            request_id,
+            request,
+        } => {
+            apply_permission_suspended(state, thread_id, turn_id, timestamp, request_id, request)
+                .await;
+        }
+        StorageWriteOp::PermissionResolved {
+            thread_id,
+            request_id,
+            timestamp,
+        } => {
+            apply_permission_resolved(state, thread_id, request_id, timestamp).await;
+        }
     }
 }
 
@@ -412,13 +467,22 @@ async fn apply_thread_upserted(state: &mut WriterState, thread: Box<zhive_proto:
         // ForkHeader first (which marks header_written), so this branch only
         // runs for forked threads whose upsert reached the writer before the
         // ForkHeader — in which case it must still carry the parent link.
+        //
+        // B9: also record subagent_parent and source so rebuild/resume can
+        // recover the parent-child relationship and thread origin.
         let parent_session = thread.forked_from.as_ref().map(|p| p.0.to_string());
+        let subagent_parent = thread.subagent_parent.as_ref().map(|p| p.0.to_string());
         let session_entry = RolloutEntry::Session {
             version: super::rollout::SESSION_VERSION,
             id: thread.id.0.to_string(),
             timestamp: thread.created_at,
             cwd,
             parent_session,
+            // Store as Some so the reader can recover the non-User origin.
+            // None for User keeps the serialized field absent, saving bytes
+            // and staying compatible with readers that predate Wave4.
+            subagent_parent,
+            source: Some(thread.source),
         };
         if let Some(w) = state.rollout_for(&thread.id).await {
             if let Err(err) = w.append(&session_entry).await {
@@ -727,7 +791,11 @@ pub async fn rebuild_state_from_rollout(
     state: &super::StateDb,
     rollout_path: &std::path::Path,
 ) -> StorageResult<()> {
-    let entries = match super::rollout::read_all(rollout_path).await {
+    // B8: use the tolerant reader so a single corrupt/truncated trailing line
+    // (common after a crash-during-append) does not abort the whole rebuild.
+    // A corrupt line before the last one is still a real corruption and
+    // propagates as `StorageError::RolloutCorrupted`.
+    let entries = match super::rollout::read_all_tolerant(rollout_path).await {
         Ok(e) => e,
         Err(StorageError::Io(io)) if io.kind() == std::io::ErrorKind::NotFound => {
             // A missing rollout file is normal for a fresh install; nothing to rebuild.
@@ -768,6 +836,10 @@ pub async fn rebuild_state_from_rollout(
 /// # Ok(())
 /// # }
 /// ```
+#[expect(
+    clippy::too_many_lines,
+    reason = "single-pass rollout replay logic; all arms are tightly coupled to the same state variables — splitting would require threading multiple mutable references"
+)]
 pub async fn rebuild_state_from_entries(
     state: &super::StateDb,
     entries: Vec<RolloutEntry>,
@@ -797,6 +869,8 @@ pub async fn rebuild_state_from_entries(
                 timestamp,
                 cwd,
                 parent_session,
+                subagent_parent,
+                source,
                 ..
             } => {
                 if thread_ids_seen.contains(&id) {
@@ -808,16 +882,18 @@ pub async fn rebuild_state_from_entries(
                 // map that back onto Thread.forked_from so the rebuilt SQL
                 // index records the fork link (it was previously dropped here).
                 let forked_from = parent_session.as_deref().map(|p| ThreadId(Arc::from(p)));
-                // Threads created through the fork path are user-initiated
-                // branches, not subagent children; persist them as User.
+                // B9: recover subagent parent and thread origin from the header.
+                // Pre-Wave4 rollouts omit both fields; serde defaults them to
+                // None.  `source.unwrap_or(User)` preserves the historical
+                // hard-coded value so old files rebuild identically to before.
+                let recovered_subagent_parent =
+                    subagent_parent.as_deref().map(|p| ThreadId(Arc::from(p)));
+                let recovered_source = source.unwrap_or(ThreadSource::User);
                 let thread = zhive_proto::domain::Thread {
                     id: ThreadId(Arc::from(id.as_str())),
                     session_id: None,
                     forked_from,
-                    // The rollout Session header records only `parent_session`
-                    // (mapped to `forked_from`); a subagent parent link is not
-                    // stored in JSONL, so rebuild leaves it `None`.
-                    subagent_parent: None,
+                    subagent_parent: recovered_subagent_parent,
                     preview: String::new(),
                     ephemeral: false,
                     model_provider: "unknown".to_owned(),
@@ -825,7 +901,7 @@ pub async fn rebuild_state_from_entries(
                     updated_at: timestamp,
                     status: ThreadStatus::Idle,
                     cwd: PathBuf::from(cwd),
-                    source: ThreadSource::User,
+                    source: recovered_source,
                     name: None,
                     turns: vec![],
                 };
@@ -856,15 +932,21 @@ pub async fn rebuild_state_from_entries(
             }
 
             // A Leaf with target_id = Some marks a fork / branch head; remember
-            // the most recent one for diagnostics. target_id = None is a plain
-            // turn-completion save point and is ignored. Neither rebuilds an
-            // item row — the active leaf is not a SQL column in Phase 1.
+            // the most recent one for diagnostics.
+            // target_id = None is a plain turn-completion save point.
+            // PendingPermission and PermissionResolved are JSONL-only control-flow
+            // entries with no SQL index equivalent.
+            // All of these are intentionally ignored here: neither the active leaf
+            // nor the pending permission state is a SQL column in Phase 1; the
+            // resume path reads PendingPermission/PermissionResolved directly.
             RolloutEntry::Leaf {
                 target_id: Some(target),
             } => {
                 last_leaf_target = Some(target);
             }
-            RolloutEntry::Leaf { target_id: None } => {}
+            RolloutEntry::Leaf { target_id: None }
+            | RolloutEntry::PendingPermission { .. }
+            | RolloutEntry::PermissionResolved { .. } => {}
 
             // Compaction checkpoint: record the synthetic compaction turn and
             // its replacement items in the SQL index. Old turn rows are NOT
@@ -937,9 +1019,13 @@ pub struct RebuildStats {
 /// Walks the directory, skips the [`session_index.jsonl`] sidecar and any
 /// non-`.jsonl` file, and replays each remaining rollout through
 /// [`rebuild_state_from_rollout`]. Counts are accumulated into a
-/// [`RebuildStats`]. The walk is best-effort per file: a single corrupt
-/// rollout aborts the whole rebuild (its error propagates) so the operator
-/// learns the index is incomplete rather than silently partial.
+/// [`RebuildStats`].
+///
+/// **Trailing-line tolerance (B8)**: a single corrupt or truncated *trailing*
+/// line per file is silently discarded (crash-truncation scenario); the valid
+/// prefix is still replayed.  A corrupt line in the *middle* of a file is
+/// still a real corruption and aborts the walk so the operator learns the
+/// index is incomplete rather than silently partial.
 ///
 /// This is the crash-recovery entry point that rebuilds the full index after
 /// the SQL database is lost or out of date; the JSONL rollout remains the
@@ -999,7 +1085,11 @@ pub async fn rebuild_indexes_from_jsonl(
 
         // Count entries (Session headers and total) before replaying so the
         // stats reflect what landed in the index.
-        let entries = match super::rollout::read_all(&path).await {
+        //
+        // B8: tolerant read — a trailing corrupt line (crash-truncation) is
+        // discarded and the valid prefix is replayed.  A corrupt mid-file line
+        // still aborts rebuild for that file so the operator is aware.
+        let entries = match super::rollout::read_all_tolerant(&path).await {
             Ok(e) => e,
             Err(StorageError::Io(io)) if io.kind() == std::io::ErrorKind::NotFound => continue,
             Err(other) => return Err(other),
@@ -1023,6 +1113,84 @@ pub async fn rebuild_indexes_from_jsonl(
     }
 
     Ok(stats)
+}
+
+/// Appends a [`RolloutEntry::PendingPermission`] entry and fsyncs (B6 save
+/// point).
+///
+/// This is a critical save point — the suspended state must survive a crash so
+/// resume can re-surface the approval prompt to a reconnecting client.
+async fn apply_permission_suspended(
+    state: &mut WriterState,
+    thread_id: ThreadId,
+    turn_id: TurnId,
+    timestamp: i64,
+    request_id: String,
+    request: Box<RequestPermissionRequest>,
+) {
+    let entry = RolloutEntry::PendingPermission {
+        thread_id: thread_id.0.to_string(),
+        turn_id: turn_id.0.to_string(),
+        timestamp,
+        request_id,
+        request,
+    };
+    if let Some(w) = state.rollout_for(&thread_id).await {
+        if let Err(err) = w.append(&entry).await {
+            tracing::error!(
+                name: "zhive.persistence.writer.permission_suspended_append_failed",
+                error = %err,
+                thread_id = %thread_id.0,
+                "failed to append PendingPermission entry to rollout"
+            );
+            return;
+        }
+        if let Err(err) = w.sync_all().await {
+            tracing::error!(
+                name: "zhive.persistence.writer.permission_suspended_sync_failed",
+                error = %err,
+                thread_id = %thread_id.0,
+                "fsync after PendingPermission entry failed"
+            );
+        }
+    }
+}
+
+/// Appends a [`RolloutEntry::PermissionResolved`] entry and fsyncs (B6 save
+/// point).
+///
+/// Called once the client answers a deferred request (or the turn is
+/// cancelled) so that a subsequent resume does not re-surface the prompt.
+async fn apply_permission_resolved(
+    state: &mut WriterState,
+    thread_id: ThreadId,
+    request_id: String,
+    timestamp: i64,
+) {
+    let entry = RolloutEntry::PermissionResolved {
+        thread_id: thread_id.0.to_string(),
+        request_id,
+        timestamp,
+    };
+    if let Some(w) = state.rollout_for(&thread_id).await {
+        if let Err(err) = w.append(&entry).await {
+            tracing::error!(
+                name: "zhive.persistence.writer.permission_resolved_append_failed",
+                error = %err,
+                thread_id = %thread_id.0,
+                "failed to append PermissionResolved entry to rollout"
+            );
+            return;
+        }
+        if let Err(err) = w.sync_all().await {
+            tracing::error!(
+                name: "zhive.persistence.writer.permission_resolved_sync_failed",
+                error = %err,
+                thread_id = %thread_id.0,
+                "fsync after PermissionResolved entry failed"
+            );
+        }
+    }
 }
 
 #[expect(
@@ -1185,6 +1353,8 @@ mod tests {
             timestamp: 1_000,
             cwd: "/tmp".into(),
             parent_session: None,
+            subagent_parent: None,
+            source: None,
         })
         .await
         .unwrap();
@@ -1370,6 +1540,8 @@ mod tests {
                 timestamp: 1_000,
                 cwd: "/tmp".into(),
                 parent_session: None,
+                subagent_parent: None,
+                source: None,
             })
             .await
             .unwrap();
@@ -1585,6 +1757,8 @@ mod tests {
             timestamp: 1_000,
             cwd: "/tmp".into(),
             parent_session: None,
+            subagent_parent: None,
+            source: None,
         })
         .await
         .unwrap();
@@ -1682,6 +1856,8 @@ mod tests {
             timestamp: 1_000,
             cwd: "/tmp".into(),
             parent_session: None,
+            subagent_parent: None,
+            source: None,
         })
         .await
         .unwrap();
@@ -1750,6 +1926,8 @@ mod tests {
             timestamp: 1_000,
             cwd: "/tmp".into(),
             parent_session: None,
+            subagent_parent: None,
+            source: None,
         })
         .await
         .unwrap();
@@ -1857,6 +2035,253 @@ mod tests {
             matches!(replayed_items[2], Item::UserMessage { .. }),
             "last replayed item must be the post-compaction turn1 item"
         );
+    }
+
+    // ----------------------------------------------------------------
+    // B8: rebuild tolerates a trailing corrupt line
+    // ----------------------------------------------------------------
+
+    /// `rebuild_state_from_rollout` succeeds even if the last JSONL line
+    /// is a truncated / corrupt half-write (crash-during-append scenario).
+    #[tokio::test]
+    async fn rebuild_recovers_from_trailing_corrupt_line() {
+        let (_dir, storage) = open_storage().await;
+
+        let thread_id = ThreadId(Arc::from("thread:native/crash-rebuild"));
+        let turn_id = TurnId(Arc::from("turn:thread:native/crash-rebuild/0"));
+        let rollout_path = storage.rollout_path(&thread_id.0);
+
+        // Write a complete, valid rollout and then append a corrupt tail.
+        let mut w = crate::persistence::RolloutWriter::open(rollout_path.clone())
+            .await
+            .unwrap();
+        w.append(&RolloutEntry::Session {
+            version: super::super::rollout::SESSION_VERSION,
+            id: thread_id.0.to_string(),
+            timestamp: 1_000,
+            cwd: "/tmp".into(),
+            parent_session: None,
+            subagent_parent: None,
+            source: None,
+        })
+        .await
+        .unwrap();
+        w.append(&RolloutEntry::Item {
+            thread_id: thread_id.0.to_string(),
+            turn_id: turn_id.0.to_string(),
+            timestamp: 1_001,
+            item: Box::new(Item::AgentMessage {
+                id: ItemId(Arc::from("item:crash/0")),
+                text: "before crash".into(),
+            }),
+        })
+        .await
+        .unwrap();
+        w.sync_all().await.unwrap();
+        drop(w);
+
+        // Simulate a crash-truncated tail: append a half-written JSON line
+        // with no trailing newline.
+        let mut f = tokio::fs::OpenOptions::new()
+            .append(true)
+            .open(&rollout_path)
+            .await
+            .unwrap();
+        tokio::io::AsyncWriteExt::write_all(
+            &mut f,
+            b"{\"type\":\"item\",\"thread_id\":\"t\",\"turn",
+        )
+        .await
+        .unwrap();
+        tokio::io::AsyncWriteExt::flush(&mut f).await.unwrap();
+        drop(f);
+
+        // Rebuild must succeed (trailing bad line is discarded).
+        rebuild_state_from_rollout(&storage.state, &rollout_path)
+            .await
+            .expect("rebuild must succeed despite trailing corrupt line");
+
+        // The valid item before the corrupt tail must be present.
+        let items = storage.state.get_turn_items(&turn_id).await.unwrap();
+        assert_eq!(items.len(), 1, "one valid item must be rebuilt");
+    }
+
+    // ----------------------------------------------------------------
+    // B9: rebuild recovers subagent_parent and source
+    // ----------------------------------------------------------------
+
+    /// `rebuild_state_from_rollout` restores `subagent_parent` and `source`
+    /// when the rollout Session header carries the Wave4 fields.
+    #[tokio::test]
+    async fn rebuild_recovers_subagent_parent_and_source() {
+        use zhive_proto::domain::ThreadSource;
+
+        let (_dir, storage) = open_storage().await;
+
+        let child_id = ThreadId(Arc::from("thread:native/child/b9"));
+        let parent_id = ThreadId(Arc::from("thread:native/parent/b9"));
+        let rollout_path = storage.rollout_path(&child_id.0);
+
+        // Write a Wave4-format Session header with subagent fields populated.
+        let mut w = crate::persistence::RolloutWriter::open(rollout_path.clone())
+            .await
+            .unwrap();
+        w.append_session_header_full(
+            &child_id.0,
+            2_000,
+            "/work",
+            None,
+            Some(&parent_id.0),
+            Some(ThreadSource::Subagent),
+        )
+        .await
+        .unwrap();
+        w.sync_all().await.unwrap();
+        drop(w);
+
+        rebuild_state_from_rollout(&storage.state, &rollout_path)
+            .await
+            .unwrap();
+
+        let t = storage
+            .state
+            .get_thread(&child_id)
+            .await
+            .unwrap()
+            .expect("child thread must be present");
+
+        assert_eq!(
+            t.subagent_parent.as_ref().map(|p| p.0.as_ref()),
+            Some(parent_id.0.as_ref()),
+            "rebuild must recover subagent_parent from Session header"
+        );
+        assert_eq!(
+            t.source,
+            ThreadSource::Subagent,
+            "rebuild must recover source from Session header"
+        );
+    }
+
+    /// A legacy (v3) rollout without `subagent_parent` / `source` rebuilds
+    /// with defaults: `subagent_parent = None`, `source = User`.
+    /// This is the backward-compatibility lock test.
+    #[tokio::test]
+    async fn rebuild_legacy_session_without_new_fields_defaults_user() {
+        use zhive_proto::domain::ThreadSource;
+
+        let (_dir, storage) = open_storage().await;
+
+        let thread_id = ThreadId(Arc::from("thread:native/legacy/b9"));
+        let rollout_path = storage.rollout_path(&thread_id.0);
+
+        // Write a JSON line that looks exactly like a pre-Wave4 v3 file
+        // (no subagent_parent / source keys).
+        let legacy_json = format!(
+            "{{\"type\":\"session\",\"version\":3,\"id\":\"{}\",\"timestamp\":500,\"cwd\":\"/old\"}}\n",
+            thread_id.0
+        );
+        tokio::fs::write(&rollout_path, legacy_json.as_bytes())
+            .await
+            .unwrap();
+
+        rebuild_state_from_rollout(&storage.state, &rollout_path)
+            .await
+            .unwrap();
+
+        let t = storage
+            .state
+            .get_thread(&thread_id)
+            .await
+            .unwrap()
+            .expect("legacy thread must be present");
+
+        assert!(
+            t.subagent_parent.is_none(),
+            "legacy rollout must rebuild with subagent_parent = None"
+        );
+        assert_eq!(
+            t.source,
+            ThreadSource::User,
+            "legacy rollout must rebuild with source = User (historic default)"
+        );
+    }
+
+    // ----------------------------------------------------------------
+    // B6: PendingPermission / PermissionResolved persistence tests
+    // ----------------------------------------------------------------
+
+    fn make_perm_request(tid: &str, tool: &str) -> RequestPermissionRequest {
+        serde_json::from_value(serde_json::json!({
+            "threadId": tid,
+            "resourceType": "tool",
+            "name": tool,
+            "reason": "test",
+            "options": []
+        }))
+        .expect("perm request fixture")
+    }
+
+    /// `PermissionSuspended` op writes a `PendingPermission` entry to the
+    /// rollout, and `PermissionResolved` follows it with the matching resolved
+    /// entry.
+    #[tokio::test]
+    async fn writer_persists_and_resolves_pending_permission() {
+        let (_dir, storage) = open_storage().await;
+        let (tx, handle) = PersistenceWriter::spawn(Arc::clone(&storage));
+
+        let thread_id = ThreadId(Arc::from("thread:native/perm-test"));
+        let turn_id = TurnId(Arc::from("turn:0"));
+
+        tx.send(StorageWriteOp::ThreadUpserted(Box::new(make_thread(
+            "thread:native/perm-test",
+        ))))
+        .await
+        .unwrap();
+
+        tx.send(StorageWriteOp::PermissionSuspended {
+            thread_id: thread_id.clone(),
+            turn_id: turn_id.clone(),
+            timestamp: 100,
+            request_id: "perm:7".into(),
+            request: Box::new(make_perm_request("thread:native/perm-test", "bash")),
+        })
+        .await
+        .unwrap();
+
+        tx.send(StorageWriteOp::PermissionResolved {
+            thread_id: thread_id.clone(),
+            request_id: "perm:7".into(),
+            timestamp: 200,
+        })
+        .await
+        .unwrap();
+
+        drop(tx);
+        handle.await.unwrap();
+
+        // Read the rollout and verify both entries landed.
+        let rollout_path = storage.rollout_path(&thread_id.0);
+        let entries = crate::persistence::read_all(&rollout_path).await.unwrap();
+
+        let pending: Vec<_> = entries
+            .iter()
+            .filter(|e| matches!(e, RolloutEntry::PendingPermission { .. }))
+            .collect();
+        let resolved: Vec<_> = entries
+            .iter()
+            .filter(|e| matches!(e, RolloutEntry::PermissionResolved { .. }))
+            .collect();
+
+        assert_eq!(pending.len(), 1, "one PendingPermission entry expected");
+        assert_eq!(resolved.len(), 1, "one PermissionResolved entry expected");
+
+        // Verify request_id matches in both.
+        if let RolloutEntry::PendingPermission { request_id, .. } = pending[0] {
+            assert_eq!(request_id, "perm:7");
+        }
+        if let RolloutEntry::PermissionResolved { request_id, .. } = resolved[0] {
+            assert_eq!(request_id, "perm:7");
+        }
     }
 }
 

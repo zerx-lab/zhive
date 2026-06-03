@@ -233,6 +233,9 @@ impl EngineSubagentSpawner {
         };
 
         let wire_id = key.to_wire();
+        // Clone `req` before moving it into the broadcast event so the Defer
+        // path can persist the full request payload below (B6).
+        let req_for_persist = if defer { Some(req.clone()) } else { None };
         let _ = self
             .inner
             .events_tx()
@@ -241,13 +244,25 @@ impl EngineSubagentSpawner {
                 request: Box::new(req),
             });
 
-        if defer && let Some(turn_id) = parent_turn_id {
+        if defer && let Some(ref turn_id) = parent_turn_id {
             let _ = self.inner.events_tx().send(EngineEvent::TurnSuspended {
                 thread_id: self.parent_thread_id.clone(),
-                turn_id,
-                request_id: wire_id,
+                turn_id: turn_id.clone(),
+                request_id: wire_id.clone(),
                 reason: None,
             });
+            // B6: persist the pending permission request (subagent Defer path).
+            if let Some(persist_req) = req_for_persist {
+                self.inner.enqueue_storage_op(
+                    crate::persistence::writer::StorageWriteOp::PermissionSuspended {
+                        thread_id: self.parent_thread_id.clone(),
+                        turn_id: turn_id.clone(),
+                        timestamp: crate::engine::lifecycle::unix_now_pub(),
+                        request_id: wire_id.0.to_string(),
+                        request: Box::new(persist_req),
+                    },
+                );
+            }
         }
 
         let outcome = if defer {
@@ -255,6 +270,18 @@ impl EngineSubagentSpawner {
         } else {
             reducer.wait(rx).await
         };
+
+        // B6: on Defer path, persist a PermissionResolved entry so resume does
+        // not re-surface a prompt that was already answered.
+        if defer {
+            self.inner.enqueue_storage_op(
+                crate::persistence::writer::StorageWriteOp::PermissionResolved {
+                    thread_id: self.parent_thread_id.clone(),
+                    request_id: wire_id.0.to_string(),
+                    timestamp: crate::engine::lifecycle::unix_now_pub(),
+                },
+            );
+        }
 
         match outcome {
             Ok(PermissionOutcome::Selected { option_id }) => {

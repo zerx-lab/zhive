@@ -641,6 +641,9 @@ async fn resolve_tool_permission_inner(
 
             // Emit PermissionRequested so the client/test can answer.
             let wire_id = key.to_wire();
+            // Clone the request before moving it into the broadcast event so the
+            // Defer path can persist it below without a second build call.
+            let req_for_persist = if is_defer { Some(req.clone()) } else { None };
             let _ = inner.events_tx().send(EngineEvent::PermissionRequested {
                 request_id: wire_id.clone(),
                 request: Box::new(req),
@@ -657,9 +660,26 @@ async fn resolve_tool_permission_inner(
                 let _ = inner.events_tx().send(EngineEvent::TurnSuspended {
                     thread_id: zhive_proto::domain::ThreadId(Arc::from(thread_id_str)),
                     turn_id: turn_id.clone(),
-                    request_id: wire_id,
+                    request_id: wire_id.clone(),
                     reason: None,
                 });
+                // B6: persist the pending permission request so resume can
+                // re-surface the approval prompt after a crash.  `sync_all` is
+                // called by `apply_permission_suspended` — this is a critical
+                // save point.  `req_for_persist` was cloned from `req` just
+                // before `req` was consumed by `events_tx.send`, so the payload
+                // here is identical to the one the client just received.
+                if let Some(persist_req) = req_for_persist {
+                    inner.enqueue_storage_op(
+                        crate::persistence::writer::StorageWriteOp::PermissionSuspended {
+                            thread_id: zhive_proto::domain::ThreadId(Arc::from(thread_id_str)),
+                            turn_id: turn_id.clone(),
+                            timestamp: crate::engine::lifecycle::unix_now_pub(),
+                            request_id: wire_id.0.to_string(),
+                            request: Box::new(persist_req),
+                        },
+                    );
+                }
             }
 
             // Race the permission wait against turn cancellation so that a
@@ -712,6 +732,21 @@ async fn resolve_tool_permission_inner(
                     ));
                 }
             };
+
+            // B6: on the Defer path, persist a PermissionResolved entry so
+            // resume does not re-surface an already-answered prompt.  This
+            // must be enqueued BEFORE the turn can reach TurnEnded so the
+            // resolved marker is always present when the turn completes
+            // (see B6 §4 timing invariant).
+            if is_defer {
+                inner.enqueue_storage_op(
+                    crate::persistence::writer::StorageWriteOp::PermissionResolved {
+                        thread_id: zhive_proto::domain::ThreadId(Arc::from(thread_id_str)),
+                        request_id: wire_id.0.to_string(),
+                        timestamp: crate::engine::lifecycle::unix_now_pub(),
+                    },
+                );
+            }
 
             match outcome {
                 Ok(PermissionOutcome::Selected { option_id }) => {

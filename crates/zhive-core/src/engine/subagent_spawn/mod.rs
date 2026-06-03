@@ -515,11 +515,27 @@ impl EngineInner {
         }
 
         // Broadcast so external subscribers observe the outcome.
+        // Clone `child_tid` before the move so we can remove the handle
+        // from the store afterwards (see below).
         let _ = inner.events_tx().send(EngineEvent::SubagentCompleted {
             parent_thread_id: parent_tid,
-            child_thread_id: child_tid,
+            child_thread_id: child_tid.clone(),
             final_message: final_msg,
         });
+
+        // Remove the child handle from the thread store now that both delivery
+        // paths have completed.  This prevents long-lived sessions that spawn
+        // many subagents from accumulating handles in memory indefinitely.
+        //
+        // Ordering: removal happens strictly *after* both the in-process send
+        // and the broadcast event, so any subscriber that holds a reference to
+        // the child thread id via those events can still look it up before this
+        // call returns.  The child's on-disk rollout and SQL rows are
+        // unaffected — history remains queryable via persistence.
+        //
+        // `ThreadStore::remove` is a no-op for unknown ids, so this is safe to
+        // call even if the thread was already removed by a concurrent path.
+        inner.threads().remove(&child_tid).await;
     }
 }
 
@@ -850,6 +866,90 @@ mod tests {
             }
             other => panic!("no error must map to Completed, got {other:?}"),
         }
+    }
+
+    /// B11: after `deliver_subagent_outcome` the child handle must have been
+    /// removed from the thread store so a long-lived session that spawns many
+    /// subagents does not accumulate handles in memory.
+    #[tokio::test]
+    async fn deliver_subagent_outcome_removes_child_handle_from_store() {
+        let inner = new_inner();
+        let child_tid = tid("thread:subagent/native/root/b11");
+        let parent_tid = tid("thread:native/root");
+
+        let (child_handle_inner, _final_rx, _decision_rx) =
+            crate::state::ThreadHandle::new_child(child_tid.clone(), parent_tid.clone());
+        let child_handle = Arc::new(child_handle_inner);
+
+        // Register the child handle in the store (mirrors spawn path).
+        inner
+            .threads()
+            .write_guard()
+            .await
+            .insert(child_tid.clone(), Arc::clone(&child_handle));
+
+        // Verify it's in the store before delivery.
+        assert!(
+            inner.threads().get(&child_tid).await.is_some(),
+            "child handle must be in the store before delivery"
+        );
+
+        // Deliver the outcome (clean completion).
+        EngineInner::deliver_subagent_outcome(
+            &inner,
+            &child_handle,
+            parent_tid,
+            child_tid.clone(),
+            None,
+            None,
+        )
+        .await;
+
+        // After delivery the handle must be gone from the store.
+        assert!(
+            inner.threads().get(&child_tid).await.is_none(),
+            "child handle must be removed from the store after delivery (B11)"
+        );
+    }
+
+    /// B11: the removal also happens on the error path — a failed child turn
+    /// must still clean up the handle.
+    #[tokio::test]
+    async fn deliver_subagent_outcome_removes_child_handle_on_error_path() {
+        use zhive_proto::domain::TurnError;
+
+        let inner = new_inner();
+        let child_tid = tid("thread:subagent/native/root/b11-err");
+        let parent_tid = tid("thread:native/root");
+
+        let (child_handle_inner, _final_rx, _decision_rx) =
+            crate::state::ThreadHandle::new_child(child_tid.clone(), parent_tid.clone());
+        let child_handle = Arc::new(child_handle_inner);
+
+        inner
+            .threads()
+            .write_guard()
+            .await
+            .insert(child_tid.clone(), Arc::clone(&child_handle));
+
+        let err = TurnError {
+            message: "provider exploded".to_owned(),
+            additional_details: None,
+        };
+        EngineInner::deliver_subagent_outcome(
+            &inner,
+            &child_handle,
+            parent_tid,
+            child_tid.clone(),
+            None,
+            Some(err),
+        )
+        .await;
+
+        assert!(
+            inner.threads().get(&child_tid).await.is_none(),
+            "child handle must be removed from the store even on error path (B11)"
+        );
     }
 
     /// A tool whose `available_in_subagent()` returns `false` must appear in

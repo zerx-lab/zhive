@@ -130,7 +130,13 @@ pub trait Sandbox: Send + Sync + std::fmt::Debug {
 /// No-op sandbox: runs commands with the host's full privileges.
 ///
 /// This is the default used by [`BashTool`] when no sandbox is configured.
-/// OS-native isolation backends are planned for a future phase.
+/// OS-native isolation backends (Landlock on Linux, Seatbelt on macOS) are
+/// planned for a future phase.
+///
+/// [`BashTool`] applies process-group isolation and environment tightening
+/// independently of the sandbox seam (see [`apply_minimal_env`] and the
+/// security-boundary note in `bash.rs`). The sandbox seam is orthogonal: a
+/// future `LandlockSandbox` would add filesystem confinement on top.
 ///
 /// # Examples
 ///
@@ -144,6 +150,49 @@ pub struct DefaultSandbox;
 
 impl Sandbox for DefaultSandbox {
     fn prepare(&self, _command: &mut tokio::process::Command) {}
+}
+
+// ============================================================
+// Minimal environment helper (env tightening for BashTool)
+// ============================================================
+
+/// Applies the minimal environment whitelist to `cmd`.
+///
+/// Clears all inherited variables with [`tokio::process::Command::env_clear`],
+/// then injects only:
+///
+/// | Variable | Source |
+/// |----------|--------|
+/// | `PATH`   | Parent `PATH`, or `/usr/local/bin:/usr/bin:/bin` if absent |
+/// | `HOME`   | Parent `HOME`, if set |
+/// | `TERM`   | Hard-coded `"dumb"` to avoid interactive-mode probing |
+///
+/// This prevents secrets or tool-specific variables present in the agent
+/// process's environment from leaking into executed shell commands.
+///
+/// # Examples
+///
+/// ```
+/// use tokio::process::Command;
+/// use zhive_core::tools::builtin::apply_minimal_env;
+/// let mut cmd = Command::new("sh");
+/// apply_minimal_env(&mut cmd);
+/// // cmd will now run with env_clear + PATH/HOME/TERM whitelist only.
+/// ```
+pub fn apply_minimal_env(cmd: &mut tokio::process::Command) {
+    cmd.env_clear();
+
+    let path = std::env::var_os("PATH")
+        .unwrap_or_else(|| std::ffi::OsString::from("/usr/local/bin:/usr/bin:/bin"));
+    cmd.env("PATH", path);
+
+    if let Some(home) = std::env::var_os("HOME") {
+        cmd.env("HOME", home);
+    }
+
+    // `TERM=dumb` prevents interactive programs (e.g. less, man) from
+    // switching to full-screen TUI mode when they detect a terminal.
+    cmd.env("TERM", "dumb");
 }
 
 // ============================================================

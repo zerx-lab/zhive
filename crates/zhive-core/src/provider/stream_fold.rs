@@ -401,13 +401,45 @@ impl StreamFold {
                 vec![]
             }
 
-            // ---- provider-executed tools (Phase 1: ignore) -----------------
-            StreamPart::ToolResult(_) | StreamPart::ToolApprovalRequest(_) => {
+            // ---- provider-executed tool result (Phase 1: surface as notice) --
+            //
+            // B10: these parts were silently dropped (warn + empty vec).  Now
+            // they surface as `Item::SystemNotice(Warn)` so the user and
+            // upper layers can see that the provider sent something zhive does
+            // not consume.  The notice is persisted and appears in the turn
+            // history identically to an in-stream error notice.
+            StreamPart::ToolResult(_) => {
+                let item_id = self.next_item_id();
                 warn!(
-                    name: "provider.fold.ignored",
-                    "provider-executed tool part ignored in Phase 1 (zhive runs tools itself)"
+                    name: "provider.fold.tool_result_unhandled",
+                    "provider sent a provider-executed tool result; \
+                     zhive runs tools itself in Phase 1 — surfaced as SystemNotice"
                 );
-                vec![]
+                vec![Item::SystemNotice {
+                    id: item_id,
+                    level: NoticeLevel::Warn,
+                    message: "provider sent a provider-executed tool result, which zhive \
+                              does not consume in Phase 1 (the engine runs tools itself); \
+                              the result was surfaced as a notice instead of being applied"
+                        .into(),
+                }]
+            }
+
+            // ---- provider tool-approval request (Phase 1: surface as notice) -
+            StreamPart::ToolApprovalRequest(_) => {
+                let item_id = self.next_item_id();
+                warn!(
+                    name: "provider.fold.tool_approval_unhandled",
+                    "provider sent a tool-approval request; \
+                     zhive does not handle provider-side approvals in Phase 1 — surfaced as SystemNotice"
+                );
+                vec![Item::SystemNotice {
+                    id: item_id,
+                    level: NoticeLevel::Warn,
+                    message: "provider sent a tool-approval request, which zhive does not \
+                              handle in Phase 1; surfaced as a notice"
+                        .into(),
+                }]
             }
 
             // ---- stream meta / custom / raw (Phase 1: ignore) --------------
@@ -893,6 +925,78 @@ mod tests {
             Some(&serde_json::json!({})),
             "argument-less tool call must reconstruct as an empty object"
         );
+    }
+
+    // ---- B10: provider-executed tool parts surface as SystemNotice(Warn) ----
+
+    /// `StreamPart::ToolResult` must produce a `SystemNotice(Warn)` item
+    /// (B10) instead of being silently dropped.  The notice message must
+    /// mention "provider-executed".
+    #[test]
+    fn fold_tool_result_emits_system_notice_warn() {
+        use llmsdk::language_model::{ToolResult, ToolResultOutput};
+
+        let mut fold = StreamFold::new(&turn_id("turn:t/b10/0"));
+        let result_part = ToolResult {
+            tool_call_id: "tc-x".into(),
+            tool_name: "some_tool".into(),
+            output: ToolResultOutput::Text {
+                value: "result text".into(),
+                provider_options: None,
+            },
+            preliminary: None,
+            provider_metadata: None,
+        };
+        let items = fold.fold(StreamPart::ToolResult(result_part));
+        assert_eq!(items.len(), 1, "ToolResult must emit exactly one item");
+        match &items[0] {
+            Item::SystemNotice { level, message, .. } => {
+                assert_eq!(*level, NoticeLevel::Warn, "must be Warn, not Error");
+                assert!(
+                    message.contains("provider-executed"),
+                    "message must mention provider-executed; got: {message}"
+                );
+            }
+            other => panic!("expected SystemNotice(Warn), got {other:?}"),
+        }
+    }
+
+    /// `StreamPart::ToolApprovalRequest` must produce a `SystemNotice(Warn)`
+    /// item (B10) instead of being silently dropped.
+    #[test]
+    fn fold_tool_approval_request_emits_system_notice_warn() {
+        use llmsdk::ToolCallPart;
+        use llmsdk::language_model::ToolApprovalRequest;
+
+        let mut fold = StreamFold::new(&turn_id("turn:t/b10/1"));
+        let approval_part = ToolApprovalRequest {
+            approval_id: "appr-1".into(),
+            tool_call: ToolCallPart {
+                tool_call_id: "tc-y".into(),
+                tool_name: "dangerous_tool".into(),
+                input: serde_json::json!({}),
+                provider_executed: None,
+                dynamic: None,
+                provider_options: None,
+            },
+            provider_metadata: None,
+        };
+        let items = fold.fold(StreamPart::ToolApprovalRequest(approval_part));
+        assert_eq!(
+            items.len(),
+            1,
+            "ToolApprovalRequest must emit exactly one item"
+        );
+        match &items[0] {
+            Item::SystemNotice { level, message, .. } => {
+                assert_eq!(*level, NoticeLevel::Warn, "must be Warn, not Error");
+                assert!(
+                    message.contains("approval"),
+                    "message must mention approval; got: {message}"
+                );
+            }
+            other => panic!("expected SystemNotice(Warn), got {other:?}"),
+        }
     }
 
     // ---- StreamFold error → SystemNotice ----

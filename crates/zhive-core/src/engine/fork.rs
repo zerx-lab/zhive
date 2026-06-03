@@ -506,6 +506,8 @@ mod tests {
             timestamp: 0,
             cwd: "/".into(),
             parent_session: None,
+            subagent_parent: None,
+            source: None,
         })
         .await
         .unwrap();

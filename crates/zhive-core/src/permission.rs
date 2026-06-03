@@ -389,6 +389,26 @@ impl PermissionReducer {
         self.resolve_with_context(key, outcome)
     }
 
+    /// Re-registers a suspended permission request from a persisted key (B6
+    /// resume path).
+    ///
+    /// Reinstates the pending map entry so a reconnecting client can discharge
+    /// the request via `session/resume_permission`.  Returns a receiver the
+    /// caller must drive: typically a detached task that calls
+    /// [`Self::wait_unbounded`] and then writes
+    /// [`crate::persistence::writer::StorageWriteOp::PermissionResolved`].
+    ///
+    /// Engine-internal: only `resume_thread` calls it.
+    pub(crate) fn reinstate_for_resume(
+        &self,
+        key: RequestKey,
+        context: RequestContext,
+    ) -> oneshot::Receiver<PermissionOutcome> {
+        let (tx, rx) = oneshot::channel();
+        self.pending.reinstate(key, tx, Some(context));
+        rx
+    }
+
     /// Resolves **every** pending request with
     /// [`PermissionOutcome::Cancelled`] (cancel propagation path).
     pub fn cancel_all(&self) {
