@@ -56,6 +56,9 @@ use super::phase::allows_transition;
 use super::submission::{
     PermissionRequestId, ResumePermissionReply, Submission, SubmissionEnvelope, SubmissionReply,
 };
+// `thread_admin` dispatch methods (`delete_thread`, `rename_thread`,
+// `search_threads`, `list_tools`) live in the sibling module; the `impl
+// EngineInner` block there is in scope via `pub(in crate::engine)` visibility.
 
 // ============================================================
 // StorageWriterState
@@ -486,6 +489,12 @@ impl EngineInner {
             | Submission::GetItems { .. }) => {
                 self.dispatch_history(history, reply).await;
             }
+            admin @ (Submission::Delete { .. }
+            | Submission::Rename { .. }
+            | Submission::Search { .. }
+            | Submission::ListTools) => {
+                self.dispatch_thread_admin(admin, reply).await;
+            }
             other => {
                 tracing::debug!(
                     name: "zhive.engine.submission.unhandled",
@@ -497,6 +506,47 @@ impl EngineInner {
                 // `EngineError::ReplyDropped` instead of timing out.
                 drop(reply);
             }
+        }
+    }
+
+    /// Handles the thread-admin submissions (`Delete`, `Rename`, `Search`,
+    /// `ListTools`).
+    ///
+    /// Split out of [`Self::dispatch`] so the main dispatch match stays under
+    /// the clippy line cap. Each arm calls the matching method from
+    /// [`super::thread_admin`] and discharges the reply oneshot. A submission
+    /// outside this group is a caller bug and the reply is dropped.
+    async fn dispatch_thread_admin(
+        self: &Arc<Self>,
+        sub: Submission,
+        reply: Option<tokio::sync::oneshot::Sender<SubmissionReply>>,
+    ) {
+        match sub {
+            Submission::Delete { thread_id } => {
+                let outcome = self.delete_thread(thread_id).await;
+                if let Some(tx) = reply {
+                    let _ = tx.send(SubmissionReply::Delete(outcome));
+                }
+            }
+            Submission::Rename { thread_id, name } => {
+                let outcome = self.rename_thread(thread_id, name);
+                if let Some(tx) = reply {
+                    let _ = tx.send(SubmissionReply::Rename(outcome));
+                }
+            }
+            Submission::Search { query, cwd } => {
+                let threads = self.search_threads(&query, cwd.as_deref()).await;
+                if let Some(tx) = reply {
+                    let _ = tx.send(SubmissionReply::Search(Box::new(threads)));
+                }
+            }
+            Submission::ListTools => {
+                let specs = self.list_tools();
+                if let Some(tx) = reply {
+                    let _ = tx.send(SubmissionReply::ListTools(Box::new(specs)));
+                }
+            }
+            _ => drop(reply),
         }
     }
 

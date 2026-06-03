@@ -1,0 +1,77 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ToolSpecKind",
+  "description": "Coarse classification of a discoverable tool.\n\nWire mirror of the engine's `domain::ToolKind`; defined as a separate type so that the discovery and display concerns can evolve independently. Zero-cost conversion from [`ToolKind`] is provided via [`From`].\n\n# Examples\n\n``` use zhive_proto::rpc::ToolSpecKind; let v = serde_json::to_value(ToolSpecKind::Read).unwrap(); assert_eq!(v, \"read\"); let back: ToolSpecKind = serde_json::from_value(v).unwrap(); assert_eq!(back, ToolSpecKind::Read); ```",
+  "oneOf": [
+    {
+      "description": "Read-only file or resource access.",
+      "type": "string",
+      "enum": [
+        "read"
+      ]
+    },
+    {
+      "description": "Modify a file or resource in place.",
+      "type": "string",
+      "enum": [
+        "edit"
+      ]
+    },
+    {
+      "description": "Delete a file or resource.",
+      "type": "string",
+      "enum": [
+        "delete"
+      ]
+    },
+    {
+      "description": "Move or rename a file or resource.",
+      "type": "string",
+      "enum": [
+        "move"
+      ]
+    },
+    {
+      "description": "Search a corpus.",
+      "type": "string",
+      "enum": [
+        "search"
+      ]
+    },
+    {
+      "description": "Execute a shell command or script.",
+      "type": "string",
+      "enum": [
+        "execute"
+      ]
+    },
+    {
+      "description": "Internal reasoning (no side effects).",
+      "type": "string",
+      "enum": [
+        "think"
+      ]
+    },
+    {
+      "description": "Fetch a remote resource.",
+      "type": "string",
+      "enum": [
+        "fetch"
+      ]
+    },
+    {
+      "description": "Switch the agent mode.",
+      "type": "string",
+      "enum": [
+        "switch_mode"
+      ]
+    },
+    {
+      "description": "Anything else.",
+      "type": "string",
+      "enum": [
+        "other"
+      ]
+    }
+  ]
+}

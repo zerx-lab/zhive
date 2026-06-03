@@ -1,0 +1,128 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ToolListResult",
+  "description": "Result of the `tools/list` RPC.\n\n# Examples\n\n``` use zhive_proto::rpc::ToolListResult; let r = ToolListResult::new(vec![]); let v = serde_json::to_value(&r).unwrap(); assert_eq!(v[\"tools\"], serde_json::json!([])); let back: ToolListResult = serde_json::from_value(v).unwrap(); assert!(back.tools.is_empty()); ```",
+  "type": "object",
+  "required": [
+    "tools"
+  ],
+  "properties": {
+    "tools": {
+      "description": "All engine-registered tools, sorted by name.",
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/ToolSpec"
+      }
+    }
+  },
+  "definitions": {
+    "ToolSpec": {
+      "description": "Metadata descriptor for one engine-registered tool.\n\nReturned by the `tools/list` RPC to let clients discover which tools the connected engine instance exposes, their input schema, and a coarse classification for UI grouping.\n\n# Examples\n\n``` use zhive_proto::rpc::{ToolSpec, ToolSpecKind}; let spec = ToolSpec::new( \"read_file\".into(), Some(\"Read a file from the filesystem.\".into()), ToolSpecKind::Read, serde_json::json!({ \"type\": \"object\", \"properties\": { \"path\": { \"type\": \"string\" } } }), ); let v = serde_json::to_value(&spec).unwrap(); assert_eq!(v[\"name\"], \"read_file\"); assert_eq!(v[\"kind\"], \"read\"); let back: ToolSpec = serde_json::from_value(v).unwrap(); assert_eq!(back, spec); ```",
+      "type": "object",
+      "required": [
+        "inputSchema",
+        "name"
+      ],
+      "properties": {
+        "description": {
+          "description": "Human-readable description, if the tool provides one.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "inputSchema": {
+          "description": "JSON Schema (object) describing the tool's input arguments.\n\nIntentionally kept as opaque `Value`: tool input schemas are tool-defined and not validated at the proto layer."
+        },
+        "kind": {
+          "description": "Coarse classification for UI grouping.",
+          "default": "other",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ToolSpecKind"
+            }
+          ]
+        },
+        "name": {
+          "description": "Stable tool name matching the engine's dispatch key.",
+          "type": "string"
+        }
+      }
+    },
+    "ToolSpecKind": {
+      "description": "Coarse classification of a discoverable tool.\n\nWire mirror of the engine's `domain::ToolKind`; defined as a separate type so that the discovery and display concerns can evolve independently. Zero-cost conversion from [`ToolKind`] is provided via [`From`].\n\n# Examples\n\n``` use zhive_proto::rpc::ToolSpecKind; let v = serde_json::to_value(ToolSpecKind::Read).unwrap(); assert_eq!(v, \"read\"); let back: ToolSpecKind = serde_json::from_value(v).unwrap(); assert_eq!(back, ToolSpecKind::Read); ```",
+      "oneOf": [
+        {
+          "description": "Read-only file or resource access.",
+          "type": "string",
+          "enum": [
+            "read"
+          ]
+        },
+        {
+          "description": "Modify a file or resource in place.",
+          "type": "string",
+          "enum": [
+            "edit"
+          ]
+        },
+        {
+          "description": "Delete a file or resource.",
+          "type": "string",
+          "enum": [
+            "delete"
+          ]
+        },
+        {
+          "description": "Move or rename a file or resource.",
+          "type": "string",
+          "enum": [
+            "move"
+          ]
+        },
+        {
+          "description": "Search a corpus.",
+          "type": "string",
+          "enum": [
+            "search"
+          ]
+        },
+        {
+          "description": "Execute a shell command or script.",
+          "type": "string",
+          "enum": [
+            "execute"
+          ]
+        },
+        {
+          "description": "Internal reasoning (no side effects).",
+          "type": "string",
+          "enum": [
+            "think"
+          ]
+        },
+        {
+          "description": "Fetch a remote resource.",
+          "type": "string",
+          "enum": [
+            "fetch"
+          ]
+        },
+        {
+          "description": "Switch the agent mode.",
+          "type": "string",
+          "enum": [
+            "switch_mode"
+          ]
+        },
+        {
+          "description": "Anything else.",
+          "type": "string",
+          "enum": [
+            "other"
+          ]
+        }
+      ]
+    }
+  }
+}

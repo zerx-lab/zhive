@@ -507,6 +507,26 @@ pub enum PermissionOutcome {
 // Permission defer / resume wire
 // ============================================================
 
+/// Method name for the server-to-client `session/request_permission` reverse RPC.
+///
+/// The server sends this when a hook returns [`PermissionDecision::Ask`] and
+/// requires a live user decision. The client replies with
+/// [`PermissionOutcome`] on the same request channel. The body is
+/// [`RequestPermissionRequest`].
+///
+/// **Note:** as of Phase 1 the engine broadcasts a
+/// `events/permission_requested` event instead of using this reverse-RPC
+/// path. This constant is reserved for the Phase B reverse-RPC
+/// implementation; the `client-native` adapter is already wired to it.
+///
+/// # Examples
+///
+/// ```
+/// use zhive_proto::permission::METHOD_REQUEST_PERMISSION;
+/// assert_eq!(METHOD_REQUEST_PERMISSION, "session/request_permission");
+/// ```
+pub const METHOD_REQUEST_PERMISSION: &str = "session/request_permission";
+
 /// Method name for the client-to-server `session/resume_permission` request.
 ///
 /// Sent to unblock a turn that a hook previously suspended with

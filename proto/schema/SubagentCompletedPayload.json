@@ -13,7 +13,7 @@
       "type": "string"
     },
     "hasFinalMessage": {
-      "description": "`true` when the child turn produced a non-empty final message.\n\nAbsent from the wire when `false`; deserialization defaults to `false`.",
+      "description": "`true` when the child turn produced a non-empty final message.\n\nAlways serialized on the wire (including `false`); `#[serde(default)]` only relaxes deserialization so a missing field parses as `false`.",
       "default": false,
       "type": "boolean"
     },

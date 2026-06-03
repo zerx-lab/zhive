@@ -1,0 +1,22 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "SearchThreadsParams",
+  "description": "Params of the `thread/search` RPC.\n\nMatches threads whose `name`, `preview`, or `cwd` contains `query` as a case-insensitive substring. An empty `query` returns all threads (subject to the optional `cwd` filter).\n\n# Examples\n\n``` use zhive_proto::rpc::SearchThreadsParams; let p = SearchThreadsParams::new(\"refactor\".into(), None); let v = serde_json::to_value(&p).unwrap(); assert_eq!(v[\"query\"], \"refactor\"); assert!(v.get(\"cwd\").is_none()); let back: SearchThreadsParams = serde_json::from_value(v).unwrap(); assert_eq!(back, p); ```",
+  "type": "object",
+  "required": [
+    "query"
+  ],
+  "properties": {
+    "cwd": {
+      "description": "Optional cwd narrowing applied before the substring match.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "query": {
+      "description": "Case-insensitive substring matched against `name`, `preview`, and `cwd`.",
+      "type": "string"
+    }
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "DeleteThreadParams",
+  "description": "Params of the `thread/delete` RPC.\n\nThe server rejects deletion when the named thread has an active turn, returning a structured error rather than silently cancelling the turn.\n\n# Examples\n\n``` use std::sync::Arc; use zhive_proto::domain::ThreadId; use zhive_proto::rpc::DeleteThreadParams; let p = DeleteThreadParams::new(ThreadId(Arc::from(\"thread:native/abc\"))); let v = serde_json::to_value(&p).unwrap(); assert_eq!(v[\"threadId\"], \"thread:native/abc\"); let back: DeleteThreadParams = serde_json::from_value(v).unwrap(); assert_eq!(back, p); ```",
+  "type": "object",
+  "required": [
+    "threadId"
+  ],
+  "properties": {
+    "threadId": {
+      "description": "Thread to delete.",
+      "type": "string"
+    }
+  }
+}

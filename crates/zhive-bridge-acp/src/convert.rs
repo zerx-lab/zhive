@@ -17,13 +17,14 @@
 //! to an empty text block, and outbound items with no ACP analogue yield `None`.
 
 use agent_client_protocol::schema::{
-    Content, ContentBlock, ContentChunk, Diff, ImageContent, Plan, PlanEntry, PlanEntryPriority,
-    PlanEntryStatus, ResourceLink, SessionUpdate, TextContent, ToolCall, ToolCallContent,
+    BlobResourceContents, Content, ContentBlock, ContentChunk, Diff, EmbeddedResource,
+    EmbeddedResourceResource, ImageContent, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus,
+    ResourceLink, SessionUpdate, TextContent, TextResourceContents, ToolCall, ToolCallContent,
     ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
 };
 
 use zhive_proto::domain::{
-    Item, ItemContent, ItemToolCallContent, PlanStep, PlanStepStatus,
+    Item, ItemContent, ItemToolCallContent, PlanStep, PlanStepStatus, ResourceContents,
     ToolCallStatus as ZToolStatus, ToolKind as ZToolKind,
 };
 
@@ -67,10 +68,7 @@ pub fn content_block_to_item_content(block: ContentBlock) -> ItemContent {
             mime_type: link.mime_type,
         },
         ContentBlock::Resource(res) => ItemContent::Resource {
-            // The ACP embedded resource is preserved verbatim as JSON; a
-            // serialization failure is impossible for a value the SDK just
-            // deserialized, so fall back to JSON null defensively.
-            resource: serde_json::to_value(&res.resource).unwrap_or(serde_json::Value::Null),
+            resource: acp_resource_to_contents(res.resource),
         },
         // `ContentBlock` is `#[non_exhaustive]`; an unknown future variant maps
         // to empty text rather than panicking (domain.rs downgrade contract).
@@ -125,15 +123,7 @@ pub fn item_content_to_block(content: ItemContent) -> ContentBlock {
             ContentBlock::ResourceLink(link)
         }
         ItemContent::Resource { resource } => {
-            // Best-effort: a typed embedded resource is reconstructed when the
-            // JSON matches, otherwise the payload is surfaced as text so no
-            // content is silently dropped.
-            match serde_json::from_value(resource.clone()) {
-                Ok(embedded) => ContentBlock::Resource(
-                    agent_client_protocol::schema::EmbeddedResource::new(embedded),
-                ),
-                Err(_) => ContentBlock::Text(TextContent::new(resource.to_string())),
-            }
+            ContentBlock::Resource(EmbeddedResource::new(contents_to_acp_resource(resource)))
         }
         // `ItemContent` is `#[non_exhaustive]`: unknown variant -> empty text.
         _ => ContentBlock::Text(TextContent::new(String::new())),
@@ -512,6 +502,69 @@ pub fn delta_to_session_update(delta: impl Into<String>) -> SessionUpdate {
     ))))
 }
 
+// ------------------------------------------------------------------
+// Resource-contents bridge helpers (A4)
+// ------------------------------------------------------------------
+
+/// Converts an ACP [`EmbeddedResourceResource`] (untagged text/blob) to the
+/// zhive internal-tag [`ResourceContents`].
+///
+/// The `_ =>` arm handles future `#[non_exhaustive]` ACP variants by falling
+/// back to an empty `Text` placeholder so no content is silently dropped and
+/// the bridge stays forward-compatible.
+fn acp_resource_to_contents(r: EmbeddedResourceResource) -> ResourceContents {
+    match r {
+        EmbeddedResourceResource::TextResourceContents(t) => ResourceContents::Text {
+            uri: t.uri,
+            text: t.text,
+            mime_type: t.mime_type,
+        },
+        EmbeddedResourceResource::BlobResourceContents(b) => ResourceContents::Blob {
+            uri: b.uri,
+            blob: b.blob,
+            mime_type: b.mime_type,
+        },
+        _ => ResourceContents::Text {
+            uri: String::new(),
+            text: String::new(),
+            mime_type: None,
+        },
+    }
+}
+
+/// Converts a zhive [`ResourceContents`] into an ACP [`EmbeddedResourceResource`].
+///
+/// This is a total conversion: every [`ResourceContents`] variant has a direct
+/// ACP counterpart, so no fallback or error path is needed.
+fn contents_to_acp_resource(c: ResourceContents) -> EmbeddedResourceResource {
+    match c {
+        ResourceContents::Text {
+            uri,
+            text,
+            mime_type,
+        } => {
+            let mut t = TextResourceContents::new(text, uri);
+            t.mime_type = mime_type;
+            EmbeddedResourceResource::TextResourceContents(t)
+        }
+        ResourceContents::Blob {
+            uri,
+            blob,
+            mime_type,
+        } => {
+            let mut b = BlobResourceContents::new(blob, uri);
+            b.mime_type = mime_type;
+            EmbeddedResourceResource::BlobResourceContents(b)
+        }
+        // `ResourceContents` is `#[non_exhaustive]`; future variants fall back
+        // to an empty text resource to preserve forward compatibility.
+        _ => EmbeddedResourceResource::TextResourceContents(TextResourceContents::new(
+            String::new(),
+            String::new(),
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -669,6 +722,62 @@ mod tests {
             item_to_session_update(&item).is_none(),
             "AgentMessage must be suppressed to avoid duplicate rendering"
         );
+    }
+
+    #[test]
+    fn resource_text_round_trips() {
+        let original = ItemContent::Resource {
+            resource: ResourceContents::Text {
+                uri: "file:///a.txt".into(),
+                text: "hello".into(),
+                mime_type: Some("text/plain".into()),
+            },
+        };
+        let block = item_content_to_block(original);
+        let back = content_block_to_item_content(block);
+        match back {
+            ItemContent::Resource {
+                resource:
+                    ResourceContents::Text {
+                        uri,
+                        text,
+                        mime_type,
+                    },
+            } => {
+                assert_eq!(uri, "file:///a.txt");
+                assert_eq!(text, "hello");
+                assert_eq!(mime_type.as_deref(), Some("text/plain"));
+            }
+            other => panic!("expected Resource/Text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resource_blob_round_trips() {
+        let original = ItemContent::Resource {
+            resource: ResourceContents::Blob {
+                uri: "file:///data.bin".into(),
+                blob: "AAAA".into(),
+                mime_type: None,
+            },
+        };
+        let block = item_content_to_block(original);
+        let back = content_block_to_item_content(block);
+        match back {
+            ItemContent::Resource {
+                resource:
+                    ResourceContents::Blob {
+                        uri,
+                        blob,
+                        mime_type,
+                    },
+            } => {
+                assert_eq!(uri, "file:///data.bin");
+                assert_eq!(blob, "AAAA");
+                assert!(mime_type.is_none());
+            }
+            other => panic!("expected Resource/Blob, got {other:?}"),
+        }
     }
 
     #[test]

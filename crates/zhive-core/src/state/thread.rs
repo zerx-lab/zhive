@@ -537,6 +537,14 @@ impl ThreadStore {
         self.inner.read().await.get(id).cloned()
     }
 
+    /// Removes the handle for `id` from the store, if present.
+    ///
+    /// Called by the engine after a thread is deleted so in-memory state does
+    /// not outlive the persistent record. A missing `id` is a no-op.
+    pub(crate) async fn remove(&self, id: &ThreadId) {
+        self.inner.write().await.remove(id);
+    }
+
     /// Returns a write-locked guard on the inner map.
     ///
     /// Used by the engine to atomically insert a new child thread handle
@@ -623,6 +631,24 @@ mod tests {
         let a = store.get_or_init(&id).await;
         let b = store.get_or_init(&id).await;
         assert!(Arc::ptr_eq(&a, &b));
+    }
+
+    #[tokio::test]
+    async fn store_remove_drops_handle() {
+        let store = ThreadStore::new();
+        let id = tid("thread:native/del");
+        store.get_or_init(&id).await;
+        assert!(
+            store.get(&id).await.is_some(),
+            "handle must be present after init"
+        );
+        store.remove(&id).await;
+        assert!(
+            store.get(&id).await.is_none(),
+            "handle must be absent after remove"
+        );
+        // Removing a non-existent id must not panic.
+        store.remove(&id).await;
     }
 }
 

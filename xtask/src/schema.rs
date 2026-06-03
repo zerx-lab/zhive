@@ -115,6 +115,27 @@ pub fn run() -> anyhow::Result<()> {
     emit!(zhive_proto::rpc::SessionCancelParams);
 
     // ------------------------------------------------------------------ //
+    // A4 strong-typed domain leaf
+    // ------------------------------------------------------------------ //
+    // ResourceContents is embedded in Item/ItemContent; emitting it
+    // separately lets client SDKs reference the type directly.
+    emit!(zhive_proto::domain::ResourceContents);
+
+    // ------------------------------------------------------------------ //
+    // A5 thread lifecycle + tool discovery
+    // ------------------------------------------------------------------ //
+    emit!(zhive_proto::rpc::DeleteThreadParams);
+    emit!(zhive_proto::rpc::DeleteThreadResult);
+    emit!(zhive_proto::rpc::RenameThreadParams);
+    emit!(zhive_proto::rpc::RenameThreadResult);
+    emit!(zhive_proto::rpc::SearchThreadsParams);
+    emit!(zhive_proto::rpc::SearchThreadsResult);
+    emit!(zhive_proto::rpc::ToolSpec);
+    emit!(zhive_proto::rpc::ToolSpecKind);
+    emit!(zhive_proto::rpc::ToolListParams);
+    emit!(zhive_proto::rpc::ToolListResult);
+
+    // ------------------------------------------------------------------ //
     // A2 event payload types
     // ------------------------------------------------------------------ //
     emit!(zhive_proto::events::UsagePayload);

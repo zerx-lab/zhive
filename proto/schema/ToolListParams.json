@@ -1,0 +1,6 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ToolListParams",
+  "description": "Params of the `tools/list` RPC.\n\nCurrently carries no fields; accepts `null` or `{}` on the wire. Reserved as `#[non_exhaustive]` so filtering fields can be added without a wire break.\n\n# Examples\n\n``` use zhive_proto::rpc::ToolListParams; // Both null and {} are accepted on the wire. let _p: ToolListParams = serde_json::from_str(\"{}\").unwrap(); let _p2 = ToolListParams::default(); ```",
+  "type": "object"
+}

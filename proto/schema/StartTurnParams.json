@@ -278,10 +278,10 @@
               ]
             },
             "raw_input": {
-              "description": "Raw JSON arguments handed to the tool."
+              "description": "Raw JSON arguments handed to the tool.\n\nIntentionally untyped: tool argument schemas are tool-defined."
             },
             "raw_output": {
-              "description": "Raw JSON output returned by the tool."
+              "description": "Raw JSON output returned by the tool.\n\nIntentionally untyped: tool output is tool-defined free-form JSON."
             },
             "status": {
               "description": "Tool call lifecycle status.",
@@ -604,7 +604,7 @@
           ],
           "properties": {
             "annotations": {
-              "description": "Optional ACP-defined annotations payload."
+              "description": "Optional ACP-defined annotations payload.\n\nKept as opaque JSON: ACP annotation schema is host-defined."
             },
             "text": {
               "description": "Text body.",
@@ -717,7 +717,7 @@
           }
         },
         {
-          "description": "Embedded resource payload.",
+          "description": "Embedded resource payload (strong-typed text or blob).",
           "type": "object",
           "required": [
             "resource",
@@ -725,7 +725,12 @@
           ],
           "properties": {
             "resource": {
-              "description": "`ResourceContents` payload; strong typing deferred to a follow-up."
+              "description": "URI-addressed text or binary payload.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/ResourceContents"
+                }
+              ]
             },
             "type": {
               "type": "string",
@@ -1020,6 +1025,75 @@
           "enum": [
             "completed"
           ]
+        }
+      ]
+    },
+    "ResourceContents": {
+      "description": "Embedded resource payload: text or binary, both URI-addressed.\n\nStrong-typed replacement for the previous `resource: Value`. Mirrors ACP `EmbeddedResourceResource` (an untagged text/blob choice) but uses an internal `type` tag so the zhive wire form is self-describing and the schema is stable. The `_meta` ACP extension slot is intentionally dropped (zhive does not consume it).\n\n# Examples\n\n``` use zhive_proto::domain::ResourceContents; let text = ResourceContents::Text { uri: \"file:///foo.txt\".into(), text: \"hello\".into(), mime_type: Some(\"text/plain\".into()), }; let v = serde_json::to_value(&text).unwrap(); assert_eq!(v[\"type\"], \"text\"); assert_eq!(v[\"uri\"], \"file:///foo.txt\"); let back: ResourceContents = serde_json::from_value(v).unwrap(); assert_eq!(back, text); ```",
+      "oneOf": [
+        {
+          "description": "UTF-8 text resource contents.",
+          "type": "object",
+          "required": [
+            "text",
+            "type",
+            "uri"
+          ],
+          "properties": {
+            "mime_type": {
+              "description": "Optional MIME type hint.\n\nIntentionally kept as an `Option<String>` rather than a typed enum because MIME types are an open set.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "text": {
+              "description": "Decoded text body.",
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "text"
+              ]
+            },
+            "uri": {
+              "description": "Resource URI (e.g. `file:///path`).",
+              "type": "string"
+            }
+          }
+        },
+        {
+          "description": "Base64-encoded binary resource contents.",
+          "type": "object",
+          "required": [
+            "blob",
+            "type",
+            "uri"
+          ],
+          "properties": {
+            "blob": {
+              "description": "Base64-encoded binary body.",
+              "type": "string"
+            },
+            "mime_type": {
+              "description": "Optional MIME type hint.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "blob"
+              ]
+            },
+            "uri": {
+              "description": "Resource URI.",
+              "type": "string"
+            }
+          }
         }
       ]
     },

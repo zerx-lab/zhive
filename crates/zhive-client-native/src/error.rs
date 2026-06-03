@@ -27,6 +27,9 @@ use zhive_proto::framing::FramingError;
 ///
 /// let n = ClientError::NotImplemented { feature: "remote/websocket", phase: 3 };
 /// assert!(matches!(n, ClientError::NotImplemented { phase: 3, .. }));
+///
+/// let dec = ClientError::Decode("missing field `turnId`".into());
+/// assert!(matches!(dec, ClientError::Decode(_)));
 /// ```
 #[derive(Debug, Error)]
 #[non_exhaustive]
@@ -92,6 +95,23 @@ pub enum ClientError {
         /// Planned delivery phase (e.g. `3` for the Phase 3 remote story).
         phase: u8,
     },
+
+    /// Local serde decode failure when deserializing a server response.
+    ///
+    /// Returned by the typed helper methods (e.g. [`crate::Client::start_turn`])
+    /// when the server's response body cannot be deserialized into the
+    /// expected result type.  This is distinct from [`Self::Server`], which
+    /// represents a structured JSON-RPC error object sent by the server.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use zhive_client_native::ClientError;
+    /// let e = ClientError::Decode("missing field `turnId`".into());
+    /// assert!(format!("{e}").contains("missing field"));
+    /// ```
+    #[error("decode error: {0}")]
+    Decode(String),
 }
 
 // Rust guideline compliant 2026-02-21

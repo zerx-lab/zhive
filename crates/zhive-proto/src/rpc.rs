@@ -29,11 +29,12 @@
 //! attributes here **is** a breaking wire change and requires a version bump.
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 #[cfg(feature = "schema")]
 use schemars::JsonSchema;
 
-use crate::domain::{Item, ItemId, Thread, ThreadId, TurnId};
+use crate::domain::{Item, ItemId, Thread, ThreadId, ToolKind, TurnId};
 use crate::hook::CompactTrigger;
 use crate::permission::PermissionScope;
 
@@ -83,6 +84,33 @@ pub struct StartTurnParams {
     /// Optional permission scope override; `None` inherits the parent scope.
     #[serde(default)]
     pub scope: Option<PermissionScope>,
+}
+
+impl StartTurnParams {
+    /// Constructs params for starting a turn with the given inputs.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use zhive_proto::domain::ThreadId;
+    /// use zhive_proto::rpc::StartTurnParams;
+    /// let p = StartTurnParams::new(ThreadId(Arc::from("thread:native/x")), vec![], None);
+    /// assert!(p.user_input.is_empty());
+    /// assert!(p.scope.is_none());
+    /// ```
+    #[must_use]
+    pub fn new(
+        thread_id: ThreadId,
+        user_input: Vec<crate::domain::Item>,
+        scope: Option<crate::permission::PermissionScope>,
+    ) -> Self {
+        Self {
+            thread_id,
+            user_input,
+            scope,
+        }
+    }
 }
 
 /// Result of the `engine/start_turn` RPC.
@@ -285,6 +313,25 @@ pub struct CompactParams {
     pub trigger: CompactTrigger,
 }
 
+impl CompactParams {
+    /// Constructs params for a manually triggered compaction.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use zhive_proto::domain::ThreadId;
+    /// use zhive_proto::hook::CompactTrigger;
+    /// use zhive_proto::rpc::CompactParams;
+    /// let p = CompactParams::new(ThreadId(Arc::from("thread:native/x")), CompactTrigger::Manual);
+    /// assert_eq!(p.trigger, CompactTrigger::Manual);
+    /// ```
+    #[must_use]
+    pub fn new(thread_id: ThreadId, trigger: crate::hook::CompactTrigger) -> Self {
+        Self { thread_id, trigger }
+    }
+}
+
 /// Wire classifier for the `engine/compact` reply.
 ///
 /// # Examples
@@ -383,6 +430,32 @@ pub struct ForkParams {
     pub summarize: bool,
 }
 
+impl ForkParams {
+    /// Constructs params for forking a thread at an optional boundary.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use zhive_proto::domain::ThreadId;
+    /// use zhive_proto::rpc::ForkParams;
+    /// let p = ForkParams::new(ThreadId(Arc::from("thread:native/src")), None, false);
+    /// assert!(!p.summarize);
+    /// ```
+    #[must_use]
+    pub fn new(
+        source_thread_id: ThreadId,
+        up_to_item: Option<crate::domain::ItemId>,
+        summarize: bool,
+    ) -> Self {
+        Self {
+            source_thread_id,
+            up_to_item,
+            summarize,
+        }
+    }
+}
+
 /// Result of the `thread/fork` RPC.
 ///
 /// # Examples
@@ -462,6 +535,24 @@ pub struct ListThreadsParams {
     pub cwd: Option<String>,
 }
 
+impl ListThreadsParams {
+    /// Constructs params with an optional working-directory filter.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use zhive_proto::rpc::ListThreadsParams;
+    /// let p = ListThreadsParams::new(None);
+    /// assert!(p.cwd.is_none());
+    /// let p2 = ListThreadsParams::new(Some("/work".into()));
+    /// assert_eq!(p2.cwd.as_deref(), Some("/work"));
+    /// ```
+    #[must_use]
+    pub fn new(cwd: Option<String>) -> Self {
+        Self { cwd }
+    }
+}
+
 /// Result of the `thread/list` RPC.
 ///
 /// # Examples
@@ -520,6 +611,24 @@ impl ListThreadsResult {
 pub struct ResumeThreadParams {
     /// Thread to restore into engine memory.
     pub thread_id: ThreadId,
+}
+
+impl ResumeThreadParams {
+    /// Constructs params for resuming a thread into engine memory.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use zhive_proto::domain::ThreadId;
+    /// use zhive_proto::rpc::ResumeThreadParams;
+    /// let p = ResumeThreadParams::new(ThreadId(Arc::from("thread:native/abc")));
+    /// assert_eq!(p.thread_id.0.as_ref(), "thread:native/abc");
+    /// ```
+    #[must_use]
+    pub fn new(thread_id: ThreadId) -> Self {
+        Self { thread_id }
+    }
 }
 
 /// Result of the `engine/resume_thread` RPC.
@@ -605,6 +714,35 @@ pub struct GetItemsParams {
     pub limit: Option<i64>,
 }
 
+impl GetItemsParams {
+    /// Constructs params for fetching thread history items.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use zhive_proto::domain::ThreadId;
+    /// use zhive_proto::rpc::GetItemsParams;
+    /// let p = GetItemsParams::new(ThreadId(Arc::from("thread:native/x")), None, None, None);
+    /// assert!(p.turn_id.is_none());
+    /// assert!(p.offset.is_none());
+    /// ```
+    #[must_use]
+    pub fn new(
+        thread_id: ThreadId,
+        turn_id: Option<crate::domain::TurnId>,
+        offset: Option<i64>,
+        limit: Option<i64>,
+    ) -> Self {
+        Self {
+            thread_id,
+            turn_id,
+            offset,
+            limit,
+        }
+    }
+}
+
 /// Result of the `thread/get_items` RPC.
 ///
 /// # Examples
@@ -672,6 +810,24 @@ pub struct InjectionParams {
     pub items: Vec<Item>,
 }
 
+impl InjectionParams {
+    /// Constructs injection params for a target thread with the given items.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use zhive_proto::domain::ThreadId;
+    /// use zhive_proto::rpc::InjectionParams;
+    /// let p = InjectionParams::new(ThreadId(Arc::from("thread:native/x")), vec![]);
+    /// assert!(p.items.is_empty());
+    /// ```
+    #[must_use]
+    pub fn new(thread_id: ThreadId, items: Vec<crate::domain::Item>) -> Self {
+        Self { thread_id, items }
+    }
+}
+
 /// Acknowledgement returned by the three injection-queue methods.
 ///
 /// The wire shape is always `{"accepted":true}`; a `false` value is reserved
@@ -733,6 +889,494 @@ impl InjectionAck {
 pub struct SessionCancelParams {
     /// Thread whose active turn should be cancelled.
     pub thread_id: ThreadId,
+}
+
+// ============================================================
+// thread/delete
+// ============================================================
+
+/// Params of the `thread/delete` RPC.
+///
+/// The server rejects deletion when the named thread has an active turn,
+/// returning a structured error rather than silently cancelling the turn.
+///
+/// # Examples
+///
+/// ```
+/// use std::sync::Arc;
+/// use zhive_proto::domain::ThreadId;
+/// use zhive_proto::rpc::DeleteThreadParams;
+/// let p = DeleteThreadParams::new(ThreadId(Arc::from("thread:native/abc")));
+/// let v = serde_json::to_value(&p).unwrap();
+/// assert_eq!(v["threadId"], "thread:native/abc");
+/// let back: DeleteThreadParams = serde_json::from_value(v).unwrap();
+/// assert_eq!(back, p);
+/// ```
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct DeleteThreadParams {
+    /// Thread to delete.
+    pub thread_id: ThreadId,
+}
+
+impl DeleteThreadParams {
+    /// Constructs params for deleting `thread_id`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use zhive_proto::domain::ThreadId;
+    /// use zhive_proto::rpc::DeleteThreadParams;
+    /// let p = DeleteThreadParams::new(ThreadId(Arc::from("thread:native/x")));
+    /// assert_eq!(p.thread_id.0.as_ref(), "thread:native/x");
+    /// ```
+    #[must_use]
+    pub fn new(thread_id: ThreadId) -> Self {
+        Self { thread_id }
+    }
+}
+
+/// Result of the `thread/delete` RPC.
+///
+/// `deleted` is `true` when a persistent row or rollout file was removed.
+/// `false` indicates the thread was not found (idempotent delete). When the
+/// thread has an active turn the server returns an error instead of this type.
+///
+/// # Examples
+///
+/// ```
+/// use zhive_proto::rpc::DeleteThreadResult;
+/// let r = DeleteThreadResult::new(true);
+/// let v = serde_json::to_value(&r).unwrap();
+/// assert_eq!(v["deleted"], true);
+/// let back: DeleteThreadResult = serde_json::from_value(v).unwrap();
+/// assert_eq!(back, r);
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct DeleteThreadResult {
+    /// `true` when a row/rollout existed and was removed; `false` when the
+    /// thread was unknown (idempotent).
+    pub deleted: bool,
+}
+
+impl DeleteThreadResult {
+    /// Constructs a delete result.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use zhive_proto::rpc::DeleteThreadResult;
+    /// let r = DeleteThreadResult::new(false);
+    /// assert!(!r.deleted);
+    /// ```
+    #[must_use]
+    pub fn new(deleted: bool) -> Self {
+        Self { deleted }
+    }
+}
+
+// ============================================================
+// thread/rename
+// ============================================================
+
+/// Params of the `thread/rename` RPC.
+///
+/// An empty `name` clears the label (stored as `NULL` in the database). The
+/// operation is best-effort: rename is accepted and queued to the async
+/// persistence writer; `renamed: true` in the result means the request was
+/// enqueued, not that it has already hit disk.
+///
+/// # Examples
+///
+/// ```
+/// use std::sync::Arc;
+/// use zhive_proto::domain::ThreadId;
+/// use zhive_proto::rpc::RenameThreadParams;
+/// let p = RenameThreadParams::new(
+///     ThreadId(Arc::from("thread:native/abc")),
+///     "My feature branch".into(),
+/// );
+/// let v = serde_json::to_value(&p).unwrap();
+/// assert_eq!(v["name"], "My feature branch");
+/// let back: RenameThreadParams = serde_json::from_value(v).unwrap();
+/// assert_eq!(back, p);
+/// ```
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct RenameThreadParams {
+    /// Thread to rename.
+    pub thread_id: ThreadId,
+    /// New display name; an empty string clears the name (stored as `NULL`).
+    pub name: String,
+}
+
+impl RenameThreadParams {
+    /// Constructs params for renaming a thread.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use zhive_proto::domain::ThreadId;
+    /// use zhive_proto::rpc::RenameThreadParams;
+    /// let p = RenameThreadParams::new(ThreadId(Arc::from("thread:native/x")), "foo".into());
+    /// assert_eq!(p.name, "foo");
+    /// ```
+    #[must_use]
+    pub fn new(thread_id: ThreadId, name: String) -> Self {
+        Self { thread_id, name }
+    }
+}
+
+/// Result of the `thread/rename` RPC.
+///
+/// `renamed` is `true` when the rename was accepted into the persistence
+/// queue. It does **not** guarantee the SQL row was updated before this
+/// response was sent (the writer is async). `false` is returned when
+/// persistence is unavailable (in-memory-only engine).
+///
+/// # Examples
+///
+/// ```
+/// use zhive_proto::rpc::RenameThreadResult;
+/// let r = RenameThreadResult::new(true);
+/// let v = serde_json::to_value(&r).unwrap();
+/// assert_eq!(v["renamed"], true);
+/// let back: RenameThreadResult = serde_json::from_value(v).unwrap();
+/// assert_eq!(back, r);
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct RenameThreadResult {
+    /// `true` when the rename was accepted (best-effort); `false` when
+    /// persistence is unavailable.
+    pub renamed: bool,
+}
+
+impl RenameThreadResult {
+    /// Constructs a rename result.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use zhive_proto::rpc::RenameThreadResult;
+    /// let r = RenameThreadResult::new(true);
+    /// assert!(r.renamed);
+    /// ```
+    #[must_use]
+    pub fn new(renamed: bool) -> Self {
+        Self { renamed }
+    }
+}
+
+// ============================================================
+// thread/search
+// ============================================================
+
+/// Params of the `thread/search` RPC.
+///
+/// Matches threads whose `name`, `preview`, or `cwd` contains `query` as a
+/// case-insensitive substring. An empty `query` returns all threads (subject
+/// to the optional `cwd` filter).
+///
+/// # Examples
+///
+/// ```
+/// use zhive_proto::rpc::SearchThreadsParams;
+/// let p = SearchThreadsParams::new("refactor".into(), None);
+/// let v = serde_json::to_value(&p).unwrap();
+/// assert_eq!(v["query"], "refactor");
+/// assert!(v.get("cwd").is_none());
+/// let back: SearchThreadsParams = serde_json::from_value(v).unwrap();
+/// assert_eq!(back, p);
+/// ```
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct SearchThreadsParams {
+    /// Case-insensitive substring matched against `name`, `preview`, and `cwd`.
+    pub query: String,
+    /// Optional cwd narrowing applied before the substring match.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+}
+
+impl SearchThreadsParams {
+    /// Constructs search params with an optional cwd pre-filter.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use zhive_proto::rpc::SearchThreadsParams;
+    /// let p = SearchThreadsParams::new("foo".into(), Some("/work".into()));
+    /// assert_eq!(p.cwd.as_deref(), Some("/work"));
+    /// ```
+    #[must_use]
+    pub fn new(query: String, cwd: Option<String>) -> Self {
+        Self { query, cwd }
+    }
+}
+
+/// Result of the `thread/search` RPC.
+///
+/// # Examples
+///
+/// ```
+/// use zhive_proto::rpc::SearchThreadsResult;
+/// let r = SearchThreadsResult::new(vec![]);
+/// let v = serde_json::to_value(&r).unwrap();
+/// assert_eq!(v["threads"], serde_json::json!([]));
+/// let back: SearchThreadsResult = serde_json::from_value(v).unwrap();
+/// assert!(back.threads.is_empty());
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct SearchThreadsResult {
+    /// Matching threads ordered most-recently-updated first; `turns` is always
+    /// empty.
+    pub threads: Vec<Thread>,
+}
+
+impl SearchThreadsResult {
+    /// Constructs a search result from the given threads.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use zhive_proto::rpc::SearchThreadsResult;
+    /// let r = SearchThreadsResult::new(vec![]);
+    /// assert!(r.threads.is_empty());
+    /// ```
+    #[must_use]
+    pub fn new(threads: Vec<Thread>) -> Self {
+        Self { threads }
+    }
+}
+
+// ============================================================
+// tools/* — tool discovery
+// ============================================================
+
+/// Coarse classification of a discoverable tool.
+///
+/// Wire mirror of the engine's `domain::ToolKind`; defined as a separate type
+/// so that the discovery and display concerns can evolve independently.
+/// Zero-cost conversion from [`ToolKind`] is provided via [`From`].
+///
+/// # Examples
+///
+/// ```
+/// use zhive_proto::rpc::ToolSpecKind;
+/// let v = serde_json::to_value(ToolSpecKind::Read).unwrap();
+/// assert_eq!(v, "read");
+/// let back: ToolSpecKind = serde_json::from_value(v).unwrap();
+/// assert_eq!(back, ToolSpecKind::Read);
+/// ```
+#[derive(Default, Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ToolSpecKind {
+    /// Read-only file or resource access.
+    Read,
+    /// Modify a file or resource in place.
+    Edit,
+    /// Delete a file or resource.
+    Delete,
+    /// Move or rename a file or resource.
+    Move,
+    /// Search a corpus.
+    Search,
+    /// Execute a shell command or script.
+    Execute,
+    /// Internal reasoning (no side effects).
+    Think,
+    /// Fetch a remote resource.
+    Fetch,
+    /// Switch the agent mode.
+    SwitchMode,
+    /// Anything else.
+    #[default]
+    Other,
+}
+
+impl From<ToolKind> for ToolSpecKind {
+    /// Converts a domain [`ToolKind`] to its discovery wire form.
+    ///
+    /// The mapping is 1:1; both enums share the same variant set.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use zhive_proto::domain::ToolKind;
+    /// use zhive_proto::rpc::ToolSpecKind;
+    /// assert_eq!(ToolSpecKind::from(ToolKind::Read), ToolSpecKind::Read);
+    /// assert_eq!(ToolSpecKind::from(ToolKind::Other), ToolSpecKind::Other);
+    /// ```
+    fn from(k: ToolKind) -> Self {
+        match k {
+            ToolKind::Read => Self::Read,
+            ToolKind::Edit => Self::Edit,
+            ToolKind::Delete => Self::Delete,
+            ToolKind::Move => Self::Move,
+            ToolKind::Search => Self::Search,
+            ToolKind::Execute => Self::Execute,
+            ToolKind::Think => Self::Think,
+            ToolKind::Fetch => Self::Fetch,
+            ToolKind::SwitchMode => Self::SwitchMode,
+            _ => Self::Other,
+        }
+    }
+}
+
+/// Metadata descriptor for one engine-registered tool.
+///
+/// Returned by the `tools/list` RPC to let clients discover which tools the
+/// connected engine instance exposes, their input schema, and a coarse
+/// classification for UI grouping.
+///
+/// # Examples
+///
+/// ```
+/// use zhive_proto::rpc::{ToolSpec, ToolSpecKind};
+/// let spec = ToolSpec::new(
+///     "read_file".into(),
+///     Some("Read a file from the filesystem.".into()),
+///     ToolSpecKind::Read,
+///     serde_json::json!({ "type": "object", "properties": { "path": { "type": "string" } } }),
+/// );
+/// let v = serde_json::to_value(&spec).unwrap();
+/// assert_eq!(v["name"], "read_file");
+/// assert_eq!(v["kind"], "read");
+/// let back: ToolSpec = serde_json::from_value(v).unwrap();
+/// assert_eq!(back, spec);
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct ToolSpec {
+    /// Stable tool name matching the engine's dispatch key.
+    pub name: String,
+    /// Human-readable description, if the tool provides one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Coarse classification for UI grouping.
+    #[serde(default)]
+    pub kind: ToolSpecKind,
+    /// JSON Schema (object) describing the tool's input arguments.
+    ///
+    /// Intentionally kept as opaque `Value`: tool input schemas are
+    /// tool-defined and not validated at the proto layer.
+    pub input_schema: Value,
+}
+
+impl ToolSpec {
+    /// Constructs a tool spec from its core fields.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use zhive_proto::rpc::{ToolSpec, ToolSpecKind};
+    /// let spec = ToolSpec::new(
+    ///     "bash".into(),
+    ///     Some("Run a shell command.".into()),
+    ///     ToolSpecKind::Execute,
+    ///     serde_json::json!({}),
+    /// );
+    /// assert_eq!(spec.name, "bash");
+    /// ```
+    #[must_use]
+    pub fn new(
+        name: String,
+        description: Option<String>,
+        kind: ToolSpecKind,
+        input_schema: Value,
+    ) -> Self {
+        Self {
+            name,
+            description,
+            kind,
+            input_schema,
+        }
+    }
+}
+
+/// Params of the `tools/list` RPC.
+///
+/// Currently carries no fields; accepts `null` or `{}` on the wire.
+/// Reserved as `#[non_exhaustive]` so filtering fields can be added without
+/// a wire break.
+///
+/// # Examples
+///
+/// ```
+/// use zhive_proto::rpc::ToolListParams;
+/// // Both null and {} are accepted on the wire.
+/// let _p: ToolListParams = serde_json::from_str("{}").unwrap();
+/// let _p2 = ToolListParams::default();
+/// ```
+// The empty braces are intentional: this is an extensible params type. The
+// unit-struct form does not roundtrip `{}` through serde_json correctly, and
+// removing the braces would break future field additions without a wire break.
+#[expect(
+    clippy::empty_structs_with_brackets,
+    reason = "extensible params placeholder; unit struct breaks serde {} roundtrip"
+)]
+#[derive(Default, Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct ToolListParams {}
+
+/// Result of the `tools/list` RPC.
+///
+/// # Examples
+///
+/// ```
+/// use zhive_proto::rpc::ToolListResult;
+/// let r = ToolListResult::new(vec![]);
+/// let v = serde_json::to_value(&r).unwrap();
+/// assert_eq!(v["tools"], serde_json::json!([]));
+/// let back: ToolListResult = serde_json::from_value(v).unwrap();
+/// assert!(back.tools.is_empty());
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct ToolListResult {
+    /// All engine-registered tools, sorted by name.
+    pub tools: Vec<ToolSpec>,
+}
+
+impl ToolListResult {
+    /// Constructs a tool list result.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use zhive_proto::rpc::ToolListResult;
+    /// let r = ToolListResult::new(vec![]);
+    /// assert!(r.tools.is_empty());
+    /// ```
+    #[must_use]
+    pub fn new(tools: Vec<ToolSpec>) -> Self {
+        Self { tools }
+    }
 }
 
 // Rust guideline compliant 2026-02-21

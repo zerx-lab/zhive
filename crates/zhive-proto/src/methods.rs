@@ -131,6 +131,63 @@ pub const METHOD_THREAD_LIST: &str = "thread/list";
 /// ```
 pub const METHOD_THREAD_GET_ITEMS: &str = "thread/get_items";
 
+/// Client-to-server: permanently delete a thread and its history.
+///
+/// The server rejects deletion when the thread has an active turn. See
+/// [`crate::rpc::DeleteThreadParams`] and [`crate::rpc::DeleteThreadResult`].
+///
+/// # Examples
+///
+/// ```
+/// use zhive_proto::methods::METHOD_THREAD_DELETE;
+/// assert_eq!(METHOD_THREAD_DELETE, "thread/delete");
+/// ```
+pub const METHOD_THREAD_DELETE: &str = "thread/delete";
+
+/// Client-to-server: rename or re-label a thread.
+///
+/// An empty `name` string clears the label (stored as `NULL` in SQL). See
+/// [`crate::rpc::RenameThreadParams`] and [`crate::rpc::RenameThreadResult`].
+///
+/// # Examples
+///
+/// ```
+/// use zhive_proto::methods::METHOD_THREAD_RENAME;
+/// assert_eq!(METHOD_THREAD_RENAME, "thread/rename");
+/// ```
+pub const METHOD_THREAD_RENAME: &str = "thread/rename";
+
+/// Client-to-server: search threads by name, preview, or working directory.
+///
+/// See [`crate::rpc::SearchThreadsParams`] and
+/// [`crate::rpc::SearchThreadsResult`].
+///
+/// # Examples
+///
+/// ```
+/// use zhive_proto::methods::METHOD_THREAD_SEARCH;
+/// assert_eq!(METHOD_THREAD_SEARCH, "thread/search");
+/// ```
+pub const METHOD_THREAD_SEARCH: &str = "thread/search";
+
+// ============================================================
+// tools/* — tool discovery
+// ============================================================
+
+/// Client-to-server: enumerate all tools registered with the engine.
+///
+/// The response lets clients build UIs, validate tool names before a turn,
+/// or surface capability differences between connected engine instances. See
+/// [`crate::rpc::ToolListResult`].
+///
+/// # Examples
+///
+/// ```
+/// use zhive_proto::methods::METHOD_TOOLS_LIST;
+/// assert_eq!(METHOD_TOOLS_LIST, "tools/list");
+/// ```
+pub const METHOD_TOOLS_LIST: &str = "tools/list";
+
 // ============================================================
 // session/* — injection queues, cancel, and permission resume
 // ============================================================
@@ -238,6 +295,21 @@ pub const METHOD_INITIALIZED: &str = "initialized";
 /// ```
 #[doc(inline)]
 pub use crate::permission::METHOD_RESUME_PERMISSION;
+
+/// Server-to-client reverse RPC for permission prompts (re-exported from
+/// [`crate::permission`]).
+///
+/// Reserved for Phase B reverse-RPC; see [`crate::permission::METHOD_REQUEST_PERMISSION`]
+/// for details.
+///
+/// # Examples
+///
+/// ```
+/// use zhive_proto::methods::METHOD_REQUEST_PERMISSION;
+/// assert_eq!(METHOD_REQUEST_PERMISSION, "session/request_permission");
+/// ```
+#[doc(inline)]
+pub use crate::permission::METHOD_REQUEST_PERMISSION;
 
 // ============================================================
 // events/* — server-to-client notifications

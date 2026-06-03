@@ -1,0 +1,15 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "DeleteThreadResult",
+  "description": "Result of the `thread/delete` RPC.\n\n`deleted` is `true` when a persistent row or rollout file was removed. `false` indicates the thread was not found (idempotent delete). When the thread has an active turn the server returns an error instead of this type.\n\n# Examples\n\n``` use zhive_proto::rpc::DeleteThreadResult; let r = DeleteThreadResult::new(true); let v = serde_json::to_value(&r).unwrap(); assert_eq!(v[\"deleted\"], true); let back: DeleteThreadResult = serde_json::from_value(v).unwrap(); assert_eq!(back, r); ```",
+  "type": "object",
+  "required": [
+    "deleted"
+  ],
+  "properties": {
+    "deleted": {
+      "description": "`true` when a row/rollout existed and was removed; `false` when the thread was unknown (idempotent).",
+      "type": "boolean"
+    }
+  }
+}

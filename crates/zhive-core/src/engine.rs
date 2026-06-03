@@ -40,6 +40,7 @@ mod prompt;
 mod resume;
 mod subagent_spawn;
 pub mod submission;
+mod thread_admin;
 mod tool_dispatch;
 mod turn;
 
@@ -995,6 +996,155 @@ impl Engine {
             .await?;
         match reply {
             submission::SubmissionReply::GetItems(r) => Ok(r.map(|b| *b)),
+            _ => Err(EngineError::ReplyDropped),
+        }
+    }
+
+    /// Deletes a thread, its rollout file, and all SQL-indexed data.
+    ///
+    /// Refused when the target thread has an active turn in progress.  An
+    /// in-memory engine (no storage) surfaces
+    /// [`submission::DeleteError::StorageUnavailable`].
+    ///
+    /// # Errors
+    ///
+    /// Channel-level [`EngineError`] variants on actor failure; the delete's
+    /// own failures are folded into the `Ok` value as
+    /// [`submission::DeleteError`].
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use zhive_core::engine::Engine;
+    /// use zhive_proto::domain::ThreadId;
+    /// # async fn demo() {
+    /// let engine = Engine::spawn(); // in-memory: no storage
+    /// let outcome = engine
+    ///     .delete_thread(ThreadId(std::sync::Arc::from("thread:native/x")))
+    ///     .await
+    ///     .expect("actor reachable");
+    /// // In-memory engine has no storage → StorageUnavailable.
+    /// assert!(outcome.is_err());
+    /// engine.shutdown().await.unwrap();
+    /// # }
+    /// ```
+    pub async fn delete_thread(
+        &self,
+        thread_id: ThreadId,
+    ) -> Result<Result<submission::DeleteReply, submission::DeleteError>, EngineError> {
+        let reply = self
+            .submit_with_reply(Submission::Delete { thread_id })
+            .await?;
+        match reply {
+            submission::SubmissionReply::Delete(r) => Ok(r),
+            _ => Err(EngineError::ReplyDropped),
+        }
+    }
+
+    /// Renames a thread's human-facing display name.
+    ///
+    /// An empty `name` clears the stored name (stored as `NULL`). The rename
+    /// is queued asynchronously; `RenameReply::renamed = true` acknowledges
+    /// receipt rather than confirming durability.  An in-memory engine (no
+    /// storage) surfaces
+    /// [`submission::RenameError::StorageUnavailable`].
+    ///
+    /// # Errors
+    ///
+    /// Channel-level [`EngineError`] variants on actor failure; the rename's
+    /// own failures are folded into the `Ok` value as
+    /// [`submission::RenameError`].
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use zhive_core::engine::Engine;
+    /// use zhive_proto::domain::ThreadId;
+    /// # async fn demo() {
+    /// let engine = Engine::spawn(); // in-memory: no storage
+    /// let outcome = engine
+    ///     .rename_thread(ThreadId(std::sync::Arc::from("thread:native/x")), "my thread".into())
+    ///     .await
+    ///     .expect("actor reachable");
+    /// assert!(outcome.is_err()); // StorageUnavailable on in-memory engine
+    /// engine.shutdown().await.unwrap();
+    /// # }
+    /// ```
+    pub async fn rename_thread(
+        &self,
+        thread_id: ThreadId,
+        name: String,
+    ) -> Result<Result<submission::RenameReply, submission::RenameError>, EngineError> {
+        let reply = self
+            .submit_with_reply(Submission::Rename { thread_id, name })
+            .await?;
+        match reply {
+            submission::SubmissionReply::Rename(r) => Ok(r),
+            _ => Err(EngineError::ReplyDropped),
+        }
+    }
+
+    /// Searches threads by a substring query against name, preview, and cwd.
+    ///
+    /// Returns an empty list when no storage is configured or when no thread
+    /// matches.  An empty `query` returns all (optionally `cwd`-scoped) threads.
+    ///
+    /// # Errors
+    ///
+    /// Channel-level [`EngineError`] variants only.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use zhive_core::engine::Engine;
+    /// # async fn demo() {
+    /// let engine = Engine::spawn(); // in-memory: no storage
+    /// let hits = engine.search_threads("refactor", None).await.unwrap();
+    /// assert!(hits.is_empty()); // empty on in-memory engine
+    /// engine.shutdown().await.unwrap();
+    /// # }
+    /// ```
+    pub async fn search_threads(
+        &self,
+        query: &str,
+        cwd: Option<&str>,
+    ) -> Result<Vec<zhive_proto::domain::Thread>, EngineError> {
+        let reply = self
+            .submit_with_reply(Submission::Search {
+                query: query.to_owned(),
+                cwd: cwd.map(str::to_owned),
+            })
+            .await?;
+        match reply {
+            submission::SubmissionReply::Search(threads) => Ok(*threads),
+            _ => Err(EngineError::ReplyDropped),
+        }
+    }
+
+    /// Returns the tool specs for every tool in the engine's registry.
+    ///
+    /// The list is sorted by tool name and is always available regardless of
+    /// storage configuration.
+    ///
+    /// # Errors
+    ///
+    /// Channel-level [`EngineError`] variants only.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use zhive_core::engine::Engine;
+    /// # async fn demo() {
+    /// let engine = Engine::spawn(); // no tools registered by default
+    /// let specs = engine.list_tools().await.unwrap();
+    /// assert!(specs.is_empty());
+    /// engine.shutdown().await.unwrap();
+    /// # }
+    /// ```
+    pub async fn list_tools(&self) -> Result<Vec<zhive_proto::rpc::ToolSpec>, EngineError> {
+        let reply = self.submit_with_reply(Submission::ListTools).await?;
+        match reply {
+            submission::SubmissionReply::ListTools(specs) => Ok(*specs),
             _ => Err(EngineError::ReplyDropped),
         }
     }

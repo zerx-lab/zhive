@@ -6,7 +6,7 @@
 //! the canonical Phase 1 method set into a [`super::router::Router`] in
 //! one call.
 //!
-//! ## Method catalogue (Phase 1)
+//! ## Method catalogue (Phase 1 + A5)
 //!
 //! * `engine/start_turn` — calls [`crate::engine::Engine::start_turn`]
 //! * `engine/cancel_turn` — calls [`crate::engine::Engine::cancel_turn`]
@@ -17,6 +17,10 @@
 //! * `thread/list` — calls [`crate::engine::Engine::list_threads`]
 //! * `engine/resume_thread` — calls [`crate::engine::Engine::resume_thread`]
 //! * `thread/get_items` — calls [`crate::engine::Engine::get_items`]
+//! * `thread/delete` — calls [`crate::engine::Engine::delete_thread`]
+//! * `thread/rename` — calls [`crate::engine::Engine::rename_thread`]
+//! * `thread/search` — calls [`crate::engine::Engine::search_threads`]
+//! * `tools/list` — calls [`crate::engine::Engine::list_tools`]
 //! * `engine/shutdown` — calls [`crate::engine::Engine::shutdown`]
 //!
 //! Method names are intentionally namespaced under `engine/` so the
@@ -32,17 +36,19 @@ use zhive_proto::ErrorObject;
 use zhive_proto::methods;
 use zhive_proto::permission::{PermissionOutcome, ResumePermissionParams};
 use zhive_proto::rpc::{
-    CancelTurnParams, CancelTurnResult, CompactParams, CompactResult, CompactStatus, ForkParams,
-    ForkResult, GetItemsParams, GetItemsResult, InjectionAck, InjectionParams, ListThreadsParams,
-    ListThreadsResult, ResumePermissionResult, ResumePermissionStatus, ResumeThreadParams,
-    ResumeThreadResult, SessionCancelParams, StartTurnParams, StartTurnResult,
+    CancelTurnParams, CancelTurnResult, CompactParams, CompactResult, CompactStatus,
+    DeleteThreadParams, DeleteThreadResult, ForkParams, ForkResult, GetItemsParams, GetItemsResult,
+    InjectionAck, InjectionParams, ListThreadsParams, ListThreadsResult, RenameThreadParams,
+    RenameThreadResult, ResumePermissionResult, ResumePermissionStatus, ResumeThreadParams,
+    ResumeThreadResult, SearchThreadsParams, SearchThreadsResult, SessionCancelParams,
+    StartTurnParams, StartTurnResult, ToolListResult,
 };
 
 use crate::engine::{
-    Engine, EngineError, PermissionRequestId,
+    Engine, EngineError, PermissionRequestId, Submission,
     submission::{
-        CompactError, CompactReply, ForkError, ForkReply, GetItemsError, ResumeError,
-        ResumePermissionReply, ResumeReply, Submission,
+        CompactError, CompactReply, DeleteError, DeleteReply, ForkError, ForkReply, GetItemsError,
+        RenameError, RenameReply, ResumeError, ResumePermissionReply, ResumeReply,
     },
 };
 use zhive_proto::permission::StreamingBehavior;
@@ -59,6 +65,11 @@ pub const ENGINE_ERROR_CODE: i64 = -32000;
 /// Subsequent calls to [`Router::register`] for the same method name
 /// silently overwrite, so callers that want custom dispatchers should
 /// invoke this first and then register their overrides.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one registration call per method; splitting into sub-functions would \
+              obscure the complete method catalogue without improving readability"
+)]
 pub fn register_engine_handlers(router: &mut Router, engine: Engine) {
     let engine = Arc::new(engine);
     router.register(
@@ -146,6 +157,31 @@ pub fn register_engine_handlers(router: &mut Router, engine: Engine) {
     router.register(
         methods::METHOD_SHUTDOWN,
         Arc::new(ShutdownHandler {
+            engine: Arc::clone(&engine),
+        }),
+    );
+    // A5 thread lifecycle + tool discovery.
+    router.register(
+        methods::METHOD_THREAD_DELETE,
+        Arc::new(DeleteThreadHandler {
+            engine: Arc::clone(&engine),
+        }),
+    );
+    router.register(
+        methods::METHOD_THREAD_RENAME,
+        Arc::new(RenameThreadHandler {
+            engine: Arc::clone(&engine),
+        }),
+    );
+    router.register(
+        methods::METHOD_THREAD_SEARCH,
+        Arc::new(SearchThreadsHandler {
+            engine: Arc::clone(&engine),
+        }),
+    );
+    router.register(
+        methods::METHOD_TOOLS_LIST,
+        Arc::new(ToolsListHandler {
             engine: Arc::clone(&engine),
         }),
     );
@@ -420,6 +456,89 @@ impl Handler for SessionCancelHandler {
 }
 
 // ============================================================
+// A5 thread lifecycle + tool discovery handlers
+// ============================================================
+
+struct DeleteThreadHandler {
+    engine: Arc<Engine>,
+}
+
+#[async_trait]
+impl Handler for DeleteThreadHandler {
+    async fn handle(&self, params: Option<Value>) -> Result<Value, ErrorObject> {
+        let params: DeleteThreadParams = decode_params(params)?;
+        match self.engine.delete_thread(params.thread_id).await {
+            Ok(Ok(DeleteReply { deleted })) => {
+                Ok(serde_json::to_value(DeleteThreadResult::new(deleted)).unwrap_or(Value::Null))
+            }
+            Ok(Err(domain)) => Err(delete_error(&domain)),
+            Err(err) => Err(engine_error(&err)),
+        }
+    }
+}
+
+struct RenameThreadHandler {
+    engine: Arc<Engine>,
+}
+
+#[async_trait]
+impl Handler for RenameThreadHandler {
+    async fn handle(&self, params: Option<Value>) -> Result<Value, ErrorObject> {
+        let params: RenameThreadParams = decode_params(params)?;
+        match self
+            .engine
+            .rename_thread(params.thread_id, params.name)
+            .await
+        {
+            Ok(Ok(RenameReply { renamed })) => {
+                Ok(serde_json::to_value(RenameThreadResult::new(renamed)).unwrap_or(Value::Null))
+            }
+            Ok(Err(domain)) => Err(rename_error(&domain)),
+            Err(err) => Err(engine_error(&err)),
+        }
+    }
+}
+
+struct SearchThreadsHandler {
+    engine: Arc<Engine>,
+}
+
+#[async_trait]
+impl Handler for SearchThreadsHandler {
+    async fn handle(&self, params: Option<Value>) -> Result<Value, ErrorObject> {
+        // `thread/search` params are required (query is mandatory).
+        let params: SearchThreadsParams = decode_params(params)?;
+        match self
+            .engine
+            .search_threads(&params.query, params.cwd.as_deref())
+            .await
+        {
+            Ok(threads) => {
+                Ok(serde_json::to_value(SearchThreadsResult::new(threads)).unwrap_or(Value::Null))
+            }
+            Err(err) => Err(engine_error(&err)),
+        }
+    }
+}
+
+/// Handler for `tools/list` — no params, returns the engine's tool specs.
+struct ToolsListHandler {
+    engine: Arc<Engine>,
+}
+
+#[async_trait]
+impl Handler for ToolsListHandler {
+    async fn handle(&self, _params: Option<Value>) -> Result<Value, ErrorObject> {
+        match self.engine.list_tools().await {
+            Ok(specs) => {
+                Ok(serde_json::to_value(ToolListResult::new(specs)).unwrap_or(Value::Null))
+            }
+            Err(err) => Err(engine_error(&err)),
+        }
+    }
+}
+
+// ============================================================
 // Injection-queue handlers (Pi `streamingBehavior` model)
 // ============================================================
 
@@ -610,6 +729,47 @@ fn resume_error(err: &ResumeError) -> ErrorObject {
         })),
         ResumeError::ReplayFailed { message } => Some(serde_json::json!({
             "kind": "replay_failed",
+            "reason": message,
+        })),
+    };
+    ErrorObject {
+        code: ENGINE_ERROR_CODE,
+        message,
+        data,
+    }
+}
+
+/// Maps a [`DeleteError`] to a wire error carrying a `kind` discriminator.
+fn delete_error(err: &DeleteError) -> ErrorObject {
+    let message = err.to_string();
+    let data = match err {
+        DeleteError::StorageUnavailable => {
+            Some(serde_json::json!({ "kind": "storage_unavailable" }))
+        }
+        DeleteError::ThreadHasActiveTurn => {
+            Some(serde_json::json!({ "kind": "thread_has_active_turn" }))
+        }
+        DeleteError::DeleteFailed { message } => Some(serde_json::json!({
+            "kind": "delete_failed",
+            "reason": message,
+        })),
+    };
+    ErrorObject {
+        code: ENGINE_ERROR_CODE,
+        message,
+        data,
+    }
+}
+
+/// Maps a [`RenameError`] to a wire error carrying a `kind` discriminator.
+fn rename_error(err: &RenameError) -> ErrorObject {
+    let message = err.to_string();
+    let data = match err {
+        RenameError::StorageUnavailable => {
+            Some(serde_json::json!({ "kind": "storage_unavailable" }))
+        }
+        RenameError::RenameFailed { message } => Some(serde_json::json!({
+            "kind": "rename_failed",
             "reason": message,
         })),
     };
@@ -897,6 +1057,87 @@ mod tests {
             .await
             .expect_err("unknown method");
         assert_eq!(err.code, JsonRpcCode::MethodNotFound.as_i64());
+
+        engine.shutdown().await.unwrap();
+    }
+
+    /// `thread/delete` is registered; on an in-memory engine it surfaces
+    /// `storage_unavailable` rather than -32601.
+    #[tokio::test]
+    async fn delete_thread_handler_without_storage_reports_storage_unavailable() {
+        let engine = Engine::spawn();
+        let mut router = Router::new();
+        register_engine_handlers(&mut router, engine.clone());
+
+        let err = router
+            .dispatch(
+                "thread/delete",
+                Some(serde_json::json!({"threadId": "thread:native/x"})),
+            )
+            .await
+            .expect_err("delete on an engine without storage is an error");
+        assert_eq!(err.code, ENGINE_ERROR_CODE);
+        assert_eq!(err.data.as_ref().unwrap()["kind"], "storage_unavailable");
+
+        engine.shutdown().await.unwrap();
+    }
+
+    /// `thread/rename` is registered; on an in-memory engine it surfaces
+    /// `storage_unavailable` rather than -32601.
+    #[tokio::test]
+    async fn rename_thread_handler_without_storage_reports_storage_unavailable() {
+        let engine = Engine::spawn();
+        let mut router = Router::new();
+        register_engine_handlers(&mut router, engine.clone());
+
+        let err = router
+            .dispatch(
+                "thread/rename",
+                Some(serde_json::json!({"threadId": "thread:native/x", "name": "new name"})),
+            )
+            .await
+            .expect_err("rename on an engine without storage is an error");
+        assert_eq!(err.code, ENGINE_ERROR_CODE);
+        assert_eq!(err.data.as_ref().unwrap()["kind"], "storage_unavailable");
+
+        engine.shutdown().await.unwrap();
+    }
+
+    /// `thread/search` is registered and returns an empty list on an in-memory
+    /// engine (no storage, but never -32601).
+    #[tokio::test]
+    async fn search_threads_handler_returns_empty_on_in_memory_engine() {
+        let engine = Engine::spawn();
+        let mut router = Router::new();
+        register_engine_handlers(&mut router, engine.clone());
+
+        let v = router
+            .dispatch(
+                "thread/search",
+                Some(serde_json::json!({"query": "anything"})),
+            )
+            .await
+            .expect("thread/search must be registered");
+        assert!(v["threads"].is_array());
+        assert_eq!(v["threads"].as_array().unwrap().len(), 0);
+
+        engine.shutdown().await.unwrap();
+    }
+
+    /// `tools/list` is registered and returns the `tools` array (empty on the
+    /// default in-memory engine that has no registered tools).
+    #[tokio::test]
+    async fn tools_list_handler_returns_empty_on_default_engine() {
+        let engine = Engine::spawn();
+        let mut router = Router::new();
+        register_engine_handlers(&mut router, engine.clone());
+
+        let v = router
+            .dispatch("tools/list", None)
+            .await
+            .expect("tools/list must be registered");
+        assert!(v["tools"].is_array());
+        assert_eq!(v["tools"].as_array().unwrap().len(), 0);
 
         engine.shutdown().await.unwrap();
     }

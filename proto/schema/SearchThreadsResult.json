@@ -1,17 +1,17 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "title": "GetItemsResult",
-  "description": "Result of the `thread/get_items` RPC.\n\n# Examples\n\n``` use zhive_proto::rpc::GetItemsResult; let r = GetItemsResult::new(vec![]); let v = serde_json::to_value(&r).unwrap(); assert_eq!(v[\"items\"], serde_json::json!([])); let back: GetItemsResult = serde_json::from_value(v).unwrap(); assert!(back.items.is_empty()); ```",
+  "title": "SearchThreadsResult",
+  "description": "Result of the `thread/search` RPC.\n\n# Examples\n\n``` use zhive_proto::rpc::SearchThreadsResult; let r = SearchThreadsResult::new(vec![]); let v = serde_json::to_value(&r).unwrap(); assert_eq!(v[\"threads\"], serde_json::json!([])); let back: SearchThreadsResult = serde_json::from_value(v).unwrap(); assert!(back.threads.is_empty()); ```",
   "type": "object",
   "required": [
-    "items"
+    "threads"
   ],
   "properties": {
-    "items": {
-      "description": "History items in conversation order (or paged subset).",
+    "threads": {
+      "description": "Matching threads ordered most-recently-updated first; `turns` is always empty.",
       "type": "array",
       "items": {
-        "$ref": "#/definitions/Item"
+        "$ref": "#/definitions/Thread"
       }
     }
   },
@@ -1008,6 +1008,237 @@
         }
       ]
     },
+    "Thread": {
+      "description": "Top-level conversation handle plus metadata.\n\n`turns` is populated lazily; most read paths return a Thread with `turns` empty and a separate request fetches the items.",
+      "type": "object",
+      "required": [
+        "createdAt",
+        "cwd",
+        "ephemeral",
+        "id",
+        "modelProvider",
+        "preview",
+        "source",
+        "status",
+        "updatedAt"
+      ],
+      "properties": {
+        "createdAt": {
+          "description": "Unix timestamp in seconds.",
+          "type": "integer",
+          "format": "int64"
+        },
+        "cwd": {
+          "description": "Working directory the thread was created in.",
+          "type": "string"
+        },
+        "ephemeral": {
+          "description": "When `true`, the thread is in-memory only and never written to JSONL.",
+          "type": "boolean"
+        },
+        "forkedFrom": {
+          "description": "Source thread id when this one was forked off another.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "description": "Stable URI-style id, see [`ThreadId`].",
+          "type": "string"
+        },
+        "modelProvider": {
+          "description": "LLM provider identifier (free-form, set at thread creation).",
+          "type": "string"
+        },
+        "name": {
+          "description": "User-supplied label, distinct from `preview`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "preview": {
+          "description": "First user message excerpt, truncated to ~200 chars for list views.",
+          "type": "string"
+        },
+        "sessionId": {
+          "description": "External session handle when the thread was opened via a bridge.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source": {
+          "description": "Whether the thread was started by a user, a subagent, or memory consolidation.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ThreadSource"
+            }
+          ]
+        },
+        "status": {
+          "description": "Current lifecycle status.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ThreadStatus"
+            }
+          ]
+        },
+        "subagentParent": {
+          "description": "Parent thread id when this one was spawned as a subagent.\n\nDistinct from `forked_from`: a fork branches an existing conversation, whereas a subagent is a child task spawned by a running turn. Recorded so resume/rebuild can recover the parent-child relationship.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "turns": {
+          "description": "Lazily populated turn list (empty for list endpoints).",
+          "default": [],
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/Turn"
+          }
+        },
+        "updatedAt": {
+          "description": "Unix timestamp in seconds.",
+          "type": "integer",
+          "format": "int64"
+        }
+      }
+    },
+    "ThreadActiveFlag": {
+      "description": "Reason the thread is in [`ThreadStatus::Active`].",
+      "oneOf": [
+        {
+          "description": "Blocked on a `permission/request` round-trip.",
+          "type": "string",
+          "enum": [
+            "waitingOnApproval"
+          ]
+        },
+        {
+          "description": "Blocked on user input (e.g. `defer` outcome).",
+          "type": "string",
+          "enum": [
+            "waitingOnUserInput"
+          ]
+        },
+        {
+          "description": "A turn is executing.",
+          "type": "string",
+          "enum": [
+            "turnInProgress"
+          ]
+        },
+        {
+          "description": "A subagent spawned by this thread is executing.",
+          "type": "string",
+          "enum": [
+            "subagentInProgress"
+          ]
+        }
+      ]
+    },
+    "ThreadSource": {
+      "description": "Origin of the thread; mirrors codex `ThreadSource`.",
+      "oneOf": [
+        {
+          "description": "Started directly by a user prompt.",
+          "type": "string",
+          "enum": [
+            "user"
+          ]
+        },
+        {
+          "description": "Spawned by another thread as a subagent.",
+          "type": "string",
+          "enum": [
+            "subagent"
+          ]
+        },
+        {
+          "description": "Created by an internal memory consolidation job.",
+          "type": "string",
+          "enum": [
+            "memory_consolidation"
+          ]
+        }
+      ]
+    },
+    "ThreadStatus": {
+      "description": "Lifecycle state of a [`Thread`].",
+      "oneOf": [
+        {
+          "description": "Indexed but not yet read into memory.",
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "notLoaded"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Resident in memory, no active turn.",
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "idle"
+              ]
+            }
+          }
+        },
+        {
+          "description": "At least one in-progress turn or awaiting input.",
+          "type": "object",
+          "required": [
+            "active_flags",
+            "type"
+          ],
+          "properties": {
+            "active_flags": {
+              "description": "Flags describing what the thread is currently waiting on.",
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/ThreadActiveFlag"
+              }
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "active"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Engine-level fatal error; the thread cannot accept further turns.",
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "systemError"
+              ]
+            }
+          }
+        }
+      ]
+    },
     "ToolCallLocation": {
       "description": "File / line hint surfaced to UI alongside a tool call.",
       "type": "object",
@@ -1134,6 +1365,159 @@
           "type": "string",
           "enum": [
             "other"
+          ]
+        }
+      ]
+    },
+    "Turn": {
+      "description": "One user-input-to-final-answer cycle within a [`Thread`].\n\nFor MCP, the bridge synthesises a turn boundary around each `tools/call` sequence by listening to the [`TurnStartedNotification`] / [`TurnCompletedNotification`] notifications emitted by the engine.",
+      "type": "object",
+      "required": [
+        "id",
+        "status"
+      ],
+      "properties": {
+        "completedAt": {
+          "description": "Unix timestamp in seconds when the turn ended.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "durationMs": {
+          "description": "`completed_at - started_at`, expressed in milliseconds.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "error": {
+          "description": "Failure details; populated only when `status == Failed`.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/TurnError"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "id": {
+          "description": "Stable turn id, see [`TurnId`].",
+          "type": "string"
+        },
+        "items": {
+          "description": "Ordered, append-only item list.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/Item"
+          }
+        },
+        "itemsView": {
+          "description": "Whether `items` is fully populated, summarised, or unloaded.",
+          "default": "full",
+          "allOf": [
+            {
+              "$ref": "#/definitions/TurnItemsView"
+            }
+          ]
+        },
+        "startedAt": {
+          "description": "Unix timestamp in seconds when the turn started.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "status": {
+          "description": "Lifecycle status of the turn.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/TurnStatus"
+            }
+          ]
+        }
+      }
+    },
+    "TurnError": {
+      "description": "Failure details attached to a [`Turn`] with `status == Failed`.",
+      "type": "object",
+      "required": [
+        "message"
+      ],
+      "properties": {
+        "additionalDetails": {
+          "description": "Free-form diagnostic payload (provider response, exit code, etc.).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "message": {
+          "description": "Short human-readable summary of the failure.",
+          "type": "string"
+        }
+      }
+    },
+    "TurnItemsView": {
+      "description": "Whether [`Turn::items`] has been loaded from the JSONL rollout.",
+      "oneOf": [
+        {
+          "description": "Items not yet read from persistence; the field is intentionally empty.",
+          "type": "string",
+          "enum": [
+            "notLoaded"
+          ]
+        },
+        {
+          "description": "Items collapsed to a single summary entry (history compaction).",
+          "type": "string",
+          "enum": [
+            "summary"
+          ]
+        },
+        {
+          "description": "Fully loaded items.",
+          "type": "string",
+          "enum": [
+            "full"
+          ]
+        }
+      ]
+    },
+    "TurnStatus": {
+      "description": "Lifecycle state of a [`Turn`].",
+      "oneOf": [
+        {
+          "description": "Active; never appears in `turn/completed` notifications.",
+          "type": "string",
+          "enum": [
+            "inProgress"
+          ]
+        },
+        {
+          "description": "Reached a final agent message without errors.",
+          "type": "string",
+          "enum": [
+            "completed"
+          ]
+        },
+        {
+          "description": "Cancelled by `session/cancel` or user abort.",
+          "type": "string",
+          "enum": [
+            "interrupted"
+          ]
+        },
+        {
+          "description": "Engine or provider raised a fatal error.",
+          "type": "string",
+          "enum": [
+            "failed"
           ]
         }
       ]

@@ -357,9 +357,13 @@ pub enum Item {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         locations: Vec<ToolCallLocation>,
         /// Raw JSON arguments handed to the tool.
+        ///
+        /// Intentionally untyped: tool argument schemas are tool-defined.
         #[serde(skip_serializing_if = "Option::is_none")]
         raw_input: Option<Value>,
         /// Raw JSON output returned by the tool.
+        ///
+        /// Intentionally untyped: tool output is tool-defined free-form JSON.
         #[serde(skip_serializing_if = "Option::is_none")]
         raw_output: Option<Value>,
         /// Provider-assigned tool call id (e.g. `toolu_01...` from Anthropic).
@@ -494,6 +498,59 @@ impl Item {
 // Leaf types (1:1 with ACP / MCP)
 // ============================================================
 
+/// Embedded resource payload: text or binary, both URI-addressed.
+///
+/// Strong-typed replacement for the previous `resource: Value`. Mirrors ACP
+/// `EmbeddedResourceResource` (an untagged text/blob choice) but uses an
+/// internal `type` tag so the zhive wire form is self-describing and the
+/// schema is stable. The `_meta` ACP extension slot is intentionally dropped
+/// (zhive does not consume it).
+///
+/// # Examples
+///
+/// ```
+/// use zhive_proto::domain::ResourceContents;
+/// let text = ResourceContents::Text {
+///     uri: "file:///foo.txt".into(),
+///     text: "hello".into(),
+///     mime_type: Some("text/plain".into()),
+/// };
+/// let v = serde_json::to_value(&text).unwrap();
+/// assert_eq!(v["type"], "text");
+/// assert_eq!(v["uri"], "file:///foo.txt");
+/// let back: ResourceContents = serde_json::from_value(v).unwrap();
+/// assert_eq!(back, text);
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(tag = "type", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ResourceContents {
+    /// UTF-8 text resource contents.
+    Text {
+        /// Resource URI (e.g. `file:///path`).
+        uri: String,
+        /// Decoded text body.
+        text: String,
+        /// Optional MIME type hint.
+        ///
+        /// Intentionally kept as an `Option<String>` rather than a typed enum
+        /// because MIME types are an open set.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mime_type: Option<String>,
+    },
+    /// Base64-encoded binary resource contents.
+    Blob {
+        /// Resource URI.
+        uri: String,
+        /// Base64-encoded binary body.
+        blob: String,
+        /// Optional MIME type hint.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mime_type: Option<String>,
+    },
+}
+
 /// Multi-part content block, 1:1 isomorphic with ACP `ContentBlock`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
@@ -505,6 +562,8 @@ pub enum ItemContent {
         /// Text body.
         text: String,
         /// Optional ACP-defined annotations payload.
+        ///
+        /// Kept as opaque JSON: ACP annotation schema is host-defined.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         annotations: Option<Value>,
     },
@@ -539,11 +598,10 @@ pub enum ItemContent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         mime_type: Option<String>,
     },
-    /// Embedded resource payload.
+    /// Embedded resource payload (strong-typed text or blob).
     Resource {
-        /// `ResourceContents` payload; strong typing deferred to a follow-up.
-        // TODO: strong-type as `ResourceContents` once Phase 1 lands.
-        resource: Value,
+        /// URI-addressed text or binary payload.
+        resource: ResourceContents,
     },
 }
 

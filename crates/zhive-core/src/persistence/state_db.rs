@@ -519,6 +519,118 @@ impl StateDb {
     // Read methods
     // ------------------------------------------------------------------
 
+    /// Deletes the thread row and all its turns and items (cascade).
+    ///
+    /// Returns `true` when a row was removed, `false` when the thread was
+    /// unknown (idempotent: a missing thread is treated as already deleted).
+    /// The `ON DELETE CASCADE` constraint on `turns` and `items` is enforced by
+    /// the `foreign_keys` pragma enabled in [`Self::open`], so one `DELETE`
+    /// removes all child rows atomically.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::Sqlx`] on a database-level failure.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # async fn demo() -> zhive_core::persistence::StorageResult<()> {
+    /// use std::sync::Arc;
+    /// use std::path::Path;
+    /// use zhive_core::persistence::StateDb;
+    /// use zhive_proto::domain::ThreadId;
+    ///
+    /// let db = StateDb::open(Path::new("/tmp/demo/state.db")).await?;
+    /// let tid = ThreadId(Arc::from("thread:native/01"));
+    /// // Idempotent: `false` when the row never existed.
+    /// let deleted = db.delete_thread(&tid).await?;
+    /// assert!(!deleted);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn delete_thread(&self, id: &ThreadId) -> StorageResult<bool> {
+        let res = sqlx::query("DELETE FROM threads WHERE id = ?1")
+            .bind(id.0.as_ref())
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    /// Returns threads whose name, preview, or cwd contains `query` (case-insensitive).
+    ///
+    /// Results are ordered most-recently-updated first. When `cwd_filter` is
+    /// `Some(path)`, only threads under that working directory are searched
+    /// (cwd normalisation matches [`Self::list_threads`]). An empty `query`
+    /// returns all matching threads (i.e., acts like [`Self::list_threads`] with
+    /// an optional cwd filter).
+    ///
+    /// LIKE wildcards (`%`, `_`, `\`) in `query` are escaped so they are treated
+    /// as literals rather than pattern characters.
+    ///
+    /// `turns` is always empty in the returned `Thread` values; use
+    /// [`Self::get_turn_items`] to fetch items.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::Sqlx`] on a query failure or [`StorageError::Json`]
+    /// when a row fails to deserialise.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # async fn demo() -> zhive_core::persistence::StorageResult<()> {
+    /// use std::path::Path;
+    /// use zhive_core::persistence::StateDb;
+    ///
+    /// let db = StateDb::open(Path::new("/tmp/demo/state.db")).await?;
+    /// let hits = db.search_threads("refactor", None).await?;
+    /// println!("found {} threads matching 'refactor'", hits.len());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn search_threads(
+        &self,
+        query: &str,
+        cwd_filter: Option<&str>,
+    ) -> StorageResult<Vec<Thread>> {
+        // Escape LIKE metacharacters so the query is treated as a literal
+        // substring. The ESCAPE '\' clause in the SQL must match this function.
+        let like = format!("%{}%", escape_like(query));
+        let col_list = r"id, session_id, forked_from, subagent_parent, preview,
+                         ephemeral, model_provider, created_at, updated_at,
+                         status, cwd, source, name";
+        let rows = match cwd_filter {
+            Some(cwd) => {
+                let normalized = normalize_cwd(cwd);
+                sqlx::query(&format!(
+                    r"SELECT {col_list} FROM threads
+                      WHERE cwd = ?1 AND (
+                          lower(COALESCE(name, ''))    LIKE lower(?2) ESCAPE '\' OR
+                          lower(COALESCE(preview, '')) LIKE lower(?2) ESCAPE '\' OR
+                          lower(cwd)                  LIKE lower(?2) ESCAPE '\')
+                      ORDER BY updated_at DESC"
+                ))
+                .bind(normalized)
+                .bind(&like)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            None => {
+                sqlx::query(&format!(
+                    r"SELECT {col_list} FROM threads
+                      WHERE lower(COALESCE(name, ''))    LIKE lower(?1) ESCAPE '\' OR
+                            lower(COALESCE(preview, '')) LIKE lower(?1) ESCAPE '\' OR
+                            lower(cwd)                  LIKE lower(?1) ESCAPE '\'
+                      ORDER BY updated_at DESC"
+                ))
+                .bind(&like)
+                .fetch_all(&self.pool)
+                .await?
+            }
+        };
+        rows.into_iter().map(|row| row_to_thread(&row)).collect()
+    }
+
     /// Returns persisted threads ordered by `updated_at DESC`.
     ///
     /// When `cwd_filter` is `Some(path)`, only threads whose normalised `cwd`
@@ -788,6 +900,22 @@ fn row_to_thread(row: &sqlx::sqlite::SqliteRow) -> StorageResult<Thread> {
 // ------------------------------------------------------------------
 // cwd normalisation
 // ------------------------------------------------------------------
+
+/// Escapes LIKE pattern metacharacters (`%`, `_`, `\`) in `s`.
+///
+/// The result is safe to embed in a `… LIKE '%<s>%' ESCAPE '\'` SQL clause;
+/// the escape character `\` prevents the metacharacter from acting as a
+/// pattern wildcard when the user's query literally contains them.
+fn escape_like(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        if matches!(ch, '%' | '_' | '\\') {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
+}
 
 /// Normalises a working-directory string for stable storage and filtering.
 ///

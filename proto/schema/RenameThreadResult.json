@@ -1,0 +1,15 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "RenameThreadResult",
+  "description": "Result of the `thread/rename` RPC.\n\n`renamed` is `true` when the rename was accepted into the persistence queue. It does **not** guarantee the SQL row was updated before this response was sent (the writer is async). `false` is returned when persistence is unavailable (in-memory-only engine).\n\n# Examples\n\n``` use zhive_proto::rpc::RenameThreadResult; let r = RenameThreadResult::new(true); let v = serde_json::to_value(&r).unwrap(); assert_eq!(v[\"renamed\"], true); let back: RenameThreadResult = serde_json::from_value(v).unwrap(); assert_eq!(back, r); ```",
+  "type": "object",
+  "required": [
+    "renamed"
+  ],
+  "properties": {
+    "renamed": {
+      "description": "`true` when the rename was accepted (best-effort); `false` when persistence is unavailable.",
+      "type": "boolean"
+    }
+  }
+}

@@ -493,6 +493,41 @@ pub enum Submission {
     },
     /// Gracefully stop the engine actor.
     Shutdown,
+    /// Delete a thread, its rollout, and all SQL-indexed data.
+    ///
+    /// Refused when the thread has an active turn in progress to prevent
+    /// deleting a thread while items are still being appended to it.
+    Delete {
+        /// Thread to delete.
+        thread_id: ThreadId,
+    },
+    /// Rename a persisted thread's human-facing display name.
+    ///
+    /// An empty name clears the stored name (reverts to `NULL` in the index).
+    /// The rename is queued asynchronously to the persistence writer; the reply
+    /// is acknowledged immediately rather than waiting for the write to land.
+    Rename {
+        /// Thread to rename.
+        thread_id: ThreadId,
+        /// New display name; empty string clears it.
+        name: String,
+    },
+    /// Search threads by a substring query against name, preview, and cwd.
+    ///
+    /// Returns an empty list when no storage is configured or when no threads
+    /// match. Does not error on an in-memory engine.
+    Search {
+        /// Case-insensitive substring to match.
+        query: String,
+        /// Optional cwd pre-filter applied before the substring search.
+        cwd: Option<String>,
+    },
+    /// List all tools known to this engine's registry.
+    ///
+    /// Returns a `Vec<proto::rpc::ToolSpec>` sorted by name. The list is
+    /// derived from the in-memory registry and is always available regardless
+    /// of storage configuration.
+    ListTools,
 }
 
 /// Reasons a [`Submission::SpawnSubagent`] dispatch failed.
@@ -532,6 +567,103 @@ impl fmt::Display for SubagentSpawnError {
 
 impl std::error::Error for SubagentSpawnError {}
 
+/// Successful outcome of a [`Submission::Delete`] dispatch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeleteReply {
+    /// `true` when the thread row and/or rollout existed and was removed;
+    /// `false` when the thread was unknown (idempotent delete).
+    pub deleted: bool,
+}
+
+/// Reasons a [`Submission::Delete`] dispatch failed inside the actor.
+///
+/// # Examples
+///
+/// ```
+/// use zhive_core::engine::submission::DeleteError;
+///
+/// assert_eq!(
+///     DeleteError::ThreadHasActiveTurn.to_string(),
+///     "cannot delete a thread with an active turn in progress",
+/// );
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DeleteError {
+    /// No persistent storage is configured; delete is a no-op on in-memory
+    /// engines.
+    StorageUnavailable,
+    /// The thread has an active turn; delete is refused to avoid corrupting the
+    /// in-flight append.
+    ThreadHasActiveTurn,
+    /// The underlying storage operation failed.
+    DeleteFailed {
+        /// Human-readable cause.
+        message: String,
+    },
+}
+
+impl fmt::Display for DeleteError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::StorageUnavailable => {
+                f.write_str("no persistent storage configured; cannot delete thread")
+            }
+            Self::ThreadHasActiveTurn => {
+                f.write_str("cannot delete a thread with an active turn in progress")
+            }
+            Self::DeleteFailed { message } => write!(f, "thread deletion failed: {message}"),
+        }
+    }
+}
+
+impl std::error::Error for DeleteError {}
+
+/// Successful outcome of a [`Submission::Rename`] dispatch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenameReply {
+    /// `true` when the rename was accepted (queued for the persistence writer);
+    /// `false` when storage was unavailable.
+    pub renamed: bool,
+}
+
+/// Reasons a [`Submission::Rename`] dispatch failed inside the actor.
+///
+/// # Examples
+///
+/// ```
+/// use zhive_core::engine::submission::RenameError;
+///
+/// assert_eq!(
+///     RenameError::StorageUnavailable.to_string(),
+///     "no persistent storage configured; cannot rename thread",
+/// );
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RenameError {
+    /// No persistent storage is configured.
+    StorageUnavailable,
+    /// The underlying storage operation failed.
+    RenameFailed {
+        /// Human-readable cause.
+        message: String,
+    },
+}
+
+impl fmt::Display for RenameError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::StorageUnavailable => {
+                f.write_str("no persistent storage configured; cannot rename thread")
+            }
+            Self::RenameFailed { message } => write!(f, "thread rename failed: {message}"),
+        }
+    }
+}
+
+impl std::error::Error for RenameError {}
+
 /// Typed reply discharged on a [`SubmissionEnvelope::reply`] sender.
 ///
 /// One variant per submission kind that has a synchronous reply. A
@@ -569,6 +701,18 @@ pub enum SubmissionReply {
     GetItems(Result<Box<Vec<Item>>, GetItemsError>),
     /// Reply to a [`Submission::Shutdown`].
     Shutdown,
+    /// Reply to a [`Submission::Delete`].
+    Delete(Result<DeleteReply, DeleteError>),
+    /// Reply to a [`Submission::Rename`].
+    Rename(Result<RenameReply, RenameError>),
+    /// Reply to a [`Submission::Search`].
+    ///
+    /// `Vec<Thread>` is boxed so the enum stays small even for a large list.
+    Search(Box<Vec<zhive_proto::domain::Thread>>),
+    /// Reply to a [`Submission::ListTools`].
+    ///
+    /// `Vec<ToolSpec>` is boxed so the enum stays small.
+    ListTools(Box<Vec<zhive_proto::rpc::ToolSpec>>),
 }
 
 /// Wraps a [`Submission`] with an optional reply oneshot.

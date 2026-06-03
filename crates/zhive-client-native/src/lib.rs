@@ -29,6 +29,18 @@
 //! * [`Client::shutdown`] — closes the connection with a 5-second drain
 //!   wait and then exits.  The same best-effort teardown runs automatically
 //!   when the last [`Client`] clone is dropped.
+//! * **Typed RPC helpers** — [`Client::start_turn`], [`Client::compact`],
+//!   [`Client::fork_thread`], [`Client::list_threads`],
+//!   [`Client::resume_thread`], [`Client::get_items`],
+//!   [`Client::enqueue_steer`], [`Client::enqueue_follow_up`],
+//!   [`Client::enqueue_next_turn`], [`Client::delete_thread`],
+//!   [`Client::rename_thread`], [`Client::search_threads`],
+//!   [`Client::tools_list`], [`Client::resume_permission`] — all take
+//!   strongly-typed `Params` / `Result` from `zhive_proto::rpc` and
+//!   internally call [`Client::call`].
+//! * [`Client::set_permission_handler`] — convenience wrapper that installs a
+//!   typed [`PermissionHandler`] for the `session/request_permission`
+//!   reverse-RPC method.
 
 #![forbid(unsafe_code)]
 
@@ -36,6 +48,7 @@ mod connect;
 mod error;
 pub mod events;
 mod pending;
+pub mod permission_handler;
 mod reverse;
 mod transport;
 
@@ -48,13 +61,24 @@ use tokio::sync::{Notify, broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 use zhive_proto::domain::{ThreadId, TurnId};
 use zhive_proto::initialize::{Capabilities, Implementation, ProtocolVersion};
-use zhive_proto::{ErrorObject, Id, Message, Notification, Request, Response, ResponseOutcome};
+use zhive_proto::permission::ResumePermissionParams;
+use zhive_proto::rpc::{
+    CompactParams, CompactResult, DeleteThreadParams, DeleteThreadResult, ForkParams, ForkResult,
+    GetItemsParams, GetItemsResult, InjectionAck, InjectionParams, ListThreadsParams,
+    ListThreadsResult, RenameThreadParams, RenameThreadResult, ResumePermissionResult,
+    ResumeThreadParams, ResumeThreadResult, SearchThreadsParams, SearchThreadsResult,
+    StartTurnParams, StartTurnResult, ToolListResult,
+};
+use zhive_proto::{
+    ErrorObject, Id, Message, Notification, Request, Response, ResponseOutcome, methods,
+};
 
 pub use connect::{ClientBuilder, HandshakeMeta};
 pub use error::ClientError;
 pub use events::{ClientEvent, ClientEventStream};
 use pending::PendingSlot;
 pub use pending::{PendingRequests, ResolveResult};
+pub use permission_handler::{PermissionHandler, PermissionReverseAdapter};
 pub use reverse::ReverseHandler;
 
 use reverse::{HandlerSlot, PendingReverse};
@@ -349,6 +373,513 @@ impl Client {
         &self.handshake.server_info
     }
 
+    // ── Typed RPC helpers ─────────────────────────────────────────────────────
+
+    /// Starts a new turn on a thread; returns the new [`TurnId`].
+    ///
+    /// Wraps `engine/start_turn`.  Use [`StartTurnParams`] to seed the
+    /// turn with user input and an optional permission scope.
+    ///
+    /// # Errors
+    ///
+    /// * [`ClientError::Disconnected`] — connection closed before the response.
+    /// * [`ClientError::Server`] — server returned a JSON-RPC error.
+    /// * [`ClientError::Decode`] — response body did not match [`StartTurnResult`].
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # async fn example() -> Result<(), zhive_client_native::ClientError> {
+    /// use std::sync::Arc;
+    /// use zhive_proto::domain::ThreadId;
+    /// use zhive_proto::rpc::StartTurnParams;
+    /// use zhive_client_native::Client;
+    ///
+    /// let client = Client::connect_uds("/tmp/zhive.sock").await?;
+    /// let p = StartTurnParams::new(ThreadId(Arc::from("thread:native/x")), vec![], None);
+    /// let result = client.start_turn(p).await?;
+    /// println!("turn: {}", result.turn_id.0);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn start_turn(
+        &self,
+        params: StartTurnParams,
+    ) -> Result<StartTurnResult, ClientError> {
+        let v = serde_json::to_value(&params).map_err(|e| ClientError::Decode(e.to_string()))?;
+        let resp = self.call(methods::METHOD_START_TURN, Some(v)).await?;
+        serde_json::from_value(resp).map_err(|e| ClientError::Decode(e.to_string()))
+    }
+
+    /// Compacts the transcript on a thread; returns the compaction result.
+    ///
+    /// Wraps `engine/compact`.
+    ///
+    /// # Errors
+    ///
+    /// * [`ClientError::Disconnected`], [`ClientError::Server`],
+    ///   [`ClientError::Decode`] — see [`Self::call`].
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # async fn example() -> Result<(), zhive_client_native::ClientError> {
+    /// use std::sync::Arc;
+    /// use zhive_proto::domain::ThreadId;
+    /// use zhive_proto::hook::CompactTrigger;
+    /// use zhive_proto::rpc::CompactParams;
+    /// use zhive_client_native::Client;
+    ///
+    /// let client = Client::connect_uds("/tmp/zhive.sock").await?;
+    /// let p = CompactParams::new(ThreadId(Arc::from("thread:native/x")), CompactTrigger::Manual);
+    /// let result = client.compact(p).await?;
+    /// println!("compacted {} entries", result.entries_compacted);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn compact(&self, params: CompactParams) -> Result<CompactResult, ClientError> {
+        let v = serde_json::to_value(&params).map_err(|e| ClientError::Decode(e.to_string()))?;
+        let resp = self.call(methods::METHOD_COMPACT, Some(v)).await?;
+        serde_json::from_value(resp).map_err(|e| ClientError::Decode(e.to_string()))
+    }
+
+    /// Forks an existing thread at an optional item boundary.
+    ///
+    /// Wraps `thread/fork`.
+    ///
+    /// # Errors
+    ///
+    /// * [`ClientError::Disconnected`], [`ClientError::Server`],
+    ///   [`ClientError::Decode`] — see [`Self::call`].
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # async fn example() -> Result<(), zhive_client_native::ClientError> {
+    /// use std::sync::Arc;
+    /// use zhive_proto::domain::ThreadId;
+    /// use zhive_proto::rpc::ForkParams;
+    /// use zhive_client_native::Client;
+    ///
+    /// let client = Client::connect_uds("/tmp/zhive.sock").await?;
+    /// let p = ForkParams::new(ThreadId(Arc::from("thread:native/src")), None, false);
+    /// let result = client.fork_thread(p).await?;
+    /// println!("fork: {}", result.new_thread_id.0);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn fork_thread(&self, params: ForkParams) -> Result<ForkResult, ClientError> {
+        let v = serde_json::to_value(&params).map_err(|e| ClientError::Decode(e.to_string()))?;
+        let resp = self.call(methods::METHOD_THREAD_FORK, Some(v)).await?;
+        serde_json::from_value(resp).map_err(|e| ClientError::Decode(e.to_string()))
+    }
+
+    /// Lists persisted threads, optionally filtered by working directory.
+    ///
+    /// Wraps `thread/list`.
+    ///
+    /// # Errors
+    ///
+    /// * [`ClientError::Disconnected`], [`ClientError::Server`],
+    ///   [`ClientError::Decode`] — see [`Self::call`].
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # async fn example() -> Result<(), zhive_client_native::ClientError> {
+    /// use zhive_proto::rpc::ListThreadsParams;
+    /// use zhive_client_native::Client;
+    ///
+    /// let client = Client::connect_uds("/tmp/zhive.sock").await?;
+    /// let result = client.list_threads(ListThreadsParams::new(None)).await?;
+    /// println!("{} thread(s)", result.threads.len());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn list_threads(
+        &self,
+        params: ListThreadsParams,
+    ) -> Result<ListThreadsResult, ClientError> {
+        let v = serde_json::to_value(&params).map_err(|e| ClientError::Decode(e.to_string()))?;
+        let resp = self.call(methods::METHOD_THREAD_LIST, Some(v)).await?;
+        serde_json::from_value(resp).map_err(|e| ClientError::Decode(e.to_string()))
+    }
+
+    /// Restores a persisted thread into engine memory.
+    ///
+    /// Wraps `engine/resume_thread`.
+    ///
+    /// # Errors
+    ///
+    /// * [`ClientError::Disconnected`], [`ClientError::Server`],
+    ///   [`ClientError::Decode`] — see [`Self::call`].
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # async fn example() -> Result<(), zhive_client_native::ClientError> {
+    /// use std::sync::Arc;
+    /// use zhive_proto::domain::ThreadId;
+    /// use zhive_proto::rpc::ResumeThreadParams;
+    /// use zhive_client_native::Client;
+    ///
+    /// let client = Client::connect_uds("/tmp/zhive.sock").await?;
+    /// let p = ResumeThreadParams::new(ThreadId(Arc::from("thread:native/abc")));
+    /// let result = client.resume_thread(p).await?;
+    /// println!("restored {} items", result.items_restored);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn resume_thread(
+        &self,
+        params: ResumeThreadParams,
+    ) -> Result<ResumeThreadResult, ClientError> {
+        let v = serde_json::to_value(&params).map_err(|e| ClientError::Decode(e.to_string()))?;
+        let resp = self.call(methods::METHOD_RESUME_THREAD, Some(v)).await?;
+        serde_json::from_value(resp).map_err(|e| ClientError::Decode(e.to_string()))
+    }
+
+    /// Fetches history items for a thread or a specific turn.
+    ///
+    /// Wraps `thread/get_items`.
+    ///
+    /// # Errors
+    ///
+    /// * [`ClientError::Disconnected`], [`ClientError::Server`],
+    ///   [`ClientError::Decode`] — see [`Self::call`].
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # async fn example() -> Result<(), zhive_client_native::ClientError> {
+    /// use std::sync::Arc;
+    /// use zhive_proto::domain::ThreadId;
+    /// use zhive_proto::rpc::GetItemsParams;
+    /// use zhive_client_native::Client;
+    ///
+    /// let client = Client::connect_uds("/tmp/zhive.sock").await?;
+    /// let p = GetItemsParams::new(ThreadId(Arc::from("thread:native/x")), None, None, None);
+    /// let result = client.get_items(p).await?;
+    /// println!("{} item(s)", result.items.len());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn get_items(&self, params: GetItemsParams) -> Result<GetItemsResult, ClientError> {
+        let v = serde_json::to_value(&params).map_err(|e| ClientError::Decode(e.to_string()))?;
+        let resp = self.call(methods::METHOD_THREAD_GET_ITEMS, Some(v)).await?;
+        serde_json::from_value(resp).map_err(|e| ClientError::Decode(e.to_string()))
+    }
+
+    /// Enqueues items into the active turn's `steer` queue.
+    ///
+    /// Wraps `session/enqueue_steer`.
+    ///
+    /// # Errors
+    ///
+    /// * [`ClientError::Disconnected`], [`ClientError::Server`],
+    ///   [`ClientError::Decode`] — see [`Self::call`].
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # async fn example() -> Result<(), zhive_client_native::ClientError> {
+    /// use std::sync::Arc;
+    /// use zhive_proto::domain::ThreadId;
+    /// use zhive_proto::rpc::InjectionParams;
+    /// use zhive_client_native::Client;
+    ///
+    /// let client = Client::connect_uds("/tmp/zhive.sock").await?;
+    /// let p = InjectionParams::new(ThreadId(Arc::from("thread:native/x")), vec![]);
+    /// let ack = client.enqueue_steer(p).await?;
+    /// assert!(ack.accepted);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn enqueue_steer(
+        &self,
+        params: InjectionParams,
+    ) -> Result<InjectionAck, ClientError> {
+        let v = serde_json::to_value(&params).map_err(|e| ClientError::Decode(e.to_string()))?;
+        let resp = self.call(methods::METHOD_ENQUEUE_STEER, Some(v)).await?;
+        serde_json::from_value(resp).map_err(|e| ClientError::Decode(e.to_string()))
+    }
+
+    /// Enqueues items into the active turn's `follow_up` queue.
+    ///
+    /// Wraps `session/enqueue_follow_up`.
+    ///
+    /// # Errors
+    ///
+    /// * [`ClientError::Disconnected`], [`ClientError::Server`],
+    ///   [`ClientError::Decode`] — see [`Self::call`].
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # async fn example() -> Result<(), zhive_client_native::ClientError> {
+    /// use std::sync::Arc;
+    /// use zhive_proto::domain::ThreadId;
+    /// use zhive_proto::rpc::InjectionParams;
+    /// use zhive_client_native::Client;
+    ///
+    /// let client = Client::connect_uds("/tmp/zhive.sock").await?;
+    /// let p = InjectionParams::new(ThreadId(Arc::from("thread:native/x")), vec![]);
+    /// let ack = client.enqueue_follow_up(p).await?;
+    /// assert!(ack.accepted);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn enqueue_follow_up(
+        &self,
+        params: InjectionParams,
+    ) -> Result<InjectionAck, ClientError> {
+        let v = serde_json::to_value(&params).map_err(|e| ClientError::Decode(e.to_string()))?;
+        let resp = self
+            .call(methods::METHOD_ENQUEUE_FOLLOW_UP, Some(v))
+            .await?;
+        serde_json::from_value(resp).map_err(|e| ClientError::Decode(e.to_string()))
+    }
+
+    /// Enqueues items for the next turn.
+    ///
+    /// Wraps `session/enqueue_next_turn`.
+    ///
+    /// # Errors
+    ///
+    /// * [`ClientError::Disconnected`], [`ClientError::Server`],
+    ///   [`ClientError::Decode`] — see [`Self::call`].
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # async fn example() -> Result<(), zhive_client_native::ClientError> {
+    /// use std::sync::Arc;
+    /// use zhive_proto::domain::ThreadId;
+    /// use zhive_proto::rpc::InjectionParams;
+    /// use zhive_client_native::Client;
+    ///
+    /// let client = Client::connect_uds("/tmp/zhive.sock").await?;
+    /// let p = InjectionParams::new(ThreadId(Arc::from("thread:native/x")), vec![]);
+    /// let ack = client.enqueue_next_turn(p).await?;
+    /// assert!(ack.accepted);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn enqueue_next_turn(
+        &self,
+        params: InjectionParams,
+    ) -> Result<InjectionAck, ClientError> {
+        let v = serde_json::to_value(&params).map_err(|e| ClientError::Decode(e.to_string()))?;
+        let resp = self
+            .call(methods::METHOD_ENQUEUE_NEXT_TURN, Some(v))
+            .await?;
+        serde_json::from_value(resp).map_err(|e| ClientError::Decode(e.to_string()))
+    }
+
+    /// Permanently deletes a thread and its history.
+    ///
+    /// Wraps `thread/delete`.  The server returns an error instead of this
+    /// result when the thread has an active turn.
+    ///
+    /// # Errors
+    ///
+    /// * [`ClientError::Disconnected`], [`ClientError::Server`],
+    ///   [`ClientError::Decode`] — see [`Self::call`].
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # async fn example() -> Result<(), zhive_client_native::ClientError> {
+    /// use std::sync::Arc;
+    /// use zhive_proto::domain::ThreadId;
+    /// use zhive_proto::rpc::DeleteThreadParams;
+    /// use zhive_client_native::Client;
+    ///
+    /// let client = Client::connect_uds("/tmp/zhive.sock").await?;
+    /// let p = DeleteThreadParams::new(ThreadId(Arc::from("thread:native/old")));
+    /// let result = client.delete_thread(p).await?;
+    /// println!("deleted: {}", result.deleted);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn delete_thread(
+        &self,
+        params: DeleteThreadParams,
+    ) -> Result<DeleteThreadResult, ClientError> {
+        let v = serde_json::to_value(&params).map_err(|e| ClientError::Decode(e.to_string()))?;
+        let resp = self.call(methods::METHOD_THREAD_DELETE, Some(v)).await?;
+        serde_json::from_value(resp).map_err(|e| ClientError::Decode(e.to_string()))
+    }
+
+    /// Renames or re-labels a thread.
+    ///
+    /// Wraps `thread/rename`.  An empty `name` clears the label.  `renamed:
+    /// true` in the result means the rename was accepted into the async
+    /// persistence queue, not necessarily flushed to disk.
+    ///
+    /// # Errors
+    ///
+    /// * [`ClientError::Disconnected`], [`ClientError::Server`],
+    ///   [`ClientError::Decode`] — see [`Self::call`].
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # async fn example() -> Result<(), zhive_client_native::ClientError> {
+    /// use std::sync::Arc;
+    /// use zhive_proto::domain::ThreadId;
+    /// use zhive_proto::rpc::RenameThreadParams;
+    /// use zhive_client_native::Client;
+    ///
+    /// let client = Client::connect_uds("/tmp/zhive.sock").await?;
+    /// let p = RenameThreadParams::new(
+    ///     ThreadId(Arc::from("thread:native/x")),
+    ///     "my feature branch".into(),
+    /// );
+    /// let result = client.rename_thread(p).await?;
+    /// println!("renamed: {}", result.renamed);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn rename_thread(
+        &self,
+        params: RenameThreadParams,
+    ) -> Result<RenameThreadResult, ClientError> {
+        let v = serde_json::to_value(&params).map_err(|e| ClientError::Decode(e.to_string()))?;
+        let resp = self.call(methods::METHOD_THREAD_RENAME, Some(v)).await?;
+        serde_json::from_value(resp).map_err(|e| ClientError::Decode(e.to_string()))
+    }
+
+    /// Searches threads by name, preview, or working directory.
+    ///
+    /// Wraps `thread/search`.
+    ///
+    /// # Errors
+    ///
+    /// * [`ClientError::Disconnected`], [`ClientError::Server`],
+    ///   [`ClientError::Decode`] — see [`Self::call`].
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # async fn example() -> Result<(), zhive_client_native::ClientError> {
+    /// use zhive_proto::rpc::SearchThreadsParams;
+    /// use zhive_client_native::Client;
+    ///
+    /// let client = Client::connect_uds("/tmp/zhive.sock").await?;
+    /// let p = SearchThreadsParams::new("refactor".into(), None);
+    /// let result = client.search_threads(p).await?;
+    /// println!("{} match(es)", result.threads.len());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn search_threads(
+        &self,
+        params: SearchThreadsParams,
+    ) -> Result<SearchThreadsResult, ClientError> {
+        let v = serde_json::to_value(&params).map_err(|e| ClientError::Decode(e.to_string()))?;
+        let resp = self.call(methods::METHOD_THREAD_SEARCH, Some(v)).await?;
+        serde_json::from_value(resp).map_err(|e| ClientError::Decode(e.to_string()))
+    }
+
+    /// Enumerates all tools registered with the engine.
+    ///
+    /// Wraps `tools/list`.  No params are required.
+    ///
+    /// # Errors
+    ///
+    /// * [`ClientError::Disconnected`], [`ClientError::Server`],
+    ///   [`ClientError::Decode`] — see [`Self::call`].
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # async fn example() -> Result<(), zhive_client_native::ClientError> {
+    /// use zhive_client_native::Client;
+    ///
+    /// let client = Client::connect_uds("/tmp/zhive.sock").await?;
+    /// let result = client.tools_list().await?;
+    /// for spec in &result.tools {
+    ///     println!("{}: {:?}", spec.name, spec.kind);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn tools_list(&self) -> Result<ToolListResult, ClientError> {
+        let resp = self.call(methods::METHOD_TOOLS_LIST, None).await?;
+        serde_json::from_value(resp).map_err(|e| ClientError::Decode(e.to_string()))
+    }
+
+    /// Resolves a deferred permission request on a thread.
+    ///
+    /// Wraps `session/resume_permission`.
+    ///
+    /// # Errors
+    ///
+    /// * [`ClientError::Disconnected`], [`ClientError::Server`],
+    ///   [`ClientError::Decode`] — see [`Self::call`].
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # async fn example() -> Result<(), zhive_client_native::ClientError> {
+    /// use zhive_proto::permission::{ResumeOutcome, ResumePermissionParams};
+    /// use zhive_client_native::Client;
+    ///
+    /// let client = Client::connect_uds("/tmp/zhive.sock").await?;
+    /// let p = ResumePermissionParams::new("perm:1", ResumeOutcome::Cancelled);
+    /// let result = client.resume_permission(p).await?;
+    /// println!("status: {:?}", result.status);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn resume_permission(
+        &self,
+        params: ResumePermissionParams,
+    ) -> Result<ResumePermissionResult, ClientError> {
+        let v = serde_json::to_value(&params).map_err(|e| ClientError::Decode(e.to_string()))?;
+        let resp = self
+            .call(methods::METHOD_RESUME_PERMISSION, Some(v))
+            .await?;
+        serde_json::from_value(resp).map_err(|e| ClientError::Decode(e.to_string()))
+    }
+
+    /// Installs a typed permission handler for `session/request_permission`.
+    ///
+    /// Convenience wrapper that creates a [`PermissionReverseAdapter`] from
+    /// `handler` and passes it to [`Self::set_reverse_handler`].  The adapter
+    /// decodes inbound params into [`RequestPermissionRequest`] and encodes the
+    /// returned [`PermissionOutcome`] back onto the wire.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::sync::Arc;
+    /// use async_trait::async_trait;
+    /// use zhive_proto::permission::{PermissionOutcome, RequestPermissionRequest};
+    /// use zhive_client_native::{Client, PermissionHandler};
+    ///
+    /// struct AlwaysAllow;
+    ///
+    /// #[async_trait]
+    /// impl PermissionHandler for AlwaysAllow {
+    ///     async fn on_permission(&self, req: RequestPermissionRequest) -> PermissionOutcome {
+    ///         let id = req.options.first().map(|o| o.id.clone()).unwrap_or_default();
+    ///         PermissionOutcome::Selected { option_id: id }
+    ///     }
+    /// }
+    ///
+    /// # async fn run() {
+    /// let client = Client::from_split(tokio::io::empty(), tokio::io::sink());
+    /// client.set_permission_handler(Arc::new(AlwaysAllow));
+    /// # }
+    /// ```
+    pub fn set_permission_handler<H: PermissionHandler + 'static>(&self, handler: Arc<H>) {
+        self.set_reverse_handler(Some(Arc::new(PermissionReverseAdapter::new(handler))));
+    }
+
+    // ── Primitive call/notify ─────────────────────────────────────────────────
+
     /// Issues a JSON-RPC request and awaits the response value.
     ///
     /// # Errors
@@ -444,7 +975,7 @@ impl Client {
     /// ```
     pub async fn cancel_turn(&self, thread_id: &ThreadId) -> Result<Option<TurnId>, ClientError> {
         let params = serde_json::json!({ "threadId": thread_id });
-        let value = self.call("engine/cancel_turn", Some(params)).await?;
+        let value = self.call(methods::METHOD_CANCEL_TURN, Some(params)).await?;
         // The server's CancelTurnHandler returns `{ "turnId": "<id>" }` or
         // `{ "turnId": null }` when no turn was active.
         let turn_id_val = value.get("turnId").ok_or_else(|| {
@@ -549,7 +1080,8 @@ impl Client {
     /// ```
     pub async fn cancel_session(&self, thread_id: &ThreadId) -> Result<(), ClientError> {
         let params = serde_json::json!({ "threadId": thread_id });
-        self.notify("session/cancel", Some(params)).await
+        self.notify(methods::METHOD_SESSION_CANCEL, Some(params))
+            .await
     }
 }
 
