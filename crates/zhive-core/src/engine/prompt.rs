@@ -263,12 +263,44 @@ fn build_tool_advertisements(
     advertised
 }
 
+// ============================================================
+// Tool-result truncation constants
+// ============================================================
+
+/// Maximum UTF-8 bytes of a single tool result embedded into the provider
+/// prompt.
+///
+/// 16 KiB keeps even a dozen large tool results well inside a 32k-token
+/// budget while preserving enough head + tail context for the model to reason
+/// about the output.  Changing this constant only affects what is sent to the
+/// provider; the canonical tool output in the rollout / SQL index is never
+/// truncated (see §B3 of the Wave 3 spec: prompt is a derived view, not the
+/// source of truth).
+const MAX_TOOL_RESULT_BYTES: usize = 16 * 1024; // 16 384 bytes
+
+/// UTF-8 bytes of the tool result head (oldest output) kept on truncation.
+///
+/// Set to half the maximum so the elision marker fits comfortably in the gap
+/// between head and tail.  Must satisfy `HEAD + TAIL < MAX`.
+const TOOL_RESULT_HEAD_BYTES: usize = 8 * 1024; // 8 192 bytes
+
+/// UTF-8 bytes of the tool result tail (newest output) kept on truncation.
+///
+/// Smaller than the head because newer lines tend to be more diagnostic and
+/// are already visible via `TOOL_RESULT_HEAD_BYTES` overlap avoidance.
+/// Must satisfy `HEAD + TAIL < MAX` (8 192 + 4 096 = 12 288 < 16 384 ✓).
+const TOOL_RESULT_TAIL_BYTES: usize = 4 * 1024; // 4 096 bytes
+
 /// Extracts the tool-result text from a finalized `ToolCall` item.
 ///
 /// Prefers the joined text of the item's `content` blocks (the human-readable
 /// result the dispatch loop stored). Falls back to the JSON `raw_output` when
 /// no text content is present, and finally to an empty string so the provider
 /// always receives a non-`null` tool result.
+///
+/// The returned text is passed through [`truncate_tool_result`] so that very
+/// large outputs (bash on a big file, read of a multi-MB log) are capped at
+/// [`MAX_TOOL_RESULT_BYTES`] before reaching the provider.
 fn tool_result_text(
     content: &[zhive_proto::domain::ItemToolCallContent],
     raw_output: Option<&serde_json::Value>,
@@ -286,15 +318,74 @@ fn tool_result_text(
         .collect::<Vec<_>>()
         .join("");
 
-    if !text.is_empty() {
-        return text;
-    }
+    let full = if text.is_empty() {
+        match raw_output {
+            Some(serde_json::Value::String(s)) => s.clone(),
+            Some(other) => other.to_string(),
+            None => String::new(),
+        }
+    } else {
+        text
+    };
+    truncate_tool_result(full)
+}
 
-    match raw_output {
-        Some(serde_json::Value::String(s)) => s.clone(),
-        Some(other) => other.to_string(),
-        None => String::new(),
+/// Truncates an over-long tool result for inclusion in the provider prompt.
+///
+/// Returns `s` unchanged when `s.len() <= MAX_TOOL_RESULT_BYTES`.  Otherwise
+/// keeps [`TOOL_RESULT_HEAD_BYTES`] from the start and [`TOOL_RESULT_TAIL_BYTES`]
+/// from the end, with an elision marker in between that states the exact byte
+/// counts so the model can gauge how much was omitted.
+///
+/// All splits are clamped to UTF-8 character boundaries via
+/// [`utf8_floor_boundary`] so the returned `String` is always valid Unicode.
+/// `tool_call_id` pairing is unaffected because the id lives in the
+/// `ToolResultPart` wrapper, not in the text content.
+fn truncate_tool_result(s: String) -> String {
+    if s.len() <= MAX_TOOL_RESULT_BYTES {
+        return s;
     }
+    // Find safe UTF-8 cut points: floor (round down) for head, ceil (round up)
+    // for tail so we never include a partial multi-byte char at either boundary.
+    let head_end = utf8_floor_boundary(&s, TOOL_RESULT_HEAD_BYTES);
+    let tail_raw = s.len().saturating_sub(TOOL_RESULT_TAIL_BYTES);
+    // tail_start must be >= head_end to avoid an inverted range.
+    let tail_start = utf8_ceil_boundary(&s, tail_raw.max(head_end));
+
+    let omitted = tail_start.saturating_sub(head_end);
+    format!(
+        "{}\n\n[... truncated {omitted} bytes; showing first {head_end} + last {} of {} bytes ...]\n\n{}",
+        &s[..head_end],
+        s.len() - tail_start,
+        s.len(),
+        &s[tail_start..]
+    )
+}
+
+/// Returns the largest byte index `<= pos` that falls on a UTF-8 char boundary.
+///
+/// Clamps to `[0, s.len()]`; always returns a valid slice index.
+/// `str::is_char_boundary` is available on all Rust versions.
+fn utf8_floor_boundary(s: &str, pos: usize) -> usize {
+    let mut b = pos.min(s.len());
+    while b > 0 && !s.is_char_boundary(b) {
+        b -= 1;
+    }
+    b
+}
+
+/// Returns the smallest byte index `>= pos` that falls on a UTF-8 char boundary.
+///
+/// Clamps to `[0, s.len()]`; `s.len()` is always a valid boundary (end of string).
+fn utf8_ceil_boundary(s: &str, pos: usize) -> usize {
+    if pos >= s.len() {
+        return s.len();
+    }
+    let mut b = pos;
+    while b < s.len() && !s.is_char_boundary(b) {
+        b += 1;
+    }
+    b
 }
 
 // ============================================================
@@ -667,6 +758,179 @@ mod tests {
         assert!(
             opts.tools.is_none(),
             "the only registered tool is disallowed → nothing advertised"
+        );
+    }
+
+    // ============================================================
+    // truncate_tool_result unit tests
+    // ============================================================
+
+    use super::{
+        MAX_TOOL_RESULT_BYTES, TOOL_RESULT_HEAD_BYTES, TOOL_RESULT_TAIL_BYTES, truncate_tool_result,
+    };
+
+    /// A result at or below the limit passes through unchanged.
+    #[test]
+    fn truncate_tool_result_short_passthrough() {
+        let short = "hello, world!".to_owned();
+        assert_eq!(truncate_tool_result(short.clone()), short);
+    }
+
+    /// An empty string also passes through unchanged.
+    #[test]
+    fn truncate_tool_result_empty_passthrough() {
+        assert_eq!(truncate_tool_result(String::new()), "");
+    }
+
+    /// A result exactly at the limit passes through unchanged.
+    #[test]
+    fn truncate_tool_result_at_limit_passthrough() {
+        let exact = "x".repeat(MAX_TOOL_RESULT_BYTES);
+        let result = truncate_tool_result(exact.clone());
+        assert_eq!(result, exact, "result at MAX should not be truncated");
+    }
+
+    /// A result one byte over the limit is truncated.
+    #[test]
+    fn truncate_tool_result_one_over_limit() {
+        let over = "x".repeat(MAX_TOOL_RESULT_BYTES + 1);
+        let result = truncate_tool_result(over.clone());
+        // Must be shorter than the original.
+        assert!(
+            result.len() < over.len(),
+            "over-limit result must be shorter after truncation"
+        );
+        assert!(
+            result.contains("[... truncated"),
+            "truncated result must contain elision marker"
+        );
+    }
+
+    /// Over-long output: head and tail are preserved, marker contains counts.
+    #[test]
+    fn truncate_tool_result_preserves_head_and_tail_with_marker() {
+        // Build a string big enough to trigger truncation with distinct head/tail.
+        let head_content = "H".repeat(TOOL_RESULT_HEAD_BYTES);
+        let middle_filler = "M".repeat(MAX_TOOL_RESULT_BYTES * 2);
+        let tail_content = "T".repeat(TOOL_RESULT_TAIL_BYTES);
+        let big = format!("{head_content}{middle_filler}{tail_content}");
+        assert!(
+            big.len() > MAX_TOOL_RESULT_BYTES,
+            "test input must exceed MAX"
+        );
+
+        let result = truncate_tool_result(big.clone());
+        assert!(
+            result.len() <= MAX_TOOL_RESULT_BYTES + 256,
+            "result must be near the cap (marker overhead < 256 bytes)"
+        );
+
+        // Head is preserved.
+        assert!(
+            result.starts_with(&head_content),
+            "result must start with the head content"
+        );
+        // Tail is preserved.
+        assert!(
+            result.ends_with(&tail_content),
+            "result must end with the tail content"
+        );
+        // Elision marker present with total size.
+        assert!(
+            result.contains(&format!("{} bytes", big.len())),
+            "elision marker must contain original byte count"
+        );
+        assert!(
+            result.contains("[... truncated"),
+            "elision marker must use the expected format"
+        );
+    }
+
+    /// UTF-8 multi-byte character boundaries are not broken by truncation.
+    #[test]
+    fn truncate_tool_result_utf8_boundary_safe() {
+        // Each '中' is 3 UTF-8 bytes; build a string large enough to truncate.
+        let cjk_char = '中';
+        let cjk_bytes = cjk_char.len_utf8(); // 3
+        // Make it long enough that truncation fires (> 16 KiB).
+        let repeat_count = (MAX_TOOL_RESULT_BYTES / cjk_bytes) * 2;
+        let long_cjk = cjk_char.to_string().repeat(repeat_count);
+        assert!(long_cjk.len() > MAX_TOOL_RESULT_BYTES);
+
+        // Must not panic, and must be valid UTF-8.
+        let result = truncate_tool_result(long_cjk);
+        assert!(
+            std::str::from_utf8(result.as_bytes()).is_ok(),
+            "truncated CJK string must be valid UTF-8"
+        );
+    }
+
+    /// Over-long tool result flowing through `build_call_options` is reflected
+    /// in the emitted `ToolResultOutput::Text` value.
+    #[tokio::test]
+    async fn build_call_options_truncates_oversized_tool_result() {
+        let handle = seeded_handle("thread:native/trunc").await;
+
+        // A tool result much larger than MAX_TOOL_RESULT_BYTES.
+        let big_result = "R".repeat(MAX_TOOL_RESULT_BYTES * 3);
+
+        handle
+            .push_item(Item::ToolCall {
+                id: ItemId(Arc::from("item:trunc-0")),
+                name: "read_file".to_owned(),
+                kind: ToolKind::Other,
+                status: ToolCallStatus::Completed,
+                content: vec![ItemToolCallContent::Content {
+                    content: ItemContent::Text {
+                        text: big_result.clone(),
+                        annotations: None,
+                    },
+                }],
+                locations: vec![],
+                raw_input: Some(serde_json::json!({ "path": "/large" })),
+                raw_output: None,
+                provider_tool_call_id: Some("toolu_trunc".to_owned()),
+            })
+            .await;
+
+        let opts = build_call_options(
+            &handle,
+            &crate::tools::ToolRegistry::new(),
+            None,
+            &PermissionScope::default_turn_scope(),
+        )
+        .await;
+
+        // Find the Tool message and check its result text.
+        let tool_msg = opts
+            .prompt
+            .iter()
+            .find(|m| matches!(m, Message::Tool { .. }))
+            .expect("a Tool message must be emitted");
+        let tool_result_part = match tool_msg {
+            Message::Tool { content, .. } => content.first().expect("tool result part"),
+            _ => unreachable!(),
+        };
+        let ToolMessagePart::ToolResult(tr) = tool_result_part else {
+            panic!("expected ToolResult part");
+        };
+        let result_text = match &tr.output {
+            ToolResultOutput::Text { value, .. } => value,
+            other => panic!("expected Text output, got {other:?}"),
+        };
+        assert!(
+            result_text.len() <= MAX_TOOL_RESULT_BYTES + 256,
+            "prompt result must be truncated to near MAX; got {} bytes",
+            result_text.len()
+        );
+        assert!(
+            result_text.contains("[... truncated"),
+            "elision marker must appear in the prompt result"
+        );
+        // tool_call_id pairing must survive truncation.
+        assert_eq!(
+            tr.tool_call_id, "toolu_trunc",
+            "tool_call_id must be preserved"
         );
     }
 }

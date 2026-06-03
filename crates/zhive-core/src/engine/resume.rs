@@ -265,18 +265,41 @@ async fn read_rollout_turns(
     };
 
     // Preserve turn order by first appearance while accumulating items per turn.
+    //
+    // On encountering a `Compaction` entry, all previously accumulated turns
+    // are discarded and replaced with the compaction's `replacement` slice.
+    // This means that after resume, the in-memory transcript starts from the
+    // most recent compaction point, not from the full un-compacted history.
+    // Any turns written after the compaction entry are then appended normally.
     let mut order: Vec<TurnId> = Vec::new();
     let mut by_turn: HashMap<TurnId, Vec<Item>> = HashMap::new();
     for entry in entries {
-        if let RolloutEntry::Item { turn_id, item, .. } = entry {
-            let tid = TurnId(Arc::from(turn_id.as_str()));
-            by_turn
-                .entry(tid.clone())
-                .or_insert_with(|| {
-                    order.push(tid.clone());
-                    Vec::new()
-                })
-                .push(*item);
+        match entry {
+            RolloutEntry::Item { turn_id, item, .. } => {
+                let tid = TurnId(Arc::from(turn_id.as_str()));
+                by_turn
+                    .entry(tid.clone())
+                    .or_insert_with(|| {
+                        order.push(tid.clone());
+                        Vec::new()
+                    })
+                    .push(*item);
+            }
+            RolloutEntry::Compaction {
+                turn_id,
+                replacement,
+                ..
+            } => {
+                // Discard all prior turns and replace with the compaction
+                // replacement transcript. Turns written after this entry in
+                // the rollout will be appended normally via the `Item` arm.
+                order.clear();
+                by_turn.clear();
+                let tid = TurnId(Arc::from(turn_id.as_str()));
+                order.push(tid.clone());
+                by_turn.insert(tid, replacement.into_iter().map(|b| *b).collect());
+            }
+            _ => {} // Session / Leaf: ignored for history reconstruction.
         }
     }
 
@@ -525,6 +548,172 @@ mod tests {
         assert_eq!(*inner.phase_lock(), EnginePhase::Turn);
     }
 
+    /// A rollout with `[Session, Item×3(turn0), Compaction, Item×1(turn1)]`
+    /// resumes to a memory transcript of `[marker, summary, turn1_item]` only —
+    /// the original `turn0` items are discarded by the `Compaction` checkpoint.
+    ///
+    /// This validates B2's core invariant: a resume after compaction does NOT
+    /// replay the full un-compacted history, preventing provider context overflow.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "linear scenario test: seeds a multi-entry rollout then asserts the post-compaction resume transcript"
+    )]
+    #[tokio::test]
+    async fn resume_after_compaction_discards_pre_compaction_history() {
+        use std::path::PathBuf;
+        use zhive_proto::domain::{Thread, ThreadSource, ThreadStatus};
+
+        use crate::persistence::{RolloutEntry, RolloutWriter};
+
+        let (inner, _dir, storage) = inner_with_storage().await;
+        let thread = tid("thread:native/resume-compact");
+
+        // Seed the SQL index row.
+        storage
+            .state
+            .upsert_thread(&Thread {
+                id: thread.clone(),
+                session_id: None,
+                forked_from: None,
+                subagent_parent: None,
+                preview: "compacted".into(),
+                ephemeral: false,
+                model_provider: "test".into(),
+                created_at: 1,
+                updated_at: 2,
+                status: ThreadStatus::Idle,
+                cwd: PathBuf::from("/"),
+                source: ThreadSource::User,
+                name: None,
+                turns: vec![],
+            })
+            .await
+            .unwrap();
+
+        // Build the rollout: Session + 3 pre-compaction items + Compaction + 1
+        // post-compaction item.
+        let rollout_path = storage.rollout_path(&thread.0);
+        let mut w = RolloutWriter::open(rollout_path).await.unwrap();
+        w.append(&RolloutEntry::Session {
+            version: 3,
+            id: thread.0.to_string(),
+            timestamp: 0,
+            cwd: "/".into(),
+            parent_session: None,
+        })
+        .await
+        .unwrap();
+
+        let turn0 = format!("turn:{}/0", thread.0);
+        for n in 0u32..3 {
+            w.append(&RolloutEntry::Item {
+                thread_id: thread.0.to_string(),
+                turn_id: turn0.clone(),
+                timestamp: 10 + i64::from(n),
+                item: Box::new(Item::AgentMessage {
+                    id: ItemId(Arc::from(format!("item:pre/{n}").as_str())),
+                    text: format!("pre-compaction-{n}"),
+                }),
+            })
+            .await
+            .unwrap();
+        }
+
+        let compact_turn = format!("{}::compaction-1", thread.0);
+        let marker = Item::ContextCompaction {
+            id: ItemId(Arc::from(
+                format!("{}::compaction-1-marker", thread.0).as_str(),
+            )),
+        };
+        let summary_item = Item::AgentMessage {
+            id: ItemId(Arc::from(
+                format!("{}::compaction-1-summary", thread.0).as_str(),
+            )),
+            text: "[context summary]\nHANDOFF SUMMARY".to_owned(),
+        };
+        w.append(&RolloutEntry::Compaction {
+            thread_id: thread.0.to_string(),
+            turn_id: compact_turn.clone(),
+            timestamp: 20,
+            summary: "HANDOFF SUMMARY".to_owned(),
+            replacement: vec![Box::new(marker.clone()), Box::new(summary_item.clone())],
+            entries_compacted: 3,
+        })
+        .await
+        .unwrap();
+
+        let turn1 = format!("turn:{}/1", thread.0);
+        w.append(&RolloutEntry::Item {
+            thread_id: thread.0.to_string(),
+            turn_id: turn1.clone(),
+            timestamp: 30,
+            item: Box::new(Item::AgentMessage {
+                id: ItemId(Arc::from("item:post/0")),
+                text: "post-compaction".to_owned(),
+            }),
+        })
+        .await
+        .unwrap();
+        w.sync_all().await.unwrap();
+
+        // Resume the thread.
+        let reply = inner
+            .resume_thread(thread.clone())
+            .await
+            .expect("resume must succeed");
+
+        // items_restored counts only what ends up in memory after processing the
+        // Compaction entry: 2 replacement items + 1 post-compaction item = 3.
+        assert_eq!(
+            reply.items_restored, 3,
+            "must restore [marker, summary, post-compaction] only"
+        );
+        // turns_restored: compaction turn + post-compaction turn = 2.
+        assert_eq!(reply.turns_restored, 2);
+
+        let handle = inner
+            .threads()
+            .get(&thread)
+            .await
+            .expect("thread must be resident");
+
+        let snapshot: Vec<Item> = handle.items_snapshot().await;
+        assert_eq!(snapshot.len(), 3, "only 3 items must be in memory");
+
+        // First item: ContextCompaction marker.
+        assert!(
+            matches!(snapshot[0], Item::ContextCompaction { .. }),
+            "first item must be ContextCompaction marker"
+        );
+        // Second item: summary AgentMessage.
+        match &snapshot[1] {
+            Item::AgentMessage { text, .. } => {
+                assert!(
+                    text.contains("HANDOFF SUMMARY"),
+                    "second item must carry the handoff summary"
+                );
+            }
+            other => panic!("expected AgentMessage summary, got {other:?}"),
+        }
+        // Third item: post-compaction item.
+        match &snapshot[2] {
+            Item::AgentMessage { text, .. } => {
+                assert_eq!(text, "post-compaction");
+            }
+            other => panic!("expected post-compaction AgentMessage, got {other:?}"),
+        }
+
+        // The pre-compaction texts must NOT appear in the transcript.
+        for item in &snapshot {
+            if let Item::AgentMessage { text, .. } = item {
+                assert!(
+                    !text.starts_with("pre-compaction"),
+                    "pre-compaction item must not appear after resume: {text}"
+                );
+            }
+        }
+    }
+
     /// After resume, the prompt the engine would build for the next turn
     /// contains the restored history (the core resume guarantee).
     #[tokio::test]
@@ -570,4 +759,4 @@ mod tests {
     }
 }
 
-// Rust guideline compliant 2026-06-03
+// Rust guideline compliant 2026-02-21

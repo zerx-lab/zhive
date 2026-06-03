@@ -70,33 +70,90 @@ pub use llmsdk::provider::DynLanguageModel;
 /// Error surfaced to the engine when a provider call fails at the call level.
 ///
 /// This is distinct from in-stream provider errors, which arrive as
-/// [`StreamPart`] and are folded to [`Item::SystemNotice`] by
-/// [`StreamFold`].
+/// [`StreamPart`] and are folded to [`Item::SystemNotice`] by [`StreamFold`].
 ///
-/// # Errors
+/// Variants are classified so the engine can decide whether to retry:
+/// - [`ProviderError::RateLimit`] and [`ProviderError::Transient`] are
+///   retryable (the call should be re-issued after a backoff).
+/// - [`ProviderError::Other`] is fatal (the turn should be failed immediately).
 ///
-/// [`ProviderError::Other`] carries the `Display` string of the underlying
-/// [`llmsdk::ProviderError`]. Use [`ProviderError::from_llmsdk`] to convert.
+/// Use [`ProviderError::from_llmsdk`] to map from an [`llmsdk::ProviderError`].
+/// Use [`ProviderError::is_retryable`] to branch on whether a retry is warranted.
 ///
 /// [`StreamPart`]: llmsdk::language_model::StreamPart
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum ProviderError {
-    /// The provider returned an unrecoverable error.
+    /// HTTP 429 rate limit.
+    ///
+    /// `retry_after` carries the server-advised delay when available.
+    /// Currently always `None` because `llmsdk::ProviderError` does not expose
+    /// a public response-headers accessor; a future llmsdk update may populate it.
+    #[error("provider rate limited{}", .retry_after.map(|d| format!(" (retry after {d:?})")).unwrap_or_default())]
+    RateLimit {
+        /// Advised back-off delay from the `Retry-After` response header, if
+        /// the provider sent one and llmsdk surfaced it.
+        retry_after: Option<std::time::Duration>,
+    },
+    /// Transient HTTP failure (408 / 409 / 5xx) flagged retryable by llmsdk.
+    #[error("transient provider error: {0}")]
+    Transient(String),
+    /// Unrecoverable provider error (other 4xx, auth failure, no-such-model, …).
     #[error("provider error: {0}")]
     Other(String),
 }
 
 impl ProviderError {
-    /// Convert an [`llmsdk::ProviderError`] to a zhive [`ProviderError`].
+    /// Convert an [`llmsdk::ProviderError`] to a classified zhive [`ProviderError`].
     ///
-    /// Maps to [`ProviderError::Other`] carrying the error's `Display`
-    /// string. This is intentionally lossy: the engine only needs to surface
-    /// a human-readable message; structured provider error fields are not part
-    /// of the zhive protocol in Phase 1.
+    /// Classification uses llmsdk's public inspection helpers only (never
+    /// matching private `ErrorKind` variants):
+    ///
+    /// - HTTP 429 → [`ProviderError::RateLimit`]
+    /// - `err.is_retryable()` true (408 / 409 / 5xx) → [`ProviderError::Transient`]
+    /// - everything else → [`ProviderError::Other`]
+    ///
+    /// `retry_after` is always `None` because `llmsdk::ProviderError` does not
+    /// currently expose a response-headers accessor.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use zhive_core::provider::ProviderError;
+    ///
+    /// let sdk_err = llmsdk::ProviderError::no_such_model("gpt-0", "languageModel");
+    /// let err = ProviderError::from_llmsdk(&sdk_err);
+    /// assert!(!err.is_retryable());
+    /// ```
     #[must_use]
     pub fn from_llmsdk(err: &llmsdk::ProviderError) -> Self {
-        Self::Other(err.to_string())
+        if err.status_code() == Some(429) {
+            // Retry-After header is not accessible via llmsdk's public API today.
+            // TODO: populate retry_after once llmsdk exposes response-headers.
+            Self::RateLimit { retry_after: None }
+        } else if err.is_retryable() {
+            // is_retryable() covers HTTP 408, 409, and 5xx per llmsdk defaults.
+            Self::Transient(err.to_string())
+        } else {
+            Self::Other(err.to_string())
+        }
+    }
+
+    /// Returns `true` when this error is safe to retry.
+    ///
+    /// Both [`ProviderError::RateLimit`] and [`ProviderError::Transient`]
+    /// are retryable; [`ProviderError::Other`] is not.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use zhive_core::provider::ProviderError;
+    ///
+    /// assert!(!ProviderError::Other("fatal".into()).is_retryable());
+    /// ```
+    #[must_use]
+    pub fn is_retryable(&self) -> bool {
+        matches!(self, Self::RateLimit { .. } | Self::Transient(_))
     }
 }
 
@@ -198,7 +255,41 @@ mod tests {
         let err = ProviderError::from(sdk_err);
         match &err {
             ProviderError::Other(msg) => assert!(msg.contains("gpt-0")),
+            other => panic!("expected Other, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn provider_error_429_maps_to_rate_limit() {
+        let sdk_err = llmsdk::ProviderError::api_call_builder("https://api.test", "rate limited")
+            .status_code(429)
+            .build();
+        let err = ProviderError::from(sdk_err);
+        assert!(
+            matches!(err, ProviderError::RateLimit { .. }),
+            "expected RateLimit, got {err:?}"
+        );
+        assert!(err.is_retryable());
+    }
+
+    #[test]
+    fn provider_error_503_maps_to_transient() {
+        let sdk_err =
+            llmsdk::ProviderError::api_call_builder("https://api.test", "service unavailable")
+                .status_code(503)
+                .build();
+        let err = ProviderError::from(sdk_err);
+        assert!(
+            matches!(err, ProviderError::Transient(_)),
+            "expected Transient, got {err:?}"
+        );
+        assert!(err.is_retryable());
+    }
+
+    #[test]
+    fn provider_error_fatal_is_not_retryable() {
+        let err = ProviderError::Other("fatal auth failure".into());
+        assert!(!err.is_retryable());
     }
 }
 

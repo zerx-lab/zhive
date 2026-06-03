@@ -157,6 +157,34 @@ pub enum StorageWriteOp {
         /// Unix-seconds creation timestamp.
         created_at: i64,
     },
+    /// Append a compaction checkpoint to the rollout and fsync (durable save
+    /// point).
+    ///
+    /// Writes a [`RolloutEntry::Compaction`] entry so that a rebuilt or
+    /// resumed engine replaces all prior items of the thread with
+    /// `replacement` rather than replaying the full un-compacted history.
+    /// The `sync_all` call guarantees the checkpoint survives a crash;
+    /// without it a restart would replay the full history and re-trigger
+    /// compaction, potentially exceeding the provider context limit.
+    ///
+    /// SQL index: the replacement items are written to a synthetic compaction
+    /// turn (`turn_id`) so they are query-accessible. Old turn rows are **not**
+    /// deleted (the index is a rebuildable derivative; historical turn data
+    /// remains available for UI review).
+    Compaction {
+        /// Thread the compaction belongs to.
+        thread_id: ThreadId,
+        /// Synthetic compaction turn id (e.g. `<thread>::compaction-1`).
+        turn_id: TurnId,
+        /// Unix-seconds timestamp of the compaction.
+        timestamp: i64,
+        /// Handoff summary text (stored verbatim for diagnostics).
+        summary: String,
+        /// Post-compaction replacement transcript (`[marker, summary]`).
+        replacement: Vec<Box<Item>>,
+        /// Number of original items compacted away.
+        entries_compacted: u32,
+    },
 }
 
 // ------------------------------------------------------------------
@@ -351,6 +379,25 @@ async fn apply_op(state: &mut WriterState, op: StorageWriteOp) {
             cwd,
             created_at,
         } => apply_fork_header(state, thread_id, parent_session, cwd, created_at).await,
+        StorageWriteOp::Compaction {
+            thread_id,
+            turn_id,
+            timestamp,
+            summary,
+            replacement,
+            entries_compacted,
+        } => {
+            apply_compaction(
+                state,
+                thread_id,
+                turn_id,
+                timestamp,
+                summary,
+                replacement,
+                entries_compacted,
+            )
+            .await;
+        }
     }
 }
 
@@ -818,6 +865,38 @@ pub async fn rebuild_state_from_entries(
                 last_leaf_target = Some(target);
             }
             RolloutEntry::Leaf { target_id: None } => {}
+
+            // Compaction checkpoint: record the synthetic compaction turn and
+            // its replacement items in the SQL index. Old turn rows are NOT
+            // deleted (the index is a rebuildable derivative; historical data
+            // is useful for diagnostics and UI review).
+            //
+            // The `summary` and `entries_compacted` fields are diagnostic-only;
+            // only `replacement` matters for the index. The `thread_id` field
+            // inside the entry is used as the turn's thread association.
+            RolloutEntry::Compaction {
+                thread_id: compaction_thread_id,
+                turn_id: compaction_turn_id,
+                replacement,
+                ..
+            } => {
+                let tid = ThreadId(Arc::from(compaction_thread_id.as_str()));
+                let tid_turn = TurnId(Arc::from(compaction_turn_id.as_str()));
+
+                turn_to_thread
+                    .entry(tid_turn.clone())
+                    .or_insert_with(|| tid.clone());
+
+                // Initialise the sequence counter for this synthetic turn.
+                let seq_base = turn_items.entry(tid_turn.clone()).or_insert(0);
+
+                state.record_turn_start(&tid, &tid_turn, now).await?;
+
+                for item in &replacement {
+                    state.append_item(&tid_turn, *seq_base, item).await?;
+                    *seq_base += 1;
+                }
+            }
         }
     }
 
@@ -944,6 +1023,94 @@ pub async fn rebuild_indexes_from_jsonl(
     }
 
     Ok(stats)
+}
+
+#[expect(
+    clippy::vec_box,
+    reason = "consistent with RolloutEntry::Compaction.replacement and StorageWriteOp::Compaction.replacement; Box keeps the enum size small on the wire"
+)]
+async fn apply_compaction(
+    state: &mut WriterState,
+    thread_id: ThreadId,
+    turn_id: TurnId,
+    timestamp: i64,
+    summary: String,
+    replacement: Vec<Box<Item>>,
+    entries_compacted: u32,
+) {
+    // JSONL first: write the compaction checkpoint and fsync (save point).
+    // Without fsync a crash after this point would cause replay of the full
+    // un-compacted history, which can exceed the provider context limit.
+    if let Some(w) = state.rollout_for(&thread_id).await {
+        let entry = RolloutEntry::Compaction {
+            thread_id: thread_id.0.to_string(),
+            turn_id: turn_id.0.to_string(),
+            timestamp,
+            summary,
+            replacement: replacement.clone(),
+            entries_compacted,
+        };
+        if let Err(err) = w.append(&entry).await {
+            tracing::error!(
+                name: "zhive.persistence.writer.compaction_append_failed",
+                error = %err,
+                thread_id = %thread_id.0,
+                "failed to append Compaction entry to rollout"
+            );
+            return;
+        }
+        if let Err(err) = w.sync_all().await {
+            tracing::error!(
+                name: "zhive.persistence.writer.compaction_sync_failed",
+                error = %err,
+                thread_id = %thread_id.0,
+                "fsync after Compaction checkpoint failed"
+            );
+        }
+    }
+
+    // SQL index: record the synthetic compaction turn and its replacement items
+    // so they are query-accessible (for UI history review). Old turn rows are
+    // intentionally left in place — the SQL index is a rebuildable derivative
+    // and historical data is useful for diagnostics.
+    let now = unix_now();
+    if let Err(err) = state
+        .storage
+        .state
+        .record_turn_start(&thread_id, &turn_id, now)
+        .await
+    {
+        tracing::error!(
+            name: "zhive.persistence.writer.compaction_turn_start_failed",
+            error = %err,
+            turn_id = %turn_id.0,
+            "SQL record_turn_start for compaction turn failed; JSONL is authoritative"
+        );
+    }
+    for (seq, item) in replacement.iter().enumerate() {
+        let seq = i64::try_from(seq).unwrap_or(i64::MAX);
+        if let Err(err) = state.storage.state.append_item(&turn_id, seq, item).await {
+            tracing::error!(
+                name: "zhive.persistence.writer.compaction_item_failed",
+                error = %err,
+                turn_id = %turn_id.0,
+                "SQL append_item for compaction replacement failed; JSONL is authoritative"
+            );
+        }
+    }
+    if let Err(err) = state
+        .storage
+        .state
+        .record_turn_end(&turn_id, TurnStatus::Completed, None, now, None)
+        .await
+    {
+        tracing::error!(
+            name: "zhive.persistence.writer.compaction_turn_end_failed",
+            error = %err,
+            turn_id = %turn_id.0,
+            "SQL record_turn_end for compaction turn failed; JSONL is authoritative"
+        );
+    }
 }
 
 // ------------------------------------------------------------------
@@ -1493,6 +1660,203 @@ mod tests {
         assert_eq!(row.0, "failed", "status column reflects the failure");
         assert_eq!(row.1.as_deref(), Some("provider exploded"));
         assert_eq!(row.2.as_deref(), Some("HTTP 500"));
+    }
+
+    /// A rollout that has no `Compaction` entry (legacy format) still rebuilds
+    /// the SQL index correctly. This is the backward-compatibility invariant:
+    /// the new `Compaction` arm is a no-op when absent.
+    #[tokio::test]
+    async fn rebuild_legacy_rollout_without_compaction_entry() {
+        let (_dir, storage) = open_storage().await;
+        let thread_id = ThreadId(Arc::from("thread:native/legacy-no-compact"));
+        let turn_id = TurnId(Arc::from("turn:thread:native/legacy-no-compact/0"));
+        let rollout_path = storage.rollout_path(&thread_id.0);
+
+        // Write a legacy rollout: Session + Item only, no Compaction entry.
+        let mut w = crate::persistence::RolloutWriter::open(rollout_path.clone())
+            .await
+            .unwrap();
+        w.append(&RolloutEntry::Session {
+            version: 3,
+            id: thread_id.0.to_string(),
+            timestamp: 1_000,
+            cwd: "/tmp".into(),
+            parent_session: None,
+        })
+        .await
+        .unwrap();
+        let item = Item::AgentMessage {
+            id: ItemId(Arc::from("item:legacy/0")),
+            text: "legacy".into(),
+        };
+        w.append(&RolloutEntry::Item {
+            thread_id: thread_id.0.to_string(),
+            turn_id: turn_id.0.to_string(),
+            timestamp: 1_001,
+            item: Box::new(item),
+        })
+        .await
+        .unwrap();
+        w.sync_all().await.unwrap();
+        drop(w);
+
+        // Rebuild must succeed and produce the same result as before.
+        rebuild_state_from_rollout(&storage.state, &rollout_path)
+            .await
+            .expect("legacy rollout rebuild must succeed");
+
+        let t = storage
+            .state
+            .get_thread(&thread_id)
+            .await
+            .unwrap()
+            .expect("thread must be present");
+        assert_eq!(t.id.0.as_ref(), "thread:native/legacy-no-compact");
+
+        let items = storage.state.get_turn_items(&turn_id).await.unwrap();
+        assert_eq!(items.len(), 1, "legacy item must be rebuilt");
+        assert!(matches!(items[0], Item::AgentMessage { .. }));
+    }
+
+    /// A rollout containing `[Session, Item×3 (turn0), Compaction, Item×1 (turn1)]`
+    /// rebuilds to a SQL index where:
+    /// - the compaction turn contains the replacement items (not turn0's items),
+    /// - the post-compaction turn (turn1) contains its own item.
+    ///
+    /// Also verifies that `replay_thread_items` (used by `get_items(None)`) returns
+    /// only `[marker, summary_item, turn1_item]` — not the original 3 items.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "linear scenario test: seeds a multi-entry rollout then asserts the rebuilt SQL index and replay"
+    )]
+    #[tokio::test]
+    async fn rebuild_and_replay_with_compaction_entry() {
+        use crate::persistence::read_all;
+
+        let (_dir, storage) = open_storage().await;
+        let thread_id = ThreadId(Arc::from("thread:native/with-compact"));
+        let turn0 = TurnId(Arc::from("turn:thread:native/with-compact/0"));
+        let compact_turn = TurnId(Arc::from("thread:native/with-compact::compaction-1"));
+        let turn1 = TurnId(Arc::from("turn:thread:native/with-compact/1"));
+        let rollout_path = storage.rollout_path(&thread_id.0);
+
+        // Build the rollout programmatically.
+        let mut w = crate::persistence::RolloutWriter::open(rollout_path.clone())
+            .await
+            .unwrap();
+        w.append(&RolloutEntry::Session {
+            version: 3,
+            id: thread_id.0.to_string(),
+            timestamp: 1_000,
+            cwd: "/tmp".into(),
+            parent_session: None,
+        })
+        .await
+        .unwrap();
+        // Three items in turn0 (will be compacted away).
+        for n in 0u32..3 {
+            w.append(&RolloutEntry::Item {
+                thread_id: thread_id.0.to_string(),
+                turn_id: turn0.0.to_string(),
+                timestamp: 1_001 + i64::from(n),
+                item: Box::new(Item::AgentMessage {
+                    id: ItemId(Arc::from(format!("item:t0/{n}").as_str())),
+                    text: format!("old-{n}"),
+                }),
+            })
+            .await
+            .unwrap();
+        }
+
+        // Compaction entry with a [marker, summary] replacement.
+        let marker = Item::ContextCompaction {
+            id: ItemId(Arc::from("thread:native/with-compact::compaction-1-marker")),
+        };
+        let summary_item = Item::AgentMessage {
+            id: ItemId(Arc::from(
+                "thread:native/with-compact::compaction-1-summary",
+            )),
+            text: "[context summary]\nSUMMARY".to_owned(),
+        };
+        let replacement: Vec<Box<Item>> =
+            vec![Box::new(marker.clone()), Box::new(summary_item.clone())];
+        w.append(&RolloutEntry::Compaction {
+            thread_id: thread_id.0.to_string(),
+            turn_id: compact_turn.0.to_string(),
+            timestamp: 1_010,
+            summary: "SUMMARY".to_owned(),
+            replacement: replacement.clone(),
+            entries_compacted: 3,
+        })
+        .await
+        .unwrap();
+
+        // One item in turn1 (written after the compaction).
+        let turn1_item = Item::UserMessage {
+            id: ItemId(Arc::from("item:t1/0")),
+            content: vec![],
+        };
+        w.append(&RolloutEntry::Item {
+            thread_id: thread_id.0.to_string(),
+            turn_id: turn1.0.to_string(),
+            timestamp: 1_020,
+            item: Box::new(turn1_item.clone()),
+        })
+        .await
+        .unwrap();
+        w.sync_all().await.unwrap();
+        drop(w);
+
+        // --- Verify rebuild_state_from_rollout (SQL index) ---
+        rebuild_state_from_rollout(&storage.state, &rollout_path)
+            .await
+            .expect("rebuild must succeed");
+
+        // The compaction turn in the SQL index contains the replacement items.
+        let compact_items = storage.state.get_turn_items(&compact_turn).await.unwrap();
+        assert_eq!(
+            compact_items.len(),
+            2,
+            "compaction turn must have the 2 replacement items"
+        );
+        assert!(
+            matches!(compact_items[0], Item::ContextCompaction { .. }),
+            "first replacement must be ContextCompaction marker"
+        );
+
+        // The post-compaction turn contains its one item.
+        let turn1_items = storage.state.get_turn_items(&turn1).await.unwrap();
+        assert_eq!(turn1_items.len(), 1);
+
+        // --- Verify replay_thread_items (full-history read for get_items(None)) ---
+        // Must return [marker, summary, turn1_item] — NOT the original 3 turn0 items.
+        let entries = read_all(&rollout_path).await.unwrap();
+        let mut replayed_items = Vec::new();
+        for entry in entries {
+            match entry {
+                RolloutEntry::Item { item, .. } => {
+                    replayed_items.push(*item);
+                }
+                RolloutEntry::Compaction { replacement, .. } => {
+                    replayed_items.clear();
+                    replayed_items.extend(replacement.into_iter().map(|b| *b));
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(
+            replayed_items.len(),
+            3,
+            "replay must yield [marker, summary, turn1_item], not the original 3 items"
+        );
+        assert!(
+            matches!(replayed_items[0], Item::ContextCompaction { .. }),
+            "first replayed item must be the compaction marker"
+        );
+        assert!(
+            matches!(replayed_items[2], Item::UserMessage { .. }),
+            "last replayed item must be the post-compaction turn1 item"
+        );
     }
 }
 

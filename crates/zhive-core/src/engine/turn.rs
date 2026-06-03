@@ -34,13 +34,14 @@
 //!    `cancel_turn` (which emits `SessionAborted`).
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures::StreamExt as _;
-use llmsdk::language_model::StreamPart;
+use llmsdk::language_model::{BoxStream, StreamPart};
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
 use zhive_proto::domain::{Item, ItemId, NoticeLevel, ThreadId, TurnError, TurnId};
-use zhive_proto::hook::CompactTrigger;
+use zhive_proto::hook::{CompactTrigger, EnginePhase};
 use zhive_proto::permission::PermissionScope;
 
 use crate::persistence::writer::StorageWriteOp;
@@ -55,6 +56,181 @@ use super::subagent_spawn::EngineSubagentSpawner;
 use super::tool_dispatch::{
     DispatchOutcome, ToolResolution, execute_resolved_tool, resolve_tool_permission,
 };
+
+// ============================================================
+// Retry constants
+// ============================================================
+
+/// Maximum retry attempts per outer provider call (stream-open failure).
+///
+/// After this many retries the turn fails with [`TurnError`], the same as
+/// if the error were non-retryable. Keeps the value low so callers observe
+/// prompt feedback rather than hanging for minutes.
+const MAX_PROVIDER_RETRIES: u32 = 3;
+
+/// Initial backoff before the first retry.
+///
+/// Subsequent delays double until [`RETRY_MAX_BACKOFF`] is reached.
+const RETRY_INITIAL_BACKOFF: Duration = Duration::from_millis(500);
+
+/// Upper cap on a single backoff sleep.
+///
+/// Even when the server sends a long `Retry-After`, the engine never waits
+/// more than this per attempt so a cancelled turn still aborts promptly.
+const RETRY_MAX_BACKOFF: Duration = Duration::from_secs(8);
+
+// ============================================================
+// Retry phase helpers
+// ============================================================
+
+/// Transitions the engine phase from `Turn` → `Retry` and broadcasts the event.
+///
+/// A CAS failure (e.g. a concurrent cancel already moved the phase) is logged
+/// at `warn` level but does not abort the caller — the retry can still proceed;
+/// the phase display just stays at `Turn`.
+fn enter_retry_phase(inner: &EngineInner, thread_id: &ThreadId) {
+    match inner.try_set_phase_atomic(EnginePhase::Turn, EnginePhase::Retry) {
+        Ok(()) => {
+            let _ = inner.events_tx().send(EngineEvent::PhaseChanged {
+                thread_id: Some(thread_id.clone()),
+                from: EnginePhase::Turn,
+                to: EnginePhase::Retry,
+            });
+        }
+        Err(err) => {
+            tracing::warn!(
+                name: "zhive.engine.retry.phase_enter_failed",
+                phase_actual = ?err.actual(),
+                "Turn→Retry CAS failed; retry will proceed without phase broadcast"
+            );
+        }
+    }
+}
+
+/// Transitions the engine phase from `Retry` → `Turn` and broadcasts the event.
+///
+/// Mirrors [`enter_retry_phase`]; a CAS failure is logged and tolerated.
+fn leave_retry_phase(inner: &EngineInner, thread_id: &ThreadId) {
+    match inner.try_set_phase_atomic(EnginePhase::Retry, EnginePhase::Turn) {
+        Ok(()) => {
+            let _ = inner.events_tx().send(EngineEvent::PhaseChanged {
+                thread_id: Some(thread_id.clone()),
+                from: EnginePhase::Retry,
+                to: EnginePhase::Turn,
+            });
+        }
+        Err(err) => {
+            tracing::warn!(
+                name: "zhive.engine.retry.phase_leave_failed",
+                phase_actual = ?err.actual(),
+                "Retry→Turn CAS failed; phase may drift"
+            );
+        }
+    }
+}
+
+/// Computes the back-off delay for `attempt` (0-indexed).
+///
+/// Formula: `min(RETRY_MAX_BACKOFF, RETRY_INITIAL_BACKOFF * 2^attempt)`.
+/// When the error carries a `RateLimit { retry_after: Some(d) }` hint, the
+/// returned delay is `max(d, computed)` so we honour the server's instruction.
+fn backoff_delay(attempt: u32, err: &ProviderError) -> Duration {
+    // 2^attempt with saturation: `checked_shl` returns None on overflow,
+    // in which case we clamp directly to the max backoff.
+    let Some(factor) = 1u32.checked_shl(attempt) else {
+        return RETRY_MAX_BACKOFF;
+    };
+    let computed = RETRY_INITIAL_BACKOFF
+        .saturating_mul(factor)
+        .min(RETRY_MAX_BACKOFF);
+    if let ProviderError::RateLimit {
+        retry_after: Some(hint),
+    } = err
+    {
+        computed.max(*hint)
+    } else {
+        computed
+    }
+}
+
+/// Calls `provider.do_stream` with up to [`MAX_PROVIDER_RETRIES`] retries for
+/// transient / rate-limit errors, applying exponential back-off between attempts.
+///
+/// Only **outer** failures (the `do_stream` future returning `Err`) are retried.
+/// In-stream errors are handled separately in the stream loop and are NOT retried
+/// here to avoid replaying already-pushed items.
+///
+/// Returns `Ok(stream)` on success, or `Err(TurnError)` when the call fails
+/// fatally or exhausts all retry attempts. Returns `None` from the parent
+/// (`run_turn_inner`) if the cancel token fires during a backoff sleep.
+///
+/// The cancel token is checked with `biased` priority so cancellations are
+/// observed promptly even during backoff sleeps.
+async fn call_provider_with_retry(
+    inner: &Arc<EngineInner>,
+    thread_id: &ThreadId,
+    call_options: llmsdk::language_model::CallOptions,
+    cancel: &CancellationToken,
+) -> Result<BoxStream<llmsdk::error::Result<StreamPart>>, Option<TurnError>> {
+    let mut attempt = 0u32;
+    loop {
+        // Always check cancel before initiating a provider call (biased
+        // ensures the cancel arm wins when both are immediately ready).
+        let stream_result = tokio::select! {
+            biased;
+            () = cancel.cancelled() => {
+                // Signal to the caller that we cancelled (None = cancel path).
+                return Err(None);
+            }
+            r = inner.provider().do_stream(call_options.clone()) => r,
+        };
+
+        match stream_result {
+            Ok(r) => return Ok(r.stream),
+            Err(raw_err) => {
+                let provider_err = ProviderError::from(raw_err);
+                if provider_err.is_retryable() && attempt < MAX_PROVIDER_RETRIES {
+                    let delay = backoff_delay(attempt, &provider_err);
+                    tracing::warn!(
+                        name: "zhive.engine.retry.attempt",
+                        attempt,
+                        max_attempts = MAX_PROVIDER_RETRIES,
+                        delay_ms = delay.as_millis(),
+                        error = %provider_err,
+                        "provider call failed with retryable error; backing off"
+                    );
+                    enter_retry_phase(inner, thread_id);
+                    // Sleep for the back-off period, but abort early on cancel.
+                    let cancelled = tokio::select! {
+                        biased;
+                        () = cancel.cancelled() => true,
+                        () = tokio::time::sleep(delay) => false,
+                    };
+                    leave_retry_phase(inner, thread_id);
+                    if cancelled {
+                        return Err(None);
+                    }
+                    attempt += 1;
+                } else {
+                    // Fatal error or retry budget exhausted.
+                    if attempt > 0 {
+                        tracing::warn!(
+                            name: "zhive.engine.retry.exhausted",
+                            attempts = attempt + 1,
+                            error = %provider_err,
+                            "provider call failed after all retries"
+                        );
+                    }
+                    let turn_error = TurnError {
+                        message: provider_err.to_string(),
+                        additional_details: None,
+                    };
+                    return Err(Some(turn_error));
+                }
+            }
+        }
+    }
+}
 
 // ============================================================
 // Tool-dispatch phasing
@@ -270,45 +446,35 @@ async fn run_turn_inner(
         let call_options =
             build_call_options(&handle, inner.tools(), inner.system_prompt(), &scope).await;
 
-        // 2. Call the provider, racing against the per-turn cancel token.
+        // 2. Call the provider with retry/backoff for transient outer errors.
         //
-        // `biased` ensures the cancel arm is always polled first so that a
-        // token already cancelled before we enter the select! (e.g. from an
-        // immediate cancel_turn or shutdown) is observed without starting the
-        // provider call at all.  When the cancel arm wins — whether because
-        // the token was pre-cancelled or because cancel_tree.cancel_all()
-        // fires during the await — we call finish_turn (failed=false; the
-        // cancel path, not an error) and return promptly, satisfying the
-        // "abort promptly on shutdown" requirement.
-        let stream_result = tokio::select! {
-            biased;
-            () = cancel.cancelled() => {
-                inner.finish_turn(&handle, thread_id, turn_id, None).await;
-                return None;
-            }
-            r = inner.provider().do_stream(call_options) => r,
-        };
-        let mut stream = match stream_result {
-            Ok(r) => r.stream,
-            Err(err) => {
-                let provider_err = ProviderError::from(err);
-                let turn_error = TurnError {
-                    message: provider_err.to_string(),
-                    additional_details: None,
-                };
-                let _ = inner.events_tx().send(EngineEvent::TurnFailed {
-                    thread_id: thread_id.clone(),
-                    turn_id: turn_id.clone(),
-                    error: turn_error.clone(),
-                });
-                // Pass the failure to finish_turn so its TurnEnded op records the
-                // error on the `turns` row; also return it for subagent callers.
-                inner
-                    .finish_turn(&handle, thread_id, turn_id, Some(turn_error.clone()))
-                    .await;
-                return Some(turn_error);
-            }
-        };
+        // `call_provider_with_retry` encapsulates cancel-aware back-off; on
+        // the cancel path it returns `Err(None)`, and on a fatal/exhausted
+        // error it returns `Err(Some(turn_error))`.  Only outer stream-open
+        // failures are retried here; in-stream errors (see step 3 below) are
+        // NOT retried to avoid replaying already-pushed items.
+        let mut stream =
+            match call_provider_with_retry(inner, &thread_id, call_options, &cancel).await {
+                Ok(s) => s,
+                Err(None) => {
+                    // Cancel fired during retry sleep or stream open.
+                    inner.finish_turn(&handle, thread_id, turn_id, None).await;
+                    return None;
+                }
+                Err(Some(turn_error)) => {
+                    let _ = inner.events_tx().send(EngineEvent::TurnFailed {
+                        thread_id: thread_id.clone(),
+                        turn_id: turn_id.clone(),
+                        error: turn_error.clone(),
+                    });
+                    // Pass the failure to finish_turn so its TurnEnded op records the
+                    // error on the `turns` row; also return it for subagent callers.
+                    inner
+                        .finish_turn(&handle, thread_id, turn_id, Some(turn_error.clone()))
+                        .await;
+                    return Some(turn_error);
+                }
+            };
 
         // 3. Stream loop with per-turn cancellation.
         let mut fold = StreamFold::new(&turn_id);
@@ -745,10 +911,28 @@ async fn run_turn_inner(
     //    Child-thread compaction, if ever wanted, must be parent-coordinated.
     if handle.parent_thread_id.is_none() {
         let item_count = handle.item_count().await;
+
+        // Token estimate: prefer last provider-reported `input_tokens` (most
+        // accurate) and fall back to a character-count heuristic when the
+        // provider has not reported usage (e.g. ScriptedModel reports 0).
         let last_input = inner.last_input_tokens();
-        let token_threshold_hit = inner
+        let token_estimate = if last_input > 0 {
+            last_input
+        } else {
+            super::compaction::estimate_tokens(&handle.items_snapshot().await)
+        };
+
+        // Token budget: use the host-supplied explicit threshold when present
+        // (preserves backward compatibility — a host that already sets
+        // `compact_token_threshold: Some(n)` keeps its chosen value).
+        // When absent, use 75 % of the conservative default context budget
+        // (24 000 tokens). This ensures the engine compacts proactively
+        // rather than waiting for a provider 400.
+        let token_budget = inner
             .compact_token_threshold()
-            .is_some_and(|t| last_input >= t);
+            .unwrap_or_else(super::compaction::default_compact_threshold);
+
+        let token_threshold_hit = token_estimate >= token_budget;
         let item_threshold_hit = item_count >= super::compaction::AUTO_COMPACT_ITEM_THRESHOLD;
         if token_threshold_hit || item_threshold_hit {
             let _ = inner
@@ -766,17 +950,119 @@ async fn run_turn_inner(
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
-    use llmsdk::language_model::StreamPart;
+    use async_trait::async_trait;
+    use futures::stream;
+    use llmsdk::LanguageModel;
+    use llmsdk::language_model::{
+        BoxStream, CallOptions, FinishReason, FinishReasonKind, GenerateResult, StreamPart,
+        StreamResult, Usage,
+    };
     use tokio::sync::broadcast;
     use zhive_proto::domain::{Item, ItemContent, ItemId, ThreadId, TurnId};
+    use zhive_proto::hook::EnginePhase;
 
     use crate::engine::event::EngineEvent;
     use crate::engine::inner::EngineInner;
     use crate::persistence::Storage;
     use crate::persistence::writer::{PersistenceWriter, StorageWriteOp};
     use crate::provider::{DynLanguageModel, ScriptedModel};
+
+    // ---- FallibleModel -------------------------------------------------------
+
+    /// A model whose first `fail_count` calls to `do_stream` return an outer
+    /// error; subsequent calls succeed with a single text turn ("ok").
+    ///
+    /// The `retryable` flag controls whether the injected error is retryable
+    /// (HTTP 503 → `Transient`) or fatal (no-such-model → `Other`).
+    #[derive(Debug, Clone)]
+    struct FallibleModel {
+        call_count: Arc<AtomicUsize>,
+        fail_count: usize,
+        retryable: bool,
+    }
+
+    impl FallibleModel {
+        fn new(fail_count: usize, retryable: bool) -> Self {
+            Self {
+                call_count: Arc::new(AtomicUsize::new(0)),
+                fail_count,
+                retryable,
+            }
+        }
+
+        fn into_dyn(self) -> DynLanguageModel {
+            DynLanguageModel::new(self)
+        }
+    }
+
+    #[async_trait]
+    impl LanguageModel for FallibleModel {
+        fn provider(&self) -> &'static str {
+            "test"
+        }
+
+        fn model_id(&self) -> &'static str {
+            "fallible"
+        }
+
+        async fn do_generate(&self, _opts: CallOptions) -> llmsdk::error::Result<GenerateResult> {
+            Ok(GenerateResult {
+                content: vec![],
+                finish_reason: FinishReason::new(FinishReasonKind::Stop),
+                usage: Usage::default(),
+                provider_metadata: None,
+                request: None,
+                response: None,
+                warnings: vec![],
+            })
+        }
+
+        async fn do_stream(&self, _opts: CallOptions) -> llmsdk::error::Result<StreamResult> {
+            let call = self.call_count.fetch_add(1, Ordering::SeqCst);
+            if call < self.fail_count {
+                // Inject an outer error before the stream opens.
+                return if self.retryable {
+                    Err(llmsdk::ProviderError::api_call_builder(
+                        "https://api.test",
+                        "service unavailable",
+                    )
+                    .status_code(503)
+                    .build())
+                } else {
+                    Err(llmsdk::ProviderError::no_such_model(
+                        "gpt-x",
+                        "languageModel",
+                    ))
+                };
+            }
+            // Successful call: emit one text block.
+            let parts = vec![
+                StreamPart::TextStart {
+                    id: "b0".into(),
+                    provider_metadata: None,
+                },
+                StreamPart::TextDelta {
+                    id: "b0".into(),
+                    delta: "ok".into(),
+                    provider_metadata: None,
+                },
+                StreamPart::TextEnd {
+                    id: "b0".into(),
+                    provider_metadata: None,
+                },
+            ];
+            let iter = parts.into_iter().map(Ok::<_, llmsdk::ProviderError>);
+            let s: BoxStream<llmsdk::error::Result<StreamPart>> = Box::pin(stream::iter(iter));
+            Ok(StreamResult {
+                stream: s,
+                request: None,
+                response: None,
+            })
+        }
+    }
 
     fn tid(s: &str) -> ThreadId {
         ThreadId(Arc::from(s))
@@ -1007,6 +1293,166 @@ mod tests {
             prompt_text.as_deref(),
             Some("investigate the repo"),
             "child rollout must persist the subagent prompt UserMessage; entries = {entries:?}"
+        );
+    }
+
+    // ---- B4 retry tests ------------------------------------------------------
+
+    /// Collects `limit` events from `rx`, returning all `PhaseChanged` events
+    /// and optionally stopping early when a `TurnCompleted` or `TurnFailed`
+    /// for `turn_id` is seen.
+    async fn collect_events_until_turn_end(
+        rx: &mut broadcast::Receiver<EngineEvent>,
+        turn_id: &TurnId,
+        limit: usize,
+    ) -> (Vec<(EnginePhase, EnginePhase)>, bool, bool) {
+        let mut phase_changes: Vec<(EnginePhase, EnginePhase)> = Vec::new();
+        let mut completed = false;
+        let mut failed = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        for _ in 0..limit {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Ok(ev)) => match ev {
+                    EngineEvent::PhaseChanged { from, to, .. } => {
+                        phase_changes.push((from, to));
+                    }
+                    EngineEvent::TurnCompleted { turn_id: t, .. } if &t == turn_id => {
+                        completed = true;
+                        break;
+                    }
+                    EngineEvent::TurnFailed { turn_id: t, .. } if &t == turn_id => {
+                        failed = true;
+                        break;
+                    }
+                    _ => {}
+                },
+                _ => break,
+            }
+        }
+        (phase_changes, completed, failed)
+    }
+
+    /// A retryable error (HTTP 503) causes the engine to retry and eventually
+    /// succeed. The turn completes normally; `Retry` phase transitions are
+    /// observed in the event stream.
+    #[tokio::test]
+    async fn retryable_error_retries_and_succeeds() {
+        // Fail 2 times then succeed on the 3rd call.
+        let model = FallibleModel::new(2, true).into_dyn();
+        let (inner, _dir, _storage) = inner_with_storage(model).await;
+        let thread_id = tid("thread:retry/success");
+        let mut events_rx = inner.events_tx().subscribe();
+
+        let reply = inner
+            .start_turn(
+                thread_id.clone(),
+                vec![user_message("item:user/0", "hello")],
+                None,
+            )
+            .await
+            .expect("start_turn");
+        let turn_id = reply.turn_id;
+
+        let (phases, completed, failed) =
+            collect_events_until_turn_end(&mut events_rx, &turn_id, 128).await;
+
+        assert!(
+            completed,
+            "turn must complete after retrying transient errors"
+        );
+        assert!(!failed, "turn must not be reported as failed");
+
+        // At least one Turn→Retry and Retry→Turn transition expected.
+        assert!(
+            phases
+                .iter()
+                .any(|(f, t)| *f == EnginePhase::Turn && *t == EnginePhase::Retry),
+            "at least one Turn→Retry transition expected; got {phases:?}"
+        );
+        assert!(
+            phases
+                .iter()
+                .any(|(f, t)| *f == EnginePhase::Retry && *t == EnginePhase::Turn),
+            "at least one Retry→Turn transition expected; got {phases:?}"
+        );
+    }
+
+    /// A fatal (non-retryable) error causes an immediate `TurnFailed` with no
+    /// retry attempts.
+    ///
+    /// Verified by checking that no `PhaseChanged(Retry)` event is emitted and
+    /// the turn ends with `TurnFailed`.
+    #[tokio::test]
+    async fn fatal_error_fails_immediately_without_retry() {
+        // Fail once with a fatal (non-retryable) error.
+        let model = FallibleModel::new(1, false).into_dyn();
+        let (inner, _dir, _storage) = inner_with_storage(model).await;
+        let thread_id = tid("thread:retry/fatal");
+        let mut events_rx = inner.events_tx().subscribe();
+
+        let reply = inner
+            .start_turn(
+                thread_id.clone(),
+                vec![user_message("item:user/0", "hello")],
+                None,
+            )
+            .await
+            .expect("start_turn");
+        let turn_id = reply.turn_id;
+
+        let (phases, completed, failed) =
+            collect_events_until_turn_end(&mut events_rx, &turn_id, 64).await;
+
+        assert!(failed, "fatal error must be reported as TurnFailed");
+        assert!(!completed, "turn must not complete after a fatal error");
+        assert!(
+            !phases.iter().any(|(_, t)| *t == EnginePhase::Retry),
+            "no Retry phase transition expected for a fatal error; got {phases:?}"
+        );
+    }
+
+    /// When all retries are exhausted (`fail_count` > `MAX_PROVIDER_RETRIES` + 1
+    /// = 4 total attempts, so `fail_count` = 4 fails all 3 retries + initial) the
+    /// turn is failed with a `TurnFailed` event.
+    #[tokio::test]
+    async fn retry_budget_exhausted_fails_turn() {
+        // Fail more times than the retry budget allows.
+        // MAX_PROVIDER_RETRIES = 3 (initial + 3 retries = 4 attempts total),
+        // so failing 4 times exhausts all retries.
+        let model = FallibleModel::new(4, true).into_dyn();
+        let (inner, _dir, _storage) = inner_with_storage(model).await;
+        let thread_id = tid("thread:retry/exhausted");
+        let mut events_rx = inner.events_tx().subscribe();
+
+        let reply = inner
+            .start_turn(
+                thread_id.clone(),
+                vec![user_message("item:user/0", "hello")],
+                None,
+            )
+            .await
+            .expect("start_turn");
+        let turn_id = reply.turn_id;
+
+        let (phases, completed, failed) =
+            collect_events_until_turn_end(&mut events_rx, &turn_id, 128).await;
+
+        assert!(
+            failed,
+            "turn must fail when retry budget is exhausted; phases = {phases:?}"
+        );
+        assert!(
+            !completed,
+            "exhausted-retry turn must not complete; phases = {phases:?}"
+        );
+        // We expect exactly MAX_PROVIDER_RETRIES (3) Retry phase round-trips.
+        let retry_entries = phases
+            .iter()
+            .filter(|(f, t)| *f == EnginePhase::Turn && *t == EnginePhase::Retry)
+            .count();
+        assert_eq!(
+            retry_entries, 3,
+            "expected exactly 3 Turn→Retry transitions (one per retry); got {phases:?}"
         );
     }
 }

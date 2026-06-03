@@ -66,6 +66,39 @@ pub enum RolloutEntry {
         /// branch.
         target_id: Option<String>,
     },
+    /// Context-compaction checkpoint: records that history up to this point
+    /// was folded into a summary, plus the replacement transcript that
+    /// supersedes it.
+    ///
+    /// On rebuild/resume, encountering this entry **discards all prior `Item`
+    /// entries of this thread accumulated so far** and replaces them with
+    /// `replacement`. Backward compatible: a rollout written before this
+    /// variant existed simply never contains it, so the old full-replay path
+    /// is unchanged.
+    ///
+    /// **Single-direction compatibility note**: a rollout file containing this
+    /// entry cannot be read by a binary that predates the variant — the old
+    /// reader will return [`StorageError::RolloutCorrupted`] for the
+    /// `"type":"compaction"` line. Mixed deployments (old reader / new writer)
+    /// are therefore unsupported; upgrade the reader before writing compacted
+    /// rollouts.
+    Compaction {
+        /// Thread the compaction belongs to.
+        thread_id: String,
+        /// Synthetic compaction turn id (e.g. `<thread>::compaction-1`).
+        turn_id: String,
+        /// Unix-seconds timestamp at append time.
+        timestamp: i64,
+        /// Handoff summary text (without any prefix; stored verbatim for
+        /// diagnostics and events).
+        summary: String,
+        /// Post-compaction transcript that replaces all prior items: the
+        /// `[marker, summary]` pair installed in memory. Rebuild splices
+        /// this in verbatim.
+        replacement: Vec<Box<Item>>,
+        /// Number of original items that were compacted away (for diagnostics).
+        entries_compacted: u32,
+    },
 }
 
 /// Append-only writer for one thread's JSONL rollout.

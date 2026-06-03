@@ -91,6 +91,12 @@ pub(crate) struct EngineInner {
     /// makes the compare-and-set atomic against the broadcast emission.
     phase: Mutex<EnginePhase>,
     turn_counter: AtomicU64,
+    /// Monotonically increasing counter for compaction operations on this
+    /// engine. Incorporated into compaction turn and item ids to prevent
+    /// duplicate-key collisions when a thread is compacted more than once
+    /// within the same process lifetime. Counter starts at 1; 0 is
+    /// deliberately never emitted so ids like `compaction-0` cannot appear.
+    compaction_counter: AtomicU64,
     /// Permission reducer shared with the reverse-RPC tracker.
     ///
     /// Exposed through [`Self::permission_reducer`] so the server module
@@ -216,6 +222,7 @@ impl EngineInner {
             events_tx,
             phase: Mutex::new(EnginePhase::Idle),
             turn_counter: AtomicU64::new(0),
+            compaction_counter: AtomicU64::new(0),
             permission: PermissionReducer::new(),
             provider,
             hook_host,
@@ -358,6 +365,16 @@ impl EngineInner {
     /// Returns the turn counter for sibling modules (e.g. lifecycle).
     pub(in crate::engine) fn turn_counter(&self) -> &AtomicU64 {
         &self.turn_counter
+    }
+
+    /// Advances the compaction sequence counter and returns the new value.
+    ///
+    /// Starts at 1 (the first call returns 1). Monotonically increasing within
+    /// a process lifetime — values are not persisted across restarts, but
+    /// duplicate ids are safe because a resumed engine truncates prior
+    /// compaction turns from memory (see `resume.rs::read_rollout_turns`).
+    pub(in crate::engine) fn next_compaction_seq(&self) -> u64 {
+        self.compaction_counter.fetch_add(1, Ordering::Relaxed) + 1
     }
 
     /// Runs the actor loop, consuming submissions until `Shutdown`.

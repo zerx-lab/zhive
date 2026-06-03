@@ -196,23 +196,35 @@ impl Storage {
 
         let mut items = Vec::new();
         for entry in entries {
-            if let RolloutEntry::Item { item, .. } = entry {
-                let reached_boundary = up_to.is_some_and(|id| item.id() == id);
-                items.push(*item);
-                if reached_boundary {
-                    // Inclusive truncation: keep the boundary item, drop the
-                    // rest.
-                    //
-                    // SEMANTICS: truncation is ITEM-level, not turn-level. The
-                    // cut happens at the exact boundary item even if it sits in
-                    // the middle of a turn — the items that preceded it within
-                    // the same turn are kept and the items that followed it
-                    // (including later items of that same turn) are dropped. A
-                    // fork at `up_to = <mid-turn item>` therefore yields a
-                    // partial turn. Callers that need turn-aligned boundaries
-                    // must pass the last item id of a turn.
-                    break;
+            match entry {
+                RolloutEntry::Item { item, .. } => {
+                    let reached_boundary = up_to.is_some_and(|id| item.id() == id);
+                    items.push(*item);
+                    if reached_boundary {
+                        // Inclusive truncation: keep the boundary item, drop the
+                        // rest.
+                        //
+                        // SEMANTICS: truncation is ITEM-level, not turn-level.
+                        // The cut happens at the exact boundary item even if it
+                        // sits in the middle of a turn — the items that preceded
+                        // it within the same turn are kept and those after are
+                        // dropped. Callers that need turn-aligned boundaries must
+                        // pass the last item id of a turn.
+                        break;
+                    }
                 }
+                RolloutEntry::Compaction { replacement, .. } => {
+                    // Compaction checkpoint: discard all prior items and replace
+                    // with the compaction's replacement transcript. Items written
+                    // after this entry are accumulated normally via the `Item` arm.
+                    //
+                    // The `up_to` boundary is not checked against replacement
+                    // items because the synthetic compaction item ids are never
+                    // used as fork boundaries by callers.
+                    items.clear();
+                    items.extend(replacement.into_iter().map(|b| *b));
+                }
+                _ => {}
             }
         }
         Ok(items)
