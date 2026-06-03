@@ -89,6 +89,30 @@ pub enum EngineNotification {
         /// Output tokens produced by this provider call.
         output_tokens: u64,
     },
+    /// A subagent (child thread) was spawned by a thread.
+    ///
+    /// The child thread's own `turn_started` / `item_appended` events also
+    /// stream in (with the child's `thread_id`); the conversation reducer uses
+    /// this event to learn the parent↔child link and route them.
+    SubagentStarted {
+        /// The parent thread that spawned the subagent.
+        parent_thread_id: ThreadId,
+        /// The child thread the subagent runs in.
+        child_thread_id: ThreadId,
+        /// The subagent definition name, if the agent was named.
+        agent_type: Option<String>,
+        /// The task description, if the spawn provided one.
+        description: Option<String>,
+    },
+    /// A subagent finished and delivered its outcome to the parent.
+    SubagentCompleted {
+        /// The parent thread.
+        parent_thread_id: ThreadId,
+        /// The child thread that completed.
+        child_thread_id: ThreadId,
+        /// Whether the subagent produced a final message.
+        has_final: bool,
+    },
     /// A recognized-but-unmodeled or unknown notification method.
     Unhandled {
         /// The notification method string.
@@ -141,6 +165,26 @@ struct PhaseChangedPayload {
 struct PermissionRequestedPayload {
     request_id: String,
     request: RequestPermissionRequest,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SubagentStartedPayload {
+    parent_thread_id: ThreadId,
+    child_thread_id: ThreadId,
+    #[serde(default)]
+    agent_type: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SubagentCompletedPayload {
+    parent_thread_id: ThreadId,
+    child_thread_id: ThreadId,
+    #[serde(default)]
+    has_final_message: bool,
 }
 
 /// Decodes a wire notification `(method, params)` into an [`EngineNotification`].
@@ -255,6 +299,38 @@ pub fn decode(method: &str, params: Option<Value>) -> EngineNotification {
                 None => unhandled(),
             }
         }
+        "events/subagent_started" | "events/subagent_completed" => decode_subagent(method, params),
+        _ => unhandled(),
+    }
+}
+
+/// Decodes the two subagent lifecycle notifications into [`EngineNotification`].
+fn decode_subagent(method: &str, params: Value) -> EngineNotification {
+    let unhandled = || EngineNotification::Unhandled {
+        method: method.to_owned(),
+    };
+    match method {
+        "events/subagent_started" => {
+            match serde_json::from_value::<SubagentStartedPayload>(params) {
+                Ok(p) => EngineNotification::SubagentStarted {
+                    parent_thread_id: p.parent_thread_id,
+                    child_thread_id: p.child_thread_id,
+                    agent_type: p.agent_type,
+                    description: p.description,
+                },
+                Err(_) => unhandled(),
+            }
+        }
+        "events/subagent_completed" => {
+            match serde_json::from_value::<SubagentCompletedPayload>(params) {
+                Ok(p) => EngineNotification::SubagentCompleted {
+                    parent_thread_id: p.parent_thread_id,
+                    child_thread_id: p.child_thread_id,
+                    has_final: p.has_final_message,
+                },
+                Err(_) => unhandled(),
+            }
+        }
         _ => unhandled(),
     }
 }
@@ -304,6 +380,47 @@ mod tests {
     fn unknown_method_is_unhandled() {
         let n = decode("events/made_up", None);
         assert!(matches!(n, EngineNotification::Unhandled { .. }));
+    }
+
+    #[test]
+    fn decodes_subagent_started() {
+        let n = decode(
+            "events/subagent_started",
+            Some(serde_json::json!({
+                "parentThreadId": "thread:native/p",
+                "childThreadId": "thread:subagent/p/1",
+                "agentType": "researcher",
+                "description": "find the bug"
+            })),
+        );
+        match n {
+            EngineNotification::SubagentStarted {
+                child_thread_id,
+                agent_type,
+                ..
+            } => {
+                assert_eq!(child_thread_id.0.as_ref(), "thread:subagent/p/1");
+                assert_eq!(agent_type.as_deref(), Some("researcher"));
+            }
+            other => panic!("expected SubagentStarted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decodes_subagent_completed_defaults_missing_has_final() {
+        let n = decode(
+            "events/subagent_completed",
+            Some(serde_json::json!({
+                "parentThreadId": "thread:native/p",
+                "childThreadId": "thread:subagent/p/1"
+            })),
+        );
+        match n {
+            EngineNotification::SubagentCompleted { has_final, .. } => {
+                assert!(!has_final, "missing hasFinalMessage defaults to false");
+            }
+            other => panic!("expected SubagentCompleted, got {other:?}"),
+        }
     }
 
     #[test]

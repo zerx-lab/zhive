@@ -1,0 +1,573 @@
+//! Historical thread listing and resume.
+//!
+//! Two read-mostly operations that let a UI present a "recent sessions" list
+//! and re-open one of them to keep talking:
+//!
+//! - [`EngineInner::list_threads`] returns the queryable thread index
+//!   (most-recently-updated first), straight from the state-database
+//!   projection.
+//! - [`EngineInner::resume_thread`] reads a persisted thread's **full** history
+//!   from its JSONL rollout (the source of truth, including history outside any
+//!   prior in-memory window), seeds that history into a resident
+//!   [`ThreadHandle`], and leaves the thread `Idle`. The seed is what makes
+//!   resume meaningful: the next [`super::lifecycle`] `start_turn` builds its
+//!   prompt from the handle's transcript (see [`super::prompt::build_call_options`]),
+//!   so the model sees the prior conversation.
+//!
+//! ## Why read the rollout, not the in-memory window
+//!
+//! After a process restart the thread store is empty, so there is nothing in
+//! memory to resume from. Even within one process, the in-memory transcript is
+//! a bounded window (see [`crate::state::TurnHistoryBuffer`]) while the rollout
+//! is complete. Reading the rollout therefore restores the whole conversation,
+//! grouped back into its original turns.
+//!
+//! ## Phase
+//!
+//! Resume mutates the thread store, so it requires the engine to be `Idle`; a
+//! resume submitted while a turn or compaction is in flight is refused with
+//! [`ResumeError::EngineBusy`]. Both operations run on the engine actor task,
+//! serialised with every other submission.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use zhive_proto::domain::{Item, Thread, ThreadId, TurnId, TurnStatus};
+use zhive_proto::hook::EnginePhase;
+
+use crate::persistence::RolloutEntry;
+use crate::persistence::writer::StorageWriteOp;
+use crate::state::ThreadHandle;
+
+use super::inner::EngineInner;
+use super::submission::{GetItemsError, ResumeError, ResumeReply};
+
+/// How long resume waits for the thread's rollout flush `ack` before reading.
+///
+/// Mirrors `super::fork`'s flush handshake so a resume taken right after a turn
+/// does not miss items still buffered in the writer. Large enough that a
+/// healthy writer always drains first; small enough that a wedged or
+/// shutting-down writer cannot stall resume. On timeout we read the current
+/// on-disk state (best-effort), matching fork's semantics.
+const RESUME_FLUSH_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+impl EngineInner {
+    /// Returns persisted threads, most-recently-updated first.
+    ///
+    /// Reads the state-database projection ([`crate::persistence::StateDb::list_threads`]).
+    /// When `cwd_filter` is `Some(path)`, only threads created under that
+    /// working directory are returned (codex-style per-project listing);
+    /// `None` returns every thread.
+    ///
+    /// When no persistent storage is configured the engine is purely in-memory
+    /// and there is no index to read, so an **empty** list is returned (never an
+    /// error) — an in-memory engine simply has no historical sessions. A
+    /// database read error is logged and also collapses to an empty list so the
+    /// listing call never fails the actor.
+    ///
+    /// The returned [`Thread`] values have an empty `turns` field (the index
+    /// does not eager-load turn items); callers fetch items separately via
+    /// [`Self::resume_thread`] or the `thread/get_items` server method.
+    pub(in crate::engine) async fn list_threads(&self, cwd_filter: Option<&str>) -> Vec<Thread> {
+        let Some(storage) = self.storage() else {
+            return Vec::new();
+        };
+        match storage.state.list_threads(cwd_filter).await {
+            Ok(threads) => threads,
+            Err(err) => {
+                tracing::warn!(
+                    name: "zhive.engine.resume.list_threads_failed",
+                    error = %err,
+                    "listing persisted threads failed; returning an empty list"
+                );
+                Vec::new()
+            }
+        }
+    }
+
+    /// Resumes a persisted thread, making its full history resident in memory.
+    ///
+    /// Confirms the thread exists in the index, reads its complete rollout,
+    /// registers a resident [`ThreadHandle`] (seeding the transcript turn by
+    /// turn), and leaves the thread `Idle`. After resume, the next `start_turn`
+    /// on this thread builds its prompt from the restored transcript, so the
+    /// model continues the prior conversation.
+    ///
+    /// # Errors
+    ///
+    /// * [`ResumeError::StorageUnavailable`] — the engine has no storage backend.
+    /// * [`ResumeError::ThreadNotFound`] — no row for `thread_id` in the index.
+    /// * [`ResumeError::EngineBusy`] — engine phase was not `Idle`.
+    /// * [`ResumeError::ReplayFailed`] — reading the rollout failed.
+    pub(in crate::engine) async fn resume_thread(
+        self: &Arc<Self>,
+        thread_id: ThreadId,
+    ) -> Result<ResumeReply, ResumeError> {
+        // 1. Resume reads persisted history; without storage there is nothing
+        //    to resume from.
+        let storage = Arc::clone(self.storage().ok_or(ResumeError::StorageUnavailable)?);
+
+        // 2. The thread must exist in the persistent index.
+        let thread = storage
+            .state
+            .get_thread(&thread_id)
+            .await
+            .map_err(|e| ResumeError::ReplayFailed {
+                message: e.to_string(),
+            })?
+            .ok_or(ResumeError::ThreadNotFound)?;
+
+        // 3. Resume mutates the thread store; require Idle so it cannot race a
+        //    live turn or compaction. Unlike fork it does not need a dedicated
+        //    phase for its duration (the work is short and append-only), so we
+        //    only assert the engine is currently Idle rather than claiming a
+        //    phase across the await points below.
+        {
+            let guard = self.phase_lock();
+            if *guard != EnginePhase::Idle {
+                return Err(ResumeError::EngineBusy { current: *guard });
+            }
+        }
+
+        // 4. Flush any buffered rollout writes for this thread before reading,
+        //    so a resume taken right after a turn sees the latest items (the
+        //    same handshake fork uses). A timeout bounds the wait; on timeout
+        //    we read whatever is on disk.
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        self.enqueue_storage_op(StorageWriteOp::Flush {
+            thread_id: thread_id.clone(),
+            ack: Some(ack_tx),
+        });
+        if tokio::time::timeout(RESUME_FLUSH_ACK_TIMEOUT, ack_rx)
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                name: "zhive.engine.resume.flush_ack_timeout",
+                thread_id = %thread_id.0,
+                "resume flush ack did not arrive within the timeout; reading current on-disk state"
+            );
+        }
+
+        // 5. Read the full rollout, preserving turn grouping. `replay_thread_items`
+        //    flattens away turn ids; reading the entries directly keeps the
+        //    original per-turn structure so the restored transcript faithfully
+        //    mirrors the persisted one (and `turns_restored` is accurate).
+        let path = storage.rollout_path(&thread_id.0);
+        let grouped = read_rollout_turns(&path).await?;
+
+        let items_restored: u32 = grouped
+            .iter()
+            .map(|(_, items)| u32::try_from(items.len()).unwrap_or(u32::MAX))
+            .fold(0u32, u32::saturating_add);
+        let turns_restored = u32::try_from(grouped.len()).unwrap_or(u32::MAX);
+
+        // 6. Register the resident handle and seed each restored turn into the
+        //    in-memory transcript. `get_or_init` reuses an already-resident
+        //    handle (idempotent re-resume) or creates a fresh idle one.
+        let handle = self.threads().get_or_init(&thread_id).await;
+        seed_history(&handle, grouped).await;
+
+        // 7. Ensure the thread is Idle (a freshly created handle already is;
+        //    this normalises a possibly stale status on a re-resume).
+        *handle.status.write().await = zhive_proto::domain::ThreadStatus::Idle;
+
+        tracing::debug!(
+            name: "zhive.engine.resume.completed",
+            thread_id = %thread_id.0,
+            items_restored,
+            turns_restored,
+            preview = %thread.preview,
+            "resumed thread history into memory"
+        );
+
+        Ok(ResumeReply {
+            thread_id,
+            items_restored,
+            turns_restored,
+        })
+    }
+
+    /// Reads persisted history items for rendering a resumed conversation.
+    ///
+    /// When `turn_id` is `Some`, returns that turn's items from the state-database
+    /// index — paged via [`crate::persistence::StateDb::load_items_page`] when
+    /// both `offset` and `limit` are provided, otherwise the whole turn via
+    /// [`crate::persistence::StateDb::get_turn_items`]. When `turn_id` is `None`,
+    /// returns the thread's **full** item history (read from the rollout, the
+    /// source of truth) in conversation order.
+    ///
+    /// This is a pure read: it does not register a handle or change any state, so
+    /// it does not require the engine to be `Idle`. A thread with no rollout / no
+    /// indexed items yields an empty list.
+    ///
+    /// # Errors
+    ///
+    /// * [`GetItemsError::StorageUnavailable`] — the engine has no storage.
+    /// * [`GetItemsError::ReadFailed`] — the index / rollout read failed.
+    pub(in crate::engine) async fn get_items(
+        &self,
+        thread_id: ThreadId,
+        turn_id: Option<TurnId>,
+        offset: Option<i64>,
+        limit: Option<i64>,
+    ) -> Result<Vec<Item>, GetItemsError> {
+        let storage = self.storage().ok_or(GetItemsError::StorageUnavailable)?;
+
+        match turn_id {
+            Some(turn) => {
+                // Per-turn read: page only when both bounds are supplied so a
+                // caller asking for "the whole turn" is not silently truncated.
+                let result = match (offset, limit) {
+                    (Some(off), Some(lim)) => storage.state.load_items_page(&turn, off, lim).await,
+                    _ => storage.state.get_turn_items(&turn).await,
+                };
+                result.map_err(|e| GetItemsError::ReadFailed {
+                    message: e.to_string(),
+                })
+            }
+            None => {
+                // Full-thread read from the rollout (source of truth). `offset` /
+                // `limit` are turn-scoped knobs and are intentionally ignored for
+                // a full-history read.
+                storage
+                    .replay_thread_items(&thread_id, None)
+                    .await
+                    .map_err(|e| GetItemsError::ReadFailed {
+                        message: e.to_string(),
+                    })
+            }
+        }
+    }
+}
+
+/// Reads a rollout file and groups its items into turns, in file order.
+///
+/// Returns one `(TurnId, Vec<Item>)` entry per distinct turn, ordered by the
+/// turn's first appearance in the rollout. A missing rollout file yields an
+/// empty list (a thread whose rollout was never written has no history to
+/// restore). `Session` / `Leaf` entries are ignored.
+async fn read_rollout_turns(
+    path: &std::path::Path,
+) -> Result<Vec<(TurnId, Vec<Item>)>, ResumeError> {
+    let entries = match crate::persistence::read_all(path).await {
+        Ok(e) => e,
+        Err(crate::persistence::StorageError::Io(io))
+            if io.kind() == std::io::ErrorKind::NotFound =>
+        {
+            return Ok(Vec::new());
+        }
+        Err(other) => {
+            return Err(ResumeError::ReplayFailed {
+                message: other.to_string(),
+            });
+        }
+    };
+
+    // Preserve turn order by first appearance while accumulating items per turn.
+    let mut order: Vec<TurnId> = Vec::new();
+    let mut by_turn: HashMap<TurnId, Vec<Item>> = HashMap::new();
+    for entry in entries {
+        if let RolloutEntry::Item { turn_id, item, .. } = entry {
+            let tid = TurnId(Arc::from(turn_id.as_str()));
+            by_turn
+                .entry(tid.clone())
+                .or_insert_with(|| {
+                    order.push(tid.clone());
+                    Vec::new()
+                })
+                .push(*item);
+        }
+    }
+
+    Ok(order
+        .into_iter()
+        .map(|tid| {
+            let items = by_turn.remove(&tid).unwrap_or_default();
+            (tid, items)
+        })
+        .collect())
+}
+
+/// Seeds restored turns into the handle's in-memory transcript.
+///
+/// Each turn is opened with [`ThreadHandle::start_turn_buffer`], its items are
+/// pushed in order, and the turn is finalised as `Completed` so the handle ends
+/// up `Idle` with a complete (non-active) history — exactly the shape the
+/// prompt builder expects when the next live turn starts.
+async fn seed_history(handle: &Arc<ThreadHandle>, turns: Vec<(TurnId, Vec<Item>)>) {
+    // A synthetic timestamp: resumed turns are historical, so their exact
+    // wall-clock boundaries are not reconstructed here (the rollout retains the
+    // original timestamps; the in-memory buffer only needs ordering).
+    let now = super::lifecycle::unix_now_pub();
+    for (turn_id, items) in turns {
+        handle.start_turn_buffer(turn_id, now).await;
+        for item in items {
+            handle.push_item(item).await;
+        }
+        // duration_ms = Some(0): a restored turn has no replayed wall-clock span.
+        handle
+            .finish_turn_buffer(TurnStatus::Completed, now, Some(0))
+            .await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use tokio::sync::broadcast;
+    use zhive_proto::domain::{Item, ItemId, ThreadId};
+    use zhive_proto::hook::EnginePhase;
+
+    use crate::engine::event::EngineEvent;
+    use crate::engine::inner::EngineInner;
+    use crate::engine::submission::ResumeError;
+    use crate::persistence::Storage;
+    use crate::persistence::writer::PersistenceWriter;
+    use crate::provider::{DynLanguageModel, ScriptedModel};
+
+    fn tid(s: &str) -> ThreadId {
+        ThreadId(Arc::from(s))
+    }
+
+    fn noop_provider() -> DynLanguageModel {
+        ScriptedModel::new("noop", "noop", vec![]).into_dyn()
+    }
+
+    /// Builds an engine inner backed by a real on-disk `Storage`.
+    async fn inner_with_storage() -> (Arc<EngineInner>, tempfile::TempDir, Arc<Storage>) {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Arc::new(Storage::open(dir.path()).await.unwrap());
+        let (tx, handle) = PersistenceWriter::spawn(Arc::clone(&storage));
+        let (events_tx, _) = broadcast::channel::<EngineEvent>(64);
+        let inner = Arc::new(EngineInner::new_with_hooks_tools_storage(
+            events_tx,
+            noop_provider(),
+            Arc::new(crate::hooks::HookHost::new()),
+            Arc::new(crate::tools::ToolRegistry::new()),
+            crate::engine::TurnLimits::default(),
+            None,
+            Some(tx),
+            Some(handle),
+            None,
+            Some(Arc::clone(&storage)),
+            std::path::PathBuf::from("."),
+        ));
+        (inner, dir, storage)
+    }
+
+    /// Seeds a thread row + a two-turn rollout, returning nothing (the thread
+    /// id is the caller's). Turn 0 has two items, turn 1 has one.
+    async fn seed_two_turn_thread(storage: &Storage, thread: &ThreadId) {
+        use std::path::PathBuf;
+        use zhive_proto::domain::{Thread, ThreadSource, ThreadStatus};
+
+        use crate::persistence::{RolloutEntry, RolloutWriter};
+
+        // Index row (so get_thread finds it).
+        storage
+            .state
+            .upsert_thread(&Thread {
+                id: thread.clone(),
+                session_id: None,
+                forked_from: None,
+                subagent_parent: None,
+                preview: "resume me".into(),
+                ephemeral: false,
+                model_provider: "anthropic".into(),
+                created_at: 1,
+                updated_at: 2,
+                status: ThreadStatus::Idle,
+                cwd: PathBuf::from("/"),
+                source: ThreadSource::User,
+                name: None,
+                turns: vec![],
+            })
+            .await
+            .unwrap();
+
+        // Rollout: Session + two turns of items.
+        let mut w = RolloutWriter::open(storage.rollout_path(&thread.0))
+            .await
+            .unwrap();
+        w.append(&RolloutEntry::Session {
+            version: 3,
+            id: thread.0.to_string(),
+            timestamp: 0,
+            cwd: "/".into(),
+            parent_session: None,
+        })
+        .await
+        .unwrap();
+        let turn0 = format!("turn:{}/0", thread.0);
+        let turn1 = format!("turn:{}/1", thread.0);
+        for (turn, n, text) in [
+            (&turn0, "0", "first"),
+            (&turn0, "1", "second"),
+            (&turn1, "2", "third"),
+        ] {
+            w.append(&RolloutEntry::Item {
+                thread_id: thread.0.to_string(),
+                turn_id: turn.clone(),
+                timestamp: 0,
+                item: Box::new(Item::AgentMessage {
+                    id: ItemId(Arc::from(format!("item:{n}").as_str())),
+                    text: text.to_owned(),
+                }),
+            })
+            .await
+            .unwrap();
+        }
+        w.sync_all().await.unwrap();
+    }
+
+    /// `list_threads` returns the persisted index; an in-memory engine returns
+    /// an empty list rather than erroring.
+    #[tokio::test]
+    async fn list_threads_reads_index_and_empty_without_storage() {
+        let (inner, _dir, storage) = inner_with_storage().await;
+        assert!(
+            inner.list_threads(None).await.is_empty(),
+            "fresh index is empty"
+        );
+
+        let thread = tid("thread:native/list-me");
+        seed_two_turn_thread(&storage, &thread).await;
+        let listed = inner.list_threads(None).await;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, thread);
+
+        // In-memory engine: no storage → empty list, no error.
+        let (events_tx, _) = broadcast::channel::<EngineEvent>(8);
+        let mem = Arc::new(EngineInner::new(events_tx, noop_provider()));
+        assert!(mem.list_threads(None).await.is_empty());
+    }
+
+    /// `resume_thread` restores the full rollout history, grouped by turn, and
+    /// reports the item / turn counts.
+    #[tokio::test]
+    async fn resume_restores_full_history_grouped_by_turn() {
+        let (inner, _dir, storage) = inner_with_storage().await;
+        let thread = tid("thread:native/resume-me");
+        seed_two_turn_thread(&storage, &thread).await;
+
+        let reply = inner
+            .resume_thread(thread.clone())
+            .await
+            .expect("resume must succeed");
+        assert_eq!(reply.thread_id, thread);
+        assert_eq!(reply.items_restored, 3, "all three items restored");
+        assert_eq!(reply.turns_restored, 2, "two turns restored");
+
+        // The thread is now resident with the items in conversation order.
+        let handle = inner
+            .threads()
+            .get(&thread)
+            .await
+            .expect("resumed thread must be resident");
+        assert_eq!(handle.item_count().await, 3);
+        let texts: Vec<String> = handle
+            .items_snapshot()
+            .await
+            .into_iter()
+            .map(|i| match i {
+                Item::AgentMessage { text, .. } => text,
+                other => panic!("expected AgentMessage, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(texts, vec!["first", "second", "third"]);
+
+        // No active turn: resume leaves the thread Idle/ready.
+        assert!(handle.active_turn.lock().await.is_none());
+    }
+
+    /// Resuming a thread that does not exist in the index is `ThreadNotFound`.
+    #[tokio::test]
+    async fn resume_unknown_thread_is_not_found() {
+        let (inner, _dir, _storage) = inner_with_storage().await;
+        let err = inner
+            .resume_thread(tid("thread:native/no-such"))
+            .await
+            .expect_err("unknown thread must fail");
+        assert!(matches!(err, ResumeError::ThreadNotFound));
+    }
+
+    /// Resume on an engine without storage is `StorageUnavailable`.
+    #[tokio::test]
+    async fn resume_without_storage_is_unavailable() {
+        let (events_tx, _) = broadcast::channel::<EngineEvent>(8);
+        let inner = Arc::new(EngineInner::new(events_tx, noop_provider()));
+        let err = inner
+            .resume_thread(tid("thread:native/x"))
+            .await
+            .expect_err("no storage must fail");
+        assert!(matches!(err, ResumeError::StorageUnavailable));
+    }
+
+    /// Resume refuses when the engine is busy (phase not Idle).
+    #[tokio::test]
+    async fn resume_busy_when_not_idle() {
+        let (inner, _dir, storage) = inner_with_storage().await;
+        let thread = tid("thread:native/resume-busy");
+        seed_two_turn_thread(&storage, &thread).await;
+
+        inner
+            .try_set_phase_atomic(EnginePhase::Idle, EnginePhase::Turn)
+            .expect("seed phase to Turn");
+
+        let err = inner
+            .resume_thread(thread)
+            .await
+            .expect_err("resume must refuse when busy");
+        assert!(matches!(err, ResumeError::EngineBusy { .. }));
+        // Phase untouched by the refused resume.
+        assert_eq!(*inner.phase_lock(), EnginePhase::Turn);
+    }
+
+    /// After resume, the prompt the engine would build for the next turn
+    /// contains the restored history (the core resume guarantee).
+    #[tokio::test]
+    async fn resume_then_prompt_includes_history() {
+        use crate::engine::prompt::build_call_options;
+        use zhive_proto::permission::PermissionScope;
+
+        let (inner, _dir, storage) = inner_with_storage().await;
+        let thread = tid("thread:native/resume-prompt");
+        seed_two_turn_thread(&storage, &thread).await;
+
+        inner.resume_thread(thread.clone()).await.unwrap();
+        let handle = inner.threads().get(&thread).await.unwrap();
+
+        let opts = build_call_options(
+            &handle,
+            &crate::tools::ToolRegistry::new(),
+            None,
+            &PermissionScope::default_turn_scope(),
+        )
+        .await;
+
+        // Each restored AgentMessage maps to an assistant message carrying its
+        // text, so the rebuilt prompt contains all three restored turns.
+        let assistant_texts: Vec<String> = opts
+            .prompt
+            .iter()
+            .filter_map(|m| match m {
+                llmsdk::language_model::Message::Assistant { content, .. } => {
+                    content.iter().find_map(|p| match p {
+                        llmsdk::language_model::AssistantPart::Text(t) => Some(t.text.clone()),
+                        _ => None,
+                    })
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            assistant_texts,
+            vec!["first", "second", "third"],
+            "resumed history must appear in the next turn's prompt"
+        );
+    }
+}
+
+// Rust guideline compliant 2026-06-03

@@ -458,18 +458,352 @@ pub enum PermissionOptionKind {
 /// The `Cancelled` variant is **mandatory** when a session is cancelled
 /// with a permission request still in flight (ACP 0.12 schema). The
 /// server must inject `Cancelled` itself if the client disconnects.
+/// The `Defer` variant is a zhive-private extension that lets a hook
+/// suspend the turn until follow-up user input arrives; clients resume it
+/// later via `session/resume_permission` (see [`ResumeOutcome`] and
+/// [`ResumePermissionParams`]).
+///
+/// # Examples
+///
+/// ```
+/// use zhive_proto::permission::PermissionOutcome;
+/// let v = serde_json::to_value(&PermissionOutcome::Defer {
+///     reason: Some("awaiting user".into()),
+/// })
+/// .unwrap();
+/// assert_eq!(v["outcome"], "defer");
+/// assert_eq!(v["reason"], "awaiting user");
+/// let back: PermissionOutcome = serde_json::from_value(v).unwrap();
+/// assert!(matches!(back, PermissionOutcome::Defer { .. }));
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(tag = "outcome", rename_all = "camelCase")]
 #[non_exhaustive]
 pub enum PermissionOutcome {
     /// User picked the option with the given id.
+    #[serde(rename_all = "camelCase")]
     Selected {
         /// Echoes [`PermissionOption::id`].
         option_id: String,
     },
     /// Session was cancelled before the user answered.
     Cancelled,
+    /// Hook suspended the turn pending follow-up user input.
+    ///
+    /// Carries an optional human-readable rationale surfaced to the user
+    /// while the turn is parked. The turn is later unblocked by
+    /// `session/resume_permission`; a [`ResumeOutcome`] is **structurally
+    /// prevented** from deferring again, so a resumed request can never
+    /// re-suspend.
+    Defer {
+        /// Optional rationale shown while the turn is suspended.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+}
+
+// ============================================================
+// Permission defer / resume wire
+// ============================================================
+
+/// Method name for the client-to-server `session/resume_permission` request.
+///
+/// Sent to unblock a turn that a hook previously suspended with
+/// [`PermissionOutcome::Defer`]. The body is [`ResumePermissionParams`].
+///
+/// # Examples
+///
+/// ```
+/// use zhive_proto::permission::METHOD_RESUME_PERMISSION;
+/// assert_eq!(METHOD_RESUME_PERMISSION, "session/resume_permission");
+/// ```
+pub const METHOD_RESUME_PERMISSION: &str = "session/resume_permission";
+
+/// Method name for the server-to-client `events/turn_suspended` notification.
+///
+/// Emitted when a turn parks on a deferred permission request; the body is
+/// [`TurnSuspendedNotification`]. Lives in the `events/` namespace
+/// alongside the other engine event notifications.
+///
+/// # Examples
+///
+/// ```
+/// use zhive_proto::permission::METHOD_TURN_SUSPENDED;
+/// assert_eq!(METHOD_TURN_SUSPENDED, "events/turn_suspended");
+/// ```
+pub const METHOD_TURN_SUSPENDED: &str = "events/turn_suspended";
+
+/// Method name for the server-to-client `events/turn_resumed` notification.
+///
+/// Emitted when a previously suspended turn is unblocked; the body is
+/// [`TurnResumedNotification`]. Lives in the `events/` namespace alongside
+/// the other engine event notifications.
+///
+/// # Examples
+///
+/// ```
+/// use zhive_proto::permission::METHOD_TURN_RESUMED;
+/// assert_eq!(METHOD_TURN_RESUMED, "events/turn_resumed");
+/// ```
+pub const METHOD_TURN_RESUMED: &str = "events/turn_resumed";
+
+/// Resolution a client supplies to `session/resume_permission`.
+///
+/// Deliberately narrower than [`PermissionOutcome`]: it offers only
+/// `Selected` and `Cancelled`, so a resumed request can never defer
+/// again. This type-level restriction is the only guard against an
+/// infinite suspend loop; see the [`From`] conversion that lifts a
+/// `ResumeOutcome` back into a [`PermissionOutcome`].
+///
+/// # Examples
+///
+/// ```
+/// use zhive_proto::permission::ResumeOutcome;
+/// let v = serde_json::to_value(&ResumeOutcome::Selected {
+///     option_id: "allow_once".into(),
+/// })
+/// .unwrap();
+/// assert_eq!(v["outcome"], "selected");
+/// assert_eq!(v["optionId"], "allow_once");
+///
+/// // A `defer` payload is rejected — resume can never re-suspend.
+/// let deferred = serde_json::json!({ "outcome": "defer" });
+/// assert!(serde_json::from_value::<ResumeOutcome>(deferred).is_err());
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(tag = "outcome", rename_all = "camelCase")]
+#[non_exhaustive]
+pub enum ResumeOutcome {
+    /// User picked the option with the given id.
+    #[serde(rename_all = "camelCase")]
+    Selected {
+        /// Echoes [`PermissionOption::id`].
+        option_id: String,
+    },
+    /// User cancelled instead of choosing an option.
+    Cancelled,
+}
+
+impl From<ResumeOutcome> for PermissionOutcome {
+    /// Lifts a resume resolution into the broader permission outcome.
+    ///
+    /// The mapping is total and cannot produce [`PermissionOutcome::Defer`],
+    /// which is what makes re-suspension impossible at the type level.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use zhive_proto::permission::{PermissionOutcome, ResumeOutcome};
+    /// let out: PermissionOutcome = ResumeOutcome::Cancelled.into();
+    /// assert_eq!(out, PermissionOutcome::Cancelled);
+    /// ```
+    fn from(value: ResumeOutcome) -> Self {
+        match value {
+            ResumeOutcome::Selected { option_id } => Self::Selected { option_id },
+            ResumeOutcome::Cancelled => Self::Cancelled,
+        }
+    }
+}
+
+/// Body of the `session/resume_permission` request.
+///
+/// Pairs the in-flight request id with the user's [`ResumeOutcome`]. The
+/// `request_id` echoes the id the server surfaced when it suspended the
+/// turn (carried by [`TurnSuspendedNotification::request_id`]).
+///
+/// # Examples
+///
+/// ```
+/// use zhive_proto::permission::{ResumeOutcome, ResumePermissionParams};
+/// let payload = r#"{
+///     "requestId": "perm:1",
+///     "outcome": { "outcome": "selected", "optionId": "allow_once" }
+/// }"#;
+/// let params: ResumePermissionParams = serde_json::from_str(payload).unwrap();
+/// assert_eq!(params.request_id, "perm:1");
+/// assert!(matches!(params.outcome, ResumeOutcome::Selected { .. }));
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct ResumePermissionParams {
+    /// Pending request id echoed from the suspend notification.
+    pub request_id: String,
+    /// Client's resolution; cannot defer again (see [`ResumeOutcome`]).
+    pub outcome: ResumeOutcome,
+}
+
+impl ResumePermissionParams {
+    /// Builds a resume request body from a request id and outcome.
+    ///
+    /// `#[non_exhaustive]` blocks external record-struct construction, so
+    /// this is the supported way to build instances outside the crate.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use zhive_proto::permission::{ResumeOutcome, ResumePermissionParams};
+    /// let params = ResumePermissionParams::new("perm:1", ResumeOutcome::Cancelled);
+    /// assert_eq!(params.request_id, "perm:1");
+    /// ```
+    #[must_use]
+    pub fn new(request_id: impl Into<String>, outcome: ResumeOutcome) -> Self {
+        Self {
+            request_id: request_id.into(),
+            outcome,
+        }
+    }
+}
+
+/// Payload of the `events/turn_suspended` server-to-client notification.
+///
+/// Reports that the named turn parked on a deferred permission request.
+/// The client unblocks it by calling `session/resume_permission` with the
+/// same `request_id`. Without a resume (or a `session/cancel`) the turn
+/// stays suspended indefinitely — the engine applies no timeout.
+///
+/// # Examples
+///
+/// ```
+/// use zhive_proto::domain::{ThreadId, TurnId};
+/// use zhive_proto::permission::TurnSuspendedNotification;
+/// use std::sync::Arc;
+/// let n = TurnSuspendedNotification::new(
+///     ThreadId(Arc::from("thread:native/abc")),
+///     TurnId(Arc::from("turn:thread:native/abc/0")),
+///     "perm:1",
+///     Some("awaiting user".into()),
+///     1_700_000_000,
+/// );
+/// let v = serde_json::to_value(&n).unwrap();
+/// assert_eq!(v["threadId"], "thread:native/abc");
+/// assert_eq!(v["requestId"], "perm:1");
+/// assert_eq!(v["suspendedAt"], 1_700_000_000_i64);
+/// let back: TurnSuspendedNotification = serde_json::from_value(v).unwrap();
+/// assert_eq!(back, n);
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct TurnSuspendedNotification {
+    /// Thread whose turn suspended.
+    pub thread_id: ThreadId,
+    /// Suspended turn.
+    pub turn_id: TurnId,
+    /// Pending request id the client passes back to resume.
+    pub request_id: String,
+    /// Optional rationale mirrored from [`PermissionOutcome::Defer`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Unix timestamp in seconds when the turn suspended.
+    pub suspended_at: i64,
+}
+
+impl TurnSuspendedNotification {
+    /// Builds a suspend notification from its component fields.
+    ///
+    /// `#[non_exhaustive]` blocks external record-struct construction, so
+    /// this is the supported way to build instances from `zhive-core`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use zhive_proto::domain::{ThreadId, TurnId};
+    /// use zhive_proto::permission::TurnSuspendedNotification;
+    /// use std::sync::Arc;
+    /// let n = TurnSuspendedNotification::new(
+    ///     ThreadId(Arc::from("thread:native/abc")),
+    ///     TurnId(Arc::from("turn:thread:native/abc/0")),
+    ///     "perm:1",
+    ///     None,
+    ///     1_700_000_000,
+    /// );
+    /// assert_eq!(n.request_id, "perm:1");
+    /// ```
+    #[must_use]
+    pub fn new(
+        thread_id: ThreadId,
+        turn_id: TurnId,
+        request_id: impl Into<String>,
+        reason: Option<String>,
+        suspended_at: i64,
+    ) -> Self {
+        Self {
+            thread_id,
+            turn_id,
+            request_id: request_id.into(),
+            reason,
+            suspended_at,
+        }
+    }
+}
+
+/// Payload of the `events/turn_resumed` server-to-client notification.
+///
+/// Dual of [`TurnSuspendedNotification`]: reports that a previously
+/// suspended turn was unblocked and resumed execution.
+///
+/// # Examples
+///
+/// ```
+/// use zhive_proto::domain::{ThreadId, TurnId};
+/// use zhive_proto::permission::TurnResumedNotification;
+/// use std::sync::Arc;
+/// let n = TurnResumedNotification::new(
+///     ThreadId(Arc::from("thread:native/abc")),
+///     TurnId(Arc::from("turn:thread:native/abc/0")),
+///     1_700_000_005,
+/// );
+/// let v = serde_json::to_value(&n).unwrap();
+/// assert_eq!(v["threadId"], "thread:native/abc");
+/// assert_eq!(v["resumedAt"], 1_700_000_005_i64);
+/// let back: TurnResumedNotification = serde_json::from_value(v).unwrap();
+/// assert_eq!(back, n);
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct TurnResumedNotification {
+    /// Thread whose turn resumed.
+    pub thread_id: ThreadId,
+    /// Resumed turn.
+    pub turn_id: TurnId,
+    /// Unix timestamp in seconds when the turn resumed.
+    pub resumed_at: i64,
+}
+
+impl TurnResumedNotification {
+    /// Builds a resume notification from its component fields.
+    ///
+    /// `#[non_exhaustive]` blocks external record-struct construction, so
+    /// this is the supported way to build instances from `zhive-core`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use zhive_proto::domain::{ThreadId, TurnId};
+    /// use zhive_proto::permission::TurnResumedNotification;
+    /// use std::sync::Arc;
+    /// let n = TurnResumedNotification::new(
+    ///     ThreadId(Arc::from("thread:native/abc")),
+    ///     TurnId(Arc::from("turn:thread:native/abc/0")),
+    ///     1_700_000_005,
+    /// );
+    /// assert_eq!(n.resumed_at, 1_700_000_005);
+    /// ```
+    #[must_use]
+    pub fn new(thread_id: ThreadId, turn_id: TurnId, resumed_at: i64) -> Self {
+        Self {
+            thread_id,
+            turn_id,
+            resumed_at,
+        }
+    }
 }
 
 // ============================================================
@@ -681,6 +1015,122 @@ mod tests {
         assert_eq!(v["outcome"], "cancelled");
         let back: PermissionOutcome = serde_json::from_value(v).unwrap();
         assert_eq!(back, PermissionOutcome::Cancelled);
+    }
+
+    #[test]
+    fn permission_outcome_defer_round_trip() {
+        let outcome = PermissionOutcome::Defer {
+            reason: Some("awaiting user".into()),
+        };
+        let v = serde_json::to_value(&outcome).unwrap();
+        assert_eq!(v["outcome"], "defer");
+        assert_eq!(v["reason"], "awaiting user");
+        let back: PermissionOutcome = serde_json::from_value(v).unwrap();
+        assert_eq!(back, outcome);
+    }
+
+    #[test]
+    fn permission_outcome_defer_omits_none_reason() {
+        let v = serde_json::to_value(&PermissionOutcome::Defer { reason: None }).unwrap();
+        assert_eq!(v["outcome"], "defer");
+        assert!(v.get("reason").is_none(), "None reason is skipped on wire");
+    }
+
+    #[test]
+    fn resume_outcome_round_trip() {
+        let outcome = ResumeOutcome::Selected {
+            option_id: "allow_once".into(),
+        };
+        let v = serde_json::to_value(&outcome).unwrap();
+        assert_eq!(v["outcome"], "selected");
+        assert_eq!(v["optionId"], "allow_once");
+        let back: ResumeOutcome = serde_json::from_value(v).unwrap();
+        assert_eq!(back, outcome);
+
+        let v = serde_json::to_value(ResumeOutcome::Cancelled).unwrap();
+        assert_eq!(v["outcome"], "cancelled");
+    }
+
+    #[test]
+    fn resume_outcome_rejects_defer() {
+        // The whole point of the narrower enum: a resumed request can
+        // never re-suspend, so a `defer` payload must fail to deserialize.
+        let deferred = serde_json::json!({ "outcome": "defer" });
+        assert!(serde_json::from_value::<ResumeOutcome>(deferred).is_err());
+    }
+
+    #[test]
+    fn resume_outcome_into_permission_outcome() {
+        let selected: PermissionOutcome = ResumeOutcome::Selected {
+            option_id: "allow_once".into(),
+        }
+        .into();
+        assert_eq!(
+            selected,
+            PermissionOutcome::Selected {
+                option_id: "allow_once".into()
+            }
+        );
+
+        let cancelled: PermissionOutcome = ResumeOutcome::Cancelled.into();
+        assert_eq!(cancelled, PermissionOutcome::Cancelled);
+    }
+
+    #[test]
+    fn resume_permission_params_deserialize() {
+        let payload = r#"{
+            "requestId": "perm:1",
+            "outcome": { "outcome": "selected", "optionId": "allow_once" }
+        }"#;
+        let params: ResumePermissionParams = serde_json::from_str(payload).unwrap();
+        assert_eq!(params.request_id, "perm:1");
+        assert_eq!(
+            params.outcome,
+            ResumeOutcome::Selected {
+                option_id: "allow_once".into()
+            }
+        );
+    }
+
+    #[test]
+    fn turn_suspended_notification_camel_case_round_trip() {
+        let n = TurnSuspendedNotification {
+            thread_id: ThreadId(Arc::from("thread:native/abc")),
+            turn_id: TurnId(Arc::from("turn:thread:native/abc/0")),
+            request_id: "perm:1".into(),
+            reason: Some("awaiting user".into()),
+            suspended_at: 1_700_000_000,
+        };
+        let v = serde_json::to_value(&n).unwrap();
+        assert_eq!(v["threadId"], "thread:native/abc");
+        assert_eq!(v["turnId"], "turn:thread:native/abc/0");
+        assert_eq!(v["requestId"], "perm:1");
+        assert_eq!(v["reason"], "awaiting user");
+        assert_eq!(v["suspendedAt"], 1_700_000_000_i64);
+        let back: TurnSuspendedNotification = serde_json::from_value(v).unwrap();
+        assert_eq!(back, n);
+    }
+
+    #[test]
+    fn turn_resumed_notification_camel_case_round_trip() {
+        let n = TurnResumedNotification {
+            thread_id: ThreadId(Arc::from("thread:native/abc")),
+            turn_id: TurnId(Arc::from("turn:thread:native/abc/0")),
+            resumed_at: 1_700_000_005,
+        };
+        let v = serde_json::to_value(&n).unwrap();
+        assert_eq!(v["threadId"], "thread:native/abc");
+        assert_eq!(v["turnId"], "turn:thread:native/abc/0");
+        assert_eq!(v["resumedAt"], 1_700_000_005_i64);
+        let back: TurnResumedNotification = serde_json::from_value(v).unwrap();
+        assert_eq!(back, n);
+    }
+
+    #[test]
+    fn resume_permission_method_constants() {
+        assert_eq!(METHOD_RESUME_PERMISSION, "session/resume_permission");
+        assert_eq!(METHOD_TURN_SUSPENDED, "events/turn_suspended");
+        assert_eq!(METHOD_TURN_RESUMED, "events/turn_resumed");
     }
 
     #[test]

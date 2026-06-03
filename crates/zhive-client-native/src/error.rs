@@ -24,6 +24,9 @@ use zhive_proto::framing::FramingError;
 ///
 /// let d = ClientError::Disconnected("peer closed".into());
 /// assert!(matches!(d, ClientError::Disconnected(_)));
+///
+/// let n = ClientError::NotImplemented { feature: "remote/websocket", phase: 3 };
+/// assert!(matches!(n, ClientError::NotImplemented { phase: 3, .. }));
 /// ```
 #[derive(Debug, Error)]
 #[non_exhaustive]
@@ -66,6 +69,28 @@ pub enum ClientError {
     InitializeFailed {
         /// Human-readable reason.
         reason: String,
+    },
+
+    /// The requested transport or protocol feature is not yet implemented.
+    ///
+    /// Used as a forward-compatible placeholder for features gated to a
+    /// future release phase. Callers can match on `phase` to distinguish
+    /// near-term gaps from longer-term roadmap items.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use zhive_client_native::ClientError;
+    ///
+    /// let err = ClientError::NotImplemented { feature: "remote/websocket", phase: 3 };
+    /// assert!(matches!(err, ClientError::NotImplemented { phase: 3, .. }));
+    /// ```
+    #[error("not implemented in phase {phase}: {feature}")]
+    NotImplemented {
+        /// Short description of the unimplemented feature.
+        feature: &'static str,
+        /// Planned delivery phase (e.g. `3` for the Phase 3 remote story).
+        phase: u8,
     },
 }
 

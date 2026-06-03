@@ -20,7 +20,7 @@ default = []
 [dependencies]
 zhive-proto = { workspace = true }
 
-tokio       = { workspace = true, features = ["io-std"] }
+tokio       = { workspace = true, features = ["io-std", "time"] }
 async-trait = { workspace = true }
 futures     = { workspace = true }
 anyhow      = { workspace = true }
@@ -29,3 +29,9 @@ tracing     = { workspace = true }
 bytes       = { workspace = true }
 serde_json  = { workspace = true }
 tokio-util.workspace = true
+
+[dev-dependencies]
+# `test-util` enables `tokio::time::pause` / `advance` / `start_paused` used
+# by the shutdown-timeout test.  Not needed at runtime; tokio is already a
+# regular dependency so this only activates an extra feature in tests.
+tokio = { workspace = true, features = ["test-util"] }

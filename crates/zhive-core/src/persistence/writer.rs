@@ -88,9 +88,74 @@ pub enum StorageWriteOp {
     },
     /// Force-flush and fsync the rollout for a given thread without ending
     /// a turn. Used for early-save scenarios.
+    ///
+    /// When `ack` is `Some`, the writer fires the oneshot **after** the
+    /// `sync_all` completes, so an enqueuer can `await` until the rollout is
+    /// durably drained (the fork path relies on this to read a self-consistent
+    /// source rollout). A `None` ack is fire-and-forget. The ack is dropped
+    /// without sending if the rollout writer cannot be opened (no fsync
+    /// happened); the awaiter then observes a closed channel rather than a
+    /// false durability signal.
     Flush {
         /// Thread whose rollout should be fsynced.
         thread_id: ThreadId,
+        /// Optional completion signal fired after the fsync.
+        ack: Option<tokio::sync::oneshot::Sender<()>>,
+    },
+    /// The active model for a thread changed; update the `model_provider`
+    /// column on the threads row.
+    ///
+    /// Best-effort SQL-only: there is no dedicated JSONL row for a model
+    /// change in Phase 1, so a crash before the next item append loses only
+    /// the index update (the JSONL session header still records the original
+    /// provider and the index can be rebuilt from a fresh upsert).
+    ModelChanged {
+        /// Thread whose model changed.
+        thread_id: ThreadId,
+        /// New provider identifier (e.g. `"anthropic"`).
+        provider: String,
+        /// New model identifier (e.g. `"claude-opus-4"`).
+        model_id: String,
+    },
+    /// The human-facing session name changed; update the `name` column on the
+    /// threads row.
+    ///
+    /// Best-effort SQL-only for the same reason as [`Self::ModelChanged`].
+    SessionNameSet {
+        /// Thread whose name changed.
+        thread_id: ThreadId,
+        /// New session name (an empty string clears it).
+        name: String,
+    },
+    /// Move (or stamp) a thread's active branch-head leaf pointer.
+    ///
+    /// Appends a [`RolloutEntry::Leaf`] and fsyncs it as a save point. A
+    /// `target_id = Some(id)` records a fork / branch leaf at item `id`;
+    /// `target_id = None` is the same turn-completion marker the writer emits at
+    /// [`Self::TurnEnded`]. Written by the fork path after replaying the source
+    /// history into a new thread's rollout (see `engine::fork`).
+    SetLeaf {
+        /// Thread whose leaf pointer moves.
+        thread_id: ThreadId,
+        /// Item id at the new branch head, or `None` for an empty branch.
+        target_id: Option<String>,
+    },
+    /// Write the first line of a **forked** thread's rollout: a session header
+    /// naming the source thread as its parent.
+    ///
+    /// The writer records `thread_id` in its `header_written` set so the
+    /// subsequent [`Self::ThreadUpserted`] for the forked thread does **not**
+    /// re-emit a header (which would carry `parent_session = None` and lose the
+    /// fork link). Used by the fork path before the replayed items are appended.
+    ForkHeader {
+        /// Forked (new) thread whose rollout is being opened.
+        thread_id: ThreadId,
+        /// Source thread the fork was taken from.
+        parent_session: ThreadId,
+        /// Working directory recorded in the header.
+        cwd: String,
+        /// Unix-seconds creation timestamp.
+        created_at: i64,
     },
 }
 
@@ -267,7 +332,25 @@ async fn apply_op(state: &mut WriterState, op: StorageWriteOp) {
             )
             .await;
         }
-        StorageWriteOp::Flush { thread_id } => apply_flush(state, thread_id).await,
+        StorageWriteOp::Flush { thread_id, ack } => apply_flush(state, thread_id, ack).await,
+        StorageWriteOp::ModelChanged {
+            thread_id,
+            provider,
+            model_id,
+        } => apply_model_changed(state, thread_id, provider, model_id).await,
+        StorageWriteOp::SessionNameSet { thread_id, name } => {
+            apply_session_name_set(state, thread_id, name).await;
+        }
+        StorageWriteOp::SetLeaf {
+            thread_id,
+            target_id,
+        } => apply_set_leaf(state, thread_id, target_id).await,
+        StorageWriteOp::ForkHeader {
+            thread_id,
+            parent_session,
+            cwd,
+            created_at,
+        } => apply_fork_header(state, thread_id, parent_session, cwd, created_at).await,
     }
 }
 
@@ -275,12 +358,20 @@ async fn apply_thread_upserted(state: &mut WriterState, thread: Box<zhive_proto:
     // JSONL first: write session header once per thread.
     if !state.header_written.contains(&thread.id) {
         let cwd = thread.cwd.to_str().unwrap_or("/").to_owned();
+        // Derive the rollout header's parent_session from the thread's
+        // forked_from link so a thread created through the fork path (or any
+        // future caller that sets forked_from) records its origin in the JSONL
+        // source of truth. The fork path itself normally writes the header via
+        // ForkHeader first (which marks header_written), so this branch only
+        // runs for forked threads whose upsert reached the writer before the
+        // ForkHeader — in which case it must still carry the parent link.
+        let parent_session = thread.forked_from.as_ref().map(|p| p.0.to_string());
         let session_entry = RolloutEntry::Session {
-            version: 3,
+            version: super::rollout::SESSION_VERSION,
             id: thread.id.0.to_string(),
             timestamp: thread.created_at,
             cwd,
-            parent_session: None,
+            parent_session,
         };
         if let Some(w) = state.rollout_for(&thread.id).await {
             if let Err(err) = w.append(&session_entry).await {
@@ -430,7 +521,15 @@ async fn apply_turn_ended(
     }
 }
 
-async fn apply_flush(state: &mut WriterState, thread_id: ThreadId) {
+async fn apply_flush(
+    state: &mut WriterState,
+    thread_id: ThreadId,
+    ack: Option<tokio::sync::oneshot::Sender<()>>,
+) {
+    // Only fsync a rollout that is already open. A thread with no buffered
+    // writes has nothing to drain; opening it here would create an empty file.
+    // In that case the durability signal is still valid (there is nothing
+    // un-synced), so the ack fires regardless of whether the writer existed.
     if let Some(w) = state.rollouts.get_mut(&thread_id)
         && let Err(err) = w.sync_all().await
     {
@@ -441,6 +540,106 @@ async fn apply_flush(state: &mut WriterState, thread_id: ThreadId) {
             "Flush sync_all failed"
         );
     }
+    // Fire the completion signal (if requested) after the fsync attempt. A
+    // dropped receiver (awaiter went away) is benign — `send` returns Err and
+    // is ignored.
+    if let Some(ack) = ack {
+        let _ = ack.send(());
+    }
+}
+
+async fn apply_model_changed(
+    state: &mut WriterState,
+    thread_id: ThreadId,
+    provider: String,
+    model_id: String,
+) {
+    // SQL-only best-effort: there is no JSONL row for a model change in
+    // Phase 1, so the index is updated directly and the JSONL is left intact.
+    if let Err(err) = state
+        .storage
+        .state
+        .set_thread_model(&thread_id, &provider, &model_id)
+        .await
+    {
+        tracing::error!(
+            name: "zhive.persistence.writer.model_changed_failed",
+            error = %err,
+            thread_id = %thread_id.0,
+            "SQL set_thread_model failed; JSONL is authoritative"
+        );
+    }
+}
+
+async fn apply_session_name_set(state: &mut WriterState, thread_id: ThreadId, name: String) {
+    // SQL-only best-effort, same rationale as `apply_model_changed`.
+    if let Err(err) = state.storage.state.set_thread_name(&thread_id, &name).await {
+        tracing::error!(
+            name: "zhive.persistence.writer.session_name_failed",
+            error = %err,
+            thread_id = %thread_id.0,
+            "SQL set_thread_name failed; JSONL is authoritative"
+        );
+    }
+}
+
+async fn apply_set_leaf(state: &mut WriterState, thread_id: ThreadId, target_id: Option<String>) {
+    // JSONL-only: append the leaf pointer then fsync so the fork's branch head
+    // survives a crash. There is no SQL column for the active leaf in Phase 1;
+    // rebuild reads the last Leaf back from the rollout (see
+    // `rebuild_state_from_rollout`).
+    if let Some(w) = state.rollout_for(&thread_id).await {
+        if let Err(err) = w.set_leaf_id(target_id.as_deref()).await {
+            tracing::error!(
+                name: "zhive.persistence.writer.set_leaf_failed",
+                error = %err,
+                thread_id = %thread_id.0,
+                "failed to append leaf entry to rollout"
+            );
+        }
+        if let Err(err) = w.sync_all().await {
+            tracing::error!(
+                name: "zhive.persistence.writer.set_leaf_sync_failed",
+                error = %err,
+                thread_id = %thread_id.0,
+                "fsync after SetLeaf failed"
+            );
+        }
+    }
+}
+
+async fn apply_fork_header(
+    state: &mut WriterState,
+    thread_id: ThreadId,
+    parent_session: ThreadId,
+    cwd: String,
+    created_at: i64,
+) {
+    // JSONL first: write the forked thread's session header naming its parent,
+    // and mark the header as written so the subsequent ThreadUpserted for the
+    // same thread skips its own (parent-less) header. Without this guard the
+    // upsert would emit a second Session line with parent_session=None and the
+    // fork link would be lost on rebuild.
+    if state.header_written.contains(&thread_id) {
+        // Header already emitted (e.g. a prior upsert raced the fork). Do not
+        // double-write; the existing header is authoritative.
+        return;
+    }
+    if let Some(w) = state.rollout_for(&thread_id).await {
+        if let Err(err) = w
+            .append_session_header(&thread_id.0, created_at, &cwd, Some(&parent_session.0))
+            .await
+        {
+            tracing::error!(
+                name: "zhive.persistence.writer.fork_header_failed",
+                error = %err,
+                thread_id = %thread_id.0,
+                "failed to write forked session header to rollout"
+            );
+        } else {
+            state.header_written.insert(thread_id);
+        }
+    }
 }
 
 // ------------------------------------------------------------------
@@ -449,8 +648,9 @@ async fn apply_flush(state: &mut WriterState, thread_id: ThreadId) {
 
 /// Rebuilds the [`StateDb`] index from the JSONL rollout at `rollout_path`.
 ///
-/// Reads all [`RolloutEntry`] values, replays them into the `state` database
-/// (upsert thread, record turn starts/ends, append items), and marks turns
+/// Reads all [`RolloutEntry`] values, then delegates to
+/// [`rebuild_state_from_entries`] which replays them into the `state` database
+/// (upsert thread, record turn starts/ends, append items) and marks turns
 /// `Completed` best-effort (since the rollout does not track final status,
 /// we use the last seen item's existence as a proxy for completion).
 ///
@@ -480,10 +680,6 @@ pub async fn rebuild_state_from_rollout(
     state: &super::StateDb,
     rollout_path: &std::path::Path,
 ) -> StorageResult<()> {
-    use std::collections::HashMap as HMap;
-    use std::path::PathBuf;
-    use zhive_proto::domain::{ThreadSource, ThreadStatus};
-
     let entries = match super::rollout::read_all(rollout_path).await {
         Ok(e) => e,
         Err(StorageError::Io(io)) if io.kind() == std::io::ErrorKind::NotFound => {
@@ -492,6 +688,46 @@ pub async fn rebuild_state_from_rollout(
         }
         Err(other) => return Err(other),
     };
+    rebuild_state_from_entries(state, entries).await
+}
+
+/// Replays already-read [`RolloutEntry`] values into the [`StateDb`] index.
+///
+/// The pure-data counterpart of [`rebuild_state_from_rollout`]: it takes the
+/// entries a caller has already loaded (so a directory walk that read a rollout
+/// for its stats does not read the same file a second time) and applies the
+/// same upsert / turn / item replay. Both entry points share this body, so the
+/// index produced from a re-read and from a passed-in slice can never diverge.
+///
+/// This function is idempotent: replaying the same entries twice re-upserts the
+/// same rows.
+///
+/// # Errors
+///
+/// Returns [`StorageError`] when a DB write fails.
+///
+/// # Examples
+///
+/// ```no_run
+/// # async fn demo() -> zhive_core::persistence::StorageResult<()> {
+/// use std::path::Path;
+/// use zhive_core::persistence::{Storage, read_all};
+/// use zhive_core::persistence::writer::rebuild_state_from_entries;
+///
+/// let storage = Storage::open(Path::new("/tmp/demo")).await?;
+/// let rollout = Path::new("/tmp/demo/rollouts/thread_native_01.jsonl");
+/// let entries = read_all(rollout).await?;
+/// rebuild_state_from_entries(&storage.state, entries).await?;
+/// # Ok(())
+/// # }
+/// ```
+pub async fn rebuild_state_from_entries(
+    state: &super::StateDb,
+    entries: Vec<RolloutEntry>,
+) -> StorageResult<()> {
+    use std::collections::HashMap as HMap;
+    use std::path::PathBuf;
+    use zhive_proto::domain::{ThreadSource, ThreadStatus};
 
     // Track per-turn item count (used to detect non-empty turns for
     // best-effort completion marking).
@@ -501,23 +737,40 @@ pub async fn rebuild_state_from_rollout(
         std::collections::HashSet::default();
     // Turn → thread mapping for marking done.
     let mut turn_to_thread: HMap<TurnId, ThreadId> = HMap::new();
+    // Last fork/branch leaf target seen (target_id = Some). Diagnostic only:
+    // the active branch head is not a SQL column in Phase 1.
+    let mut last_leaf_target: Option<String> = None;
 
     let now = unix_now();
 
     for entry in entries {
         match entry {
             RolloutEntry::Session {
-                id, timestamp, cwd, ..
+                id,
+                timestamp,
+                cwd,
+                parent_session,
+                ..
             } => {
                 if thread_ids_seen.contains(&id) {
                     continue;
                 }
                 thread_ids_seen.insert(id.clone());
 
+                // A forked thread's header names its source as parent_session;
+                // map that back onto Thread.forked_from so the rebuilt SQL
+                // index records the fork link (it was previously dropped here).
+                let forked_from = parent_session.as_deref().map(|p| ThreadId(Arc::from(p)));
+                // Threads created through the fork path are user-initiated
+                // branches, not subagent children; persist them as User.
                 let thread = zhive_proto::domain::Thread {
                     id: ThreadId(Arc::from(id.as_str())),
                     session_id: None,
-                    forked_from: None,
+                    forked_from,
+                    // The rollout Session header records only `parent_session`
+                    // (mapped to `forked_from`); a subagent parent link is not
+                    // stored in JSONL, so rebuild leaves it `None`.
+                    subagent_parent: None,
                     preview: String::new(),
                     ephemeral: false,
                     model_provider: "unknown".to_owned(),
@@ -555,9 +808,25 @@ pub async fn rebuild_state_from_rollout(
                 *seq += 1;
             }
 
-            // Leaf and any future variants: no item to replay.
-            _ => {}
+            // A Leaf with target_id = Some marks a fork / branch head; remember
+            // the most recent one for diagnostics. target_id = None is a plain
+            // turn-completion save point and is ignored. Neither rebuilds an
+            // item row — the active leaf is not a SQL column in Phase 1.
+            RolloutEntry::Leaf {
+                target_id: Some(target),
+            } => {
+                last_leaf_target = Some(target);
+            }
+            RolloutEntry::Leaf { target_id: None } => {}
         }
+    }
+
+    if let Some(leaf) = &last_leaf_target {
+        tracing::debug!(
+            name: "zhive.persistence.rebuild.active_leaf",
+            target_id = %leaf,
+            "rebuilt rollout had an explicit fork/branch leaf"
+        );
     }
 
     // Best-effort: mark every non-empty turn as Completed.
@@ -568,6 +837,113 @@ pub async fn rebuild_state_from_rollout(
     }
 
     Ok(())
+}
+
+/// Aggregate counts produced by [`rebuild_indexes_from_jsonl`].
+///
+/// `threads_rebuilt` counts distinct `Session` headers replayed across every
+/// rollout file; `entries_replayed` counts every JSONL line fed to the
+/// per-file rebuild (`Session` + `Item` + `Leaf`).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RebuildStats {
+    /// Number of distinct threads (one per `Session` header) rebuilt.
+    pub threads_rebuilt: u64,
+    /// Total rollout entries replayed across all files.
+    pub entries_replayed: u64,
+}
+
+/// Rebuilds the [`StateDb`] index from every rollout under `rollouts_dir`.
+///
+/// Walks the directory, skips the [`session_index.jsonl`] sidecar and any
+/// non-`.jsonl` file, and replays each remaining rollout through
+/// [`rebuild_state_from_rollout`]. Counts are accumulated into a
+/// [`RebuildStats`]. The walk is best-effort per file: a single corrupt
+/// rollout aborts the whole rebuild (its error propagates) so the operator
+/// learns the index is incomplete rather than silently partial.
+///
+/// This is the crash-recovery entry point that rebuilds the full index after
+/// the SQL database is lost or out of date; the JSONL rollout remains the
+/// source of truth (see the module header).
+///
+/// [`session_index.jsonl`]: super::session_index::SESSION_INDEX_FILE
+///
+/// # Errors
+///
+/// Returns [`StorageError`] when the directory cannot be read or any rollout
+/// fails to replay.
+///
+/// # Examples
+///
+/// ```no_run
+/// # async fn demo() -> zhive_core::persistence::StorageResult<()> {
+/// use std::path::Path;
+/// use zhive_core::persistence::Storage;
+/// use zhive_core::persistence::writer::rebuild_indexes_from_jsonl;
+///
+/// let storage = Storage::open(Path::new("/tmp/demo")).await?;
+/// let stats = rebuild_indexes_from_jsonl(
+///     Path::new("/tmp/demo/rollouts"),
+///     &storage.state,
+/// )
+/// .await?;
+/// println!("rebuilt {} threads", stats.threads_rebuilt);
+/// # Ok(())
+/// # }
+/// ```
+pub async fn rebuild_indexes_from_jsonl(
+    rollouts_dir: &std::path::Path,
+    state_db: &super::StateDb,
+) -> StorageResult<RebuildStats> {
+    let mut stats = RebuildStats::default();
+    let mut dir = match tokio::fs::read_dir(rollouts_dir).await {
+        Ok(d) => d,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            // No rollout directory yet (fresh install): nothing to rebuild.
+            return Ok(stats);
+        }
+        Err(err) => return Err(err.into()),
+    };
+
+    while let Some(entry) = dir.next_entry().await? {
+        let path = entry.path();
+        // Only consider regular `*.jsonl` files; skip the session-index
+        // sidecar so it is never replayed as a rollout.
+        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            continue;
+        }
+        if path.file_name().and_then(|n| n.to_str())
+            == Some(super::session_index::SESSION_INDEX_FILE)
+        {
+            continue;
+        }
+
+        // Count entries (Session headers and total) before replaying so the
+        // stats reflect what landed in the index.
+        let entries = match super::rollout::read_all(&path).await {
+            Ok(e) => e,
+            Err(StorageError::Io(io)) if io.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(other) => return Err(other),
+        };
+        let threads_in_file = entries
+            .iter()
+            .filter(|e| matches!(e, RolloutEntry::Session { .. }))
+            .count();
+        stats.threads_rebuilt = stats
+            .threads_rebuilt
+            .saturating_add(u64::try_from(threads_in_file).unwrap_or(u64::MAX));
+        stats.entries_replayed = stats
+            .entries_replayed
+            .saturating_add(u64::try_from(entries.len()).unwrap_or(u64::MAX));
+
+        // Replay the SAME entries we counted above: passing the already-read
+        // Vec to `rebuild_state_from_entries` (instead of calling
+        // `rebuild_state_from_rollout`, which would re-`read_all` the file)
+        // guarantees the stats and the index reflect one identical read.
+        rebuild_state_from_entries(state_db, entries).await?;
+    }
+
+    Ok(stats)
 }
 
 // ------------------------------------------------------------------
@@ -605,6 +981,7 @@ mod tests {
             id: ThreadId(Arc::from(id)),
             session_id: None,
             forked_from: None,
+            subagent_parent: None,
             preview: "preview".into(),
             ephemeral: false,
             model_provider: "test".into(),
@@ -766,6 +1143,200 @@ mod tests {
         );
     }
 
+    /// `ModelChanged` and `SessionNameSet` ops update the existing threads
+    /// row in place (best-effort SQL index update).
+    #[tokio::test]
+    async fn writer_applies_model_and_name_ops() {
+        let (_dir, storage) = open_storage().await;
+
+        // Seed the threads row first via a direct upsert.
+        let thread_id = ThreadId(Arc::from("thread:native/meta-test"));
+        storage
+            .state
+            .upsert_thread(&make_thread("thread:native/meta-test"))
+            .await
+            .unwrap();
+
+        let (tx, handle) = PersistenceWriter::spawn(Arc::clone(&storage));
+        tx.send(StorageWriteOp::ModelChanged {
+            thread_id: thread_id.clone(),
+            provider: "anthropic".into(),
+            model_id: "claude-opus-4".into(),
+        })
+        .await
+        .unwrap();
+        tx.send(StorageWriteOp::SessionNameSet {
+            thread_id: thread_id.clone(),
+            name: "release planning".into(),
+        })
+        .await
+        .unwrap();
+        drop(tx);
+        handle.await.unwrap();
+
+        let t = storage
+            .state
+            .get_thread(&thread_id)
+            .await
+            .unwrap()
+            .expect("thread must be present");
+        assert_eq!(t.model_provider, "anthropic/claude-opus-4");
+        assert_eq!(t.name.as_deref(), Some("release planning"));
+    }
+
+    /// `rebuild_indexes_from_jsonl` replays every per-thread rollout in a
+    /// directory, skips the `session_index.jsonl` sidecar, and reports the
+    /// aggregate counts.
+    #[tokio::test]
+    async fn rebuild_indexes_from_jsonl_scans_directory() {
+        let (_dir, storage) = open_storage().await;
+        let rollouts_dir = storage.rollout_path("ignored").parent().unwrap().to_owned();
+
+        // Two thread rollouts, each one Session + one Item.
+        for n in 0..2 {
+            let thread_id = ThreadId(Arc::from(format!("thread:native/scan-{n}").as_str()));
+            let path = storage.rollout_path(&thread_id.0);
+            let mut w = crate::persistence::RolloutWriter::open(path).await.unwrap();
+            w.append(&RolloutEntry::Session {
+                version: 3,
+                id: thread_id.0.to_string(),
+                timestamp: 1_000,
+                cwd: "/tmp".into(),
+                parent_session: None,
+            })
+            .await
+            .unwrap();
+            w.append(&RolloutEntry::Item {
+                thread_id: thread_id.0.to_string(),
+                turn_id: format!("turn:{}/0", thread_id.0),
+                timestamp: 1_001,
+                item: Box::new(Item::AgentMessage {
+                    id: ItemId(Arc::from(format!("item:scan-{n}/0").as_str())),
+                    text: "scanned".into(),
+                }),
+            })
+            .await
+            .unwrap();
+            w.sync_all().await.unwrap();
+        }
+
+        // A session-index sidecar in the same directory must be skipped.
+        crate::persistence::session_index::append_entry(
+            &rollouts_dir,
+            &crate::persistence::session_index::SessionIndexEntry::new(
+                "thread:native/scan-0",
+                "named",
+                5,
+            ),
+        )
+        .await
+        .unwrap();
+
+        let stats = rebuild_indexes_from_jsonl(&rollouts_dir, &storage.state)
+            .await
+            .unwrap();
+        assert_eq!(stats.threads_rebuilt, 2, "two Session headers");
+        assert_eq!(stats.entries_replayed, 4, "2 Session + 2 Item lines");
+
+        // Both threads landed in the SQL index; the sidecar did not.
+        let threads = storage.state.list_threads(None).await.unwrap();
+        assert_eq!(threads.len(), 2);
+    }
+
+    /// `ForkHeader` writes a Session header naming the parent, and a subsequent
+    /// `ThreadUpserted` for the same thread does NOT overwrite it with a
+    /// parent-less header. `SetLeaf` appends a fork leaf at the file tail.
+    #[tokio::test]
+    async fn writer_fork_header_and_set_leaf() {
+        let (_dir, storage) = open_storage().await;
+
+        let (tx, handle) = PersistenceWriter::spawn(Arc::clone(&storage));
+        let forked_id = ThreadId(Arc::from("thread:native/fork/0"));
+        let source_id = ThreadId(Arc::from("thread:native/src"));
+
+        // ForkHeader first: writes the parent-naming session header.
+        tx.send(StorageWriteOp::ForkHeader {
+            thread_id: forked_id.clone(),
+            parent_session: source_id.clone(),
+            cwd: "/work".into(),
+            created_at: 1_000,
+        })
+        .await
+        .unwrap();
+        // A later upsert for the same thread must be skipped for header purposes.
+        let mut forked_thread = make_thread("thread:native/fork/0");
+        forked_thread.forked_from = Some(source_id.clone());
+        tx.send(StorageWriteOp::ThreadUpserted(Box::new(forked_thread)))
+            .await
+            .unwrap();
+        // SetLeaf at the tail.
+        tx.send(StorageWriteOp::SetLeaf {
+            thread_id: forked_id.clone(),
+            target_id: Some("item:replay/1".into()),
+        })
+        .await
+        .unwrap();
+        drop(tx);
+        handle.await.unwrap();
+
+        let rollout_path = storage.rollout_path(&forked_id.0);
+        let entries = crate::persistence::read_all(&rollout_path).await.unwrap();
+
+        // Exactly one Session header, carrying the parent link.
+        let sessions: Vec<_> = entries
+            .iter()
+            .filter_map(|e| match e {
+                RolloutEntry::Session { parent_session, .. } => Some(parent_session.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sessions.len(), 1, "exactly one Session header");
+        assert_eq!(sessions[0].as_deref(), Some("thread:native/src"));
+
+        // Tail is a fork leaf.
+        assert_eq!(
+            entries.last(),
+            Some(&RolloutEntry::Leaf {
+                target_id: Some("item:replay/1".to_owned()),
+            })
+        );
+    }
+
+    /// A rollout whose Session header carries `parent_session` rebuilds the SQL
+    /// `forked_from` column (previously dropped during rebuild).
+    #[tokio::test]
+    async fn rebuild_recovers_forked_from_from_parent_session() {
+        let (_dir, storage) = open_storage().await;
+
+        let forked_id = ThreadId(Arc::from("thread:native/fork/rebuild"));
+        let rollout_path = storage.rollout_path(&forked_id.0);
+        let mut w = crate::persistence::RolloutWriter::open(rollout_path.clone())
+            .await
+            .unwrap();
+        w.append_session_header(&forked_id.0, 1_000, "/work", Some("thread:native/origin"))
+            .await
+            .unwrap();
+        w.set_leaf_id(Some("item:replay/0")).await.unwrap();
+        w.sync_all().await.unwrap();
+        drop(w);
+
+        rebuild_state_from_rollout(&storage.state, &rollout_path)
+            .await
+            .unwrap();
+
+        let t = storage
+            .state
+            .get_thread(&forked_id)
+            .await
+            .unwrap()
+            .expect("forked thread must be present");
+        assert_eq!(
+            t.forked_from.as_ref().map(|f| f.0.to_string()).as_deref(),
+            Some("thread:native/origin"),
+            "rebuild must recover forked_from from Session.parent_session"
+        );
+    }
+
     /// `rebuild_state_from_rollout` must return `Ok(())` for a missing rollout
     /// file (normal condition on first boot; nothing to rebuild).
     #[tokio::test]
@@ -775,6 +1346,153 @@ mod tests {
         rebuild_state_from_rollout(&storage.state, nonexistent)
             .await
             .expect("missing rollout must be treated as empty, not an error");
+    }
+
+    /// A `Flush { ack: Some(_) }` op fires its oneshot AFTER the item it follows
+    /// is durably written, so an awaiter that drains the ack observes the
+    /// preceding `ItemAppended` on disk.
+    #[tokio::test]
+    async fn flush_ack_fires_after_item_durable() {
+        let (_dir, storage) = open_storage().await;
+        let (tx, handle) = PersistenceWriter::spawn(Arc::clone(&storage));
+
+        let thread_id = ThreadId(Arc::from("thread:native/flush-ack"));
+        let turn_id = TurnId(Arc::from("turn:thread:native/flush-ack/0"));
+
+        tx.send(StorageWriteOp::ItemAppended {
+            thread_id: thread_id.clone(),
+            turn_id,
+            seq: 0,
+            item: Box::new(Item::AgentMessage {
+                id: ItemId(Arc::from("item:flush-ack/0")),
+                text: "buffered".into(),
+            }),
+        })
+        .await
+        .unwrap();
+
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        tx.send(StorageWriteOp::Flush {
+            thread_id: thread_id.clone(),
+            ack: Some(ack_tx),
+        })
+        .await
+        .unwrap();
+
+        // The ack resolves once the writer has fsynced.
+        ack_rx.await.expect("ack must fire after flush");
+
+        // The preceding item is durably visible on disk (the ack is a true
+        // durability barrier, not merely an enqueue echo).
+        let rollout_path = storage.rollout_path(&thread_id.0);
+        let entries = crate::persistence::read_all(&rollout_path).await.unwrap();
+        assert!(
+            entries.iter().any(|e| matches!(
+                e,
+                RolloutEntry::Item { item, .. }
+                    if item.id().0.as_ref() == "item:flush-ack/0"
+            )),
+            "item must be on disk by the time the flush ack fires"
+        );
+
+        drop(tx);
+        handle.await.unwrap();
+    }
+
+    /// `rebuild_state_from_entries` produces the same index as
+    /// `rebuild_state_from_rollout` reading the same file (shared body, no
+    /// divergence between the stats read and the index read).
+    #[tokio::test]
+    async fn rebuild_from_entries_matches_rollout_read() {
+        let (_dir, storage) = open_storage().await;
+        let thread_id = ThreadId(Arc::from("thread:native/entries-eq"));
+        let turn_id = TurnId(Arc::from("turn:thread:native/entries-eq/0"));
+        let rollout_path = storage.rollout_path(&thread_id.0);
+
+        let mut w = crate::persistence::RolloutWriter::open(rollout_path.clone())
+            .await
+            .unwrap();
+        w.append(&RolloutEntry::Session {
+            version: 3,
+            id: thread_id.0.to_string(),
+            timestamp: 1_000,
+            cwd: "/tmp".into(),
+            parent_session: None,
+        })
+        .await
+        .unwrap();
+        w.append(&RolloutEntry::Item {
+            thread_id: thread_id.0.to_string(),
+            turn_id: turn_id.0.to_string(),
+            timestamp: 1_001,
+            item: Box::new(Item::AgentMessage {
+                id: ItemId(Arc::from("item:entries-eq/0")),
+                text: "x".into(),
+            }),
+        })
+        .await
+        .unwrap();
+        w.sync_all().await.unwrap();
+        drop(w);
+
+        let entries = crate::persistence::read_all(&rollout_path).await.unwrap();
+        rebuild_state_from_entries(&storage.state, entries)
+            .await
+            .unwrap();
+
+        let items = storage.state.get_turn_items(&turn_id).await.unwrap();
+        assert_eq!(items.len(), 1, "entries replay populates the SQL index");
+    }
+
+    /// A failed `TurnEnded { error: Some(_) }` writes the failure cause to the
+    /// `turns` row's `error_message` / `error_details` columns — the cause that
+    /// `finish_turn` now threads through (previously hard-coded `error: None`).
+    #[tokio::test]
+    async fn turn_ended_persists_error_detail() {
+        let (_dir, storage) = open_storage().await;
+        let (tx, handle) = PersistenceWriter::spawn(Arc::clone(&storage));
+
+        let thread_id = ThreadId(Arc::from("thread:native/failed-turn"));
+        let turn_id = TurnId(Arc::from("turn:thread:native/failed-turn/0"));
+
+        tx.send(StorageWriteOp::ThreadUpserted(Box::new(make_thread(
+            "thread:native/failed-turn",
+        ))))
+        .await
+        .unwrap();
+        tx.send(StorageWriteOp::TurnStarted {
+            thread_id: thread_id.clone(),
+            turn_id: turn_id.clone(),
+            started_at: 1_000,
+        })
+        .await
+        .unwrap();
+        tx.send(StorageWriteOp::TurnEnded {
+            thread_id,
+            turn_id: turn_id.clone(),
+            status: TurnStatus::Failed,
+            error: Some(TurnError {
+                message: "provider exploded".to_owned(),
+                additional_details: Some("HTTP 500".to_owned()),
+            }),
+            completed_at: 2_000,
+            duration_ms: Some(1_000),
+        })
+        .await
+        .unwrap();
+        drop(tx);
+        handle.await.unwrap();
+
+        // Read the persisted error columns directly.
+        let row: (String, Option<String>, Option<String>) =
+            sqlx::query_as("SELECT status, error_message, error_details FROM turns WHERE id = ?1")
+                .bind(turn_id.0.as_ref())
+                .fetch_one(storage.state.pool())
+                .await
+                .unwrap();
+        assert_eq!(row.0, "failed", "status column reflects the failure");
+        assert_eq!(row.1.as_deref(), Some("provider exploded"));
+        assert_eq!(row.2.as_deref(), Some("HTTP 500"));
     }
 }
 

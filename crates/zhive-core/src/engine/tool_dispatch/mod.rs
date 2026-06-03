@@ -49,11 +49,13 @@ use crate::cancel::CancellationTree;
 use crate::engine::event::EngineEvent;
 use crate::engine::inner::EngineInner;
 use crate::hooks::HookHost;
-use crate::permission::{PermissionReducer, evaluate};
+use crate::permission::{PermissionReducer, RequestContext, evaluate};
+use crate::subagent::SubagentDecisionRequest;
 use crate::tools::{SubagentSpawner, ToolContext, ToolRegistry};
 
 use helpers::{
-    blocked_outcome, build_permission_request, cancelled_during_execution, classify_option_id,
+    HandshakeVerdict, blocked_outcome, build_permission_request, cancelled_during_execution,
+    classify_option_id, handshake_with_parent,
 };
 
 // ============================================================
@@ -235,6 +237,8 @@ pub(super) async fn dispatch_tool_call(
         tool_use_id,
         scope,
         cancel,
+        // Top-level (direct-caller) path: no parent handshake.
+        None,
     )
     .await
     {
@@ -284,6 +288,7 @@ pub(super) async fn resolve_tool_permission(
     tool_use_id: &str,
     scope: &zhive_proto::permission::PermissionScope,
     cancel: &CancellationToken,
+    decision_tx: Option<&tokio::sync::mpsc::Sender<SubagentDecisionRequest>>,
 ) -> ToolResolution {
     // Span name and field names are string literals (tracing macro
     // requirement).  The constants spans::TOOL_CALL, fields::THREAD_ID,
@@ -300,12 +305,14 @@ pub(super) async fn resolve_tool_permission(
         hook_host,
         reducer,
         thread_id_str,
+        turn_id,
         item_id,
         tool_name,
         raw_args,
         tool_use_id,
         scope,
         cancel,
+        decision_tx,
     )
     .instrument(span)
     .await
@@ -336,12 +343,14 @@ async fn resolve_tool_permission_inner(
     hook_host: &Arc<HookHost>,
     reducer: &PermissionReducer,
     thread_id_str: &str,
+    turn_id: &TurnId,
     item_id: ItemId,
     tool_name: &str,
     raw_args: serde_json::Value,
     tool_use_id: &str,
     scope: &zhive_proto::permission::PermissionScope,
     cancel: &CancellationToken,
+    decision_tx: Option<&tokio::sync::mpsc::Sender<SubagentDecisionRequest>>,
 ) -> ToolResolution {
     // ---- Scope gate (authoritative enforcement) ----
     // Reject a tool the active permission scope forbids — a subagent
@@ -486,6 +495,49 @@ async fn resolve_tool_permission_inner(
 
     // ---- Step d: Permission evaluation ----
     let decision = evaluate(scope, &decisions);
+
+    // ---- Child (subagent) handshake path ----
+    //
+    // When `decision_tx` is `Some`, this resolve runs inside a *child* turn.
+    // The child never raises its own `Ask` / `Defer` reverse-RPC; instead it
+    // reports each non-`Deny` decision to the parent spawner and parks until
+    // the parent's second fold returns a terminal verdict. This is the full
+    // per-tool-call handshake (codex `codex_delegate.rs` semantics): all
+    // approval is routed to the parent session, the parent can only equal or
+    // tighten the child's decision, and a lost handshake degrades to deny.
+    //
+    // The top-level turn (`decision_tx == None`) falls through to the original
+    // `Ask` / `Defer` reverse-RPC flow below with zero behaviour change.
+    if let Some(tx) = decision_tx {
+        if matches!(decision, PermissionDecision::Deny) {
+            // Short-circuit: the parent can never relax a child deny, so skip
+            // the round trip entirely (codex applies the same optimisation).
+            return ToolResolution::Blocked(blocked_outcome(
+                item_id,
+                tool_name,
+                raw_args,
+                tool_use_id,
+                "permission denied".to_owned(),
+                stop_loop,
+            ));
+        }
+        // Allow / Ask / Defer: report upward and await the parent verdict.
+        return match handshake_with_parent(tx, tool_use_id, tool_name, &args, decision, cancel)
+            .await
+        {
+            HandshakeVerdict::Allow => ToolResolution::Approved { args, stop_loop },
+            HandshakeVerdict::Deny => ToolResolution::Blocked(blocked_outcome(
+                item_id,
+                tool_name,
+                raw_args,
+                tool_use_id,
+                "permission denied by parent agent".to_owned(),
+                stop_loop,
+            )),
+        };
+    }
+
+    // ---- Top-level turn permission flow ----
     match decision {
         PermissionDecision::Allow => {
             // Continue to the approval below.
@@ -571,14 +623,44 @@ async fn resolve_tool_permission_inner(
             // clone the small option vec up front rather than reaching into the
             // boxed event copy afterwards.
             let options = request.options.clone();
-            let (key, req, rx) = reducer.enroll(request);
+            // The `Defer` path records the turn context so that the engine
+            // actor can emit a matching `TurnResumed` when the request later
+            // resolves; the bounded `Ask` path needs no context (it resolves
+            // inline without a suspend/resume notification pair).
+            let (key, req, rx) = if is_defer {
+                reducer.enroll_with_context(
+                    request,
+                    RequestContext {
+                        thread_id: zhive_proto::domain::ThreadId(Arc::from(thread_id_str)),
+                        turn_id: turn_id.clone(),
+                    },
+                )
+            } else {
+                reducer.enroll(request)
+            };
 
             // Emit PermissionRequested so the client/test can answer.
             let wire_id = key.to_wire();
             let _ = inner.events_tx().send(EngineEvent::PermissionRequested {
-                request_id: wire_id,
+                request_id: wire_id.clone(),
                 request: Box::new(req),
             });
+
+            // On the `Defer` path the turn is now suspended: surface a
+            // `TurnSuspended` so subscribers can distinguish "waiting on the
+            // user" from "hung". The matching `TurnResumed` is emitted by the
+            // engine actor in `resume_permission` (driven off the actor loop,
+            // never this parked turn task — that separation is the deadlock
+            // guard). The reason mirrors the optional defer rationale; the
+            // engine has no folded reason string here, so it is left `None`.
+            if is_defer {
+                let _ = inner.events_tx().send(EngineEvent::TurnSuspended {
+                    thread_id: zhive_proto::domain::ThreadId(Arc::from(thread_id_str)),
+                    turn_id: turn_id.clone(),
+                    request_id: wire_id,
+                    reason: None,
+                });
+            }
 
             // Race the permission wait against turn cancellation so that a
             // cancelled turn does not block for up to DEFAULT_PERMISSION_TIMEOUT

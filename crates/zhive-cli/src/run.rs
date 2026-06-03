@@ -392,7 +392,12 @@ async fn run_serve(
     let provider = crate::provider::build(&cfg)?;
     let runtime = crate::boot::build_runtime(&cfg).await?;
     let socket = args.socket.unwrap_or_else(default_socket);
-    let _ = std::fs::remove_file(&socket);
+    // NOTE: do NOT remove_file here. serve_uds_with_events delegates to
+    // serve_uds_inner -> prepare_uds_path which probes for a live server
+    // (AddrInUse), removes a stale socket (ConnectionRefused), and errors on a
+    // non-socket path.  A bare remove_file before this probe would delete an
+    // active server's socket causing the live-server check to see NotFound and
+    // mis-classify a running peer as "clean".
 
     let engine = Engine::spawn_with_config(EngineConfig {
         provider,
@@ -402,6 +407,7 @@ async fn run_serve(
         turn_limits: runtime.turn_limits,
         system_prompt: Some(Arc::clone(&runtime.system_prompt)),
         compact_token_threshold: None,
+        cwd: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
     });
     let mut router = Router::new();
     register_engine_handlers(&mut router, engine.clone());
@@ -422,11 +428,12 @@ async fn run_serve(
         .await
     });
 
-    eprintln!(
-        "zhive engine serving on {} · provider={} model={}",
-        socket.display(),
-        cfg.active_provider_label(),
-        cfg.active_model(),
+    tracing::info!(
+        name: "server.serve.start",
+        socket = %socket.display(),
+        provider = %cfg.active_provider_label(),
+        model = %cfg.active_model(),
+        "engine serving on {{socket}} (provider={{provider}} model={{model}})",
     );
 
     // Watch the serve task and Ctrl-C together: if the bind (or serving) fails
@@ -439,7 +446,7 @@ async fn run_serve(
             None
         }
     };
-    eprintln!("zhive: shutting down");
+    tracing::info!(name: "server.shutdown", "engine shutting down");
 
     token.cancel();
     // Close MCP connections before the engine that dispatches through them.
@@ -535,6 +542,7 @@ async fn run_acp(config_path: Option<std::path::PathBuf>) -> Result<()> {
         turn_limits: runtime.turn_limits,
         system_prompt: Some(Arc::clone(&runtime.system_prompt)),
         compact_token_threshold: None,
+        cwd: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
     });
 
     // `serve` owns the engine and drives it until the ACP client disconnects.

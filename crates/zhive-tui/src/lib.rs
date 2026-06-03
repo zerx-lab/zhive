@@ -46,6 +46,35 @@ use crate::app::{Action, App};
 /// How often the UI ticks to animate the spinner and repaint.
 const TICK: Duration = Duration::from_millis(90);
 
+/// A message from a detached RPC task back into the render loop.
+///
+/// RPCs run off-thread so they never block rendering; their results return
+/// here for the loop to apply against [`App`] (which the tasks cannot touch).
+#[derive(Debug)]
+enum LoopMsg {
+    /// Show a transient one-line status in the footer.
+    Flash(String),
+    /// Populate and open the `/session` picker with the fetched threads.
+    ///
+    /// Carries the scope the listing was fetched under so the re-opened overlay
+    /// renders the matching hint and Tab continues toggling from the right mode.
+    ShowSessions {
+        /// The fetched session rows, newest first.
+        entries: Vec<crate::rpc::SessionEntry>,
+        /// The scope these rows were listed under (cwd vs. all).
+        filter: crate::app::SessionFilter,
+    },
+    /// A resumed thread's restored history, to fold into a fresh view.
+    Resumed {
+        /// The thread that was resumed.
+        thread_id: zhive_proto::domain::ThreadId,
+        /// Its history items, in conversation order.
+        items: Vec<zhive_proto::domain::Item>,
+        /// Historical subagent children to reattach as nested summaries.
+        subagents: Vec<crate::rpc::SubagentRestore>,
+    },
+}
+
 /// Reports this crate's package version.
 #[must_use]
 pub fn version() -> &'static str {
@@ -121,8 +150,8 @@ async fn event_loop(
     let mut engine_alive = true;
     // RPC calls run on detached tasks so a slow round-trip (e.g. compaction)
     // never freezes input or rendering; their user-facing outcome flows back
-    // here as a flash message. The loop keeps a sender so `recv()` never ends.
-    let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel::<String>(16);
+    // here as a [`LoopMsg`]. The loop keeps a sender so `recv()` never ends.
+    let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel::<LoopMsg>(16);
     loop {
         terminal.draw(|frame| ui::draw(frame, app))?;
         if app.should_quit {
@@ -157,7 +186,7 @@ async fn event_loop(
             maybe_event = engine_events.next_event(), if engine_alive => {
                 engine_alive = handle_engine(app, maybe_event);
             }
-            Some(msg) = cmd_rx.recv() => app.flash = Some(msg),
+            Some(msg) = cmd_rx.recv() => apply_loop_msg(app, msg),
             _ = ticker.tick() => app.tick(),
         }
     }
@@ -200,7 +229,7 @@ fn perform(
     client: &Client,
     app: &mut App,
     action: Action,
-    cmd_tx: &tokio::sync::mpsc::Sender<String>,
+    cmd_tx: &tokio::sync::mpsc::Sender<LoopMsg>,
 ) {
     let thread = app.conversation.thread_id.clone();
     match action {
@@ -214,21 +243,21 @@ fn perform(
             rpc::start_turn(&client, &thread, &text)
                 .await
                 .err()
-                .map(|e| format!("send failed: {e}"))
+                .map(|e| LoopMsg::Flash(format!("send failed: {e}")))
         }),
         Action::Cancel => spawn_rpc(client, cmd_tx, move |client, _tx| async move {
             rpc::cancel_turn(&client, &thread)
                 .await
                 .err()
-                .map(|e| format!("cancel failed: {e}"))
+                .map(|e| LoopMsg::Flash(format!("cancel failed: {e}")))
         }),
         Action::Compact => spawn_rpc(client, cmd_tx, move |client, _tx| async move {
             match rpc::compact(&client, &thread).await {
-                Ok(outcome) => Some(format!(
+                Ok(outcome) => Some(LoopMsg::Flash(format!(
                     "compact: {} ({} entries)",
                     outcome.status, outcome.entries_compacted
-                )),
-                Err(e) => Some(format!("compact failed: {e}")),
+                ))),
+                Err(e) => Some(LoopMsg::Flash(format!("compact failed: {e}"))),
             }
         }),
         Action::ResolvePermission {
@@ -238,16 +267,106 @@ fn perform(
             rpc::resume_permission(&client, &request_id, outcome)
                 .await
                 .err()
-                .map(|e| format!("permission failed: {e}"))
+                .map(|e| LoopMsg::Flash(format!("permission failed: {e}")))
         }),
+        Action::OpenSessionList { filter } => {
+            // Resolve the cwd filter at dispatch time from the host config: `All`
+            // lists everything (`None`), `Cwd` scopes to the current project.
+            let cwd = match filter {
+                crate::app::SessionFilter::All => None,
+                crate::app::SessionFilter::Cwd => {
+                    Some(app.config.cwd.to_string_lossy().into_owned())
+                }
+            };
+            spawn_rpc(client, cmd_tx, move |client, _tx| async move {
+                match rpc::list_threads(&client, cwd.as_deref()).await {
+                    Ok(entries) => Some(LoopMsg::ShowSessions { entries, filter }),
+                    Err(e) => Some(LoopMsg::Flash(format!("session list failed: {e}"))),
+                }
+            });
+        }
+        // Resume restores the thread in the engine, then pulls its history for
+        // replay plus any historical subagent children. All round-trips run
+        // off-thread; the loop folds the result in.
+        Action::ResumeSession { thread_id } => {
+            spawn_rpc(client, cmd_tx, move |client, _tx| async move {
+                if let Err(e) = rpc::resume_thread(&client, &thread_id).await {
+                    return Some(LoopMsg::Flash(format!("resume failed: {e}")));
+                }
+                let items = match rpc::get_thread_items(&client, &thread_id).await {
+                    Ok(items) => items,
+                    Err(e) => return Some(LoopMsg::Flash(format!("resume failed: {e}"))),
+                };
+                // Best-effort: a failure to enumerate subagent children must not
+                // fail the resume — the main transcript is the important part.
+                let subagents = rpc::resume_subagent_children(&client, &thread_id)
+                    .await
+                    .unwrap_or_default();
+                Some(LoopMsg::Resumed {
+                    thread_id,
+                    items,
+                    subagents,
+                })
+            });
+        }
     }
 }
 
-/// Spawns `f` on a detached task, forwarding any returned flash to `cmd_tx`.
-fn spawn_rpc<F, Fut>(client: &Client, cmd_tx: &tokio::sync::mpsc::Sender<String>, f: F)
+/// Applies a [`LoopMsg`] from a detached RPC task to the live [`App`] state.
+fn apply_loop_msg(app: &mut App, msg: LoopMsg) {
+    match msg {
+        LoopMsg::Flash(text) => app.flash = Some(text),
+        LoopMsg::ShowSessions { entries, filter } => {
+            let count = entries.len();
+            app.overlay = Some(crate::app::Overlay::SessionList {
+                entries,
+                selected: 0,
+                query: String::new(),
+                filter_mode: filter,
+            });
+            app.flash = Some(format!("{count} session(s) · {}", filter.label()));
+        }
+        LoopMsg::Resumed {
+            thread_id,
+            items,
+            subagents,
+        } => {
+            let count = items.len();
+            let sub_count = subagents.len();
+            app.reset_thread(thread_id);
+            app.conversation.load_history(items);
+            // Reattach historical subagent children as nested summaries (after
+            // load_history, which clears any existing subagents). Each restored
+            // child becomes a completed `SubagentView` built from its history.
+            if !subagents.is_empty() {
+                let views = subagents
+                    .into_iter()
+                    .map(|s| {
+                        crate::conversation::SubagentView::from_history(
+                            s.child_thread_id,
+                            s.agent_type,
+                            s.description,
+                            s.items,
+                        )
+                    })
+                    .collect();
+                app.conversation.restore_subagents(views);
+            }
+            app.scrollback = 0;
+            app.flash = if sub_count > 0 {
+                Some(format!("resumed · {count} items · {sub_count} subagent(s)"))
+            } else {
+                Some(format!("resumed · {count} items"))
+            };
+        }
+    }
+}
+
+/// Spawns `f` on a detached task, forwarding any returned message to `cmd_tx`.
+fn spawn_rpc<F, Fut>(client: &Client, cmd_tx: &tokio::sync::mpsc::Sender<LoopMsg>, f: F)
 where
-    F: FnOnce(Client, tokio::sync::mpsc::Sender<String>) -> Fut + Send + 'static,
-    Fut: std::future::Future<Output = Option<String>> + Send,
+    F: FnOnce(Client, tokio::sync::mpsc::Sender<LoopMsg>) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Option<LoopMsg>> + Send,
 {
     let client = client.clone();
     let tx = cmd_tx.clone();

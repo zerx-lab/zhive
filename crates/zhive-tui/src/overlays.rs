@@ -23,7 +23,86 @@ pub(crate) fn render_overlay(frame: &mut Frame, app: &App, overlay: &Overlay, ar
         Overlay::ModelInfo => render_model_info(frame, app, area),
         Overlay::Settings => render_settings(frame, app, area),
         Overlay::Approval { request, .. } => render_approval(frame, app, area, request),
+        Overlay::SessionList {
+            entries,
+            selected,
+            query,
+            filter_mode,
+        } => render_session_list(frame, app, area, entries, *selected, query, *filter_mode),
     }
+}
+
+/// A single row's display fields for [`render_select_list`].
+///
+/// `prefix` is a small leading marker (e.g. a `●` for the current session or a
+/// blank), `primary` is the highlighted title, and `secondary` is dimmed
+/// trailing context (preview, relative time). All strings are owned so callers
+/// can build rows from formatted data without lifetime juggling.
+pub(crate) struct SelectRow {
+    /// Leading marker drawn before the title (e.g. `●` or two spaces).
+    pub prefix: String,
+    /// The main, highlighted text of the row.
+    pub primary: String,
+    /// Dimmed trailing context shown after the title.
+    pub secondary: String,
+}
+
+/// Renders a generic filterable select list into `inner` (already a popup body).
+///
+/// Draws the query line, then each row with the selected one reverse-highlighted
+/// (matching [`render_palette`]'s scheme), then a bottom hint strip. The caller
+/// owns the popup chrome and supplies pre-filtered `rows` plus the highlighted
+/// `selected` index; this function is pure presentation so it stays reusable for
+/// future pickers (model list, etc.).
+pub(crate) fn render_select_list(
+    frame: &mut Frame,
+    p: &Palette,
+    inner: Rect,
+    query: &str,
+    rows: &[SelectRow],
+    selected: usize,
+    hint: &str,
+) {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    // Filter query line so the user sees what they are matching against.
+    lines.push(Line::from(vec![
+        Span::styled("/ ", Style::new().fg(p.fg_mute)),
+        Span::styled(query.to_owned(), Style::new().fg(p.fg)),
+        Span::styled("▌", Style::new().fg(p.accent)),
+    ]));
+
+    if rows.is_empty() {
+        lines.push(Line::styled(
+            "  no matching sessions",
+            Style::new().fg(p.fg_mute),
+        ));
+    }
+    let selected = selected.min(rows.len().saturating_sub(1));
+    for (i, row) in rows.iter().enumerate() {
+        let is_sel = i == selected;
+        let primary_style = if is_sel {
+            Style::new().fg(p.accent).add_modifier(Modifier::BOLD)
+        } else {
+            Style::new().fg(p.fg)
+        };
+        let line = Line::from(vec![
+            Span::styled(if is_sel { "▸ " } else { "  " }, Style::new().fg(p.accent)),
+            Span::styled(row.prefix.clone(), Style::new().fg(p.success)),
+            Span::styled(row.primary.clone(), primary_style),
+            Span::raw("  "),
+            Span::styled(row.secondary.clone(), Style::new().fg(p.fg_dim)),
+        ]);
+        let line = if is_sel {
+            line.style(Style::new().bg(p.sel_bg))
+        } else {
+            line
+        };
+        lines.push(line);
+    }
+
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(hint.to_owned(), Style::new().fg(p.fg_mute)));
+    frame.render_widget(Paragraph::new(Text::from(lines)), inner);
 }
 
 /// Clears `popup`, draws a rounded titled block, and returns the inner rect.
@@ -157,6 +236,118 @@ fn render_approval(frame: &mut Frame, app: &App, area: Rect, request: &RequestPe
         Style::new().fg(p.fg_dim),
     ));
     frame.render_widget(Paragraph::new(Text::from(lines)), inner);
+}
+
+/// Renders the `/session` history picker as a centered filterable list.
+///
+/// Each row shows a `●` marker for the current conversation, the session title
+/// (falling back to the preview, then a short id when both are empty), and a
+/// dimmed `preview · relative-time` trailer. Filtering, selection, and the
+/// cwd/all scope toggle are driven by [`crate::app::App`]'s key handler; this
+/// only draws the filtered view and surfaces the active scope in the hint.
+fn render_session_list(
+    frame: &mut Frame,
+    app: &App,
+    area: Rect,
+    entries: &[crate::rpc::SessionEntry],
+    selected: usize,
+    query: &str,
+    filter_mode: crate::app::SessionFilter,
+) {
+    let p = &app.palette;
+    let popup = area.centered(Constraint::Percentage(70), Constraint::Percentage(70));
+    let inner = open_popup(frame, popup, "⌘ resume session", p);
+
+    let current = &app.conversation.thread_id;
+    let now = now_unix();
+    let rows: Vec<SelectRow> = crate::app::filter_sessions(entries, query)
+        .into_iter()
+        .map(|e| {
+            // Fallback order for the row title: explicit name → first-message
+            // preview → a short id tail (so an unnamed, preview-less legacy
+            // session is still recognisable and selectable).
+            let title = e
+                .title
+                .clone()
+                .filter(|t| !t.is_empty())
+                .unwrap_or_else(|| {
+                    if e.preview.is_empty() {
+                        short_id(e.id.0.as_ref())
+                    } else {
+                        truncate(&e.preview, 40)
+                    }
+                });
+            let prefix = if &e.id == current { "● " } else { "  " }.to_owned();
+            let secondary = format!(
+                "{} · {}",
+                truncate(&e.preview, 48),
+                relative_time(now, e.updated_at)
+            );
+            SelectRow {
+                prefix,
+                primary: title,
+                secondary,
+            }
+        })
+        .collect();
+
+    // The scope line names the active filter and the key that toggles it; the
+    // `▸`-marked mode is the one currently in effect.
+    let scope = match filter_mode {
+        crate::app::SessionFilter::All => "scope: ▸all  cwd   ",
+        crate::app::SessionFilter::Cwd => "scope:  all  ▸cwd  ",
+    };
+    let hint = format!("{scope}· tab toggle · ↑↓ select · ↵ resume · esc cancel · type to filter");
+
+    render_select_list(frame, p, inner, query, &rows, selected, &hint);
+}
+
+/// Returns a short, recognisable tail of a thread id for unnamed sessions.
+///
+/// Keeps the segment after the last `/` (the per-thread suffix, e.g. a
+/// timestamp-counter), capped so it stays compact in the list row.
+fn short_id(id: &str) -> String {
+    let tail = id.rsplit('/').next().unwrap_or(id);
+    truncate(tail, 24)
+}
+
+/// Truncates `s` to at most `max` chars, appending `…` when shortened.
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_owned()
+    } else {
+        let mut out: String = s.chars().take(max).collect();
+        out.push('…');
+        out
+    }
+}
+
+/// Current Unix time in seconds, or `0` if the clock predates the epoch.
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+}
+
+/// Formats `then` (Unix seconds) as a coarse relative time versus `now`.
+///
+/// Thresholds are chosen for a compact single-token label ("3h", "2d"); a
+/// future or zero timestamp renders as "just now" rather than a negative value.
+fn relative_time(now: i64, then: i64) -> String {
+    /// Seconds in a minute, hour, and day for the relative-time buckets.
+    const MINUTE: i64 = 60;
+    const HOUR: i64 = 60 * MINUTE;
+    const DAY: i64 = 24 * HOUR;
+    let delta = now.saturating_sub(then);
+    if delta < MINUTE {
+        "just now".to_owned()
+    } else if delta < HOUR {
+        format!("{}m ago", delta / MINUTE)
+    } else if delta < DAY {
+        format!("{}h ago", delta / HOUR)
+    } else {
+        format!("{}d ago", delta / DAY)
+    }
 }
 
 /// Renders the slash-command palette popup anchored above the composer.

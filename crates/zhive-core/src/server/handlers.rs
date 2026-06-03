@@ -13,6 +13,10 @@
 //! * `engine/resume_permission` — calls
 //!   [`crate::engine::Engine::resume_permission`]
 //! * `engine/compact` — calls [`crate::engine::Engine::compact`]
+//! * `thread/fork` — calls [`crate::engine::Engine::fork_thread`]
+//! * `thread/list` — calls [`crate::engine::Engine::list_threads`]
+//! * `engine/resume_thread` — calls [`crate::engine::Engine::resume_thread`]
+//! * `thread/get_items` — calls [`crate::engine::Engine::get_items`]
 //! * `engine/shutdown` — calls [`crate::engine::Engine::shutdown`]
 //!
 //! Method names are intentionally namespaced under `engine/` so the
@@ -25,13 +29,18 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use zhive_proto::ErrorObject;
-use zhive_proto::domain::{Item, ThreadId, TurnId};
+use zhive_proto::domain::{Item, ItemId, ThreadId, TurnId};
 use zhive_proto::hook::CompactTrigger;
-use zhive_proto::permission::{PermissionOutcome, PermissionScope, StreamingBehavior};
+use zhive_proto::permission::{
+    PermissionOutcome, PermissionScope, ResumePermissionParams, StreamingBehavior,
+};
 
 use crate::engine::{
     Engine, EngineError, PermissionRequestId,
-    submission::{CompactError, CompactReply, ResumePermissionReply, Submission},
+    submission::{
+        CompactError, CompactReply, ForkError, ForkReply, GetItemsError, ResumeError,
+        ResumePermissionReply, ResumeReply, Submission,
+    },
 };
 
 use super::router::{Handler, JsonRpcCode, Router};
@@ -66,9 +75,45 @@ pub fn register_engine_handlers(router: &mut Router, engine: Engine) {
             engine: Arc::clone(&engine),
         }),
     );
+    // Canonical ACP-style alias for the same handler. The deferred-permission
+    // suspend/resume wire surface names this method
+    // ([`zhive_proto::permission::METHOD_RESUME_PERMISSION`]); the legacy
+    // `engine/resume_permission` is kept registered so existing clients keep
+    // working. Both route to the same handler.
+    router.register(
+        zhive_proto::permission::METHOD_RESUME_PERMISSION,
+        Arc::new(ResumePermissionHandler {
+            engine: Arc::clone(&engine),
+        }),
+    );
     router.register(
         "engine/compact",
         Arc::new(CompactHandler {
+            engine: Arc::clone(&engine),
+        }),
+    );
+    router.register(
+        "thread/fork",
+        Arc::new(ForkHandler {
+            engine: Arc::clone(&engine),
+        }),
+    );
+    // History / resume surface (recent-session list, resume, item fetch).
+    router.register(
+        "thread/list",
+        Arc::new(ListThreadsHandler {
+            engine: Arc::clone(&engine),
+        }),
+    );
+    router.register(
+        "engine/resume_thread",
+        Arc::new(ResumeThreadHandler {
+            engine: Arc::clone(&engine),
+        }),
+    );
+    router.register(
+        "thread/get_items",
+        Arc::new(GetItemsHandler {
             engine: Arc::clone(&engine),
         }),
     );
@@ -94,7 +139,19 @@ pub fn register_engine_handlers(router: &mut Router, engine: Engine) {
             engine: Arc::clone(&engine),
         }),
     );
-    router.register("engine/shutdown", Arc::new(ShutdownHandler { engine }));
+    router.register(
+        "engine/shutdown",
+        Arc::new(ShutdownHandler {
+            engine: Arc::clone(&engine),
+        }),
+    );
+    // ACP session/cancel notification handler (B7).
+    // Receives a client-sent `session/cancel` notification and maps it to
+    // `engine.cancel_turn(thread_id)`.  The handler is registered here so
+    // the server does not silently drop the notification once clients start
+    // sending `Client::cancel_session`.  For notifications the router
+    // dispatches but discards the returned value; an `Err` is only logged.
+    router.register("session/cancel", Arc::new(SessionCancelHandler { engine }));
 }
 
 // ============================================================
@@ -128,13 +185,6 @@ struct CancelTurnParams {
 struct CancelTurnResult {
     /// `Some(id)` when the cancel hit an active turn, `None` otherwise.
     turn_id: Option<TurnId>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ResumePermissionParams {
-    request_id: PermissionRequestId,
-    outcome: PermissionOutcome,
 }
 
 /// Wire-form classifier for the resume-permission outcome.
@@ -192,6 +242,89 @@ struct CompactResult {
     entries_compacted: u32,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ForkParams {
+    source_thread_id: ThreadId,
+    /// Inclusive item to fork at; absent / null forks the full history.
+    #[serde(default)]
+    up_to_item: Option<ItemId>,
+    /// Whether to generate an LLM branch summary as the new thread's opener.
+    #[serde(default)]
+    summarize: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ForkResult {
+    /// Id of the newly created forked thread.
+    new_thread_id: ThreadId,
+    /// Number of source items replayed into the new thread.
+    items_replayed: u32,
+    /// Whether a branch summary was generated and prepended.
+    summarized: bool,
+}
+
+/// Result payload for `thread/list`: the persisted thread index.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ListThreadsResult {
+    /// Threads ordered most-recently-updated first (empty `turns` field).
+    threads: Vec<zhive_proto::domain::Thread>,
+}
+
+/// Optional params for `thread/list`: a working-directory filter.
+///
+/// `{ "cwd": "/work/project" }` lists only threads created under that
+/// directory; omitting `cwd` (or passing no params) lists every thread.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ListThreadsParams {
+    #[serde(default)]
+    cwd: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ResumeThreadParams {
+    thread_id: ThreadId,
+}
+
+/// Result payload for `engine/resume_thread`.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ResumeThreadResult {
+    /// Id of the resumed thread.
+    thread_id: ThreadId,
+    /// Number of history items restored into memory.
+    items_restored: u32,
+    /// Number of turns the restored items spanned.
+    turns_restored: u32,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GetItemsParams {
+    thread_id: ThreadId,
+    /// Optional single turn to scope the read to; absent reads full history.
+    #[serde(default)]
+    turn_id: Option<TurnId>,
+    /// Optional page offset (only applied with `turnId`).
+    #[serde(default)]
+    offset: Option<i64>,
+    /// Optional page limit (only applied with `turnId`).
+    #[serde(default)]
+    limit: Option<i64>,
+}
+
+/// Result payload for `thread/get_items`.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GetItemsResult {
+    /// History items in conversation (or page) order.
+    items: Vec<Item>,
+}
+
 // ============================================================
 // Handlers
 // ============================================================
@@ -245,11 +378,13 @@ struct ResumePermissionHandler {
 impl Handler for ResumePermissionHandler {
     async fn handle(&self, params: Option<Value>) -> Result<Value, ErrorObject> {
         let params: ResumePermissionParams = decode_params(params)?;
-        match self
-            .engine
-            .resume_permission(params.request_id, params.outcome)
-            .await
-        {
+        // The proto carries the request id as a plain string and a narrower
+        // `ResumeOutcome` (no `Defer`); lift both into the engine's types. The
+        // `From<ResumeOutcome>` conversion is total and can never produce
+        // `PermissionOutcome::Defer`, so a resumed request can never re-suspend.
+        let request_id = PermissionRequestId(Arc::from(params.request_id.as_str()));
+        let outcome: PermissionOutcome = params.outcome.into();
+        match self.engine.resume_permission(request_id, outcome).await {
             Ok(reply) => {
                 let status = match reply {
                     ResumePermissionReply::Resolved => ResumePermissionStatus::Resolved,
@@ -300,6 +435,120 @@ impl Handler for CompactHandler {
     }
 }
 
+struct ForkHandler {
+    engine: Arc<Engine>,
+}
+
+#[async_trait]
+impl Handler for ForkHandler {
+    async fn handle(&self, params: Option<Value>) -> Result<Value, ErrorObject> {
+        let params: ForkParams = decode_params(params)?;
+        match self
+            .engine
+            .fork_thread(params.source_thread_id, params.up_to_item, params.summarize)
+            .await
+        {
+            Ok(Ok(ForkReply::Forked {
+                new_thread_id,
+                items_replayed,
+                summarized,
+            })) => {
+                let result = ForkResult {
+                    new_thread_id,
+                    items_replayed,
+                    summarized,
+                };
+                // A fully-typed struct cannot fail to serialise; fall back to
+                // Null rather than `.expect()` (CLAUDE.md no-expect rule).
+                Ok(serde_json::to_value(result).unwrap_or(Value::Null))
+            }
+            Ok(Err(domain)) => Err(fork_error(&domain)),
+            Err(err) => Err(engine_error(&err)),
+        }
+    }
+}
+
+struct ListThreadsHandler {
+    engine: Arc<Engine>,
+}
+
+#[async_trait]
+impl Handler for ListThreadsHandler {
+    async fn handle(&self, params: Option<Value>) -> Result<Value, ErrorObject> {
+        // `thread/list` params are optional: a missing/null body lists every
+        // thread, a `{ cwd }` body scopes the listing to that directory.
+        let cwd = match params {
+            Some(value) => {
+                let parsed: ListThreadsParams = decode_params(Some(value))?;
+                parsed.cwd
+            }
+            None => None,
+        };
+        match self.engine.list_threads(cwd.as_deref()).await {
+            Ok(threads) => {
+                // A fully-typed struct cannot fail to serialise; fall back to
+                // Null rather than `.expect()` (CLAUDE.md no-expect rule).
+                Ok(serde_json::to_value(ListThreadsResult { threads }).unwrap_or(Value::Null))
+            }
+            Err(err) => Err(engine_error(&err)),
+        }
+    }
+}
+
+struct ResumeThreadHandler {
+    engine: Arc<Engine>,
+}
+
+#[async_trait]
+impl Handler for ResumeThreadHandler {
+    async fn handle(&self, params: Option<Value>) -> Result<Value, ErrorObject> {
+        let params: ResumeThreadParams = decode_params(params)?;
+        match self.engine.resume_thread(params.thread_id).await {
+            Ok(Ok(ResumeReply {
+                thread_id,
+                items_restored,
+                turns_restored,
+            })) => {
+                let result = ResumeThreadResult {
+                    thread_id,
+                    items_restored,
+                    turns_restored,
+                };
+                Ok(serde_json::to_value(result).unwrap_or(Value::Null))
+            }
+            Ok(Err(domain)) => Err(resume_error(&domain)),
+            Err(err) => Err(engine_error(&err)),
+        }
+    }
+}
+
+struct GetItemsHandler {
+    engine: Arc<Engine>,
+}
+
+#[async_trait]
+impl Handler for GetItemsHandler {
+    async fn handle(&self, params: Option<Value>) -> Result<Value, ErrorObject> {
+        let params: GetItemsParams = decode_params(params)?;
+        match self
+            .engine
+            .get_items(
+                params.thread_id,
+                params.turn_id,
+                params.offset,
+                params.limit,
+            )
+            .await
+        {
+            Ok(Ok(items)) => {
+                Ok(serde_json::to_value(GetItemsResult { items }).unwrap_or(Value::Null))
+            }
+            Ok(Err(domain)) => Err(get_items_error(&domain)),
+            Err(err) => Err(engine_error(&err)),
+        }
+    }
+}
+
 struct ShutdownHandler {
     engine: Arc<Engine>,
 }
@@ -309,6 +558,38 @@ impl Handler for ShutdownHandler {
     async fn handle(&self, _params: Option<Value>) -> Result<Value, ErrorObject> {
         match self.engine.shutdown().await {
             Ok(()) => Ok(Value::Null),
+            Err(err) => Err(engine_error(&err)),
+        }
+    }
+}
+
+/// Handler for the ACP `session/cancel` notification.
+///
+/// Maps an inbound `session/cancel { threadId }` notification to
+/// `engine.cancel_turn(thread_id)`, mirroring the semantics of the
+/// `engine/cancel_turn` RPC but on the ACP notification channel.
+///
+/// The handler is registered by [`register_engine_handlers`] so
+/// that [`zhive_client_native::Client::cancel_session`] works end-to-end
+/// without any protocol-level configuration.  For the notification dispatch
+/// path the router discards the returned [`Value`]; only an `Err` is logged.
+struct SessionCancelHandler {
+    engine: Arc<Engine>,
+}
+
+#[async_trait]
+impl Handler for SessionCancelHandler {
+    async fn handle(&self, params: Option<Value>) -> Result<Value, ErrorObject> {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct SessionCancelParams {
+            thread_id: ThreadId,
+        }
+        let p: SessionCancelParams = decode_params(params)?;
+        // `cancel_turn` returns Option<TurnId>; both Some and None are
+        // success cases for a notification (no active turn is idempotent).
+        match self.engine.cancel_turn(p.thread_id).await {
+            Ok(_turn_id) => Ok(Value::Null),
             Err(err) => Err(engine_error(&err)),
         }
     }
@@ -457,6 +738,84 @@ fn compact_error(err: &CompactError) -> ErrorObject {
             "kind": "summarization_failed",
             "reason": message,
         })),
+        CompactError::BlockedByHook { reason } => Some(serde_json::json!({
+            "kind": "blocked_by_hook",
+            "reason": reason,
+        })),
+    };
+    ErrorObject {
+        code: ENGINE_ERROR_CODE,
+        message,
+        data,
+    }
+}
+
+/// Maps a [`ForkError`] to a wire error carrying a `kind` discriminator.
+///
+/// Uses the same [`ENGINE_ERROR_CODE`] and `data.kind` convention as
+/// [`engine_error`] / [`compact_error`].
+fn fork_error(err: &ForkError) -> ErrorObject {
+    let message = err.to_string();
+    let data = match err {
+        ForkError::SourceNotFound => Some(serde_json::json!({ "kind": "source_not_found" })),
+        ForkError::EngineBusy { current } => Some(serde_json::json!({
+            "kind": "engine_busy",
+            "currentPhase": current,
+        })),
+        ForkError::ReplayFailed { message } => Some(serde_json::json!({
+            "kind": "replay_failed",
+            "reason": message,
+        })),
+        ForkError::SummarizationFailed { message } => Some(serde_json::json!({
+            "kind": "summarization_failed",
+            "reason": message,
+        })),
+    };
+    ErrorObject {
+        code: ENGINE_ERROR_CODE,
+        message,
+        data,
+    }
+}
+
+/// Maps a [`ResumeError`] to a wire error carrying a `kind` discriminator.
+///
+/// Uses the same [`ENGINE_ERROR_CODE`] and `data.kind` convention as the other
+/// domain-error mappers.
+fn resume_error(err: &ResumeError) -> ErrorObject {
+    let message = err.to_string();
+    let data = match err {
+        ResumeError::StorageUnavailable => {
+            Some(serde_json::json!({ "kind": "storage_unavailable" }))
+        }
+        ResumeError::ThreadNotFound => Some(serde_json::json!({ "kind": "thread_not_found" })),
+        ResumeError::EngineBusy { current } => Some(serde_json::json!({
+            "kind": "engine_busy",
+            "currentPhase": current,
+        })),
+        ResumeError::ReplayFailed { message } => Some(serde_json::json!({
+            "kind": "replay_failed",
+            "reason": message,
+        })),
+    };
+    ErrorObject {
+        code: ENGINE_ERROR_CODE,
+        message,
+        data,
+    }
+}
+
+/// Maps a [`GetItemsError`] to a wire error carrying a `kind` discriminator.
+fn get_items_error(err: &GetItemsError) -> ErrorObject {
+    let message = err.to_string();
+    let data = match err {
+        GetItemsError::StorageUnavailable => {
+            Some(serde_json::json!({ "kind": "storage_unavailable" }))
+        }
+        GetItemsError::ReadFailed { message } => Some(serde_json::json!({
+            "kind": "read_failed",
+            "reason": message,
+        })),
     };
     ErrorObject {
         code: ENGINE_ERROR_CODE,
@@ -569,6 +928,32 @@ mod tests {
         engine.shutdown().await.unwrap();
     }
 
+    /// Both the legacy `engine/resume_permission` and the canonical
+    /// `session/resume_permission` alias must route to the same handler.
+    #[tokio::test]
+    async fn resume_permission_alias_routes_to_same_handler() {
+        let engine = Engine::spawn();
+        let mut router = Router::new();
+        register_engine_handlers(&mut router, engine.clone());
+
+        for method in [
+            "engine/resume_permission",
+            zhive_proto::permission::METHOD_RESUME_PERMISSION,
+        ] {
+            let params = serde_json::json!({
+                "requestId": "perm:9999",
+                "outcome": { "outcome": "selected", "optionId": "allow_once" },
+            });
+            let v = router
+                .dispatch(method, Some(params))
+                .await
+                .unwrap_or_else(|e| panic!("{method} must be registered, got {e:?}"));
+            // No such pending request → unknown_request from both routes.
+            assert_eq!(v["status"], "unknown_request", "{method} routed");
+        }
+        engine.shutdown().await.unwrap();
+    }
+
     /// Verifies the `engine_error` mapping carries the `engine_busy`
     /// discriminator that clients key off.
     #[test]
@@ -599,6 +984,87 @@ mod tests {
             .expect_err("compact on missing thread is an error");
         assert_eq!(err.code, ENGINE_ERROR_CODE);
         assert_eq!(err.data.as_ref().unwrap()["kind"], "thread_not_found");
+
+        engine.shutdown().await.unwrap();
+    }
+
+    /// `thread/fork` is registered; on an in-memory engine (no storage) it
+    /// surfaces the `source_not_found` fork error rather than -32601.
+    #[tokio::test]
+    async fn fork_handler_without_storage_reports_source_not_found() {
+        let engine = Engine::spawn();
+        let mut router = Router::new();
+        register_engine_handlers(&mut router, engine.clone());
+
+        let err = router
+            .dispatch(
+                "thread/fork",
+                Some(serde_json::json!({"sourceThreadId": "thread:native/src"})),
+            )
+            .await
+            .expect_err("fork on an engine without storage is an error");
+        assert_eq!(err.code, ENGINE_ERROR_CODE);
+        assert_eq!(err.data.as_ref().unwrap()["kind"], "source_not_found");
+
+        engine.shutdown().await.unwrap();
+    }
+
+    /// `thread/list` is registered and returns an empty `threads` array on an
+    /// in-memory engine (no persisted sessions, but never -32601).
+    #[tokio::test]
+    async fn list_threads_handler_returns_empty_on_in_memory_engine() {
+        let engine = Engine::spawn();
+        let mut router = Router::new();
+        register_engine_handlers(&mut router, engine.clone());
+
+        let v = router
+            .dispatch("thread/list", None)
+            .await
+            .expect("thread/list must be registered");
+        assert!(v["threads"].is_array());
+        assert_eq!(v["threads"].as_array().unwrap().len(), 0);
+
+        engine.shutdown().await.unwrap();
+    }
+
+    /// `engine/resume_thread` on an in-memory engine surfaces the
+    /// `storage_unavailable` engine error rather than -32601.
+    #[tokio::test]
+    async fn resume_thread_handler_without_storage_reports_storage_unavailable() {
+        let engine = Engine::spawn();
+        let mut router = Router::new();
+        register_engine_handlers(&mut router, engine.clone());
+
+        let err = router
+            .dispatch(
+                "engine/resume_thread",
+                Some(serde_json::json!({"threadId": "thread:native/x"})),
+            )
+            .await
+            .expect_err("resume on an engine without storage is an error");
+        assert_eq!(err.code, ENGINE_ERROR_CODE);
+        assert_eq!(err.data.as_ref().unwrap()["kind"], "storage_unavailable");
+
+        engine.shutdown().await.unwrap();
+    }
+
+    /// `thread/get_items` is registered; on an in-memory engine it surfaces the
+    /// `storage_unavailable` error rather than -32601.
+    #[tokio::test]
+    async fn get_items_handler_without_storage_reports_storage_unavailable() {
+        let engine = Engine::spawn();
+        let mut router = Router::new();
+        register_engine_handlers(&mut router, engine.clone());
+
+        let err = router
+            .dispatch(
+                "thread/get_items",
+                Some(serde_json::json!({"threadId": "thread:native/x"})),
+            )
+            .await
+            .expect_err("get_items on an engine without storage is an error");
+        assert_eq!(err.code, ENGINE_ERROR_CODE);
+        assert_eq!(err.data.as_ref().unwrap()["kind"], "storage_unavailable");
 
         engine.shutdown().await.unwrap();
     }

@@ -82,7 +82,7 @@ async fn connect_uds_handshake_populates_negotiated_metadata() {
     assert_eq!(client.server_info().name, "zhive");
     assert!(!client.server_info().version.is_empty());
 
-    client.shutdown();
+    let _ = client.shutdown().await;
     token.cancel();
     let _ = engine.shutdown().await;
 }
@@ -106,7 +106,7 @@ async fn start_turn_round_trip_via_client() {
     let turn_id = response["turnId"].as_str().expect("turnId is string");
     assert!(turn_id.starts_with("turn:thread:native/e2e-1/"));
 
-    client.shutdown();
+    let _ = client.shutdown().await;
     token.cancel();
     let _ = engine.shutdown().await;
 }
@@ -126,7 +126,7 @@ async fn cancel_turn_returns_null_for_missing_thread() {
     assert!(response.get("turnId").is_some());
     assert!(response["turnId"].is_null());
 
-    client.shutdown();
+    let _ = client.shutdown().await;
     token.cancel();
     let _ = engine.shutdown().await;
 }
@@ -147,7 +147,7 @@ async fn cancel_turn_typed_helper_returns_none_for_missing_thread() {
         "expected None for a thread with no active turn, got {result:?}"
     );
 
-    client.shutdown();
+    let _ = client.shutdown().await;
     token.cancel();
     let _ = engine.shutdown().await;
 }
@@ -218,7 +218,7 @@ async fn resume_permission_with_invalid_id_surfaces_status() {
         .expect("call ok");
     assert_eq!(response["status"], "invalid_request_id");
 
-    client.shutdown();
+    let _ = client.shutdown().await;
     token.cancel();
     let _ = engine.shutdown().await;
 }
@@ -237,7 +237,7 @@ async fn unknown_method_returns_method_not_found() {
         other => panic!("expected Server error, got {other:?}"),
     }
 
-    client.shutdown();
+    let _ = client.shutdown().await;
     token.cancel();
     let _ = engine.shutdown().await;
 }
@@ -263,7 +263,7 @@ async fn engine_busy_error_round_trips_with_kind_payload() {
     // exported constant, so a future engine-side failure carries it.
     assert_eq!(ENGINE_ERROR_CODE, -32000);
 
-    client.shutdown();
+    let _ = client.shutdown().await;
     token.cancel();
     let _ = engine.shutdown().await;
 }
@@ -365,7 +365,7 @@ async fn client_receives_turn_lifecycle_notifications() {
     assert!(saw_phase_to_turn, "did not receive phase_changed idle→turn");
     assert!(saw_phase_to_idle, "did not receive phase_changed turn→idle");
 
-    client.shutdown();
+    let _ = client.shutdown().await;
     token.cancel();
     let _ = engine.shutdown().await;
 }
@@ -396,7 +396,7 @@ async fn subscribe_notifications_before_any_event_still_receives_next() {
     assert!(saw_completed_a, "subscriber A missed turn_completed");
     assert!(saw_completed_b, "subscriber B missed turn_completed");
 
-    client.shutdown();
+    let _ = client.shutdown().await;
     token.cancel();
     let _ = engine.shutdown().await;
 }
@@ -537,9 +537,9 @@ async fn per_connection_filter_turns_vs_phase() {
         "C (unsubscribed) must see phase_changed; got {c_methods:?}"
     );
 
-    client_a.shutdown();
-    client_b.shutdown();
-    client_c.shutdown();
+    let _ = client_a.shutdown().await;
+    let _ = client_b.shutdown().await;
+    let _ = client_c.shutdown().await;
     token.cancel();
     let _ = engine.shutdown().await;
 }
@@ -580,7 +580,7 @@ async fn unsubscribe_resets_to_allow_all() {
         "after unsubscribe the connection must receive phase_changed (allow-all restored)"
     );
 
-    client.shutdown();
+    let _ = client.shutdown().await;
     token.cancel();
     let _ = engine.shutdown().await;
 }
@@ -602,7 +602,7 @@ async fn subscribe_with_malformed_params_returns_invalid_params() {
         other => panic!("expected Server InvalidParams error, got {other:?}"),
     }
 
-    client.shutdown();
+    let _ = client.shutdown().await;
     token.cancel();
     let _ = engine.shutdown().await;
 }

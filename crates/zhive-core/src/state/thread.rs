@@ -1,9 +1,10 @@
 //! Thread / turn handles owned by the engine.
 //!
-//! Phase 1 keeps the surface intentionally thin: the [`ThreadHandle`]
-//! carries enough state for the engine actor to route messages and emit
-//! events; the lazy-loaded transcript window and the persistence sync
-//! point land in B2 / B3.
+//! The [`ThreadHandle`] carries enough state for the engine actor to route
+//! messages and emit events: a turn-dimensioned transcript
+//! ([`crate::state::TurnHistoryBuffer`]) with lazy eviction (B2) and a
+//! per-thread [`crate::state::ThreadEvent`] broadcast. The persistence sync
+//! point lands in B3.
 //!
 //! ## Injection queues
 //!
@@ -14,15 +15,17 @@
 //! is taken and released within a single non-async statement, matching
 //! the same pattern used for `EngineInner::phase`.
 
-use std::collections::VecDeque;
 use std::sync::Arc;
 
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, broadcast};
 use tokio_util::sync::CancellationToken;
-use zhive_proto::domain::{Item, ItemId, ThreadId, ThreadStatus, TurnId};
+use zhive_proto::domain::{Item, ItemId, ThreadId, ThreadStatus, TurnId, TurnStatus};
 use zhive_proto::permission::PermissionScope;
 
 use crate::queues::InjectionQueues;
+use crate::state::PendingSessionWrites;
+use crate::state::thread_event::{THREAD_EVENT_CAP, ThreadEvent};
+use crate::state::turn_buffer::TurnHistoryBuffer;
 
 /// Single owner record for an active or recently-loaded thread.
 #[derive(Debug)]
@@ -33,12 +36,25 @@ pub struct ThreadHandle {
     pub status: RwLock<ThreadStatus>,
     /// At most one active turn at a time (B7 may relax this).
     pub active_turn: Mutex<Option<ActiveTurn>>,
-    /// Bounded tail of recent items kept in memory; older items live in
-    /// the JSONL rollout (B3).
-    pub items_tail: RwLock<VecDeque<Item>>,
-    /// Maximum tail length before older items are evicted to the rollout
-    /// loader.
-    pub items_tail_capacity: usize,
+    /// Turn-dimensioned in-memory transcript with lazy eviction.
+    ///
+    /// Replaces the former flat `items_tail` (B2): the buffer keeps a rolling
+    /// window of recent turns and evicts the oldest completed turns' items to
+    /// [`zhive_proto::domain::TurnItemsView::NotLoaded`], leaving headers
+    /// resident so they can be lazily reloaded from the rollout. This is the
+    /// single in-memory item store on the handle; flat-view consumers use
+    /// [`Self::items_snapshot`].
+    ///
+    /// A `tokio::sync::Mutex` (not `std::sync::Mutex`) is used because the
+    /// push / snapshot call sites in the turn loop are async; the buffer
+    /// methods themselves never await, so the lock is always short-held.
+    pub(crate) history: Mutex<TurnHistoryBuffer>,
+    /// Per-thread broadcast of [`ThreadEvent`]s, a second event layer beside
+    /// the engine-wide [`crate::engine::event::EngineEvent`] bus.
+    ///
+    /// Additive: the engine bus is unchanged. Senders ignore the result, so a
+    /// lagging subscriber never blocks the turn loop.
+    pub(crate) events: broadcast::Sender<ThreadEvent>,
     /// Three-queue injection buffer for this thread.
     ///
     /// Steer items are drained before each LLM request within the active
@@ -51,6 +67,19 @@ pub struct ThreadHandle {
     /// `EngineInner::phase`.  Lock poison is recovered via
     /// `into_inner()` (consistent with `phase_lock`).
     pub injection: std::sync::Mutex<InjectionQueues>,
+    /// Per-thread buffer of session writes deferred outside the `Idle` phase.
+    ///
+    /// While the engine phase is non-`Idle` (turn / compaction / subagent /
+    /// retry), session writes are buffered here instead of reaching storage
+    /// immediately, so a crash mid-turn cannot leave half-finished state on
+    /// disk.  At the next save point the engine flushes the buffer to the
+    /// persistence writer (B7).
+    ///
+    /// A `std::sync::Mutex` is used rather than a `tokio::sync::Mutex` for the
+    /// same reason as [`Self::injection`]: pushes and flushes complete
+    /// synchronously without crossing an `await` point.  Lock poison is
+    /// recovered via `into_inner()` (consistent with `injection_lock`).
+    pub(crate) pending_session_writes: std::sync::Mutex<PendingSessionWrites>,
     /// For subagent threads: the id of the thread that spawned this one.
     ///
     /// `Some` means this thread is a child (subagent). `None` means it is
@@ -73,33 +102,57 @@ pub struct ThreadHandle {
     /// remains active for external observers regardless of whether this
     /// channel is wired.
     pub subagent_final_tx: Option<tokio::sync::mpsc::Sender<crate::subagent::SubagentFinalEvent>>,
+    /// In-process child → parent per-tool-call permission handshake channel.
+    ///
+    /// A subagent (child) thread holds a `Sender` so its tool dispatch can
+    /// report each non-`Deny` decision to the parent spawner and park on the
+    /// reply before executing (the full per-tool-call handshake). The matching
+    /// `Receiver` is returned by [`ThreadHandle::new_child`] to the spawn site,
+    /// where the parent's `spawn_and_await` select loop consumes it and runs a
+    /// second fold (parent hooks + the child decision) before replying.
+    ///
+    /// `None` for top-level threads (whose tool dispatch runs its own
+    /// `Ask` / `Defer` reverse-RPC directly) and for any idle / lazily reloaded
+    /// thread; the channel lifetime is strictly contained within one child
+    /// turn. The capacity is 1 because a child resolves its tool calls
+    /// serially in Phase 1.
+    pub(crate) subagent_decision_tx:
+        Option<tokio::sync::mpsc::Sender<crate::subagent::SubagentDecisionRequest>>,
 }
 
 impl ThreadHandle {
-    /// Default capacity for [`Self::items_tail`].
+    /// Default number of completed turns kept resident in memory.
     ///
-    /// Sized to cover a typical mid-length turn (≈ 200 items) with
-    /// headroom; tunable per-thread via [`Self::with_capacity`].
-    pub const DEFAULT_TAIL_CAPACITY: usize = 256;
+    /// Forwards to [`crate::state::turn_buffer::IN_MEMORY_TURN_CAP`]; tunable
+    /// per-thread via [`Self::with_capacity`].
+    pub const DEFAULT_TURN_CAPACITY: usize = crate::state::turn_buffer::IN_MEMORY_TURN_CAP;
 
     /// Builds a fresh handle in the [`ThreadStatus::Idle`] state.
     #[must_use]
     pub fn new_idle(id: ThreadId) -> Self {
-        Self::with_capacity(id, Self::DEFAULT_TAIL_CAPACITY)
+        Self::with_capacity(id, Self::DEFAULT_TURN_CAPACITY)
     }
 
-    /// Same as [`Self::new_idle`] with an explicit tail size cap.
+    /// Same as [`Self::new_idle`] with an explicit completed-turn cap.
+    ///
+    /// `capacity` is the number of completed turns kept fully resident before
+    /// the oldest are evicted to
+    /// [`zhive_proto::domain::TurnItemsView::NotLoaded`] (B2 turn-dimensioned
+    /// model), not a flat item count.
     #[must_use]
     pub fn with_capacity(id: ThreadId, capacity: usize) -> Self {
+        let (events, _rx) = broadcast::channel(THREAD_EVENT_CAP);
         Self {
             id,
             status: RwLock::new(ThreadStatus::Idle),
             active_turn: Mutex::new(None),
-            items_tail: RwLock::new(VecDeque::with_capacity(capacity)),
-            items_tail_capacity: capacity,
+            history: Mutex::new(TurnHistoryBuffer::with_cap(capacity)),
+            events,
             injection: std::sync::Mutex::new(InjectionQueues::new()),
+            pending_session_writes: std::sync::Mutex::new(PendingSessionWrites::new()),
             parent_thread_id: None,
             subagent_final_tx: None,
+            subagent_decision_tx: None,
         }
     }
 
@@ -111,51 +164,61 @@ impl ThreadHandle {
     /// - Skip the global `EnginePhase` rollback in `finish_turn` (child threads
     ///   do not own a slot in the phase machine; only top-level threads do).
     ///
-    /// Returns `(handle, rx)` where `rx` is the in-process receiver for the
-    /// child's [`crate::subagent::SubagentFinalEvent`].  The spawning site
-    /// retains `rx` and can `await` it to get the child result directly,
-    /// without subscribing to the broadcast bus.
+    /// Returns `(handle, final_rx, decision_rx)`:
+    /// - `final_rx` is the in-process receiver for the child's
+    ///   [`crate::subagent::SubagentFinalEvent`] (completion / error /
+    ///   suspension); the spawn site `await`s it for the child result.
+    /// - `decision_rx` is the per-tool-call handshake receiver carrying
+    ///   [`crate::subagent::SubagentDecisionRequest`]s; the parent spawner
+    ///   consumes it in its select loop to run a second permission fold and
+    ///   reply with a [`crate::subagent::ParentVerdict`] before the child
+    ///   executes the call.
+    ///
+    /// Both channels have capacity 1: a child turn produces exactly one final
+    /// event and resolves its tool calls serially in Phase 1.
     ///
     /// The broadcast path ([`crate::engine::event::EngineEvent::SubagentCompleted`])
     /// is always emitted in addition to the in-process channel delivery —
     /// external observers can use either mechanism.
     ///
-    /// # Examples
-    ///
-    /// ```
-    /// use std::sync::Arc;
-    /// use zhive_proto::domain::ThreadId;
-    /// use zhive_core::state::ThreadHandle;
-    ///
-    /// let parent_id = ThreadId(Arc::from("thread:native/parent"));
-    /// let child_id  = ThreadId(Arc::from("thread:subagent/parent/0"));
-    /// let (handle, _rx) = ThreadHandle::new_child(child_id.clone(), parent_id.clone());
-    /// assert_eq!(handle.parent_thread_id, Some(parent_id));
-    /// ```
+    /// Visibility is `pub(crate)` because the returned `decision_rx` carries
+    /// [`crate::subagent::SubagentDecisionRequest`] (an in-process,
+    /// non-`Clone` handshake type that never crosses the crate boundary); the
+    /// engine is the only legitimate creator of child threads. See the engine
+    /// `subagent_spawn` integration tests for usage.
     #[must_use]
-    pub fn new_child(
+    pub(crate) fn new_child(
         id: ThreadId,
         parent_thread_id: ThreadId,
     ) -> (
         Self,
         tokio::sync::mpsc::Receiver<crate::subagent::SubagentFinalEvent>,
+        tokio::sync::mpsc::Receiver<crate::subagent::SubagentDecisionRequest>,
     ) {
         // Channel capacity 1: exactly one final event per subagent turn.
-        // The spawner may drop `rx` without consuming it if it only cares
-        // about the broadcast bus; the `Sender` side simply fails silently
-        // (the broadcast path still delivers the outcome).
-        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        // The spawner may drop `final_rx` without consuming it if it only
+        // cares about the broadcast bus; the `Sender` side simply fails
+        // silently (the broadcast path still delivers the outcome).
+        let (final_tx, final_rx) = tokio::sync::mpsc::channel(1);
+        // Decision channel capacity 1: the child resolves tool calls serially,
+        // so at most one handshake is in flight at a time. If the parent
+        // spawner already dropped `decision_rx`, the child's `send` fails and
+        // its dispatch falls back to a conservative deny.
+        let (decision_tx, decision_rx) = tokio::sync::mpsc::channel(1);
+        let (events, _erx) = broadcast::channel(THREAD_EVENT_CAP);
         let handle = Self {
             id,
             status: RwLock::new(ThreadStatus::Idle),
             active_turn: Mutex::new(None),
-            items_tail: RwLock::new(VecDeque::with_capacity(Self::DEFAULT_TAIL_CAPACITY)),
-            items_tail_capacity: Self::DEFAULT_TAIL_CAPACITY,
+            history: Mutex::new(TurnHistoryBuffer::with_cap(Self::DEFAULT_TURN_CAPACITY)),
+            events,
             injection: std::sync::Mutex::new(InjectionQueues::new()),
+            pending_session_writes: std::sync::Mutex::new(PendingSessionWrites::new()),
             parent_thread_id: Some(parent_thread_id),
-            subagent_final_tx: Some(tx),
+            subagent_final_tx: Some(final_tx),
+            subagent_decision_tx: Some(decision_tx),
         };
-        (handle, rx)
+        (handle, final_rx, decision_rx)
     }
 
     /// Returns a lock guard on the injection queues.
@@ -171,27 +234,130 @@ impl ThreadHandle {
         }
     }
 
-    /// Appends an item to the tail, evicting older entries when over capacity.
+    /// Returns a lock guard on the pending session-write buffer.
     ///
-    /// The loop tolerates the tail already exceeding `items_tail_capacity`
-    /// (e.g. after a future API lowers the cap at runtime); the strict `==`
-    /// guard previously used would have stopped evicting in that case.
-    pub async fn push_item(&self, item: Item) {
-        let mut tail = self.items_tail.write().await;
-        while tail.len() >= self.items_tail_capacity {
-            tail.pop_front();
+    /// Recovers from mutex poison the same way as [`Self::injection_lock`]:
+    /// a poisoned lock means another thread panicked while holding it, which
+    /// is a programming error; recovering the inner value lets the engine
+    /// continue rather than tearing down the actor.
+    pub(crate) fn pending_writes_lock(&self) -> std::sync::MutexGuard<'_, PendingSessionWrites> {
+        match self.pending_session_writes.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
         }
-        tail.push_back(item);
     }
 
-    /// Returns a snapshot of every retained item id.
-    pub async fn item_ids(&self) -> Vec<ItemId> {
-        self.items_tail
-            .read()
+    /// Returns a fresh subscription to this thread's [`ThreadEvent`] stream.
+    ///
+    /// Independent of the engine-wide [`crate::engine::event::EngineEvent`]
+    /// bus; both fire for the same lifecycle transitions.
+    #[must_use]
+    pub fn subscribe_events(&self) -> broadcast::Receiver<ThreadEvent> {
+        self.events.subscribe()
+    }
+
+    /// Installs a fresh active turn in the history buffer.
+    ///
+    /// Called by the engine when a turn is accepted, before any item is
+    /// pushed, so [`Self::push_item`] has a turn to append to.
+    pub(crate) async fn start_turn_buffer(&self, turn_id: TurnId, started_at: i64) {
+        use zhive_proto::domain::{Turn, TurnItemsView};
+        let turn = Turn {
+            id: turn_id,
+            items: vec![],
+            items_view: TurnItemsView::Full,
+            status: TurnStatus::InProgress,
+            error: None,
+            started_at: Some(started_at),
+            completed_at: None,
+            duration_ms: None,
+        };
+        self.history.lock().await.start_turn(turn);
+    }
+
+    /// Finalises the active turn in the history buffer.
+    ///
+    /// Moves the active turn into the completed window with its terminal
+    /// `status`, then enforces the in-memory turn cap.
+    pub(crate) async fn finish_turn_buffer(
+        &self,
+        status: TurnStatus,
+        completed_at: i64,
+        duration_ms: Option<i64>,
+    ) {
+        self.history
+            .lock()
             .await
-            .iter()
-            .map(|i| i.id().clone())
-            .collect()
+            .finish_turn(status, completed_at, duration_ms);
+    }
+
+    /// Appends an item to the active turn's transcript.
+    ///
+    /// Items only arrive inside a turn; when no turn is active the buffer drops
+    /// the item with a debug log (an engine-side ordering bug, not a
+    /// recoverable condition).
+    ///
+    /// A [`ThreadEvent::ItemAppended`] is fanned out on the thread-scoped
+    /// broadcast channel for every push that lands in an active turn. This is
+    /// additive: the engine-wide [`crate::engine::event::EngineEvent`] bus is
+    /// emitted separately by the engine and is unaffected.
+    pub async fn push_item(&self, item: Item) {
+        let turn_id = {
+            let mut hist = self.history.lock().await;
+            let turn_id = hist.active_turn_id();
+            hist.push_item(item.clone());
+            turn_id
+        };
+        if let Some(turn_id) = turn_id {
+            let _ = self.events.send(ThreadEvent::ItemAppended {
+                turn_id,
+                item: Box::new(item),
+            });
+        }
+    }
+
+    /// Returns a snapshot of every resident item id in conversation order.
+    pub async fn item_ids(&self) -> Vec<ItemId> {
+        self.history.lock().await.all_item_ids()
+    }
+
+    /// Returns a flat, in-order clone of every resident item.
+    ///
+    /// Walks completed turns then the active turn (see
+    /// [`TurnHistoryBuffer::iter_items`]); evicted turns contribute nothing.
+    /// This is the flat-view entry point for the prompt builder, compaction
+    /// snapshot, and subagent final-message extraction.
+    pub async fn items_snapshot(&self) -> Vec<Item> {
+        self.history.lock().await.iter_items().cloned().collect()
+    }
+
+    /// Returns a clone of only the **active** turn's items, in append order.
+    ///
+    /// Thin async wrapper over [`TurnHistoryBuffer::active_turn_items`]. The
+    /// turn runner calls this at the start of a turn to enqueue the input
+    /// items (user message / next-turn seeds / subagent prompt) for storage —
+    /// they are pushed before the provider loop and would otherwise never be
+    /// persisted. Returns an empty `Vec` when no turn is active.
+    ///
+    /// [`TurnHistoryBuffer::active_turn_items`]: crate::state::TurnHistoryBuffer::active_turn_items
+    pub async fn active_turn_items(&self) -> Vec<Item> {
+        self.history.lock().await.active_turn_items()
+    }
+
+    /// Returns the count of resident items across active + completed turns.
+    pub async fn item_count(&self) -> usize {
+        self.history.lock().await.item_count()
+    }
+
+    /// Replaces the whole transcript with a single compaction-handoff turn.
+    ///
+    /// Used by context compaction to swap the live history for `[marker,
+    /// summary]`; see [`TurnHistoryBuffer::replace_with_compaction`].
+    pub(crate) async fn replace_history_with_compaction(&self, turn_id: TurnId, items: Vec<Item>) {
+        self.history
+            .lock()
+            .await
+            .replace_with_compaction(turn_id, items);
     }
 }
 
@@ -395,9 +561,32 @@ mod tests {
         ItemId(Arc::from(s))
     }
 
+    #[test]
+    fn new_idle_starts_with_empty_pending_writes() {
+        let h = ThreadHandle::new_idle(tid("thread:native/pw"));
+        assert!(h.pending_writes_lock().is_empty());
+    }
+
+    #[test]
+    fn new_child_starts_with_empty_pending_writes() {
+        let (h, _final_rx, _decision_rx) =
+            ThreadHandle::new_child(tid("thread:subagent/p/0"), tid("thread:native/p"));
+        assert!(h.pending_writes_lock().is_empty());
+    }
+
     #[tokio::test]
-    async fn push_item_respects_capacity() {
-        let h = ThreadHandle::with_capacity(tid("thread:native/x"), 2);
+    async fn push_item_appends_to_active_turn() {
+        let h = ThreadHandle::new_idle(tid("thread:native/x"));
+        // No active turn yet: pushes are dropped (engine seeds the turn first).
+        h.push_item(Item::AgentMessage {
+            id: item_id("orphan"),
+            text: "x".into(),
+        })
+        .await;
+        assert!(h.item_ids().await.is_empty());
+
+        // Seed a turn, then pushed items are retained in order.
+        h.start_turn_buffer(TurnId(Arc::from("turn:x/0")), 0).await;
         h.push_item(Item::AgentMessage {
             id: item_id("a"),
             text: "1".into(),
@@ -408,15 +597,23 @@ mod tests {
             text: "2".into(),
         })
         .await;
-        h.push_item(Item::AgentMessage {
-            id: item_id("c"),
-            text: "3".into(),
-        })
-        .await;
         let ids: Vec<_> = h.item_ids().await.into_iter().map(|i| i.0).collect();
         assert_eq!(ids.len(), 2);
-        assert_eq!(&*ids[0], "b");
-        assert_eq!(&*ids[1], "c");
+        assert_eq!(&*ids[0], "a");
+        assert_eq!(&*ids[1], "b");
+        assert_eq!(h.item_count().await, 2);
+    }
+
+    #[tokio::test]
+    async fn subscribe_events_receives_broadcast() {
+        let h = ThreadHandle::new_idle(tid("thread:native/ev"));
+        let mut rx = h.subscribe_events();
+        let _ = h.events.send(ThreadEvent::TurnStarted {
+            turn_id: TurnId(Arc::from("turn:ev/0")),
+            started_at: 7,
+        });
+        let ev = rx.try_recv().expect("event delivered");
+        assert!(matches!(ev, ThreadEvent::TurnStarted { started_at: 7, .. }));
     }
 
     #[tokio::test]

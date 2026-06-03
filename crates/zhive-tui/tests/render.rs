@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
-use zhive_proto::domain::{Item, ItemContent, ItemId, ThreadId, TurnId};
+use zhive_proto::domain::{Item, ItemContent, ItemId, ThreadId, ToolCallStatus, ToolKind, TurnId};
 use zhive_tui::app::App;
 use zhive_tui::config::TuiConfig;
 use zhive_tui::protocol::EngineNotification;
@@ -74,6 +74,71 @@ fn renders_user_and_agent_messages() {
     assert!(text.contains("hello world"), "user text rendered");
     assert!(text.contains("hi there"), "agent text rendered");
     assert!(text.contains("zap"), "model pill / brand present");
+}
+
+#[test]
+fn renders_subagent_summary_under_agent_tool_call() {
+    let mut app = App::new(TuiConfig::default(), thread());
+    app.on_engine(&EngineNotification::TurnStarted {
+        thread_id: thread(),
+        turn_id: turn(),
+    });
+    // The parent flow issues an `agent` tool call that spawns a subagent.
+    app.on_engine(&EngineNotification::ItemAppended {
+        thread_id: thread(),
+        turn_id: turn(),
+        item: Box::new(Item::ToolCall {
+            id: ItemId(Arc::from("item:turn:render/0/0")),
+            name: "agent".to_owned(),
+            kind: ToolKind::default(),
+            status: ToolCallStatus::InProgress,
+            content: Vec::new(),
+            locations: Vec::new(),
+            raw_input: None,
+            raw_output: None,
+            provider_tool_call_id: None,
+        }),
+    });
+    let child = ThreadId(Arc::from("thread:subagent/render/1"));
+    app.on_engine(&EngineNotification::SubagentStarted {
+        parent_thread_id: thread(),
+        child_thread_id: child.clone(),
+        agent_type: Some("researcher".to_owned()),
+        description: Some("scan the repo".to_owned()),
+    });
+    // A child-thread tool call drives the `N toolcalls · running <tool>` line.
+    app.on_engine(&EngineNotification::ItemAppended {
+        thread_id: child.clone(),
+        turn_id: TurnId(Arc::from("turn:subagent/render/1/0")),
+        item: Box::new(Item::ToolCall {
+            id: ItemId(Arc::from("item:turn:subagent/render/1/0/0")),
+            name: "grep".to_owned(),
+            kind: ToolKind::default(),
+            status: ToolCallStatus::InProgress,
+            content: Vec::new(),
+            locations: Vec::new(),
+            raw_input: None,
+            raw_output: None,
+            provider_tool_call_id: None,
+        }),
+    });
+
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("terminal");
+    terminal.draw(|frame| ui::draw(frame, &app)).expect("draw");
+
+    let text = screen_text(&terminal);
+    assert!(
+        text.contains("researcher"),
+        "subagent type shown in summary; got: {text}"
+    );
+    assert!(
+        text.contains("scan the repo"),
+        "subagent description shown; got: {text}"
+    );
+    assert!(
+        text.contains("toolcalls"),
+        "subagent toolcall count row shown; got: {text}"
+    );
 }
 
 #[test]

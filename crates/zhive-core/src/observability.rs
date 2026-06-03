@@ -1,15 +1,21 @@
 //! Tracing + OpenTelemetry plumbing (D-014 revised).
 //!
+//! ## Phase 1: `OTel` feature gate (decision-diffs §2.6 method b)
+//!
+//! The `otel` Cargo feature is **disabled by default**.  Without it, this
+//! module only exports the span-name and field-name constants in the
+//! [`spans`] and [`fields`] submodules, which carry no compile-time `OTel`
+//! dependencies.  Enable the feature with
+//! `cargo check -p zhive-core --features otel` to include the real
+//! `SdkTracerProvider` constructor.
+//!
+//! ## Semantic conventions
+//!
 //! The engine emits structured [`tracing`] spans with field names
 //! following OpenTelemetry semantic conventions
 //! (`session.id`, `zhive.turn.id`, `gen_ai.tool.name`, `db.operation`,
 //! `error.type`, ...), so attaching an OTLP exporter at deployment time
 //! does not force a rename round.
-//!
-//! Phase 1 ships the tracer-provider plumbing but does not bind a
-//! transport — callers compose [`OtelLayer`] with their preferred
-//! exporter (`opentelemetry-stdout`, `opentelemetry-otlp`, …) at the
-//! application entry point.
 //!
 //! ## Required spans (D-014)
 //!
@@ -68,15 +74,49 @@ pub mod fields {
     pub const PARENT_THREAD_ID: &str = "zhive.parent.session.id";
 }
 
-/// Builds a no-op [`opentelemetry_sdk::trace::SdkTracerProvider`] suitable
-/// for unit tests and developer runs (no exporter attached).
+/// Builds a no-op `OTel` tracer provider with no exporter attached.
 ///
+/// When the `otel` Cargo feature is **enabled**, returns a real
+/// `opentelemetry_sdk::trace::SdkTracerProvider` built with default
+/// configuration, suitable for unit tests and developer runs.
 /// Production callers compose their own provider with the desired
-/// exporter and pass it to
-/// [`tracing_opentelemetry::OpenTelemetryLayer::new`].
+/// exporter (e.g. `opentelemetry-otlp`) and pass it to
+/// `tracing_opentelemetry::OpenTelemetryLayer::new`.
+///
+/// When the `otel` feature is **disabled** (default in Phase 1), this
+/// function is a no-op stub that compiles without any `OTel` dependency.
+/// Phase 2 will activate the feature once an OTLP exporter target is
+/// confirmed.
+///
+/// # Examples
+///
+/// ```rust
+/// // Works with or without the `otel` feature.
+/// zhive_core::observability::noop_tracer_provider();
+/// ```
+#[cfg(feature = "otel")]
 #[must_use]
 pub fn noop_tracer_provider() -> opentelemetry_sdk::trace::SdkTracerProvider {
     opentelemetry_sdk::trace::SdkTracerProvider::builder().build()
+}
+
+/// No-op stub when the `otel` feature is disabled.
+///
+/// This function is a compile-time placeholder for
+/// `noop_tracer_provider` when the `otel` Cargo feature is **off**.
+/// It performs no work and returns `()`.  Enable `--features otel` to
+/// get the real `SdkTracerProvider`-returning variant.
+///
+/// # Examples
+///
+/// ```rust
+/// // No-op when `otel` feature is not enabled.
+/// zhive_core::observability::noop_tracer_provider();
+/// ```
+#[cfg(not(feature = "otel"))]
+pub fn noop_tracer_provider() {
+    // Phase 1: OTel feature gate disabled. This is a no-op stub.
+    // Enable `--features otel` to get the real SdkTracerProvider.
 }
 
 #[cfg(test)]
@@ -100,6 +140,7 @@ mod tests {
         assert_eq!(fields::ERROR_TYPE, "error.type");
     }
 
+    #[cfg(feature = "otel")]
     #[test]
     fn noop_provider_builds() {
         let _p = noop_tracer_provider();
@@ -129,6 +170,8 @@ mod tests {
         assert_eq!(spans::ROLLBACK_POINT, "zhive.rollback_point");
         // engine/compaction.rs: info_span!("zhive.compaction", ...)
         assert_eq!(spans::COMPACTION, "zhive.compaction");
+        // engine/fork.rs: info_span!("zhive.branch_summary", ...)
+        assert_eq!(spans::BRANCH_SUMMARY, "zhive.branch_summary");
 
         // ---- field names (OTel semconv values) ----
         // All sites use "session.id", "zhive.turn.id", "gen_ai.tool.name",
@@ -137,16 +180,10 @@ mod tests {
         assert_eq!(fields::TURN_ID, "zhive.turn.id");
         assert_eq!(fields::TOOL_NAME, "gen_ai.tool.name");
         assert_eq!(fields::DB_OPERATION, "db.operation");
-        // engine/subagent_spawn.rs: "zhive.parent.session.id" (B9 §3.2 row
-        // parent_thread_id → zhive.parent.session.id).
+        // engine/subagent_spawn.rs + engine/fork.rs: "zhive.parent.session.id"
+        // (B9 §3.2 row parent_thread_id → zhive.parent.session.id). The fork
+        // span reuses this field to name the source thread.
         assert_eq!(fields::PARENT_THREAD_ID, "zhive.parent.session.id");
-
-        // ---- not yet instrumented (deferred) ----
-        // `BRANCH_SUMMARY` corresponds to Pi's `navigateTree` branch-summary,
-        // which depends on a thread fork/branch model that does not exist yet
-        // and is not part of the codex core harness. It is deferred with the
-        // fork feature; the constant stays so the wire/field names are stable.
-        let _ = spans::BRANCH_SUMMARY;
     }
 }
 
@@ -365,6 +402,7 @@ mod span_emission_tests {
             turn_limits: TurnLimits::default(),
             system_prompt: None,
             compact_token_threshold: None,
+            cwd: std::path::PathBuf::from("."),
         };
         let engine = Engine::spawn_with_config(cfg);
 
@@ -454,6 +492,106 @@ mod span_emission_tests {
             names.iter().any(|n| n == "zhive.compaction"),
             "expected a 'zhive.compaction' span, recorded: {names:?}"
         );
+    }
+
+    /// Forking a thread must open a `zhive.branch_summary` span.
+    ///
+    /// This is the real producer of the `BranchSummary` phase / span (closing
+    /// the previously-deferred B9 gap): the fork claims `Idle → BranchSummary`
+    /// and brackets the replay + summary in the span. A seeded source rollout
+    /// plus a scripted summary model keep the test offline.
+    #[tokio::test]
+    async fn fork_opens_zhive_branch_summary_span() {
+        use std::path::Path;
+        use std::sync::Arc;
+        use zhive_proto::domain::{Item, ItemId, ThreadId};
+
+        use crate::engine::EngineConfig;
+        use crate::persistence::{RolloutEntry, RolloutWriter, Storage};
+
+        let capture = SpanCapture::new();
+
+        // On-disk storage so the fork has a source rollout to read.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = Arc::new(Storage::open(Path::new(dir.path())).await.expect("open"));
+        let source = ThreadId(Arc::from("thread:native/span-fork-src"));
+
+        // Seed a Session + one item directly into the source rollout.
+        let mut w = RolloutWriter::open(storage.rollout_path(&source.0))
+            .await
+            .expect("rollout open");
+        w.append(&RolloutEntry::Session {
+            version: 3,
+            id: source.0.to_string(),
+            timestamp: 0,
+            cwd: "/".into(),
+            parent_session: None,
+        })
+        .await
+        .expect("session");
+        w.append(&RolloutEntry::Item {
+            thread_id: source.0.to_string(),
+            turn_id: format!("turn:{}/0", source.0),
+            timestamp: 0,
+            item: Box::new(Item::AgentMessage {
+                id: ItemId(Arc::from("item:span-fork/0")),
+                text: "hi".into(),
+            }),
+        })
+        .await
+        .expect("item");
+        w.sync_all().await.expect("sync");
+        drop(w);
+
+        // Scripted summary model so summarize=true does not hit the network.
+        let model = ScriptedModel::new(
+            "test",
+            "m",
+            vec![
+                StreamPart::TextStart {
+                    id: "b".into(),
+                    provider_metadata: None,
+                },
+                StreamPart::TextDelta {
+                    id: "b".into(),
+                    delta: "S".into(),
+                    provider_metadata: None,
+                },
+                StreamPart::TextEnd {
+                    id: "b".into(),
+                    provider_metadata: None,
+                },
+            ],
+        )
+        .into_dyn();
+
+        let cfg = EngineConfig {
+            provider: model,
+            tools: Arc::new(ToolRegistry::new()),
+            hook_host: Arc::new(HookHost::new()),
+            storage: Some(storage),
+            turn_limits: TurnLimits::default(),
+            system_prompt: None,
+            compact_token_threshold: None,
+            cwd: std::path::PathBuf::from("."),
+        };
+        let engine = Engine::spawn_with_config(cfg);
+
+        let _guard = tracing::subscriber::set_default(capture.clone());
+
+        engine
+            .fork_thread(source, None, true)
+            .await
+            .expect("actor reachable")
+            .expect("fork must succeed");
+
+        let names = capture.recorded();
+        assert!(
+            names.iter().any(|n| n == "zhive.branch_summary"),
+            "expected a 'zhive.branch_summary' span, recorded: {names:?}"
+        );
+
+        engine.shutdown().await.expect("shutdown");
     }
 }
 

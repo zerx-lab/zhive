@@ -137,6 +137,17 @@ pub enum ServerError {
     /// `max_connections` was `0`, which would deadlock the semaphore.
     #[error("max_connections must be >= 1")]
     InvalidMaxConnections,
+
+    /// Another zhive server is already listening on the requested UDS socket path.
+    ///
+    /// Returned by [`serve_uds`] / [`serve_uds_with_events`] when a connection
+    /// probe in [`prepare_uds_path`] succeeds, indicating a live server is
+    /// already bound at the given socket path.
+    #[error("zhive server already running at {path}")]
+    UdsAlreadyRunning {
+        /// Filesystem path of the active server's UDS socket.
+        path: String,
+    },
 }
 
 /// Owns the process stdin/stdout and runs [`serve_loop`] on them.
@@ -256,6 +267,158 @@ fn spawn_connection(
     });
 }
 
+/// Guard that holds an exclusive startup lock for the duration of its
+/// lifetime.
+///
+/// Created by [`acquire_startup_lock`]. The lock is released when this
+/// value is dropped (i.e. when the underlying `File` is closed). The
+/// lock prevents two concurrently-starting server processes from racing
+/// through the socket-path setup at the same time.
+#[cfg(unix)]
+pub(crate) struct ServerStartupLock {
+    _file: std::fs::File,
+}
+
+/// Acquires an exclusive startup lock at `path`, blocking until any
+/// competing process releases it.
+///
+/// The lock is an advisory `flock(LOCK_EX)` applied to the file at
+/// `path`. The call is run on a `spawn_blocking` worker thread so the
+/// tokio runtime thread is not blocked. Returns a [`ServerStartupLock`]
+/// that releases the lock on drop.
+///
+/// # Errors
+///
+/// Returns `io::Error` if the lock file cannot be opened or the
+/// `flock` call fails at the OS level.
+// `std::fs::File::lock()` was stabilized in Rust 1.89.  The workspace
+// `rust-version` is now 1.89, so no compatibility override is needed here.
+#[cfg(unix)]
+pub(crate) async fn acquire_startup_lock(
+    path: std::path::PathBuf,
+) -> std::io::Result<ServerStartupLock> {
+    tokio::task::spawn_blocking(move || {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)?;
+        file.lock()?;
+        Ok(ServerStartupLock { _file: file })
+    })
+    .await
+    .map_err(std::io::Error::other)?
+}
+
+/// RAII guard that removes the UDS socket file when dropped.
+///
+/// Created after a successful [`tokio::net::UnixListener::bind`] so
+/// that the socket file is always cleaned up when the server exits,
+/// even on panic.
+#[cfg(unix)]
+struct UdsFileGuard(std::path::PathBuf);
+
+#[cfg(unix)]
+impl Drop for UdsFileGuard {
+    fn drop(&mut self) {
+        if let Err(e) = std::fs::remove_file(&self.0)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(
+                name: "zhive.server.uds.socket_cleanup_failed",
+                socket_path = %self.0.display(),
+                error_message = %e,
+                "failed to remove UDS socket on shutdown"
+            );
+        }
+    }
+}
+
+/// Prepares the UDS socket path for binding by probing for a live server
+/// and cleaning up stale sockets.
+///
+/// The probe sequence is:
+///
+/// 1. Attempt a connection to `path` via [`tokio::net::UnixStream::connect`].
+/// 2. If the connection succeeds the path hosts a live server → return
+///    [`std::io::ErrorKind::AddrInUse`].
+/// 3. If the connection is refused (`ConnectionRefused`) the socket file
+///    exists but nothing is listening → stale; remove and return `Ok`.
+/// 4. If the path does not exist (`NotFound`) → return `Ok` immediately.
+/// 5. Any other error: if the path no longer exists at this point return
+///    `Ok`; otherwise propagate the error.
+///
+/// On a successful return the caller may safely call
+/// [`tokio::net::UnixListener::bind`] at `path`.
+///
+/// The parent directory is `chmod 0700` before the probe so both the
+/// probe and the subsequent bind happen in a directory that is
+/// inaccessible to other users.
+///
+/// # Errors
+///
+/// Returns `io::Error` with:
+/// * `AddrInUse` when a live server is detected at `path`.
+/// * `AlreadyExists` when `path` exists but is not a socket.
+/// * Propagated OS errors from directory permission, metadata, or
+///   `remove_file` syscalls.
+#[cfg(unix)]
+async fn prepare_uds_path(path: &Path) -> std::io::Result<()> {
+    use std::io::ErrorKind;
+    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+
+    // Ensure the parent directory exists and is private (0700).
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+        let dir_perms = std::fs::Permissions::from_mode(0o700);
+        // Best-effort: non-fatal if we do not own the directory.
+        let _ = std::fs::set_permissions(parent, dir_perms);
+    }
+
+    // Probe: try to connect to the existing socket path.
+    match tokio::net::UnixStream::connect(path).await {
+        Ok(_stream) => {
+            // A connection succeeded → there is a live server listening.
+            return Err(std::io::Error::new(
+                ErrorKind::AddrInUse,
+                format!("zhive server already running at {}", path.display()),
+            ));
+        }
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            // Socket file does not exist at all → clean state.
+            return Ok(());
+        }
+        Err(e) if e.kind() == ErrorKind::ConnectionRefused => {
+            // File exists but no process is listening → stale socket;
+            // fall through to the remove block below.
+        }
+        Err(e) => {
+            // Some other OS error: check if the file still exists before
+            // propagating so a TOCTOU removal does not cause a spurious
+            // failure.
+            match path.try_exists() {
+                Ok(false) => return Ok(()),
+                _ => return Err(e),
+            }
+        }
+    }
+
+    // At this point we have a stale socket. Verify it really is a socket
+    // before removing it (guard against misconfigured mounts etc.).
+    let meta = tokio::fs::symlink_metadata(path).await?;
+    if !meta.file_type().is_socket() {
+        return Err(std::io::Error::new(
+            ErrorKind::AlreadyExists,
+            format!("path exists but is not a socket: {}", path.display()),
+        ));
+    }
+
+    // Remove the stale socket so the caller can bind fresh.
+    tokio::fs::remove_file(path).await?;
+    Ok(())
+}
+
 #[cfg(unix)]
 async fn serve_uds_inner(
     socket_path: &Path,
@@ -270,25 +433,22 @@ async fn serve_uds_inner(
         return Err(ServerError::InvalidMaxConnections);
     }
 
-    // Best-effort cleanup of a stale socket file from a previous run.
-    // A NotFound is the normal case; any other failure is logged so a
-    // permissions or fs error does not silently swallow the bind below.
-    match tokio::fs::remove_file(socket_path).await {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => {
-            let path_display = socket_path.display().to_string();
-            let kind = e.kind();
-            let message = e.to_string();
-            tracing::warn!(
-                name: "zhive.server.stale_socket.cleanup_failed",
-                socket_path = %path_display,
-                error_type = ?kind,
-                error_message = %message,
-                "stale UDS socket cleanup failed; bind may still succeed"
-            );
+    // Acquire the startup lock first so that two concurrently-starting
+    // server processes serialise here rather than racing on the bind.
+    let lock_path = path::startup_lock_path();
+    let startup_lock = acquire_startup_lock(lock_path).await?;
+
+    // Probe for an active server and clean up any stale socket file.
+    // `prepare_uds_path` returns `AddrInUse` when a live server is found.
+    prepare_uds_path(socket_path).await.map_err(|e| {
+        if e.kind() == std::io::ErrorKind::AddrInUse {
+            ServerError::UdsAlreadyRunning {
+                path: socket_path.display().to_string(),
+            }
+        } else {
+            ServerError::Io(e)
         }
-    }
+    })?;
 
     let listener = tokio::net::UnixListener::bind(socket_path)?;
 
@@ -296,6 +456,16 @@ async fn serve_uds_inner(
     // `chmod 0600` so that other users cannot connect.
     let perms = std::fs::Permissions::from_mode(0o600);
     std::fs::set_permissions(socket_path, perms)?;
+
+    // Register a guard that unlinks the socket file on exit.
+    // Must be placed after `bind` so the guard owns a file that was
+    // created by this process.
+    let _socket_guard = UdsFileGuard(socket_path.to_path_buf());
+
+    // The startup lock has served its purpose: this process has
+    // successfully bound the socket. Release it now so a second process
+    // can start immediately (e.g., after the user manually stops us).
+    drop(startup_lock);
 
     let limiter = Arc::new(Semaphore::new(max_connections));
     let mut tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
@@ -579,6 +749,172 @@ mod tests {
             },
             other => panic!("expected response, got {other:?}"),
         }
+    }
+
+    // ── flock / stale-socket tests ────────────────────────────────────
+
+    /// A stale socket (bound, then listener dropped) must be replaced
+    /// transparently so that `serve_uds` can start on the same path.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stale_socket_is_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("stale.sock");
+
+        // Bind, then drop the listener immediately — leaves a socket file
+        // with no process listening behind it.
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        drop(listener);
+        assert!(socket.exists(), "socket file must still exist after drop");
+
+        // `serve_uds` should detect the stale socket, remove it, and bind fresh.
+        let router = Arc::new(Router::new());
+        let token = CancellationToken::new();
+        let cancel = token.clone();
+        let socket_for_task = socket.clone();
+        let handle = tokio::spawn(async move {
+            serve_uds(&socket_for_task, router, DEFAULT_MAX_CONNECTIONS, cancel).await
+        });
+
+        // Give the server time to start then shut it down cleanly.
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        token.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+            .await
+            .expect("serve_uds must return after cancel")
+            .expect("task join")
+            .expect("stale socket must not prevent startup");
+    }
+
+    /// A second call to `serve_uds` on a path where a live server is
+    /// already listening must return `ServerError::UdsAlreadyRunning`
+    /// immediately.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn active_server_returns_already_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("active.sock");
+        let router = Arc::new(Router::new());
+        let token = CancellationToken::new();
+
+        let router2 = Arc::clone(&router);
+        let socket2 = socket.clone();
+        let cancel = token.clone();
+        let server = tokio::spawn(async move {
+            serve_uds(&socket2, router2, DEFAULT_MAX_CONNECTIONS, cancel).await
+        });
+
+        // Wait for the first server to bind.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if tokio::net::UnixStream::connect(&socket).await.is_ok() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "first server did not bind in time"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        // Second attempt must immediately fail with UdsAlreadyRunning.
+        let router3 = Arc::clone(&router);
+        let socket3 = socket.clone();
+        let err = serve_uds(
+            &socket3,
+            router3,
+            DEFAULT_MAX_CONNECTIONS,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, ServerError::UdsAlreadyRunning { .. }),
+            "expected UdsAlreadyRunning, got {err:?}"
+        );
+
+        // Shut down the first server cleanly.
+        token.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(2), server)
+            .await
+            .expect("first server must shut down")
+            .expect("task join")
+            .expect("clean exit");
+    }
+
+    /// Two concurrent `acquire_startup_lock` calls must serialise: the
+    /// second one blocks until the first releases its lock.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn startup_lock_serializes_concurrent_starts() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join("zhive-startup.lock");
+
+        // Acquire the first lock.
+        let lock1 = acquire_startup_lock(lock_path.clone())
+            .await
+            .expect("first acquire must succeed");
+
+        // Attempt a second acquire in a separate task; it should block.
+        let path2 = lock_path.clone();
+        let second_task = tokio::spawn(async move { acquire_startup_lock(path2).await });
+
+        // Give the task a chance to make progress (it should not yet succeed).
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        assert!(
+            !second_task.is_finished(),
+            "second acquire must block while first lock is held"
+        );
+
+        // Release the first lock; the second task must now complete.
+        drop(lock1);
+        let _lock2 = tokio::time::timeout(std::time::Duration::from_secs(2), second_task)
+            .await
+            .expect("second acquire must complete after first lock drop")
+            .expect("task join")
+            .expect("second acquire must succeed");
+    }
+
+    /// `UdsFileGuard` must remove the socket file when dropped.
+    #[cfg(unix)]
+    #[test]
+    fn uds_file_guard_removes_on_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("guard.sock");
+
+        // Create a dummy file to simulate the socket.
+        std::fs::write(&socket, b"").unwrap();
+        assert!(socket.exists());
+
+        let guard = UdsFileGuard(socket.clone());
+        drop(guard);
+
+        assert!(
+            !socket.exists(),
+            "UdsFileGuard must remove the file on drop"
+        );
+    }
+
+    /// `prepare_uds_path` must reject a path that exists but is not a socket.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn prepare_uds_path_non_socket_file_is_rejected() {
+        use std::io::ErrorKind;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("not_a_socket.txt");
+
+        // Create a regular file at the path.
+        std::fs::write(&path, b"hello").unwrap();
+
+        let err = prepare_uds_path(&path)
+            .await
+            .expect_err("non-socket file must be rejected");
+        assert_eq!(
+            err.kind(),
+            ErrorKind::AlreadyExists,
+            "expected AlreadyExists, got {err:?}"
+        );
     }
 }
 

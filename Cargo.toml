@@ -23,7 +23,7 @@ default-members = [
 [workspace.package]
 version       = "0.1.0"
 edition       = "2024"
-rust-version  = "1.88"
+rust-version  = "1.89"
 license       = "Apache-2.0"
 repository    = "https://github.com/zerx-lab/zhive"
 homepage      = "https://github.com/zerx-lab/zhive"
@@ -105,7 +105,12 @@ glob   = "0.3.3"
 # ---- tracing + OpenTelemetry (D-014 revised 2026-05-28: OTel ships in
 #      Phase 1 per user decision). Field names follow OTel semantic
 #      conventions (thread.id, turn.id, tool.name, …) so attaching an
-#      OTLP exporter later does not require a rename. ----
+#      OTLP exporter later does not require a rename.
+#
+#      Workspace-level dependency entries cannot be marked `optional`; that
+#      flag must be applied at the *crate* level (e.g. in zhive-core's
+#      Cargo.toml).  These three entries are therefore workspace-visible but
+#      default to not compiling unless a crate enables the `otel` feature. ----
 tracing-opentelemetry = { version = "0.33", default-features = false }
 opentelemetry         = { version = "0.32", default-features = false, features = ["trace"] }
 opentelemetry_sdk     = { version = "0.32", default-features = false, features = ["trace", "rt-tokio"] }

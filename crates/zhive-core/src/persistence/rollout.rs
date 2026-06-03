@@ -21,6 +21,15 @@ use zhive_proto::domain::Item;
 
 use super::error::{StorageError, StorageResult};
 
+/// Current rollout JSONL schema version stamped on every [`RolloutEntry::Session`]
+/// header.
+///
+/// Bumped only on a breaking change to the on-disk line shape; the reader
+/// tolerates older versions by best-effort field defaulting. Kept here as the
+/// single source of truth so header writers (the persistence writer and the
+/// fork path) cannot drift to different version numbers.
+pub const SESSION_VERSION: u32 = 3;
+
 /// One line in the rollout JSONL stream.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -112,6 +121,98 @@ impl RolloutWriter {
         Ok(())
     }
 
+    /// Appends a session header line, optionally naming a parent rollout.
+    ///
+    /// Convenience over [`Self::append`] for the
+    /// [`RolloutEntry::Session`] variant; used by the fork path to write the
+    /// first line of a forked thread's rollout with
+    /// `parent_session = Some(source)`. The schema `version` is stamped to the
+    /// current rollout format ([`SESSION_VERSION`]). Flushes the buffer but does
+    /// **not** `fsync`; call [`Self::sync_all`] for a durable save point.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::Json`] when the entry fails to encode,
+    /// [`StorageError::Io`] when writing fails.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # async fn demo() -> zhive_core::persistence::StorageResult<()> {
+    /// use zhive_core::persistence::{RolloutWriter, RolloutEntry, read_all};
+    /// let dir = tempfile::tempdir().expect("tempdir");
+    /// let path = dir.path().join("forked.jsonl");
+    /// let mut w = RolloutWriter::open(path.clone()).await?;
+    /// w.append_session_header("thread:native/fork/1", 0, "/tmp", Some("thread:native/src"))
+    ///     .await?;
+    /// w.sync_all().await?;
+    /// drop(w);
+    /// let entries = read_all(&path).await?;
+    /// assert!(matches!(
+    ///     &entries[0],
+    ///     RolloutEntry::Session { parent_session: Some(p), .. } if p == "thread:native/src"
+    /// ));
+    /// # Ok(())
+    /// # }
+    /// # tokio::runtime::Runtime::new().unwrap().block_on(demo()).unwrap();
+    /// ```
+    pub async fn append_session_header(
+        &mut self,
+        id: &str,
+        timestamp: i64,
+        cwd: &str,
+        parent_session: Option<&str>,
+    ) -> StorageResult<()> {
+        let entry = RolloutEntry::Session {
+            version: SESSION_VERSION,
+            id: id.to_owned(),
+            timestamp,
+            cwd: cwd.to_owned(),
+            parent_session: parent_session.map(str::to_owned),
+        };
+        self.append(&entry).await
+    }
+
+    /// Appends a [`RolloutEntry::Leaf`] pointing at the active branch head.
+    ///
+    /// `target_id = Some(id)` marks a fork / branch leaf at item `id`;
+    /// `target_id = None` is the turn-completion save-point marker written by
+    /// the writer at [`super::writer::StorageWriteOp::TurnEnded`]. Flushes the
+    /// buffer but does **not** `fsync`; the caller chooses the durability save
+    /// point via [`Self::sync_all`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::Json`] when the entry fails to encode,
+    /// [`StorageError::Io`] when writing fails.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # async fn demo() -> zhive_core::persistence::StorageResult<()> {
+    /// use zhive_core::persistence::{RolloutWriter, RolloutEntry, read_all};
+    /// let dir = tempfile::tempdir().expect("tempdir");
+    /// let path = dir.path().join("leaf.jsonl");
+    /// let mut w = RolloutWriter::open(path.clone()).await?;
+    /// w.set_leaf_id(Some("item:turn/0")).await?;
+    /// w.sync_all().await?;
+    /// drop(w);
+    /// let entries = read_all(&path).await?;
+    /// assert!(matches!(
+    ///     entries.last(),
+    ///     Some(RolloutEntry::Leaf { target_id: Some(t) }) if t == "item:turn/0"
+    /// ));
+    /// # Ok(())
+    /// # }
+    /// # tokio::runtime::Runtime::new().unwrap().block_on(demo()).unwrap();
+    /// ```
+    pub async fn set_leaf_id(&mut self, target_id: Option<&str>) -> StorageResult<()> {
+        let entry = RolloutEntry::Leaf {
+            target_id: target_id.map(str::to_owned),
+        };
+        self.append(&entry).await
+    }
+
     /// Forces the kernel to flush dirty pages to the underlying device.
     ///
     /// Call this at every save point that must survive a crash.
@@ -187,6 +288,59 @@ mod tests {
         let entries = read_all(&path).await.unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0], session);
+    }
+
+    #[tokio::test]
+    async fn set_leaf_id_round_trips_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+
+        let mut writer = RolloutWriter::open(path.clone()).await.unwrap();
+        writer.set_leaf_id(Some("item:turn:t/0")).await.unwrap();
+        writer.sync_all().await.unwrap();
+        drop(writer);
+
+        let entries = read_all(&path).await.unwrap();
+        assert_eq!(
+            entries.last(),
+            Some(&RolloutEntry::Leaf {
+                target_id: Some("item:turn:t/0".to_owned()),
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn append_session_header_writes_parent_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+
+        let mut writer = RolloutWriter::open(path.clone()).await.unwrap();
+        writer
+            .append_session_header(
+                "thread:native/fork/1",
+                7,
+                "/work",
+                Some("thread:native/src"),
+            )
+            .await
+            .unwrap();
+        writer.sync_all().await.unwrap();
+        drop(writer);
+
+        let entries = read_all(&path).await.unwrap();
+        match &entries[0] {
+            RolloutEntry::Session {
+                version,
+                id,
+                parent_session,
+                ..
+            } => {
+                assert_eq!(*version, SESSION_VERSION);
+                assert_eq!(id, "thread:native/fork/1");
+                assert_eq!(parent_session.as_deref(), Some("thread:native/src"));
+            }
+            other => panic!("expected Session header, got {other:?}"),
+        }
     }
 
     #[tokio::test]

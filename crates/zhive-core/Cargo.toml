@@ -22,6 +22,10 @@ workspace = true
 #                      `ignore` / `regex` / `glob`.
 [features]
 default = []
+# Enable the real OpenTelemetry SDK tracer-provider and the tracing bridge.
+# Disabled by default (decision-diffs §2.6 method b); Phase 2 will activate
+# this once an OTLP exporter target is confirmed.
+otel    = ["dep:tracing-opentelemetry", "dep:opentelemetry", "dep:opentelemetry_sdk"]
 sandbox = []
 skills  = ["dep:serde_norway"]
 tools   = ["dep:ignore", "dep:regex", "dep:glob"]
@@ -50,10 +54,12 @@ jsonschema = { workspace = true }
 # LLM provider abstraction (D-010 Phase 1 dependency).
 llmsdk = { workspace = true }
 
-# OpenTelemetry layer for `tracing` (D-014 revised).
-tracing-opentelemetry = { workspace = true }
-opentelemetry         = { workspace = true }
-opentelemetry_sdk     = { workspace = true }
+# OpenTelemetry layer for `tracing` — disabled by default (decision-diffs §2.6
+# method b). Enable with `--features otel`; Phase 2 will activate this in the
+# default feature set once an OTLP exporter target is confirmed.
+tracing-opentelemetry = { workspace = true, optional = true }
+opentelemetry         = { workspace = true, optional = true }
+opentelemetry_sdk     = { workspace = true, optional = true }
 serde_norway = { version = "0.9.42", optional = true }
 
 # Built-in coding tools (read / write / edit / grep / glob / ls / bash) behind

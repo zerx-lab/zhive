@@ -34,7 +34,7 @@ static MIGRATIONS: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/state"
 /// use std::path::Path;
 /// use zhive_core::persistence::StateDb;
 /// let db = StateDb::open(Path::new("/tmp/demo/state.db")).await?;
-/// let threads = db.list_threads().await?;
+/// let threads = db.list_threads(None).await?;
 /// assert!(threads.is_empty());
 /// # Ok(())
 /// # }
@@ -99,7 +99,7 @@ impl StateDb {
     /// let db = StateDb::open(Path::new("/tmp/demo/state.db")).await?;
     /// let t = Thread {
     ///     id: ThreadId(Arc::from("thread:native/01")),
-    ///     session_id: None, forked_from: None,
+    ///     session_id: None, forked_from: None, subagent_parent: None,
     ///     preview: "hello".into(), ephemeral: false,
     ///     model_provider: "anthropic".into(),
     ///     created_at: 0, updated_at: 0,
@@ -116,32 +116,46 @@ impl StateDb {
         let status = thread_status_to_str(&thread.status);
         let source = thread_source_to_str(thread.source);
         let ephemeral: i64 = i64::from(thread.ephemeral);
-        let cwd = thread.cwd.to_str().unwrap_or("").to_owned();
+        let cwd = normalize_cwd(thread.cwd.to_str().unwrap_or(""));
         let session_id = thread.session_id.as_ref().map(|s| s.0.as_ref().to_owned());
         let forked_from = thread.forked_from.as_ref().map(|s| s.0.as_ref().to_owned());
+        let subagent_parent = thread
+            .subagent_parent
+            .as_ref()
+            .map(|s| s.0.as_ref().to_owned());
 
+        // The `preview` ON CONFLICT clause only overwrites the stored preview
+        // when the incoming value is non-empty. The preview is derived once at
+        // `start_turn` from the first user message; later idle / cancel
+        // snapshots carry an empty preview and must NOT clear it (mirrors
+        // codex's `set_preview_if_empty`).
         sqlx::query(
             r"
             INSERT INTO threads
-                (id, session_id, forked_from, preview, ephemeral, model_provider,
-                 created_at, updated_at, status, cwd, source, name)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                (id, session_id, forked_from, subagent_parent, preview, ephemeral,
+                 model_provider, created_at, updated_at, status, cwd, source, name)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
             ON CONFLICT(id) DO UPDATE SET
-                session_id    = excluded.session_id,
-                forked_from   = excluded.forked_from,
-                preview       = excluded.preview,
-                ephemeral     = excluded.ephemeral,
-                model_provider = excluded.model_provider,
-                updated_at    = excluded.updated_at,
-                status        = excluded.status,
-                cwd           = excluded.cwd,
-                source        = excluded.source,
-                name          = excluded.name
+                session_id      = excluded.session_id,
+                forked_from     = excluded.forked_from,
+                subagent_parent = excluded.subagent_parent,
+                preview         = CASE
+                                      WHEN excluded.preview != '' THEN excluded.preview
+                                      ELSE preview
+                                  END,
+                ephemeral       = excluded.ephemeral,
+                model_provider  = excluded.model_provider,
+                updated_at      = excluded.updated_at,
+                status          = excluded.status,
+                cwd             = excluded.cwd,
+                source          = excluded.source,
+                name            = excluded.name
             ",
         )
         .bind(thread.id.0.as_ref())
         .bind(session_id)
         .bind(forked_from)
+        .bind(subagent_parent)
         .bind(&thread.preview)
         .bind(ephemeral)
         .bind(&thread.model_provider)
@@ -151,6 +165,198 @@ impl StateDb {
         .bind(cwd)
         .bind(source)
         .bind(thread.name.as_deref())
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Updates the `model_provider` column on an existing threads row.
+    ///
+    /// Best-effort: when no row matches `thread_id` the statement affects zero
+    /// rows and still returns `Ok(())`.  The `model_id` is folded into the
+    /// stored provider string as `"{provider}/{model_id}"` so the single
+    /// `model_provider` column captures both without a schema change; an empty
+    /// `model_id` stores the bare provider.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::Sqlx`] on a database-level failure.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # async fn demo() -> zhive_core::persistence::StorageResult<()> {
+    /// use std::sync::Arc;
+    /// use std::path::Path;
+    /// use zhive_core::persistence::StateDb;
+    /// use zhive_proto::domain::ThreadId;
+    ///
+    /// let db = StateDb::open(Path::new("/tmp/demo/state.db")).await?;
+    /// let tid = ThreadId(Arc::from("thread:native/01"));
+    /// db.set_thread_model(&tid, "anthropic", "claude-opus-4").await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn set_thread_model(
+        &self,
+        thread_id: &ThreadId,
+        provider: &str,
+        model_id: &str,
+    ) -> StorageResult<()> {
+        let model_provider = if model_id.is_empty() {
+            provider.to_owned()
+        } else {
+            format!("{provider}/{model_id}")
+        };
+        sqlx::query(
+            r"
+            UPDATE threads
+            SET model_provider = ?1
+            WHERE id = ?2
+            ",
+        )
+        .bind(model_provider)
+        .bind(thread_id.0.as_ref())
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Updates the `name` column on an existing threads row.
+    ///
+    /// Best-effort: when no row matches `thread_id` the statement affects zero
+    /// rows and still returns `Ok(())`.  An empty `name` is stored as `NULL`
+    /// (cleared session name).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::Sqlx`] on a database-level failure.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # async fn demo() -> zhive_core::persistence::StorageResult<()> {
+    /// use std::sync::Arc;
+    /// use std::path::Path;
+    /// use zhive_core::persistence::StateDb;
+    /// use zhive_proto::domain::ThreadId;
+    ///
+    /// let db = StateDb::open(Path::new("/tmp/demo/state.db")).await?;
+    /// let tid = ThreadId(Arc::from("thread:native/01"));
+    /// db.set_thread_name(&tid, "release planning").await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn set_thread_name(&self, thread_id: &ThreadId, name: &str) -> StorageResult<()> {
+        let stored: Option<&str> = if name.is_empty() { None } else { Some(name) };
+        sqlx::query(
+            r"
+            UPDATE threads
+            SET name = ?1
+            WHERE id = ?2
+            ",
+        )
+        .bind(stored)
+        .bind(thread_id.0.as_ref())
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Sets the `preview` column only when the stored value is currently empty.
+    ///
+    /// Backfill entry point (idempotent): a thread whose preview was already
+    /// derived keeps it, so re-running backfill never clobbers a good preview.
+    /// An empty `preview` argument is a no-op (there is nothing to fill). The
+    /// `WHERE preview = ''` guard makes the set-if-empty atomic at the SQL level
+    /// rather than racing a read-then-write.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::Sqlx`] on a database-level failure.
+    ///
+    /// [`StorageError::Sqlx`]: super::StorageError::Sqlx
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # async fn demo() -> zhive_core::persistence::StorageResult<()> {
+    /// use std::sync::Arc;
+    /// use std::path::Path;
+    /// use zhive_core::persistence::StateDb;
+    /// use zhive_proto::domain::ThreadId;
+    ///
+    /// let db = StateDb::open(Path::new("/tmp/demo/state.db")).await?;
+    /// let tid = ThreadId(Arc::from("thread:native/01"));
+    /// db.set_thread_preview_if_empty(&tid, "first user message").await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn set_thread_preview_if_empty(
+        &self,
+        thread_id: &ThreadId,
+        preview: &str,
+    ) -> StorageResult<()> {
+        if preview.is_empty() {
+            return Ok(());
+        }
+        sqlx::query(
+            r"
+            UPDATE threads
+            SET preview = ?1
+            WHERE id = ?2 AND preview = ''
+            ",
+        )
+        .bind(preview)
+        .bind(thread_id.0.as_ref())
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Overwrites the `cwd` column on an existing threads row.
+    ///
+    /// The value is normalised the same way as on upsert (trailing slashes
+    /// trimmed) so a backfilled cwd indexes and filters identically to one
+    /// written live. Best-effort: no matching row affects zero rows and still
+    /// returns `Ok(())`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::Sqlx`] on a database-level failure.
+    ///
+    /// [`StorageError::Sqlx`]: super::StorageError::Sqlx
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # async fn demo() -> zhive_core::persistence::StorageResult<()> {
+    /// use std::sync::Arc;
+    /// use std::path::Path;
+    /// use zhive_core::persistence::StateDb;
+    /// use zhive_proto::domain::ThreadId;
+    ///
+    /// let db = StateDb::open(Path::new("/tmp/demo/state.db")).await?;
+    /// let tid = ThreadId(Arc::from("thread:native/01"));
+    /// db.set_thread_cwd(&tid, "/work/project").await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn set_thread_cwd(&self, thread_id: &ThreadId, cwd: &str) -> StorageResult<()> {
+        let normalized = normalize_cwd(cwd);
+        sqlx::query(
+            r"
+            UPDATE threads
+            SET cwd = ?1
+            WHERE id = ?2
+            ",
+        )
+        .bind(normalized)
+        .bind(thread_id.0.as_ref())
         .execute(&self.pool)
         .await?;
 
@@ -313,7 +519,12 @@ impl StateDb {
     // Read methods
     // ------------------------------------------------------------------
 
-    /// Returns all threads ordered by `updated_at DESC`.
+    /// Returns persisted threads ordered by `updated_at DESC`.
+    ///
+    /// When `cwd_filter` is `Some(path)`, only threads whose normalised `cwd`
+    /// column matches are returned (codex-style per-project listing); `None`
+    /// returns every thread. The filter path is normalised the same way as on
+    /// write (trailing slashes trimmed) so the two always agree.
     ///
     /// Turns are NOT populated (the `turns` field is always empty); callers
     /// that need turn data should fetch them separately.
@@ -330,24 +541,48 @@ impl StateDb {
     /// use std::path::Path;
     /// use zhive_core::persistence::StateDb;
     /// let db = StateDb::open(Path::new("/tmp/demo/state.db")).await?;
-    /// let threads = db.list_threads().await?;
-    /// for t in threads {
+    /// // All threads:
+    /// let all = db.list_threads(None).await?;
+    /// // Only threads created under /work/project:
+    /// let scoped = db.list_threads(Some("/work/project")).await?;
+    /// for t in all.into_iter().chain(scoped) {
     ///     println!("{}", t.id.0);
     /// }
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn list_threads(&self) -> StorageResult<Vec<Thread>> {
-        let rows = sqlx::query(
-            r"
-            SELECT id, session_id, forked_from, preview, ephemeral, model_provider,
-                   created_at, updated_at, status, cwd, source, name
-            FROM threads
-            ORDER BY updated_at DESC
-            ",
-        )
-        .fetch_all(&self.pool)
-        .await?;
+    pub async fn list_threads(&self, cwd_filter: Option<&str>) -> StorageResult<Vec<Thread>> {
+        let rows = match cwd_filter {
+            Some(cwd) => {
+                let normalized = normalize_cwd(cwd);
+                sqlx::query(
+                    r"
+                    SELECT id, session_id, forked_from, subagent_parent, preview,
+                           ephemeral, model_provider, created_at, updated_at,
+                           status, cwd, source, name
+                    FROM threads
+                    WHERE cwd = ?1
+                    ORDER BY updated_at DESC
+                    ",
+                )
+                .bind(normalized)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            None => {
+                sqlx::query(
+                    r"
+                    SELECT id, session_id, forked_from, subagent_parent, preview,
+                           ephemeral, model_provider, created_at, updated_at,
+                           status, cwd, source, name
+                    FROM threads
+                    ORDER BY updated_at DESC
+                    ",
+                )
+                .fetch_all(&self.pool)
+                .await?
+            }
+        };
 
         rows.into_iter().map(|row| row_to_thread(&row)).collect()
     }
@@ -377,8 +612,8 @@ impl StateDb {
     pub async fn get_thread(&self, id: &ThreadId) -> StorageResult<Option<Thread>> {
         let row = sqlx::query(
             r"
-            SELECT id, session_id, forked_from, preview, ephemeral, model_provider,
-                   created_at, updated_at, status, cwd, source, name
+            SELECT id, session_id, forked_from, subagent_parent, preview, ephemeral,
+                   model_provider, created_at, updated_at, status, cwd, source, name
             FROM threads
             WHERE id = ?1
             ",
@@ -436,6 +671,74 @@ impl StateDb {
             })
             .collect()
     }
+
+    /// Returns a `seq`-ordered page of a turn's items, applying `limit` /
+    /// `offset`.
+    ///
+    /// This is the lazy-load read entry point: a UI that evicted a turn's
+    /// in-memory items (see [`crate::state::TurnHistoryBuffer`]) refills it
+    /// page by page rather than reloading the whole transcript. A `limit`
+    /// of `0` returns no rows; a negative `limit` is normalised to `0` so it
+    /// is never forwarded as a malformed bind. The same row payload mapping
+    /// as [`Self::get_turn_items`] is used.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::Sqlx`] on a database failure or
+    /// [`StorageError::Json`] when a payload cannot be deserialised.
+    ///
+    /// [`StorageError::Sqlx`]: super::StorageError::Sqlx
+    /// [`StorageError::Json`]: super::StorageError::Json
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # async fn demo() -> zhive_core::persistence::StorageResult<()> {
+    /// use std::sync::Arc;
+    /// use std::path::Path;
+    /// use zhive_core::persistence::StateDb;
+    /// use zhive_proto::domain::TurnId;
+    /// let db = StateDb::open(Path::new("/tmp/demo/state.db")).await?;
+    /// let turn_id = TurnId(Arc::from("turn:t/0"));
+    /// // Second page of two items.
+    /// let page = db.load_items_page(&turn_id, 2, 2).await?;
+    /// assert!(page.is_empty()); // nothing inserted yet
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn load_items_page(
+        &self,
+        turn_id: &TurnId,
+        offset: i64,
+        limit: i64,
+    ) -> StorageResult<Vec<Item>> {
+        // A negative limit is meaningless for `LIMIT`; clamp to 0 so the
+        // query returns an empty page rather than a driver error.
+        let limit = limit.max(0);
+        let offset = offset.max(0);
+        let rows = sqlx::query(
+            r"
+            SELECT payload
+            FROM items
+            WHERE turn_id = ?1
+            ORDER BY seq
+            LIMIT ?2 OFFSET ?3
+            ",
+        )
+        .bind(turn_id.0.as_ref())
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|row| {
+                let payload: String = row.try_get("payload")?;
+                let item: Item = serde_json::from_str(&payload)?;
+                Ok(item)
+            })
+            .collect()
+    }
 }
 
 // ------------------------------------------------------------------
@@ -450,6 +753,7 @@ fn row_to_thread(row: &sqlx::sqlite::SqliteRow) -> StorageResult<Thread> {
     let id: String = row.try_get("id")?;
     let session_id: Option<String> = row.try_get("session_id")?;
     let forked_from: Option<String> = row.try_get("forked_from")?;
+    let subagent_parent: Option<String> = row.try_get("subagent_parent")?;
     let preview: String = row.try_get("preview")?;
     let ephemeral: i64 = row.try_get("ephemeral")?;
     let model_provider: String = row.try_get("model_provider")?;
@@ -467,6 +771,7 @@ fn row_to_thread(row: &sqlx::sqlite::SqliteRow) -> StorageResult<Thread> {
         id: ThreadId(Arc::from(id.as_str())),
         session_id: session_id.map(|s| AcpSessionId(Arc::from(s.as_str()))),
         forked_from: forked_from.map(|s| ThreadId(Arc::from(s.as_str()))),
+        subagent_parent: subagent_parent.map(|s| ThreadId(Arc::from(s.as_str()))),
         preview,
         ephemeral: ephemeral != 0,
         model_provider,
@@ -478,6 +783,24 @@ fn row_to_thread(row: &sqlx::sqlite::SqliteRow) -> StorageResult<Thread> {
         name,
         turns: vec![],
     })
+}
+
+// ------------------------------------------------------------------
+// cwd normalisation
+// ------------------------------------------------------------------
+
+/// Normalises a working-directory string for stable storage and filtering.
+///
+/// Trims trailing path separators (`/`) so that `"/work/project"` and
+/// `"/work/project/"` index and filter identically. The root path `"/"` and an
+/// empty string are preserved verbatim. Applied at both write
+/// ([`StateDb::upsert_thread`]) and filter ([`StateDb::list_threads`]) time so
+/// the two never disagree.
+fn normalize_cwd(cwd: &str) -> String {
+    if cwd == "/" || cwd.is_empty() {
+        return cwd.to_owned();
+    }
+    cwd.trim_end_matches('/').to_owned()
 }
 
 // ------------------------------------------------------------------
@@ -586,6 +909,7 @@ mod tests {
             id: ThreadId(Arc::from(id)),
             session_id: None,
             forked_from: None,
+            subagent_parent: None,
             preview: "test preview".into(),
             ephemeral: false,
             model_provider: "anthropic".into(),
@@ -608,7 +932,7 @@ mod tests {
         let (_dir, db) = open_temp().await;
 
         // Initially empty.
-        let threads = db.list_threads().await.unwrap();
+        let threads = db.list_threads(None).await.unwrap();
         assert!(threads.is_empty());
         assert!(
             db.get_thread(&ThreadId(Arc::from("thread:native/01")))
@@ -631,7 +955,7 @@ mod tests {
         assert_eq!(fetched.preview, "test preview");
 
         // Verify via list_threads.
-        let list = db.list_threads().await.unwrap();
+        let list = db.list_threads(None).await.unwrap();
         assert_eq!(list.len(), 1);
 
         // Upsert (update).
@@ -742,6 +1066,179 @@ mod tests {
             panic!("expected ToolCall");
         };
         assert_eq!(*status, zhive_proto::domain::ToolCallStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn load_items_page_returns_seq_ordered_window() {
+        let (_dir, db) = open_temp().await;
+
+        let thread_id = ThreadId(Arc::from("thread:native/page"));
+        let turn_id = TurnId(Arc::from("turn:thread:native/page/0"));
+        db.upsert_thread(&make_thread("thread:native/page"))
+            .await
+            .unwrap();
+        db.record_turn_start(&thread_id, &turn_id, 0).await.unwrap();
+
+        // Write 5 items with seq 0..5.
+        for seq in 0..5 {
+            let item = Item::AgentMessage {
+                id: ItemId(Arc::from(format!("item:page/{seq}").as_str())),
+                text: format!("m{seq}"),
+            };
+            db.append_item(&turn_id, seq, &item).await.unwrap();
+        }
+
+        // offset=2, limit=2 → items at seq 2 and 3.
+        let page = db.load_items_page(&turn_id, 2, 2).await.unwrap();
+        assert_eq!(page.len(), 2);
+        let texts: Vec<String> = page
+            .iter()
+            .map(|i| match i {
+                Item::AgentMessage { text, .. } => text.clone(),
+                other => panic!("expected AgentMessage, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(texts, vec!["m2".to_owned(), "m3".to_owned()]);
+
+        // A zero (and a negative) limit returns an empty page.
+        assert!(db.load_items_page(&turn_id, 0, 0).await.unwrap().is_empty());
+        assert!(
+            db.load_items_page(&turn_id, 0, -1)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // cwd filtering + normalisation
+    // ------------------------------------------------------------------
+
+    /// `normalize_cwd` trims trailing slashes while preserving root and empty.
+    #[test]
+    fn normalize_cwd_trims_trailing_slashes() {
+        assert_eq!(normalize_cwd("/work/project"), "/work/project");
+        assert_eq!(normalize_cwd("/work/project/"), "/work/project");
+        assert_eq!(normalize_cwd("/work/project///"), "/work/project");
+        assert_eq!(normalize_cwd("/"), "/");
+        assert_eq!(normalize_cwd(""), "");
+    }
+
+    /// `list_threads(Some(cwd))` returns only threads under that directory, and
+    /// a trailing slash on the filter still matches a row stored without one.
+    #[tokio::test]
+    async fn list_threads_filters_by_cwd_with_normalisation() {
+        let (_dir, db) = open_temp().await;
+
+        let mut a = make_thread("thread:native/a");
+        a.cwd = PathBuf::from("/work/alpha");
+        let mut b = make_thread("thread:native/b");
+        // Stored with a trailing slash; must normalise to "/work/alpha".
+        b.cwd = PathBuf::from("/work/alpha/");
+        let mut c = make_thread("thread:native/c");
+        c.cwd = PathBuf::from("/work/beta");
+
+        db.upsert_thread(&a).await.unwrap();
+        db.upsert_thread(&b).await.unwrap();
+        db.upsert_thread(&c).await.unwrap();
+
+        // No filter: all three.
+        assert_eq!(db.list_threads(None).await.unwrap().len(), 3);
+
+        // Filter by /work/alpha matches a and b (b stored with trailing slash).
+        let alpha = db.list_threads(Some("/work/alpha")).await.unwrap();
+        assert_eq!(alpha.len(), 2);
+
+        // A trailing slash on the *filter* still matches.
+        let alpha_slash = db.list_threads(Some("/work/alpha/")).await.unwrap();
+        assert_eq!(alpha_slash.len(), 2);
+
+        // Filter by /work/beta matches only c.
+        let beta = db.list_threads(Some("/work/beta")).await.unwrap();
+        assert_eq!(beta.len(), 1);
+        assert_eq!(beta[0].id.0.as_ref(), "thread:native/c");
+
+        // An unrelated directory matches nothing.
+        assert!(db.list_threads(Some("/nope")).await.unwrap().is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // subagent_parent persistence
+    // ------------------------------------------------------------------
+
+    /// `subagent_parent` round-trips through `upsert_thread` →
+    /// `get_thread` / `list_threads`.
+    #[tokio::test]
+    async fn subagent_parent_round_trips() {
+        let (_dir, db) = open_temp().await;
+
+        let parent = ThreadId(Arc::from("thread:native/parent"));
+        let mut child = make_thread("thread:subagent/parent/0");
+        child.subagent_parent = Some(parent.clone());
+        child.source = ThreadSource::Subagent;
+
+        db.upsert_thread(&make_thread("thread:native/parent"))
+            .await
+            .unwrap();
+        db.upsert_thread(&child).await.unwrap();
+
+        let fetched = db
+            .get_thread(&ThreadId(Arc::from("thread:subagent/parent/0")))
+            .await
+            .unwrap()
+            .expect("child present");
+        assert_eq!(fetched.subagent_parent.as_ref(), Some(&parent));
+        assert_eq!(fetched.source, ThreadSource::Subagent);
+
+        // A top-level thread has no parent link.
+        let top = db
+            .get_thread(&ThreadId(Arc::from("thread:native/parent")))
+            .await
+            .unwrap()
+            .expect("parent present");
+        assert!(top.subagent_parent.is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // preview set-if-empty semantics
+    // ------------------------------------------------------------------
+
+    /// A first upsert sets a non-empty preview; a later upsert carrying an
+    /// **empty** preview must NOT clear it (mirrors codex `set_preview_if_empty`).
+    #[tokio::test]
+    async fn upsert_keeps_preview_when_later_snapshot_is_empty() {
+        let (_dir, db) = open_temp().await;
+
+        let mut first = make_thread("thread:native/pv");
+        first.preview = "first user message".into();
+        db.upsert_thread(&first).await.unwrap();
+
+        // A later idle snapshot carries an empty preview.
+        let mut idle = make_thread("thread:native/pv");
+        idle.preview = String::new();
+        idle.updated_at = 5_000;
+        db.upsert_thread(&idle).await.unwrap();
+
+        let fetched = db
+            .get_thread(&ThreadId(Arc::from("thread:native/pv")))
+            .await
+            .unwrap()
+            .expect("present");
+        assert_eq!(
+            fetched.preview, "first user message",
+            "empty later snapshot must not clear the derived preview"
+        );
+
+        // A later non-empty preview DOES overwrite.
+        let mut renamed = make_thread("thread:native/pv");
+        renamed.preview = "edited preview".into();
+        db.upsert_thread(&renamed).await.unwrap();
+        let fetched2 = db
+            .get_thread(&ThreadId(Arc::from("thread:native/pv")))
+            .await
+            .unwrap()
+            .expect("present");
+        assert_eq!(fetched2.preview, "edited preview");
     }
 }
 

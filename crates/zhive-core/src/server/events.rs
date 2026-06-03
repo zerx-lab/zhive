@@ -21,6 +21,11 @@
 //! | `SessionAborted`           | `events/session_aborted`       |
 //! | `PermissionRequested`      | `events/permission_requested`  |
 //! | `Usage`                    | `events/usage`                 |
+//! | `TurnSuspended`            | `events/turn_suspended`        |
+//! | `TurnResumed`              | `events/turn_resumed`          |
+//! | `ThreadForked`             | `events/thread_forked`         |
+//! | `SubagentStarted`          | `events/subagent_started`      |
+//! | `SubagentCompleted`        | `events/subagent_completed`    |
 //!
 //! ## Per-connection filtering
 //!
@@ -41,6 +46,9 @@ use zhive_proto::Message;
 use zhive_proto::Notification;
 use zhive_proto::domain::{ItemId, ThreadId, TurnError, TurnId};
 use zhive_proto::hook::EnginePhase;
+use zhive_proto::permission::{
+    METHOD_TURN_RESUMED, METHOD_TURN_SUSPENDED, TurnResumedNotification, TurnSuspendedNotification,
+};
 
 use crate::engine::{EngineEvent, TurnRejectionReason};
 
@@ -253,6 +261,63 @@ struct PermissionRequestedPayload<'a> {
     request: &'a zhive_proto::permission::RequestPermissionRequest,
 }
 
+/// JSON-RPC method name for the [`EngineEvent::SubagentStarted`] notification.
+pub const METHOD_SUBAGENT_STARTED: &str = "events/subagent_started";
+
+/// JSON-RPC method name for the [`EngineEvent::SubagentCompleted`] notification.
+pub const METHOD_SUBAGENT_COMPLETED: &str = "events/subagent_completed";
+
+/// Wire-form payload for [`EngineEvent::SubagentStarted`].
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SubagentStartedPayload<'a> {
+    parent_thread_id: &'a ThreadId,
+    child_thread_id: &'a ThreadId,
+    /// The subagent's declared name / type; omitted when absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent_type: Option<&'a str>,
+    /// The subagent's declared description; omitted when absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<&'a str>,
+}
+
+/// Wire-form payload for [`EngineEvent::SubagentCompleted`].
+///
+/// The child's `final_message` item is intentionally not serialised here:
+/// external clients observe the child's items through `events/item_appended`
+/// on the child thread. This notification carries only the parent ↔ child
+/// relationship plus a boolean telling whether a final message was produced.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SubagentCompletedPayload<'a> {
+    parent_thread_id: &'a ThreadId,
+    child_thread_id: &'a ThreadId,
+    /// Whether the child turn delivered a non-empty final message.
+    has_final_message: bool,
+}
+
+/// Wire-form payload for [`EngineEvent::ThreadForked`].
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ThreadForkedPayload<'a> {
+    source_thread_id: &'a ThreadId,
+    new_thread_id: &'a ThreadId,
+    /// Inclusive item the fork was taken at; omitted for a full-history fork.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    forked_from_item: Option<&'a ItemId>,
+}
+
+/// Returns the current time as seconds since the Unix epoch.
+///
+/// Used to stamp `events/turn_suspended` / `events/turn_resumed` notifications,
+/// whose `EngineEvent` does not carry a timestamp. Saturates to `0` on clock
+/// errors and to [`i64::MAX`] on overflow, so it never panics.
+fn unix_now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs().try_into().unwrap_or(i64::MAX))
+}
+
 /// Converts an [`EngineEvent`] into a [`Notification`] ready to ship
 /// over the wire.
 ///
@@ -370,12 +435,78 @@ pub fn engine_event_to_notification(event: &EngineEvent) -> Option<Notification>
             })
             .ok()?,
         ),
-        // SubagentCompleted is an internal engine event. It is
-        // suppressed from the wire notification stream in Phase 1 —
-        // external clients observe subagent outcomes via ItemAppended
-        // events on the child thread rather than a dedicated wire type.
-        // Returning `None` causes the forwarder to silently skip it.
-        EngineEvent::SubagentCompleted { .. } => return None,
+        EngineEvent::TurnSuspended {
+            thread_id,
+            turn_id,
+            request_id,
+            reason,
+        } => (
+            METHOD_TURN_SUSPENDED,
+            serde_json::to_value(TurnSuspendedNotification::new(
+                thread_id.clone(),
+                turn_id.clone(),
+                request_id.0.as_ref(),
+                reason.clone(),
+                unix_now_secs(),
+            ))
+            .ok()?,
+        ),
+        EngineEvent::TurnResumed { thread_id, turn_id } => (
+            METHOD_TURN_RESUMED,
+            serde_json::to_value(TurnResumedNotification::new(
+                thread_id.clone(),
+                turn_id.clone(),
+                unix_now_secs(),
+            ))
+            .ok()?,
+        ),
+        EngineEvent::ThreadForked {
+            source_thread_id,
+            new_thread_id,
+            forked_from_item,
+        } => (
+            "events/thread_forked",
+            serde_json::to_value(ThreadForkedPayload {
+                source_thread_id,
+                new_thread_id,
+                forked_from_item: forked_from_item.as_ref(),
+            })
+            .ok()?,
+        ),
+        EngineEvent::SubagentStarted {
+            parent_thread_id,
+            child_thread_id,
+            agent_type,
+            description,
+        } => (
+            METHOD_SUBAGENT_STARTED,
+            serde_json::to_value(SubagentStartedPayload {
+                parent_thread_id,
+                child_thread_id,
+                agent_type: agent_type.as_deref(),
+                description: description.as_deref(),
+            })
+            .ok()?,
+        ),
+        EngineEvent::SubagentCompleted {
+            parent_thread_id,
+            child_thread_id,
+            final_message,
+        } => (
+            METHOD_SUBAGENT_COMPLETED,
+            serde_json::to_value(SubagentCompletedPayload {
+                parent_thread_id,
+                child_thread_id,
+                has_final_message: final_message.is_some(),
+            })
+            .ok()?,
+        ),
+        // Internal engine event suppressed from the wire stream in Phase 1.
+        //
+        // SavePoint is a persistence marker (deferred session writes flushed);
+        // clients observe durable completion through TurnCompleted. Returning
+        // `None` causes the forwarder to silently skip it.
+        EngineEvent::SavePoint { .. } => return None,
     };
     Some(Notification::new(method, Some(params)))
 }
@@ -534,6 +665,129 @@ mod tests {
         let p = n.params.as_ref().unwrap();
         assert_eq!(p["itemId"], "item:0");
         assert!(p["item"].is_object());
+    }
+
+    #[test]
+    fn turn_suspended_maps_to_events_turn_suspended() {
+        use crate::engine::PermissionRequestId;
+        let ev = EngineEvent::TurnSuspended {
+            thread_id: tid("thread:native/s"),
+            turn_id: turn_id("turn:thread:native/s/0"),
+            request_id: PermissionRequestId(Arc::from("perm:3")),
+            reason: Some("awaiting user".into()),
+        };
+        let n = engine_event_to_notification(&ev).unwrap();
+        assert_eq!(n.method, "events/turn_suspended");
+        let p = n.params.as_ref().unwrap();
+        assert_eq!(p["threadId"], "thread:native/s");
+        assert_eq!(p["turnId"], "turn:thread:native/s/0");
+        assert_eq!(p["requestId"], "perm:3");
+        assert_eq!(p["reason"], "awaiting user");
+        assert!(p["suspendedAt"].is_i64());
+    }
+
+    #[test]
+    fn turn_resumed_maps_to_events_turn_resumed() {
+        let ev = EngineEvent::TurnResumed {
+            thread_id: tid("thread:native/r"),
+            turn_id: turn_id("turn:thread:native/r/0"),
+        };
+        let n = engine_event_to_notification(&ev).unwrap();
+        assert_eq!(n.method, "events/turn_resumed");
+        let p = n.params.as_ref().unwrap();
+        assert_eq!(p["threadId"], "thread:native/r");
+        assert_eq!(p["turnId"], "turn:thread:native/r/0");
+        assert!(p["resumedAt"].is_i64());
+    }
+
+    #[test]
+    fn thread_forked_maps_to_events_thread_forked() {
+        use zhive_proto::domain::ItemId;
+        let ev = EngineEvent::ThreadForked {
+            source_thread_id: tid("thread:native/src"),
+            new_thread_id: tid("thread:native/fork/src/3"),
+            forked_from_item: Some(ItemId(Arc::from("item:src/1"))),
+        };
+        let n = engine_event_to_notification(&ev).unwrap();
+        assert_eq!(n.method, "events/thread_forked");
+        let p = n.params.as_ref().unwrap();
+        assert_eq!(p["sourceThreadId"], "thread:native/src");
+        assert_eq!(p["newThreadId"], "thread:native/fork/src/3");
+        assert_eq!(p["forkedFromItem"], "item:src/1");
+    }
+
+    #[test]
+    fn thread_forked_full_history_omits_item() {
+        let ev = EngineEvent::ThreadForked {
+            source_thread_id: tid("thread:native/src"),
+            new_thread_id: tid("thread:native/fork/src/4"),
+            forked_from_item: None,
+        };
+        let n = engine_event_to_notification(&ev).unwrap();
+        let p = n.params.as_ref().unwrap();
+        assert!(p.get("forkedFromItem").is_none());
+    }
+
+    #[test]
+    fn subagent_started_maps_to_events_subagent_started() {
+        let ev = EngineEvent::SubagentStarted {
+            parent_thread_id: tid("thread:native/parent"),
+            child_thread_id: tid("thread:subagent/native/parent/0"),
+            agent_type: Some("scout".into()),
+            description: Some("read-only scout".into()),
+        };
+        let n = engine_event_to_notification(&ev).unwrap();
+        assert_eq!(n.method, "events/subagent_started");
+        let p = n.params.as_ref().unwrap();
+        assert_eq!(p["parentThreadId"], "thread:native/parent");
+        assert_eq!(p["childThreadId"], "thread:subagent/native/parent/0");
+        assert_eq!(p["agentType"], "scout");
+        assert_eq!(p["description"], "read-only scout");
+    }
+
+    #[test]
+    fn subagent_started_omits_absent_optional_fields() {
+        let ev = EngineEvent::SubagentStarted {
+            parent_thread_id: tid("thread:native/parent"),
+            child_thread_id: tid("thread:subagent/native/parent/1"),
+            agent_type: None,
+            description: None,
+        };
+        let n = engine_event_to_notification(&ev).unwrap();
+        let p = n.params.as_ref().unwrap();
+        assert!(p.get("agentType").is_none());
+        assert!(p.get("description").is_none());
+    }
+
+    #[test]
+    fn subagent_completed_maps_to_events_subagent_completed() {
+        use zhive_proto::domain::ItemId;
+        let ev = EngineEvent::SubagentCompleted {
+            parent_thread_id: tid("thread:native/parent"),
+            child_thread_id: tid("thread:subagent/native/parent/2"),
+            final_message: Some(Arc::new(Item::AgentMessage {
+                id: ItemId(Arc::from("item:0")),
+                text: "done".into(),
+            })),
+        };
+        let n = engine_event_to_notification(&ev).unwrap();
+        assert_eq!(n.method, "events/subagent_completed");
+        let p = n.params.as_ref().unwrap();
+        assert_eq!(p["parentThreadId"], "thread:native/parent");
+        assert_eq!(p["childThreadId"], "thread:subagent/native/parent/2");
+        assert_eq!(p["hasFinalMessage"], true);
+    }
+
+    #[test]
+    fn subagent_completed_without_final_message_reports_false() {
+        let ev = EngineEvent::SubagentCompleted {
+            parent_thread_id: tid("thread:native/parent"),
+            child_thread_id: tid("thread:subagent/native/parent/3"),
+            final_message: None,
+        };
+        let n = engine_event_to_notification(&ev).unwrap();
+        let p = n.params.as_ref().unwrap();
+        assert_eq!(p["hasFinalMessage"], false);
     }
 
     #[test]

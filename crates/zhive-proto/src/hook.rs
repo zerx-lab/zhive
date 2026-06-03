@@ -16,12 +16,16 @@
 //!
 //! # Unknown events
 //!
-//! [`HookEvent`] is `#[non_exhaustive]` so callers must keep a wildcard
-//! arm and decode unknown events to a side channel. A first-class
-//! `Unknown` variant is intentionally **not** part of Phase 1: it would
-//! require a hand-written [`serde::Deserialize`] impl that defers to a
-//! raw [`serde_json::Value`], which B5 (the hook host) will land
-//! together with the dispatch loop.
+//! [`HookEvent`] is `#[non_exhaustive]` and decodes any unrecognised
+//! `hook_event_name` into the [`HookEvent::Unknown`] variant rather than
+//! failing — a future SDK event must never crash the dispatch loop (red
+//! line A4). The variant is produced **only** by deserialization: it is
+//! not subscribable, the dispatch loop never constructs it, and it has no
+//! defined serialization (the [`Serialize`] derive skips it). A
+//! hand-written [`serde::Deserialize`] impl reads the tag first, routes
+//! known events through the typed payload structs, and parks everything
+//! else (or a missing tag) under `Unknown` with the full payload
+//! preserved.
 //!
 //! [`PhaseTransition`]: HookEvent::PhaseTransition
 
@@ -153,10 +157,13 @@ pub struct HookEventBase {
 // HookEvent
 // ============================================================
 
-/// 14 + 1 hook events emitted by the engine.
+/// 14 + 1 hook events emitted by the engine, plus an `Unknown` fallback.
 ///
-/// Internally tagged by `hook_event_name`. Every variant's payload
-/// flattens [`HookEventBase`] into the JSON root.
+/// Internally tagged by `hook_event_name`. Every typed variant's payload
+/// flattens [`HookEventBase`] into the JSON root. A hand-written
+/// [`Deserialize`] impl downgrades any unrecognised tag (or a payload with
+/// no tag at all) to [`HookEvent::Unknown`] instead of erroring, so a
+/// future SDK event can never crash the dispatch loop.
 ///
 /// # Examples
 ///
@@ -171,8 +178,13 @@ pub struct HookEventBase {
 /// }"#;
 /// let ev: HookEvent = serde_json::from_str(payload).unwrap();
 /// assert!(matches!(ev, HookEvent::Stop(_)));
+///
+/// // An event the SDK adds in the future degrades to `Unknown`.
+/// let future = r#"{ "hook_event_name": "FutureEvent", "extra": 42 }"#;
+/// let ev: HookEvent = serde_json::from_str(future).unwrap();
+/// assert!(matches!(ev, HookEvent::Unknown { .. }));
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(tag = "hook_event_name")]
 #[non_exhaustive]
@@ -199,6 +211,16 @@ pub enum HookEvent {
     PreCompact(PreCompactInput),
     /// Fired immediately after context compaction completes.
     PostCompact(PostCompactInput),
+    /// Reserved: fired immediately before a branch summary runs.
+    ///
+    /// Type reserved for the fork/branch-summary feature; dispatch wiring
+    /// is deferred. Aligns with decision-diffs §1.7.
+    PreBranchSummary(PreBranchSummaryInput),
+    /// Reserved: fired immediately after a branch summary completes.
+    ///
+    /// Type reserved for the fork/branch-summary feature; dispatch wiring
+    /// is deferred. Aligns with decision-diffs §1.7.
+    PostBranchSummary(PostBranchSummaryInput),
     /// Fired when a permission/request reverse RPC is about to ship.
     PermissionRequest(PermissionRequestInput),
     /// Fired when the agent decides to stop.
@@ -211,6 +233,77 @@ pub enum HookEvent {
     ToolApprovalChange(ToolApprovalChangeInput),
     /// Fired when the engine moves between phases (15th event).
     PhaseTransition(PhaseTransitionInput),
+    /// Graceful fallback for an unrecognised `hook_event_name`.
+    ///
+    /// Produced **only** by [`Deserialize`]; the dispatch loop never
+    /// constructs it and it is not subscribable. It preserves the
+    /// original tag (`name`) and the full JSON `payload` so callers can
+    /// inspect or log a future SDK event without losing data. The
+    /// [`Serialize`] derive skips this variant: it has no defined wire
+    /// form (an unknown event is decode-only), and attempting to
+    /// serialize it returns an `Err` rather than emitting bytes.
+    #[serde(skip)]
+    #[cfg_attr(feature = "schema", schemars(skip))]
+    Unknown {
+        /// Raw `hook_event_name`, or an empty string when the tag was
+        /// absent.
+        name: String,
+        /// The complete JSON object as received.
+        payload: Value,
+    },
+}
+
+/// The `hook_event_name` discriminator key, shared by serde and the
+/// hand-written [`Deserialize`] impl below.
+const HOOK_EVENT_NAME_KEY: &str = "hook_event_name";
+
+impl<'de> Deserialize<'de> for HookEvent {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // Decode the whole object once, then dispatch on the tag. Routing
+        // each known tag back through its typed payload preserves the
+        // `#[serde(flatten)] base` behaviour, while any unrecognised tag
+        // (or a missing one) falls back to `Unknown` instead of erroring.
+        let payload = Value::deserialize(deserializer)?;
+        let name = payload
+            .get(HOOK_EVENT_NAME_KEY)
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+
+        // Routes a known tag through its typed payload struct.
+        macro_rules! typed {
+            ($variant:ident) => {
+                serde_json::from_value(payload.clone())
+                    .map(HookEvent::$variant)
+                    .map_err(serde::de::Error::custom)
+            };
+        }
+
+        match name.as_str() {
+            "PreToolUse" => typed!(PreToolUse),
+            "PostToolUse" => typed!(PostToolUse),
+            "PostToolUseFailure" => typed!(PostToolUseFailure),
+            "UserPromptSubmit" => typed!(UserPromptSubmit),
+            "SessionStart" => typed!(SessionStart),
+            "SessionEnd" => typed!(SessionEnd),
+            "SubagentStart" => typed!(SubagentStart),
+            "SubagentStop" => typed!(SubagentStop),
+            "PreCompact" => typed!(PreCompact),
+            "PostCompact" => typed!(PostCompact),
+            "PreBranchSummary" => typed!(PreBranchSummary),
+            "PostBranchSummary" => typed!(PostBranchSummary),
+            "PermissionRequest" => typed!(PermissionRequest),
+            "Stop" => typed!(Stop),
+            "Notification" => typed!(Notification),
+            "Setup" => typed!(Setup),
+            "ToolApprovalChange" => typed!(ToolApprovalChange),
+            "PhaseTransition" => typed!(PhaseTransition),
+            _ => Ok(HookEvent::Unknown { name, payload }),
+        }
+    }
 }
 
 // ============================================================
@@ -455,6 +548,44 @@ pub struct PostCompactInput {
     pub entries_compacted: u32,
 }
 
+/// Payload of [`HookEvent::PreBranchSummary`] (reserved).
+///
+/// Reserved for the fork/branch-summary feature. Mirrors the shape of
+/// [`PreCompactInput`]: it carries the source thread a branch was forked
+/// from plus how many transcript entries the summary will cover. Dispatch
+/// wiring is deferred; only the type and its serde shape exist today.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct PreBranchSummaryInput {
+    /// Flattened generic fields.
+    #[serde(flatten)]
+    pub base: HookEventBase,
+    /// Thread the branch was forked from.
+    pub source_thread_id: String,
+    /// Number of transcript entries the branch summary will cover.
+    pub entries_count: u32,
+}
+
+/// Payload of [`HookEvent::PostBranchSummary`] (reserved).
+///
+/// Dual of [`PreBranchSummaryInput`]. Reserved for the fork/branch-summary
+/// feature; dispatch wiring is deferred.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct PostBranchSummaryInput {
+    /// Flattened generic fields.
+    #[serde(flatten)]
+    pub base: HookEventBase,
+    /// Thread the branch was forked from.
+    pub source_thread_id: String,
+    /// Number of transcript entries the branch summary covered.
+    pub entries_summarized: u32,
+}
+
 /// Payload of [`HookEvent::PermissionRequest`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
@@ -692,6 +823,98 @@ mod tests {
         });
         let v = serde_json::to_value(&ev).unwrap();
         assert_eq!(v["reason"], "prompt_input_exit");
+    }
+
+    #[test]
+    fn unknown_tag_falls_back_and_preserves_payload() {
+        let payload = r#"{
+            "hook_event_name": "FutureEvent",
+            "sessionId": "thread:native/abc",
+            "extra": 42
+        }"#;
+        let ev: HookEvent = serde_json::from_str(payload).unwrap();
+        match ev {
+            HookEvent::Unknown { name, payload } => {
+                assert_eq!(name, "FutureEvent");
+                // Full payload is preserved, including the unknown field.
+                assert_eq!(payload["extra"], 42);
+                assert_eq!(payload["hook_event_name"], "FutureEvent");
+                assert_eq!(payload["sessionId"], "thread:native/abc");
+            }
+            other => panic!("expected Unknown, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_tag_falls_back_to_unknown() {
+        // A payload with no `hook_event_name` must not panic or error.
+        let payload = r#"{ "sessionId": "thread:native/abc" }"#;
+        let ev: HookEvent = serde_json::from_str(payload).unwrap();
+        match ev {
+            HookEvent::Unknown { name, payload } => {
+                assert_eq!(name, "", "absent tag yields empty name");
+                assert_eq!(payload["sessionId"], "thread:native/abc");
+            }
+            other => panic!("expected Unknown, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn known_tag_still_typed_not_unknown() {
+        // Regression guard: known events keep decoding to their typed
+        // variant rather than degrading to Unknown.
+        let ev = HookEvent::PreToolUse(PreToolUseInput {
+            base: base(),
+            tool_name: "read_file".into(),
+            tool_input: serde_json::json!({"path": "/tmp/x"}),
+            tool_use_id: "tool-1".into(),
+        });
+        let s = serde_json::to_string(&ev).unwrap();
+        let back: HookEvent = serde_json::from_str(&s).unwrap();
+        assert!(matches!(back, HookEvent::PreToolUse(_)));
+        assert_eq!(ev, back);
+    }
+
+    #[test]
+    fn unknown_variant_is_not_serialized() {
+        // `Unknown` has no defined wire form: the `#[serde(skip)]` derive
+        // refuses to serialize it, returning an `Err` instead of panicking
+        // or emitting bytes. This enforces the decode-only contract.
+        let ev = HookEvent::Unknown {
+            name: "FutureEvent".into(),
+            payload: serde_json::json!({"hook_event_name": "FutureEvent"}),
+        };
+        assert!(serde_json::to_value(&ev).is_err());
+    }
+
+    #[test]
+    fn pre_branch_summary_round_trip() {
+        let ev = HookEvent::PreBranchSummary(PreBranchSummaryInput {
+            base: base(),
+            source_thread_id: "thread:native/src".into(),
+            entries_count: 7,
+        });
+        let v = serde_json::to_value(&ev).unwrap();
+        assert_eq!(v["hook_event_name"], "PreBranchSummary");
+        assert_eq!(v["sourceThreadId"], "thread:native/src");
+        assert_eq!(v["entriesCount"], 7);
+        assert_eq!(v["sessionId"], "thread:native/abc");
+        let back: HookEvent = serde_json::from_str(&serde_json::to_string(&ev).unwrap()).unwrap();
+        assert_eq!(ev, back);
+    }
+
+    #[test]
+    fn post_branch_summary_round_trip() {
+        let ev = HookEvent::PostBranchSummary(PostBranchSummaryInput {
+            base: base(),
+            source_thread_id: "thread:native/src".into(),
+            entries_summarized: 7,
+        });
+        let v = serde_json::to_value(&ev).unwrap();
+        assert_eq!(v["hook_event_name"], "PostBranchSummary");
+        assert_eq!(v["entriesSummarized"], 7);
+        let back: HookEvent = serde_json::from_str(&serde_json::to_string(&ev).unwrap()).unwrap();
+        assert_eq!(ev, back);
     }
 }
 

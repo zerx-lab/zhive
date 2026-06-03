@@ -39,6 +39,55 @@ pub enum Action {
         /// The user's decision.
         outcome: PermissionOutcome,
     },
+    /// Open the session-list overlay (populated by an async `thread/list`).
+    ///
+    /// `filter` selects whether the async listing is scoped to the current
+    /// working directory or lists every persisted thread.
+    OpenSessionList {
+        /// Which set of sessions to fetch (current cwd vs. all).
+        filter: SessionFilter,
+    },
+    /// Resume a persisted thread: restore its history and switch the view to it.
+    ResumeSession {
+        /// The thread to resume.
+        thread_id: zhive_proto::domain::ThreadId,
+    },
+}
+
+/// Which set of persisted sessions the `/session` picker lists.
+///
+/// Defaults to [`SessionFilter::All`]: legacy recordings were stored with a
+/// placeholder `cwd` (`"."`), so a cwd filter would hide them; listing all by
+/// default keeps every session reachable. The user toggles to
+/// [`SessionFilter::Cwd`] (current project only) with Tab.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum SessionFilter {
+    /// List every persisted thread, regardless of working directory.
+    #[default]
+    All,
+    /// List only threads created under the current working directory.
+    Cwd,
+}
+
+impl SessionFilter {
+    /// Returns the other mode (the `All` ⇄ `Cwd` toggle).
+    #[must_use]
+    pub fn toggled(self) -> Self {
+        match self {
+            Self::All => Self::Cwd,
+            Self::Cwd => Self::All,
+        }
+    }
+
+    /// A short label for the footer hint (`"all"` / `"cwd"`).
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Cwd => "cwd",
+        }
+    }
 }
 
 /// A modal overlay layered above the conversation.
@@ -57,6 +106,17 @@ pub enum Overlay {
         request_id: String,
         /// The prompt to render.
         request: Box<RequestPermissionRequest>,
+    },
+    /// The history-session picker (`/session`), a filterable select list.
+    SessionList {
+        /// All sessions returned by `thread/list`, newest first.
+        entries: Vec<crate::rpc::SessionEntry>,
+        /// Index of the highlighted entry among the filtered rows.
+        selected: usize,
+        /// Live fuzzy-filter query typed by the user.
+        query: String,
+        /// Whether the listing is scoped to the current cwd or lists all.
+        filter_mode: SessionFilter,
     },
 }
 
@@ -104,6 +164,7 @@ pub fn builtin_commands() -> Vec<SlashCommand> {
         ("theme", "switch theme — dark | light | mono"),
         ("accent", "switch accent — cyan | amber | lime | magenta"),
         ("compact", "summarize and condense the conversation"),
+        ("session", "list and resume past sessions"),
         ("clear", "start a fresh thread"),
         ("quit", "exit zap"),
     ]
@@ -325,7 +386,71 @@ impl App {
                 request_id,
                 request,
             }) => self.resolve_approval(key, request_id, &request),
+            Some(Overlay::SessionList {
+                entries,
+                selected,
+                query,
+                filter_mode,
+            }) => self.on_session_list_key(key, entries, selected, query, filter_mode),
         }
+    }
+
+    /// Key handling for the `/session` picker: navigate, filter, resume, toggle
+    /// the cwd/all scope, cancel.
+    ///
+    /// The overlay was `take`n by the caller; this re-installs it (with updated
+    /// state) for every key except Enter (resume), Esc (cancel), and Tab (which
+    /// closes this overlay and re-opens it with the toggled scope via an async
+    /// re-fetch). Navigation and filtering keep the highlight within the
+    /// filtered rows.
+    fn on_session_list_key(
+        &mut self,
+        key: KeyEvent,
+        entries: Vec<crate::rpc::SessionEntry>,
+        selected: usize,
+        mut query: String,
+        filter_mode: SessionFilter,
+    ) -> Action {
+        let filtered = filter_sessions(&entries, &query);
+        let max = filtered.len().saturating_sub(1);
+        let mut selected = selected.min(max);
+        match key.code {
+            // Esc closes the overlay (already `take`n) with no further action.
+            KeyCode::Esc => return Action::None,
+            // Tab flips the listing scope. The overlay stays `take`n (closed);
+            // the async re-fetch re-opens it with the new mode's results.
+            KeyCode::Tab => {
+                return Action::OpenSessionList {
+                    filter: filter_mode.toggled(),
+                };
+            }
+            KeyCode::Up => selected = selected.saturating_sub(1),
+            KeyCode::Down => selected = (selected + 1).min(max),
+            KeyCode::Enter => {
+                if let Some(entry) = filtered.get(selected) {
+                    return Action::ResumeSession {
+                        thread_id: entry.id.clone(),
+                    };
+                }
+                // Empty list: nothing to resume; keep the overlay open.
+            }
+            KeyCode::Backspace => {
+                query.pop();
+                selected = 0;
+            }
+            KeyCode::Char(c) => {
+                query.push(c);
+                selected = 0;
+            }
+            _ => {}
+        }
+        self.overlay = Some(Overlay::SessionList {
+            entries,
+            selected,
+            query,
+            filter_mode,
+        });
+        Action::None
     }
 
     /// Maps an approval keypress to a [`PermissionOutcome`].
@@ -526,6 +651,10 @@ impl App {
             "quit" | "exit" | "q" => Action::Quit,
             "clear" | "new" => Action::Clear,
             "compact" => Action::Compact,
+            // Open the picker in the default scope (All); Tab toggles to cwd.
+            "session" | "resume" => Action::OpenSessionList {
+                filter: SessionFilter::default(),
+            },
             "help" | "?" => {
                 self.overlay = Some(Overlay::Help);
                 Action::None
@@ -585,6 +714,50 @@ impl App {
         self.palette = Palette::resolve(self.theme, self.accent);
         self.flash = Some(format!("accent: {name:?}"));
     }
+}
+
+/// Filters session entries by a case-insensitive substring of title or preview.
+///
+/// An empty query matches everything, preserving the newest-first order. Used
+/// by both the `/session` key handler and the overlay renderer so the
+/// highlighted index always lines up with what is drawn.
+///
+/// # Examples
+///
+/// ```
+/// use std::sync::Arc;
+/// use zhive_tui::app::filter_sessions;
+/// use zhive_tui::rpc::SessionEntry;
+/// use zhive_proto::domain::ThreadId;
+/// let entries = vec![SessionEntry {
+///     id: ThreadId(Arc::from("thread:native/a")),
+///     title: Some("Refactor".to_owned()),
+///     preview: "parser cleanup".to_owned(),
+///     updated_at: 0,
+///     subagent_parent: None,
+/// }];
+/// assert_eq!(filter_sessions(&entries, "refac").len(), 1);
+/// assert_eq!(filter_sessions(&entries, "deploy").len(), 0);
+/// assert_eq!(filter_sessions(&entries, "").len(), 1);
+/// ```
+#[must_use]
+pub fn filter_sessions<'a>(
+    entries: &'a [crate::rpc::SessionEntry],
+    query: &str,
+) -> Vec<&'a crate::rpc::SessionEntry> {
+    if query.is_empty() {
+        return entries.iter().collect();
+    }
+    let needle = query.to_lowercase();
+    entries
+        .iter()
+        .filter(|e| {
+            e.title
+                .as_deref()
+                .is_some_and(|t| t.to_lowercase().contains(&needle))
+                || e.preview.to_lowercase().contains(&needle)
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -808,6 +981,182 @@ mod tests {
         app.on_disconnected();
         assert!(app.disconnected, "disconnected flag must be set");
         assert!(!app.conversation.busy, "busy must be cleared on disconnect");
+    }
+
+    // ---- session list (/session resume) ----
+
+    fn session_entry(id: &str, title: &str, preview: &str) -> crate::rpc::SessionEntry {
+        crate::rpc::SessionEntry {
+            id: ThreadId(Arc::from(id)),
+            title: Some(title.to_owned()),
+            preview: preview.to_owned(),
+            updated_at: 0,
+            subagent_parent: None,
+        }
+    }
+
+    #[test]
+    fn slash_session_opens_session_list_action() {
+        let mut app = app();
+        for c in "/session".chars() {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+        // The picker opens in the default (All) scope.
+        assert_eq!(
+            app.on_key(key(KeyCode::Enter)),
+            Action::OpenSessionList {
+                filter: SessionFilter::All
+            }
+        );
+    }
+
+    #[test]
+    fn slash_resume_alias_also_opens_session_list() {
+        let mut app = app();
+        for c in "/resume".chars() {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+        assert_eq!(
+            app.on_key(key(KeyCode::Enter)),
+            Action::OpenSessionList {
+                filter: SessionFilter::All
+            }
+        );
+    }
+
+    #[test]
+    fn session_list_enter_resumes_selected_thread() {
+        let mut app = app();
+        app.overlay = Some(Overlay::SessionList {
+            entries: vec![
+                session_entry("thread:native/a", "alpha", "first"),
+                session_entry("thread:native/b", "beta", "second"),
+            ],
+            selected: 1,
+            query: String::new(),
+            filter_mode: SessionFilter::All,
+        });
+        let action = app.on_key(key(KeyCode::Enter));
+        match action {
+            Action::ResumeSession { thread_id } => {
+                assert_eq!(thread_id.0.as_ref(), "thread:native/b");
+            }
+            other => panic!("expected ResumeSession, got {other:?}"),
+        }
+        assert!(app.overlay.is_none(), "resume closes the overlay");
+    }
+
+    #[test]
+    fn session_list_esc_cancels_without_action() {
+        let mut app = app();
+        app.overlay = Some(Overlay::SessionList {
+            entries: vec![session_entry("thread:native/a", "alpha", "first")],
+            selected: 0,
+            query: String::new(),
+            filter_mode: SessionFilter::All,
+        });
+        assert_eq!(app.on_key(key(KeyCode::Esc)), Action::None);
+        assert!(app.overlay.is_none(), "esc closes the overlay");
+    }
+
+    #[test]
+    fn session_list_tab_toggles_scope_and_requests_refetch() {
+        let mut app = app();
+        app.overlay = Some(Overlay::SessionList {
+            entries: vec![session_entry("thread:native/a", "alpha", "first")],
+            selected: 0,
+            query: String::new(),
+            filter_mode: SessionFilter::All,
+        });
+        // Tab from All requests a re-fetch scoped to the current cwd...
+        assert_eq!(
+            app.on_key(key(KeyCode::Tab)),
+            Action::OpenSessionList {
+                filter: SessionFilter::Cwd
+            }
+        );
+        // ...and the overlay is closed pending the async re-open.
+        assert!(app.overlay.is_none(), "tab closes the overlay for re-fetch");
+
+        // Tab from Cwd toggles back to All.
+        app.overlay = Some(Overlay::SessionList {
+            entries: vec![session_entry("thread:native/a", "alpha", "first")],
+            selected: 0,
+            query: String::new(),
+            filter_mode: SessionFilter::Cwd,
+        });
+        assert_eq!(
+            app.on_key(key(KeyCode::Tab)),
+            Action::OpenSessionList {
+                filter: SessionFilter::All
+            }
+        );
+    }
+
+    #[test]
+    fn session_list_navigation_clamps_within_filtered_rows() {
+        let mut app = app();
+        app.overlay = Some(Overlay::SessionList {
+            entries: vec![
+                session_entry("thread:native/a", "alpha", "first"),
+                session_entry("thread:native/b", "beta", "second"),
+            ],
+            selected: 0,
+            query: String::new(),
+            filter_mode: SessionFilter::All,
+        });
+        // Down past the end clamps to the last row.
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Down));
+        match &app.overlay {
+            Some(Overlay::SessionList { selected, .. }) => assert_eq!(*selected, 1),
+            other => panic!("overlay must remain open, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn session_list_typing_filters_and_enter_resumes_match() {
+        let mut app = app();
+        app.overlay = Some(Overlay::SessionList {
+            entries: vec![
+                session_entry("thread:native/a", "alpha", "refactor parser"),
+                session_entry("thread:native/b", "beta", "write docs"),
+            ],
+            selected: 0,
+            query: String::new(),
+            filter_mode: SessionFilter::All,
+        });
+        // Type "doc" → only the second entry survives, becoming index 0.
+        for c in "doc".chars() {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+        let action = app.on_key(key(KeyCode::Enter));
+        match action {
+            Action::ResumeSession { thread_id } => {
+                assert_eq!(thread_id.0.as_ref(), "thread:native/b");
+            }
+            other => panic!("expected ResumeSession for filtered match, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn filter_sessions_empty_query_keeps_all() {
+        let entries = vec![
+            session_entry("thread:native/a", "alpha", "x"),
+            session_entry("thread:native/b", "beta", "y"),
+        ];
+        assert_eq!(filter_sessions(&entries, "").len(), 2);
+    }
+
+    #[test]
+    fn filter_sessions_matches_preview_case_insensitively() {
+        let entries = vec![
+            session_entry("thread:native/a", "alpha", "Refactor Parser"),
+            session_entry("thread:native/b", "beta", "write docs"),
+        ];
+        let hits = filter_sessions(&entries, "parser");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id.0.as_ref(), "thread:native/a");
     }
 }
 

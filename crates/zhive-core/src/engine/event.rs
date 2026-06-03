@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use zhive_proto::domain::{Item, ThreadId, TurnError, TurnId};
+use zhive_proto::domain::{Item, ItemId, ThreadId, TurnError, TurnId};
 use zhive_proto::hook::EnginePhase;
 use zhive_proto::permission::{RequestPermissionRequest, SessionAbortedNotification};
 
@@ -137,6 +137,40 @@ pub enum EngineEvent {
         output_tokens: u64,
     },
 
+    /// A persistence save point was reached and the thread's deferred
+    /// session writes were flushed.
+    ///
+    /// Emitted by [`crate::engine::lifecycle`] when the engine reaches a
+    /// consistent state (turn end, or just before falling back to `Idle`) and
+    /// drains the thread's [`crate::state::PendingSessionWrites`] buffer to the
+    /// persistence writer.  `had_pending_mutations` is `true` when the buffer
+    /// held at least one deferred write at flush time, so subscribers can tell
+    /// a save point that actually persisted work apart from a no-op one.
+    SavePoint {
+        /// Thread whose buffer was flushed.
+        thread_id: ThreadId,
+        /// Whether the buffer held deferred writes when flushed.
+        had_pending_mutations: bool,
+    },
+
+    /// A subagent child turn has just started.
+    ///
+    /// Emitted once per spawned subagent, immediately after the child turn is
+    /// installed, so external observers can route the child thread's subsequent
+    /// `ItemAppended` / `TurnStarted` events (which carry the child thread id)
+    /// back to the parent. The `agent_type` and `description` are mirrored from
+    /// the spawning [`zhive_proto::permission::SubagentDefinition`] when present.
+    SubagentStarted {
+        /// Thread id of the parent that spawned the subagent.
+        parent_thread_id: ThreadId,
+        /// Thread id of the newly spawned subagent child.
+        child_thread_id: ThreadId,
+        /// The subagent's declared name / type, if any.
+        agent_type: Option<String>,
+        /// The subagent's declared description, if any.
+        description: Option<String>,
+    },
+
     /// A subagent turn finished (completed or failed).
     ///
     /// External observers see exactly one `SubagentCompleted` per spawned
@@ -155,6 +189,53 @@ pub enum EngineEvent {
         child_thread_id: ThreadId,
         /// The single item delivered back to the parent, or `None`.
         final_message: Option<Arc<Item>>,
+    },
+
+    /// A turn parked on a deferred permission request (suspended).
+    ///
+    /// Emitted when a tool call folds to
+    /// [`zhive_proto::permission::PermissionDecision::Defer`] and the engine
+    /// suspends the turn until a matching `session/resume_permission` arrives.
+    /// `request_id` is the globally unique pending id the client echoes back to
+    /// resume. The server maps this to an `events/turn_suspended` notification.
+    TurnSuspended {
+        /// Owning thread.
+        thread_id: ThreadId,
+        /// Suspended turn.
+        turn_id: TurnId,
+        /// Pending permission request id the client passes back to resume.
+        request_id: PermissionRequestId,
+        /// Optional rationale mirrored from the deferring hook, if any.
+        reason: Option<String>,
+    },
+
+    /// A previously suspended turn was unblocked and resumed.
+    ///
+    /// Dual of [`EngineEvent::TurnSuspended`]: emitted once the deferred
+    /// permission request is resolved (allow / deny / cancel) and the turn
+    /// continues. The server maps this to an `events/turn_resumed`
+    /// notification.
+    TurnResumed {
+        /// Owning thread.
+        thread_id: ThreadId,
+        /// Resumed turn.
+        turn_id: TurnId,
+    },
+
+    /// A new thread was forked from a source thread's history.
+    ///
+    /// Emitted once the fork path has replayed the source transcript into the
+    /// new thread and registered it. `forked_from_item` echoes the inclusive
+    /// truncation point requested by the caller (`None` = full history). The
+    /// server maps this to an `events/thread_forked` notification so UIs can
+    /// open the new branch.
+    ThreadForked {
+        /// Thread whose history seeded the fork.
+        source_thread_id: ThreadId,
+        /// Newly allocated forked thread.
+        new_thread_id: ThreadId,
+        /// Inclusive item the fork was taken at, or `None` for full history.
+        forked_from_item: Option<ItemId>,
     },
 }
 

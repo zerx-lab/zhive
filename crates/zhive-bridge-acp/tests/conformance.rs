@@ -607,6 +607,7 @@ fn scripted_tool_call_engine(decision: PermissionDecision) -> Engine {
         tools: Arc::new(tools),
         hook_host,
         storage: None,
+        cwd: std::path::PathBuf::from("."),
         turn_limits: TurnLimits::default(),
         system_prompt: None,
         compact_token_threshold: None,

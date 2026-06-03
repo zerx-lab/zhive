@@ -32,21 +32,24 @@
 
 mod compaction;
 pub mod event;
+mod fork;
 mod inner;
 mod lifecycle;
 pub mod phase;
 mod prompt;
+mod resume;
 mod subagent_spawn;
 pub mod submission;
 mod tool_dispatch;
 mod turn;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use thiserror::Error;
 use tokio::sync::{broadcast, mpsc};
-use zhive_proto::domain::{Item, ThreadId, TurnId};
+use zhive_proto::domain::{Item, ItemId, ThreadId, TurnId};
 use zhive_proto::hook::EnginePhase;
 use zhive_proto::permission::{PermissionOutcome, PermissionScope, SubagentDefinition};
 
@@ -210,6 +213,14 @@ pub struct EngineConfig {
     ///
     /// `None` (the default) keeps the prior item-count-only behaviour.
     pub compact_token_threshold: Option<u64>,
+
+    /// Working directory recorded on every thread this engine creates.
+    ///
+    /// Persisted into the `cwd` column so sessions can be listed per project
+    /// (codex-style filtering). Defaults to `PathBuf::from(".")`, which keeps
+    /// the prior behaviour for callers that do not set a real path. Hosts
+    /// (CLI / TUI) should set this to the user's current directory at launch.
+    pub cwd: PathBuf,
 }
 
 impl Default for EngineConfig {
@@ -223,6 +234,7 @@ impl Default for EngineConfig {
             turn_limits: TurnLimits::default(),
             system_prompt: None,
             compact_token_threshold: None,
+            cwd: PathBuf::from("."),
         }
     }
 }
@@ -394,6 +406,7 @@ impl Engine {
     ///     turn_limits: Default::default(),
     ///     system_prompt: None,
     ///     compact_token_threshold: None,
+    ///     cwd: std::path::PathBuf::from("."),
     /// };
     /// let engine = Engine::spawn_with_config(cfg);
     /// engine.shutdown().await.unwrap();
@@ -417,6 +430,14 @@ impl Engine {
             Some((tx, handle)) => (Some(tx), Some(handle)),
             None => (None, None),
         };
+
+        // Retain a read handle to storage in the engine inner rather than
+        // dropping `config.storage` after spawning the writer: cross-thread
+        // fork reads the source thread's rollout directly (the writer holds its
+        // own `Arc<Storage>`; this clone is the engine's read path). For a
+        // purely in-memory engine this stays `None`, so existing storage-less
+        // tests are unaffected.
+        let storage_read = config.storage.clone();
 
         // Backfill the SchemaCache from each trait tool's advertised schema so
         // red line 11 (updated_input revalidation) has a schema to check even
@@ -449,6 +470,8 @@ impl Engine {
             maybe_tx,
             maybe_handle,
             config.compact_token_threshold,
+            storage_read,
+            config.cwd,
         ));
         let threads = Arc::clone(inner.threads());
         let permission = inner.permission_reducer();
@@ -507,6 +530,38 @@ impl Engine {
     #[must_use]
     pub fn subscribe(&self) -> broadcast::Receiver<EngineEvent> {
         self.events_tx.subscribe()
+    }
+
+    /// Returns a thread-scoped [`crate::state::ThreadEvent`] subscription, or
+    /// `None` when the thread is not resident.
+    ///
+    /// This is the per-thread event layer that sits beside the engine-wide
+    /// [`EngineEvent`] bus exposed by [`Self::subscribe`]; both fire for the
+    /// same lifecycle transitions. A consumer that cares about a single thread
+    /// (a UI pane, a `thread/read` handler) subscribes here instead of
+    /// filtering the global bus.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::sync::Arc;
+    /// use zhive_core::engine::Engine;
+    /// use zhive_proto::domain::ThreadId;
+    /// # async fn demo() {
+    /// let engine = Engine::spawn();
+    /// // An unknown thread has no event stream yet.
+    /// let id = ThreadId(Arc::from("thread:native/missing"));
+    /// assert!(engine.thread_events(&id).await.is_none());
+    /// # }
+    /// ```
+    pub async fn thread_events(
+        &self,
+        thread_id: &ThreadId,
+    ) -> Option<broadcast::Receiver<crate::state::ThreadEvent>> {
+        self.threads
+            .get(thread_id)
+            .await
+            .map(|h| h.subscribe_events())
     }
 
     /// Returns the live [`crate::state::ThreadStore`] handle.
@@ -656,6 +711,65 @@ impl Engine {
         }
     }
 
+    /// Forks a new thread from `source_thread_id`'s history.
+    ///
+    /// Reads the source thread's JSONL rollout (the source of truth, including
+    /// history beyond the in-memory window), allocates a fresh thread id, and
+    /// replays the source items into the new thread up to `up_to_item`
+    /// (inclusive) or in full when `None`. The new thread records its origin
+    /// via [`zhive_proto::domain::Thread::forked_from`] and a `parent_session`
+    /// rollout header, so it can be resumed and rebuilt on its own. When
+    /// `summarize` is `true` an LLM branch summary is generated and prepended as
+    /// the new thread's opening context.
+    ///
+    /// Fork claims the [`EnginePhase::BranchSummary`] phase for its duration, so
+    /// it is refused (with [`submission::ForkError::EngineBusy`]) while a turn
+    /// or compaction is in flight. Cross-thread fork requires persistent storage
+    /// to be configured: an in-memory engine returns
+    /// [`submission::ForkError::SourceNotFound`].
+    ///
+    /// # Errors
+    ///
+    /// Channel-level [`EngineError`] variants on actor failure; the fork's own
+    /// failures (unknown source, busy engine, replay / summary error) are
+    /// folded into the `Ok` value as [`submission::ForkError`].
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use zhive_core::engine::Engine;
+    /// use zhive_proto::domain::ThreadId;
+    ///
+    /// # async fn demo() {
+    /// let engine = Engine::spawn(); // in-memory: no storage configured
+    /// // An unknown source (and no storage) yields SourceNotFound.
+    /// let outcome = engine
+    ///     .fork_thread(ThreadId(std::sync::Arc::from("thread:native/nope")), None, false)
+    ///     .await
+    ///     .expect("actor reachable");
+    /// assert!(outcome.is_err());
+    /// engine.shutdown().await.unwrap();
+    /// # }
+    /// ```
+    pub async fn fork_thread(
+        &self,
+        source_thread_id: ThreadId,
+        up_to_item: Option<ItemId>,
+        summarize: bool,
+    ) -> Result<Result<submission::ForkReply, submission::ForkError>, EngineError> {
+        let reply = self
+            .submit_with_reply(Submission::Fork {
+                source_thread_id,
+                up_to_item,
+                summarize,
+            })
+            .await?;
+        match reply {
+            submission::SubmissionReply::Fork(r) => Ok(r),
+            _ => Err(EngineError::ReplyDropped),
+        }
+    }
+
     /// Sends a graceful shutdown and awaits the actor's acknowledgement.
     ///
     /// # Errors
@@ -733,6 +847,154 @@ impl Engine {
             submission::SubmissionReply::SpawnSubagent(Err(err)) => {
                 Err(EngineError::SubagentSpawnFailed(err))
             }
+            _ => Err(EngineError::ReplyDropped),
+        }
+    }
+
+    /// Lists persisted threads, most-recently-updated first.
+    ///
+    /// Reads the engine's state-database index through the actor. When `cwd` is
+    /// `Some(path)`, only threads created under that working directory are
+    /// returned (codex-style per-project listing); `None` lists every thread.
+    ///
+    /// When the engine has **no** persistent storage configured (the in-memory
+    /// default), the returned list is **empty** — an in-memory engine keeps no
+    /// historical sessions. A database read failure is logged inside the actor
+    /// and also surfaces as an empty list, so this method only ever errors on a
+    /// channel-level failure.
+    ///
+    /// The returned [`zhive_proto::domain::Thread`] values carry an empty
+    /// `turns` field; use [`Self::resume_thread`] (or the `thread/get_items`
+    /// server method) to fetch a thread's items.
+    ///
+    /// # Errors
+    ///
+    /// Channel-level [`EngineError`] variants only ([`EngineError::ActorStopped`]
+    /// / [`EngineError::ReplyDropped`] / [`EngineError::ReplyTimedOut`]).
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use zhive_core::engine::Engine;
+    /// # async fn demo() {
+    /// let engine = Engine::spawn(); // in-memory: no storage
+    /// let threads = engine.list_threads(None).await.unwrap();
+    /// assert!(threads.is_empty());
+    /// engine.shutdown().await.unwrap();
+    /// # }
+    /// ```
+    pub async fn list_threads(
+        &self,
+        cwd: Option<&str>,
+    ) -> Result<Vec<zhive_proto::domain::Thread>, EngineError> {
+        let reply = self
+            .submit_with_reply(Submission::ListThreads {
+                cwd: cwd.map(str::to_owned),
+            })
+            .await?;
+        match reply {
+            submission::SubmissionReply::ListThreads(threads) => Ok(*threads),
+            _ => Err(EngineError::ReplyDropped),
+        }
+    }
+
+    /// Resumes a persisted thread, making its full history resident in memory.
+    ///
+    /// Reads the thread's complete JSONL rollout (the source of truth, including
+    /// history beyond any prior in-memory window), seeds the in-memory
+    /// transcript turn by turn, and leaves the thread `Idle`. After resume, the
+    /// next [`Self::start_turn`] on this thread builds its prompt from the
+    /// restored transcript, so the model continues the prior conversation.
+    ///
+    /// Resume requires the engine to be `Idle` (it mutates the thread store);
+    /// it is refused with [`submission::ResumeError::EngineBusy`] while a turn or
+    /// compaction is in flight. It also requires persistent storage: an
+    /// in-memory engine returns [`submission::ResumeError::StorageUnavailable`].
+    ///
+    /// # Errors
+    ///
+    /// Channel-level [`EngineError`] variants on actor failure; the resume's own
+    /// failures (storage unavailable, unknown thread, busy engine, replay error)
+    /// are folded into the `Ok` value as [`submission::ResumeError`].
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use zhive_core::engine::Engine;
+    /// use zhive_proto::domain::ThreadId;
+    /// # async fn demo() {
+    /// let engine = Engine::spawn(); // in-memory: no storage configured
+    /// let outcome = engine
+    ///     .resume_thread(ThreadId(std::sync::Arc::from("thread:native/01")))
+    ///     .await
+    ///     .expect("actor reachable");
+    /// assert!(outcome.is_err()); // StorageUnavailable: no persistence
+    /// engine.shutdown().await.unwrap();
+    /// # }
+    /// ```
+    pub async fn resume_thread(
+        &self,
+        thread_id: ThreadId,
+    ) -> Result<Result<submission::ResumeReply, submission::ResumeError>, EngineError> {
+        let reply = self
+            .submit_with_reply(Submission::ResumeThread { thread_id })
+            .await?;
+        match reply {
+            submission::SubmissionReply::ResumeThread(r) => Ok(r),
+            _ => Err(EngineError::ReplyDropped),
+        }
+    }
+
+    /// Reads persisted history items for a thread, for rendering a resumed
+    /// conversation.
+    ///
+    /// When `turn_id` is `Some`, returns that turn's items (paged via `offset` /
+    /// `limit` when both are supplied, otherwise the whole turn). When `turn_id`
+    /// is `None`, returns the thread's full item history in conversation order
+    /// (`offset` / `limit` are ignored — they are turn-scoped knobs).
+    ///
+    /// This is a pure read served by the actor; it requires persistent storage
+    /// ([`submission::GetItemsError::StorageUnavailable`] on an in-memory
+    /// engine) but not an `Idle` phase.
+    ///
+    /// # Errors
+    ///
+    /// Channel-level [`EngineError`] variants on actor failure; the read's own
+    /// failures (storage unavailable, index / rollout read error) are folded
+    /// into the `Ok` value as [`submission::GetItemsError`].
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use zhive_core::engine::Engine;
+    /// use zhive_proto::domain::ThreadId;
+    /// # async fn demo() {
+    /// let engine = Engine::spawn(); // in-memory: no storage configured
+    /// let outcome = engine
+    ///     .get_items(ThreadId(std::sync::Arc::from("thread:native/01")), None, None, None)
+    ///     .await
+    ///     .expect("actor reachable");
+    /// assert!(outcome.is_err()); // StorageUnavailable: no persistence
+    /// engine.shutdown().await.unwrap();
+    /// # }
+    /// ```
+    pub async fn get_items(
+        &self,
+        thread_id: ThreadId,
+        turn_id: Option<TurnId>,
+        offset: Option<i64>,
+        limit: Option<i64>,
+    ) -> Result<Result<Vec<Item>, submission::GetItemsError>, EngineError> {
+        let reply = self
+            .submit_with_reply(Submission::GetItems {
+                thread_id,
+                turn_id,
+                offset,
+                limit,
+            })
+            .await?;
+        match reply {
+            submission::SubmissionReply::GetItems(r) => Ok(r.map(|b| *b)),
             _ => Err(EngineError::ReplyDropped),
         }
     }
@@ -1240,6 +1502,105 @@ mod tests {
         );
         engine.shutdown().await.unwrap();
     }
+
+    /// End-to-end actor round-trip for the history surface: a storage-backed
+    /// engine lists the persisted thread, resumes it, and reads its items back —
+    /// exercising the `ListThreads` / `ResumeThread` / `GetItems` submissions
+    /// through the public [`Engine`] API.
+    #[tokio::test]
+    async fn list_resume_get_items_round_trip_through_engine() {
+        use std::path::PathBuf;
+        use zhive_proto::domain::{Item, ItemId, Thread, ThreadSource, ThreadStatus};
+
+        use crate::persistence::{RolloutEntry, RolloutWriter, Storage};
+
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Arc::new(Storage::open(dir.path()).await.unwrap());
+        let thread = tid("thread:native/e2e-resume");
+
+        // Seed an index row + a one-turn rollout with two items.
+        storage
+            .state
+            .upsert_thread(&Thread {
+                id: thread.clone(),
+                session_id: None,
+                forked_from: None,
+                subagent_parent: None,
+                preview: "hello".into(),
+                ephemeral: false,
+                model_provider: "anthropic".into(),
+                created_at: 1,
+                updated_at: 2,
+                status: ThreadStatus::Idle,
+                cwd: PathBuf::from("/"),
+                source: ThreadSource::User,
+                name: None,
+                turns: vec![],
+            })
+            .await
+            .unwrap();
+        let turn = format!("turn:{}/0", thread.0);
+        let mut w = RolloutWriter::open(storage.rollout_path(&thread.0))
+            .await
+            .unwrap();
+        w.append(&RolloutEntry::Session {
+            version: 3,
+            id: thread.0.to_string(),
+            timestamp: 0,
+            cwd: "/".into(),
+            parent_session: None,
+        })
+        .await
+        .unwrap();
+        for (n, text) in [("0", "earlier user"), ("1", "earlier agent")] {
+            w.append(&RolloutEntry::Item {
+                thread_id: thread.0.to_string(),
+                turn_id: turn.clone(),
+                timestamp: 0,
+                item: Box::new(Item::AgentMessage {
+                    id: ItemId(Arc::from(format!("item:{n}").as_str())),
+                    text: text.to_owned(),
+                }),
+            })
+            .await
+            .unwrap();
+        }
+        w.sync_all().await.unwrap();
+        drop(w);
+
+        let cfg = EngineConfig {
+            storage: Some(Arc::clone(&storage)),
+            ..Default::default()
+        };
+        let engine =
+            Engine::spawn_with_config(cfg).with_reply_timeout(std::time::Duration::from_secs(10));
+
+        // list_threads sees the persisted row.
+        let listed = engine.list_threads(None).await.expect("actor reachable");
+        assert!(
+            listed.iter().any(|t| t.id == thread),
+            "persisted thread must appear in list_threads"
+        );
+
+        // resume_thread restores both items, one turn.
+        let reply = engine
+            .resume_thread(thread.clone())
+            .await
+            .expect("actor reachable")
+            .expect("resume must succeed");
+        assert_eq!(reply.items_restored, 2);
+        assert_eq!(reply.turns_restored, 1);
+
+        // get_items (full history) returns the two restored items.
+        let items = engine
+            .get_items(thread.clone(), None, None, None)
+            .await
+            .expect("actor reachable")
+            .expect("get_items must succeed");
+        assert_eq!(items.len(), 2, "full-history read returns both items");
+
+        engine.shutdown().await.unwrap();
+    }
 }
 
 // ============================================================
@@ -1538,6 +1899,7 @@ mod inc3_tests {
             turn_limits: TurnLimits::default(),
             system_prompt: None,
             compact_token_threshold: None,
+            cwd: std::path::PathBuf::from("."),
         };
         let engine =
             Engine::spawn_with_config(cfg).with_reply_timeout(std::time::Duration::from_secs(5));
@@ -1632,6 +1994,7 @@ mod inc3_tests {
             turn_limits: TurnLimits::default(),
             system_prompt: None,
             compact_token_threshold: None,
+            cwd: std::path::PathBuf::from("."),
         };
         let engine =
             Engine::spawn_with_config(cfg).with_reply_timeout(std::time::Duration::from_secs(5));
@@ -1738,6 +2101,7 @@ mod inc3_tests {
             turn_limits: TurnLimits::default(),
             system_prompt: None,
             compact_token_threshold: None,
+            cwd: std::path::PathBuf::from("."),
         };
         let engine =
             Engine::spawn_with_config(cfg).with_reply_timeout(std::time::Duration::from_secs(5));
@@ -1839,6 +2203,7 @@ mod inc3_tests {
             turn_limits: TurnLimits::default(),
             system_prompt: None,
             compact_token_threshold: None,
+            cwd: std::path::PathBuf::from("."),
         };
         let engine =
             Engine::spawn_with_config(cfg).with_reply_timeout(std::time::Duration::from_secs(5));
@@ -1937,6 +2302,7 @@ mod inc3_tests {
             turn_limits: TurnLimits::default(),
             system_prompt: None,
             compact_token_threshold: None,
+            cwd: std::path::PathBuf::from("."),
         };
         let engine =
             Engine::spawn_with_config(cfg).with_reply_timeout(std::time::Duration::from_secs(5));
@@ -2019,6 +2385,7 @@ mod inc3_tests {
             turn_limits: TurnLimits::default(),
             system_prompt: None,
             compact_token_threshold: None,
+            cwd: std::path::PathBuf::from("."),
         };
         let engine =
             Engine::spawn_with_config(cfg).with_reply_timeout(std::time::Duration::from_secs(10));
@@ -2140,6 +2507,7 @@ mod inc3_tests {
             turn_limits: TurnLimits::default(),
             system_prompt: None,
             compact_token_threshold: None,
+            cwd: std::path::PathBuf::from("."),
         };
         let engine =
             Engine::spawn_with_config(cfg).with_reply_timeout(std::time::Duration::from_secs(10));
@@ -2298,6 +2666,7 @@ mod inc3_tests {
             turn_limits: TurnLimits::default(),
             system_prompt: None,
             compact_token_threshold: None,
+            cwd: std::path::PathBuf::from("."),
         };
         let engine =
             Engine::spawn_with_config(cfg).with_reply_timeout(std::time::Duration::from_secs(10));
@@ -2399,6 +2768,7 @@ mod inc3_tests {
             turn_limits: TurnLimits::default(),
             system_prompt: None,
             compact_token_threshold: None,
+            cwd: std::path::PathBuf::from("."),
         };
         let engine =
             Engine::spawn_with_config(cfg).with_reply_timeout(std::time::Duration::from_secs(10));
@@ -2607,6 +2977,7 @@ mod inc3_tests {
             },
             system_prompt: None,
             compact_token_threshold: None,
+            cwd: std::path::PathBuf::from("."),
         };
         let engine =
             Engine::spawn_with_config(cfg).with_reply_timeout(std::time::Duration::from_secs(60));
@@ -2672,6 +3043,7 @@ mod inc3_tests {
             turn_limits: TurnLimits::default(),
             system_prompt: None,
             compact_token_threshold: None,
+            cwd: std::path::PathBuf::from("."),
         };
         let engine =
             Engine::spawn_with_config(cfg).with_reply_timeout(std::time::Duration::from_secs(5));
@@ -2748,6 +3120,7 @@ mod inc3_tests {
             turn_limits: TurnLimits::default(),
             system_prompt: None,
             compact_token_threshold: None,
+            cwd: std::path::PathBuf::from("."),
         };
         let engine =
             Engine::spawn_with_config(cfg).with_reply_timeout(std::time::Duration::from_secs(10));
@@ -3016,6 +3389,7 @@ mod post_hook_dispatch_tests {
             turn_limits: TurnLimits::default(),
             system_prompt: None,
             compact_token_threshold: None,
+            cwd: std::path::PathBuf::from("."),
         };
         let engine =
             Engine::spawn_with_config(cfg).with_reply_timeout(std::time::Duration::from_secs(5));
@@ -3095,6 +3469,7 @@ mod post_hook_dispatch_tests {
             turn_limits: TurnLimits::default(),
             system_prompt: None,
             compact_token_threshold: None,
+            cwd: std::path::PathBuf::from("."),
         };
         let engine =
             Engine::spawn_with_config(cfg).with_reply_timeout(std::time::Duration::from_secs(5));
@@ -3169,7 +3544,7 @@ mod inc4_tests {
     }
 
     fn user_item(text: &str) -> zhive_proto::domain::Item {
-        use zhive_proto::domain::{ItemContent, ItemId};
+        use zhive_proto::domain::ItemContent;
         zhive_proto::domain::Item::UserMessage {
             id: ItemId(Arc::from(text)),
             content: vec![ItemContent::Text {
@@ -3856,6 +4231,7 @@ mod inc5_tests {
             turn_limits: TurnLimits::default(),
             system_prompt: None,
             compact_token_threshold: None,
+            cwd: std::path::PathBuf::from("."),
         };
 
         let engine =
@@ -3903,7 +4279,7 @@ mod inc5_tests {
         assert_eq!(t.id, thread_id);
 
         // At least one item must have been persisted.
-        let all_threads = storage.state.list_threads().await.unwrap();
+        let all_threads = storage.state.list_threads(None).await.unwrap();
         assert!(
             !all_threads.is_empty(),
             "state.db must have at least one thread"
@@ -3920,6 +4296,115 @@ mod inc5_tests {
         assert!(
             has_item,
             "JSONL rollout must contain at least one ItemAppended entry"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // cwd injection + preview derivation end to end
+    // ------------------------------------------------------------------
+
+    /// A real turn started with a user message must persist:
+    /// - the engine's configured `cwd` on the thread row (NOT `"."`),
+    /// - a `preview` derived from the first user message, and
+    /// - the row must be findable via `list_threads(Some(cwd))` but not under
+    ///   an unrelated cwd.
+    ///
+    /// This guards the whole wiring: `EngineConfig.cwd` → `EngineInner.cwd` →
+    /// every snapshot's `cwd`/`preview`, plus the `set_preview_if_empty`
+    /// upsert clause that keeps the derived preview across the idle snapshot.
+    #[tokio::test]
+    async fn turn_persists_engine_cwd_and_derived_preview() {
+        use zhive_proto::domain::{Item, ItemContent, ItemId};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Arc::new(Storage::open(tmp.path()).await.unwrap());
+
+        // An empty-stream provider: the turn completes immediately, exercising
+        // start_turn (sets preview) AND finish_turn (idle snapshot, empty
+        // preview) so the set-if-empty clause is on the hot path.
+        let cfg = EngineConfig {
+            provider: ScriptedModel::new("test", "m", vec![]).into_dyn(),
+            tools: Arc::new(crate::tools::ToolRegistry::new()),
+            hook_host: Arc::new(crate::hooks::HookHost::new()),
+            storage: Some(Arc::clone(&storage)),
+            turn_limits: TurnLimits::default(),
+            system_prompt: None,
+            compact_token_threshold: None,
+            cwd: std::path::PathBuf::from("/work/myproject"),
+        };
+        let engine =
+            Engine::spawn_with_config(cfg).with_reply_timeout(std::time::Duration::from_secs(10));
+        let mut events = engine.subscribe();
+
+        let thread_id = tid("thread:native/cwd-preview");
+        let user_input = vec![Item::UserMessage {
+            id: ItemId(Arc::from("item:cwd-preview/0")),
+            content: vec![ItemContent::Text {
+                text: "  Refactor the persistence layer  ".into(),
+                annotations: None,
+            }],
+        }];
+        engine
+            .start_turn(thread_id.clone(), user_input, None)
+            .await
+            .unwrap();
+
+        // Wait for the terminal event.
+        let mut saw_completed = false;
+        for _ in 0..32 {
+            let ev = tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
+                .await
+                .expect("timeout")
+                .expect("broadcast");
+            if matches!(ev, EngineEvent::TurnCompleted { .. }) {
+                saw_completed = true;
+                break;
+            }
+        }
+        assert!(saw_completed, "expected TurnCompleted");
+
+        // Await the writer so the idle snapshot is durable.
+        engine.shutdown().await.unwrap();
+
+        let t = storage
+            .state
+            .get_thread(&thread_id)
+            .await
+            .unwrap()
+            .expect("thread row present");
+        assert_eq!(
+            t.cwd,
+            std::path::PathBuf::from("/work/myproject"),
+            "the engine's configured cwd must be persisted, not the \".\" placeholder"
+        );
+        assert_eq!(
+            t.preview, "Refactor the persistence layer",
+            "preview must be derived (trimmed) from the first user message and survive the idle snapshot"
+        );
+        assert!(
+            t.subagent_parent.is_none(),
+            "a top-level thread has no subagent parent"
+        );
+
+        // Listable under its own cwd, but not under a different one. Queried
+        // through storage directly because `shutdown` already stopped the
+        // actor (and `shutdown` awaited the writer, so the upsert is durable).
+        let scoped = storage
+            .state
+            .list_threads(Some("/work/myproject"))
+            .await
+            .unwrap();
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].id, thread_id);
+
+        let other = storage
+            .state
+            .list_threads(Some("/work/other"))
+            .await
+            .unwrap();
+        assert!(
+            other.is_empty(),
+            "thread must not appear under an unrelated cwd"
         );
     }
 
@@ -3995,6 +4480,7 @@ mod inc5_tests {
             turn_limits: TurnLimits::default(),
             system_prompt: None,
             compact_token_threshold: None,
+            cwd: std::path::PathBuf::from("."),
         };
         let engine =
             Engine::spawn_with_config(cfg).with_reply_timeout(std::time::Duration::from_secs(10));
@@ -4134,6 +4620,7 @@ mod inc5_tests {
             turn_limits: TurnLimits::default(),
             system_prompt: None,
             compact_token_threshold: None,
+            cwd: std::path::PathBuf::from("."),
         };
         let engine =
             Engine::spawn_with_config(cfg).with_reply_timeout(std::time::Duration::from_secs(10));
@@ -4281,7 +4768,7 @@ mod inc6_tests {
     /// - `spawn_subagent` returns a child `ThreadId`
     /// - `EngineEvent::SubagentCompleted` is broadcast with `final_message`
     ///   carrying the `AgentMessage` text
-    /// - The child thread's `items_tail` did NOT inherit parent items
+    /// - The child thread's transcript did NOT inherit parent items
     ///   (fresh context window)
     ///
     /// The shared provider returns an empty stream on the first call (parent
@@ -4352,7 +4839,7 @@ mod inc6_tests {
 
         // Verify the child transcript is fresh: it must NOT contain the
         // parent thread's items (empty parent input in this test, but the
-        // child items_tail must be independent of the parent's items_tail).
+        // child history buffer is independent of the parent's).
         let child_handle = engine
             .threads()
             .get(&child_id)
@@ -4371,17 +4858,16 @@ mod inc6_tests {
             "child must record its parent"
         );
 
-        // Parent items must not appear in child's items_tail (pointer inequality).
-        // We verify independence by checking that the two VecDeques are
-        // distinct objects (the child was created with a fresh VecDeque).
-        let parent_tail_len = parent_handle.items_tail.read().await.len();
-        let child_tail_len = child_handle.items_tail.read().await.len();
-        // Parent had no user input so its tail is empty; child has its prompt
-        // item (1) plus the AgentMessage (1) = 2 items.
-        assert_eq!(parent_tail_len, 0, "parent tail must be empty");
+        // Parent items must not appear in the child's transcript: the child
+        // owns an independent history buffer (B2). The parent ran no turn, so
+        // its transcript is empty; the child holds its prompt item plus the
+        // AgentMessage.
+        let parent_item_count = parent_handle.item_count().await;
+        let child_item_count = child_handle.item_count().await;
+        assert_eq!(parent_item_count, 0, "parent transcript must be empty");
         assert!(
-            child_tail_len > 0,
-            "child tail must contain at least the agent message"
+            child_item_count > 0,
+            "child transcript must contain at least the agent message"
         );
 
         engine.shutdown().await.unwrap();
@@ -4541,9 +5027,9 @@ mod inc6_tests {
         // Manually insert a child-like thread handle into the store.
         // This simulates a thread that was itself spawned as a subagent.
         let fake_parent_id = tid("thread:subagent/native/root/0");
-        // `new_child` returns `(handle, rx)`; the receiver is unused in this
-        // test (we only need the handle to be registered in the thread store).
-        let (child_handle_inner, _rx) =
+        // `new_child` returns `(handle, final_rx, decision_rx)`; both receivers
+        // are unused here (we only need the handle registered in the store).
+        let (child_handle_inner, _final_rx, _decision_rx) =
             ThreadHandle::new_child(fake_parent_id.clone(), tid("thread:native/root"));
         let child_handle = Arc::new(child_handle_inner);
         engine
@@ -4624,6 +5110,7 @@ mod inc6_tests {
     /// [`agent_routing_provider`] inspects the reconstructed prompt rather than
     /// a call index, so concurrency between the parent's second iteration and
     /// the child turn cannot reorder the scripted responses.
+    #[cfg(feature = "tools")]
     #[tokio::test]
     async fn agent_tool_spawns_child_and_returns_result() {
         let mut tools = crate::tools::ToolRegistry::new();
@@ -4637,6 +5124,7 @@ mod inc6_tests {
             turn_limits: TurnLimits::default(),
             system_prompt: None,
             compact_token_threshold: None,
+            cwd: std::path::PathBuf::from("."),
         };
         let engine =
             Engine::spawn_with_config(cfg).with_reply_timeout(std::time::Duration::from_secs(10));
@@ -4687,9 +5175,11 @@ mod inc6_tests {
 
     /// Marker carried in the subagent prompt so [`agent_routing_provider`] can
     /// recognise the child turn from the reconstructed `CallOptions.prompt`.
+    #[cfg(feature = "tools")]
     const AGENT_CHILD_MARKER: &str = "ZHIVE_CHILD_TASK_MARKER";
 
     /// Extracts the text of a completed `agent` `ToolCall` item, if `item` is one.
+    #[cfg(feature = "tools")]
     fn agent_tool_result_text(item: &zhive_proto::domain::Item) -> Option<String> {
         let zhive_proto::domain::Item::ToolCall {
             name,
@@ -4718,6 +5208,7 @@ mod inc6_tests {
     /// - Else a `Message::User` containing [`AGENT_CHILD_MARKER`] → child turn →
     ///   emit the child's text answer.
     /// - Else (first parent call) → emit the `agent` tool call.
+    #[cfg(feature = "tools")]
     fn agent_routing_provider() -> DynLanguageModel {
         use llmsdk::ToolCallPart;
         use llmsdk::language_model::{Message, UserPart};
@@ -5101,6 +5592,7 @@ mod inc6_tests {
             turn_limits: TurnLimits::default(),
             system_prompt: None,
             compact_token_threshold: None,
+            cwd: std::path::PathBuf::from("."),
         };
         let engine =
             Engine::spawn_with_config(cfg).with_reply_timeout(std::time::Duration::from_secs(10));
@@ -5202,6 +5694,7 @@ mod inc6_tests {
             turn_limits: TurnLimits::default(),
             system_prompt: None,
             compact_token_threshold: None,
+            cwd: std::path::PathBuf::from("."),
         };
         let engine =
             Engine::spawn_with_config(cfg).with_reply_timeout(std::time::Duration::from_secs(5));
@@ -5294,6 +5787,7 @@ mod inc6_tests {
             turn_limits: TurnLimits::default(),
             system_prompt: None,
             compact_token_threshold: Some(1),
+            cwd: std::path::PathBuf::from("."),
         };
         let engine =
             Engine::spawn_with_config(cfg).with_reply_timeout(std::time::Duration::from_secs(5));
@@ -5370,6 +5864,7 @@ mod inc6_tests {
             turn_limits: TurnLimits::default(),
             system_prompt: None,
             compact_token_threshold: None,
+            cwd: std::path::PathBuf::from("."),
         };
         let engine =
             Engine::spawn_with_config(cfg).with_reply_timeout(std::time::Duration::from_secs(5));

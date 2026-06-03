@@ -29,7 +29,7 @@
 pub mod pending;
 
 #[doc(inline)]
-pub use pending::{InvalidRequestId, PendingPermissions, RequestKey};
+pub use pending::{InvalidRequestId, PendingPermissions, RequestContext, RequestKey};
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -238,6 +238,31 @@ impl PermissionReducer {
         (key, request, rx)
     }
 
+    /// Enrolls a request and records the turn context for later resumption.
+    ///
+    /// Like [`Self::enroll`] but also stores the supplied turn [`RequestContext`].
+    /// The context is returned by [`Self::resolve_by_wire_id_with_context`] so
+    /// the engine can emit a `TurnResumed` for the originating turn once a
+    /// deferred request is discharged. Used by the suspendable `Defer` path.
+    ///
+    /// Engine-internal: callers (`tool_dispatch`, `spawner`) construct the
+    /// `#[non_exhaustive]` [`RequestPermissionRequest`] in-crate; external code
+    /// only ever receives it over the wire, so this is `pub(crate)`.
+    #[must_use = "the returned key is required to discharge the request"]
+    pub(crate) fn enroll_with_context(
+        &self,
+        request: RequestPermissionRequest,
+        context: RequestContext,
+    ) -> (
+        RequestKey,
+        RequestPermissionRequest,
+        oneshot::Receiver<PermissionOutcome>,
+    ) {
+        let (tx, rx) = oneshot::channel();
+        let key = self.pending.insert_with_context(tx, Some(context));
+        (key, request, rx)
+    }
+
     /// Waits for the client to resolve `rx`, applying the reducer's
     /// timeout.
     ///
@@ -290,13 +315,34 @@ impl PermissionReducer {
     /// went away before the outcome could be delivered (typically the
     /// `wait` future was dropped because of a timeout or cancel).
     pub fn resolve(&self, key: RequestKey, outcome: PermissionOutcome) -> Result<(), ReducerError> {
-        self.pending
+        self.resolve_with_context(key, outcome).map(|_ctx| ())
+    }
+
+    /// Resolves a pending request and returns its recorded turn context.
+    ///
+    /// Identical to [`Self::resolve`] but surfaces the [`RequestContext`]
+    /// captured at [`Self::enroll_with_context`] time (or `None` for a
+    /// context-free `Ask` request) so the engine can emit a `TurnResumed` for
+    /// the right turn.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::resolve`].
+    ///
+    /// Engine-internal (`pub(crate)`): returns the [`RequestContext`] recorded
+    /// by [`Self::enroll_with_context`], or `None` for a context-free enroll.
+    pub(crate) fn resolve_with_context(
+        &self,
+        key: RequestKey,
+        outcome: PermissionOutcome,
+    ) -> Result<Option<RequestContext>, ReducerError> {
+        let (tx, context) = self
+            .pending
             .remove(key)
-            .ok_or(ReducerError::UnknownRequest(key))
-            .and_then(|tx| {
-                tx.send(outcome)
-                    .map_err(|_send_err| ReducerError::Abandoned)
-            })
+            .ok_or(ReducerError::UnknownRequest(key))?;
+        tx.send(outcome)
+            .map_err(|_send_err| ReducerError::Abandoned)?;
+        Ok(context)
     }
 
     /// Resolves a pending request by its wire-form id.
@@ -317,8 +363,30 @@ impl PermissionReducer {
         id: &crate::engine::submission::PermissionRequestId,
         outcome: PermissionOutcome,
     ) -> Result<(), ReducerError> {
+        self.resolve_by_wire_id_with_context(id, outcome)
+            .map(|_ctx| ())
+    }
+
+    /// Resolves a pending request by wire id, returning its turn context.
+    ///
+    /// Combines [`RequestKey::from_wire`] with [`Self::resolve_with_context`]
+    /// so the engine actor can emit a `TurnResumed` for the resumed turn.
+    ///
+    /// # Errors
+    ///
+    /// * [`ReducerError::InvalidRequestId`] when the wire form does not parse.
+    /// * [`ReducerError::UnknownRequest`] / [`ReducerError::Abandoned`] as in
+    ///   [`Self::resolve`].
+    ///
+    /// Engine-internal (`pub(crate)`): the engine actor (`inner.rs`) calls this
+    /// to recover the suspended turn's [`RequestContext`] and emit `TurnResumed`.
+    pub(crate) fn resolve_by_wire_id_with_context(
+        &self,
+        id: &crate::engine::submission::PermissionRequestId,
+        outcome: PermissionOutcome,
+    ) -> Result<Option<RequestContext>, ReducerError> {
         let key = RequestKey::from_wire(id)?;
-        self.resolve(key, outcome)
+        self.resolve_with_context(key, outcome)
     }
 
     /// Resolves **every** pending request with

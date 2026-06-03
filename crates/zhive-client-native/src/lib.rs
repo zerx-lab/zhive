@@ -24,8 +24,10 @@
 //!   for server-initiated requests.
 //! * [`Client::cancel_turn`] — typed helper wrapping the
 //!   `engine/cancel_turn` RPC call.
-//! * [`Client::shutdown`] — closes the connection; the reader and
-//!   writer tasks exit promptly.  The same teardown runs automatically
+//! * [`Client::cancel_session`] — ACP `session/cancel` notification helper
+//!   (fire-and-forget, distinct from `cancel_turn`).
+//! * [`Client::shutdown`] — closes the connection with a 5-second drain
+//!   wait and then exits.  The same best-effort teardown runs automatically
 //!   when the last [`Client`] clone is dropped.
 
 #![forbid(unsafe_code)]
@@ -39,15 +41,16 @@ mod transport;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{Notify, broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 use zhive_proto::domain::{ThreadId, TurnId};
 use zhive_proto::initialize::{Capabilities, Implementation, ProtocolVersion};
 use zhive_proto::{ErrorObject, Id, Message, Notification, Request, Response, ResponseOutcome};
 
-pub use connect::HandshakeMeta;
+pub use connect::{ClientBuilder, HandshakeMeta};
 pub use error::ClientError;
 pub use events::{ClientEvent, ClientEventStream};
 use pending::PendingSlot;
@@ -74,12 +77,27 @@ pub const DEFAULT_NOTIFICATION_BUFFER: usize = 256;
 /// callers in the common case.
 pub(crate) const OUTBOUND_QUEUE_CAP: usize = 64;
 
+/// How long [`Client::shutdown`] waits for the reader task to drain
+/// before giving up and returning.
+///
+/// Five seconds is generous enough to absorb normal I/O latency while
+/// keeping shutdown deterministic in tests.  Once the deadline passes
+/// the shutdown returns anyway — the reader/writer tasks will exit on
+/// their own when the cancel token fires.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Inner handle whose [`Drop`] cancels the per-connection shutdown
 /// token so both reader and writer tasks exit when the last
 /// [`Client`] clone goes out of scope.
 #[derive(Debug)]
 pub(crate) struct Inner {
     pub(crate) shutdown: CancellationToken,
+    /// Notified once when the reader task exits its teardown sequence.
+    ///
+    /// `shutdown().await` registers a waiter on this [`Notify`] *before*
+    /// cancelling the shutdown token to avoid a race where the reader
+    /// fires `notify_one()` before the waiter is registered.
+    pub(crate) worker_done: Arc<Notify>,
 }
 
 impl Drop for Inner {
@@ -449,16 +467,89 @@ impl Client {
         Ok(Some(TurnId(Arc::from(id_str))))
     }
 
-    /// Explicitly cancels the per-connection shutdown token so both
-    /// reader and writer tasks exit promptly.
+    /// Shuts the connection down, waiting up to 5 s for the reader task
+    /// to drain before returning.
     ///
-    /// Equivalent to dropping the last [`Client`] clone.  Subsequent
-    /// `call` / `notify` invocations on still-alive clones surface
-    /// [`ClientError::Io`] (writer gone) or
+    /// Cancels the per-connection shutdown token, closes the outbound
+    /// queue, and then awaits a signal from the reader task.  If the
+    /// reader does not signal within [`SHUTDOWN_TIMEOUT`] (5 s) the
+    /// method returns anyway — the tasks will eventually exit when the
+    /// cancel token is observed.
+    ///
+    /// Subsequent `call` / `notify` invocations on still-alive clones
+    /// surface [`ClientError::Io`] (writer gone) or
     /// [`ClientError::Disconnected`] (reader gone).
-    pub fn shutdown(self) {
+    ///
+    /// # Errors
+    ///
+    /// This method never returns an `Err` variant; the return type is
+    /// `Result<(), ClientError>` so that callers can use `let _ =` to
+    /// silence the return value symmetrically with other client methods.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # #[tokio::main]
+    /// # async fn main() {
+    /// use zhive_client_native::Client;
+    ///
+    /// let client = Client::from_split(tokio::io::empty(), tokio::io::sink());
+    /// let _ = client.shutdown().await;
+    /// # }
+    /// ```
+    pub async fn shutdown(self) -> Result<(), ClientError> {
+        // Register the waiter *before* cancelling the token so that we
+        // do not miss the notify_one() call if the reader exits very
+        // quickly after the cancel.  See design doc §risk-2 for details.
+        let notified = self.inner.worker_done.notified();
         self.inner.shutdown.cancel();
+        // Close the outbound queue so the writer task exits promptly.
         drop(self.outbound_tx);
+        // Wait for the reader to complete its ordered teardown, or
+        // give up after SHUTDOWN_TIMEOUT and return anyway.
+        let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, notified).await;
+        Ok(())
+    }
+
+    /// Sends an ACP `session/cancel` notification for `thread_id`.
+    ///
+    /// This is a fire-and-forget notification distinct from
+    /// [`Self::cancel_turn`]:
+    ///
+    /// * `cancel_turn` is an engine-private *request* (`engine/cancel_turn`)
+    ///   that returns the cancelled [`TurnId`] synchronously.
+    /// * `cancel_session` is an ACP-standard *notification*
+    ///   (`session/cancel`) — the server processes it asynchronously and
+    ///   may emit a `session/aborted` notification in response.
+    ///
+    /// The server registers a `session/cancel` handler that calls
+    /// `engine.cancel_turn(thread_id)` upon receipt (landed in B7 alongside
+    /// `register_engine_handlers`).  The turn is cancelled asynchronously;
+    /// the engine may emit a `session/aborted` notification once the
+    /// cancellation propagates.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Io`] when the outbound queue is closed (writer task
+    /// has already exited).
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # async fn example() -> Result<(), zhive_client_native::ClientError> {
+    /// use std::sync::Arc;
+    /// use zhive_proto::domain::ThreadId;
+    /// use zhive_client_native::Client;
+    ///
+    /// let client = Client::connect_uds("/tmp/zhive.sock").await?;
+    /// let tid = ThreadId(Arc::from("thread:native/my-session"));
+    /// client.cancel_session(&tid).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn cancel_session(&self, thread_id: &ThreadId) -> Result<(), ClientError> {
+        let params = serde_json::json!({ "threadId": thread_id });
+        self.notify("session/cancel", Some(params)).await
     }
 }
 
@@ -761,6 +852,230 @@ mod integration_tests {
             after.is_none(),
             "expected None after Disconnected, got {after:?}"
         );
+    }
+
+    // ── Part 5: shutdown tests ────────────────────────────────────────
+
+    /// `shutdown` notifies the reader and returns once the reader
+    /// signals completion; the outbound queue is closed first so the
+    /// writer exits promptly.
+    ///
+    /// We drive this deterministically: the server side keeps the read
+    /// end alive (so the reader doesn't error), waits for the outbound
+    /// queue to close, then drops its write end — which makes the reader
+    /// observe EOF and fire `worker_done`.
+    #[tokio::test]
+    async fn shutdown_waits_for_reader() {
+        let (client_io, server_io) = duplex(4096);
+        let (server_read, server_write) = tokio::io::split(server_io);
+        let (client_read, client_write) = tokio::io::split(client_io);
+
+        let client = Client::from_split(client_read, client_write);
+
+        let server_task = tokio::spawn(async move {
+            // Keep the read end alive until the client's outbound queue
+            // is fully closed (writer exits), then close the write end.
+            // When the write end closes the client reader observes EOF.
+            let _read_end = server_read;
+            // Wait a short grace period for the client to call shutdown
+            // and close its outbound_tx.
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            // Dropping server_write causes client reader to see EOF.
+            drop(server_write);
+        });
+
+        // shutdown should complete without timing out.
+        tokio::time::timeout(std::time::Duration::from_secs(2), client.shutdown())
+            .await
+            .expect("shutdown must return within deadline")
+            .expect("shutdown never errors");
+
+        server_task.await.unwrap();
+    }
+
+    /// When the reader task does not signal within `SHUTDOWN_TIMEOUT` (5 s)
+    /// `shutdown` must still return — it must not block forever.
+    ///
+    /// We use `tokio::time::pause` + `advance` to skip the timeout
+    /// instantly without real clock delay.
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_timeout_abort() {
+        let (client_io, _server_io) = duplex(64);
+        let (client_read, client_write) = tokio::io::split(client_io);
+
+        // `_server_io` is intentionally kept alive so the reader never
+        // sees EOF and therefore never fires `worker_done`.
+        let client = Client::from_split(client_read, client_write);
+
+        // Drive shutdown and advance the clock past SHUTDOWN_TIMEOUT (5 s)
+        // so the timeout branch fires and the method returns.
+        let shutdown_fut = client.shutdown();
+        tokio::pin!(shutdown_fut);
+
+        // Poll once to let the future register the notified() waiter and
+        // cancel the token, then advance time past the 5 s timeout.
+        tokio::select! {
+            biased;
+            result = &mut shutdown_fut => {
+                result.expect("shutdown must not error");
+            }
+            () = tokio::time::sleep(std::time::Duration::from_nanos(1)) => {
+                // Advance clock far past SHUTDOWN_TIMEOUT.
+                tokio::time::advance(std::time::Duration::from_secs(10)).await;
+                // Now the timeout should have fired; drive the future to completion.
+                shutdown_fut.await.expect("shutdown must not error after timeout");
+            }
+        }
+    }
+
+    // ── Part 6: cancel_session tests ─────────────────────────────────
+
+    /// `cancel_session` sends a `session/cancel` notification with
+    /// `{ "threadId": "<id>" }` in the params.
+    #[tokio::test]
+    async fn cancel_session_sends_notification() {
+        use std::sync::Arc;
+        use zhive_proto::domain::ThreadId;
+
+        let (client_io, server_io) = duplex(4096);
+        let (server_read, _server_write) = tokio::io::split(server_io);
+        let (client_read, client_write) = tokio::io::split(client_io);
+
+        let client = Client::from_split(client_read, client_write);
+
+        let tid = ThreadId(Arc::from("thread:native/test"));
+
+        let server_task = tokio::spawn(async move {
+            let mut reader = tokio::io::BufReader::new(server_read);
+            let msg = framing::read_message(&mut reader)
+                .await
+                .expect("server must read a message");
+            match msg {
+                Message::Notification(n) => {
+                    assert_eq!(n.method, "session/cancel");
+                    let params = n.params.expect("cancel notification must have params");
+                    assert_eq!(
+                        params["threadId"], "thread:native/test",
+                        "threadId must match"
+                    );
+                }
+                other => panic!("expected Notification, got {other:?}"),
+            }
+        });
+
+        client
+            .cancel_session(&tid)
+            .await
+            .expect("cancel_session must not error on connected client");
+
+        server_task.await.unwrap();
+    }
+
+    /// `cancel_session` on a client whose outbound queue is closed
+    /// returns `Err(Io)`.
+    ///
+    /// We explicitly call `shutdown` (which cancels the token and drops
+    /// this clone's `outbound_tx`) then keep a second clone alive.
+    /// After the writer task observes the cancel and drains, any
+    /// subsequent `notify` on the second clone fails because the
+    /// `outbound_rx` has been dropped by the writer.
+    #[tokio::test]
+    async fn cancel_session_disconnected_returns_err() {
+        use std::sync::Arc;
+        use zhive_proto::domain::ThreadId;
+
+        let (client_io, _server_io) = duplex(64);
+        let (client_read, client_write) = tokio::io::split(client_io);
+
+        let client = Client::from_split(client_read, client_write);
+        // Keep a second handle alive for the cancel_session call.
+        let client_for_test = client.clone();
+
+        // `shutdown` cancels the token immediately, drops the client's
+        // outbound_tx, and waits for the reader to signal done.  The
+        // writer also observes the cancel token and exits shortly after.
+        let _ = client.shutdown().await;
+
+        // Yield a few times to give the writer task a chance to exit
+        // and drop `outbound_rx`; once dropped, any send returns Err.
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        // Small deterministic sleep to absorb scheduling jitter.
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        let tid = ThreadId(Arc::from("thread:native/gone"));
+        let err = client_for_test
+            .cancel_session(&tid)
+            .await
+            .expect_err("cancel_session after shutdown must fail");
+
+        assert!(
+            matches!(err, ClientError::Io(_)),
+            "expected ClientError::Io, got {err:?}"
+        );
+    }
+
+    // ── Part 7: ClientBuilder custom client_info test ─────────────────
+
+    /// A custom `client_info` set on [`ClientBuilder`] appears verbatim
+    /// in the `initialize` request sent over the wire.
+    #[tokio::test]
+    async fn builder_custom_client_info_in_handshake() {
+        use super::connect::perform_handshake_with_params;
+        use zhive_proto::initialize::Implementation;
+
+        let (client_io, server_io) = duplex(4096);
+        let (server_read, server_write) = tokio::io::split(server_io);
+        let (client_read, client_write) = tokio::io::split(client_io);
+
+        // Stub server: read the initialize request and echo back a valid
+        // InitializeResponse, then discard the rest of the connection.
+        let server_task = tokio::spawn(async move {
+            let mut reader = tokio::io::BufReader::new(server_read);
+            let msg = framing::read_message(&mut reader)
+                .await
+                .expect("server must read initialize");
+            let req = match msg {
+                Message::Request(r) => r,
+                other => panic!("expected Request, got {other:?}"),
+            };
+            // Verify the clientInfo in the initialize params.
+            let params = req.params.expect("initialize must have params");
+            let name = params["clientInfo"]["name"]
+                .as_str()
+                .expect("clientInfo.name must be present");
+            let version = params["clientInfo"]["version"]
+                .as_str()
+                .expect("clientInfo.version must be present");
+            assert_eq!(name, "my-app", "clientInfo.name mismatch");
+            assert_eq!(version, "2.0.0", "clientInfo.version mismatch");
+
+            // Send back a minimal valid InitializeResponse.
+            let resp = zhive_proto::Response::ok(
+                req.id,
+                serde_json::json!({
+                    "protocolVersion": 1,
+                    "serverCapabilities": { "cancellation": false },
+                    "serverInfo": { "name": "stub", "version": "0.0.0" },
+                }),
+            );
+            let mut writer = server_write;
+            server_send(&mut writer, &Message::Response(resp)).await;
+        });
+
+        let raw_client = Client::from_split(client_read, client_write);
+        let info: Implementation =
+            serde_json::from_value(serde_json::json!({"name": "my-app", "version": "2.0.0"}))
+                .unwrap();
+        let builder = ClientBuilder::new().client_info(info);
+        let meta = perform_handshake_with_params(&raw_client, &builder)
+            .await
+            .expect("handshake must succeed");
+
+        assert_eq!(meta.server_info.name, "stub");
+
+        server_task.await.unwrap();
     }
 }
 

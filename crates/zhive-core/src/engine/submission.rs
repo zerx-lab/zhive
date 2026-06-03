@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
-use zhive_proto::domain::{Item, ThreadId, TurnId};
+use zhive_proto::domain::{Item, ItemId, ThreadId, TurnId};
 use zhive_proto::hook::{CompactTrigger, EnginePhase};
 use zhive_proto::permission::{
     PermissionOutcome, PermissionScope, StreamingBehavior, SubagentDefinition,
@@ -111,6 +111,13 @@ pub enum CompactError {
         /// Human-readable provider error.
         message: String,
     },
+    /// A `PreCompact` hook returned a blocking decision
+    /// (`continue_loop = false` or `permission_decision = Deny`),
+    /// aborting the compaction before it begins.
+    BlockedByHook {
+        /// Human-readable reason from the hook, if any.
+        reason: Option<String>,
+    },
 }
 
 impl fmt::Display for CompactError {
@@ -126,11 +133,249 @@ impl fmt::Display for CompactError {
             Self::SummarizationFailed { message } => {
                 write!(f, "summarization failed: {message}")
             }
+            Self::BlockedByHook { reason } => match reason {
+                Some(r) => write!(f, "compaction blocked by PreCompact hook: {r}"),
+                None => f.write_str("compaction blocked by PreCompact hook"),
+            },
         }
     }
 }
 
 impl std::error::Error for CompactError {}
+
+/// Outcome of a `Fork` dispatch.
+///
+/// Forking creates a brand-new thread seeded with the source thread's
+/// transcript (replayed from its JSONL rollout up to an optional boundary
+/// item). The new thread records its origin via [`zhive_proto::domain::Thread::forked_from`]
+/// and a `parent_session` rollout header, so it can be resumed and rebuilt
+/// independently.
+///
+/// # Examples
+///
+/// ```
+/// use std::sync::Arc;
+/// use zhive_proto::domain::ThreadId;
+/// use zhive_core::engine::submission::ForkReply;
+///
+/// let reply = ForkReply::Forked {
+///     new_thread_id: ThreadId(Arc::from("thread:native/fork/src/0")),
+///     items_replayed: 3,
+///     summarized: false,
+/// };
+/// // `ForkReply` is `#[non_exhaustive]`, so match (not an irrefutable `let`).
+/// match reply {
+///     ForkReply::Forked { items_replayed, summarized, .. } => {
+///         assert_eq!(items_replayed, 3);
+///         assert!(!summarized);
+///     }
+///     _ => unreachable!("only one variant today"),
+/// }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ForkReply {
+    /// A new thread was created from the source history.
+    Forked {
+        /// Id of the freshly allocated forked thread.
+        new_thread_id: ThreadId,
+        /// Number of source items replayed into the new thread.
+        items_replayed: u32,
+        /// Whether a branch-summary item was generated and prepended.
+        summarized: bool,
+    },
+}
+
+/// Reasons a `Fork` submission failed inside the actor.
+///
+/// Hand-written `Display` + `Error` (matching [`CompactError`]) rather than a
+/// `thiserror` derive, to keep the engine submission module's error style
+/// uniform.
+///
+/// # Examples
+///
+/// ```
+/// use zhive_core::engine::submission::ForkError;
+///
+/// let err = ForkError::SourceNotFound;
+/// assert!(matches!(err, ForkError::SourceNotFound));
+/// // Display renders a human-readable cause.
+/// assert_eq!(
+///     ForkError::ReplayFailed { message: "torn line".to_owned() }.to_string(),
+///     "fork replay failed: torn line",
+/// );
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ForkError {
+    /// The source thread has no readable history: it is unknown to the thread
+    /// store and no rollout exists for it (also returned when storage is not
+    /// configured, since cross-thread fork reads the source rollout).
+    SourceNotFound,
+    /// Engine phase was not `Idle` at dispatch time; fork claims the
+    /// `BranchSummary` phase and so cannot race a live turn or compaction.
+    EngineBusy {
+        /// Observed phase.
+        current: EnginePhase,
+    },
+    /// Replaying the source rollout into the new thread failed (I/O or a
+    /// corrupt rollout line).
+    ReplayFailed {
+        /// Human-readable cause.
+        message: String,
+    },
+    /// The optional branch-summary provider call failed.
+    SummarizationFailed {
+        /// Human-readable provider error.
+        message: String,
+    },
+}
+
+impl fmt::Display for ForkError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SourceNotFound => f.write_str("source thread not found (no history to fork)"),
+            Self::EngineBusy { current } => {
+                write!(f, "engine busy (phase {current:?}); fork requires Idle")
+            }
+            Self::ReplayFailed { message } => write!(f, "fork replay failed: {message}"),
+            Self::SummarizationFailed { message } => {
+                write!(f, "branch summary failed: {message}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ForkError {}
+
+/// Outcome of a [`Submission::ResumeThread`] dispatch.
+///
+/// Resume reads a persisted thread's full history from its JSONL rollout, makes
+/// the thread resident in memory (so the next turn's prompt includes the prior
+/// context), and reports how much history was restored.
+///
+/// `#[non_exhaustive]`, so it is produced only by the engine
+/// ([`crate::engine::Engine::resume_thread`]); read its fields rather than
+/// constructing it.
+///
+/// # Examples
+///
+/// ```no_run
+/// use zhive_core::engine::Engine;
+/// use zhive_proto::domain::ThreadId;
+/// # async fn demo() {
+/// let engine = Engine::spawn();
+/// if let Ok(Ok(reply)) = engine
+///     .resume_thread(ThreadId(std::sync::Arc::from("thread:native/01")))
+///     .await
+/// {
+///     println!("restored {} items in {} turns", reply.items_restored, reply.turns_restored);
+/// }
+/// # }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ResumeReply {
+    /// Id of the resumed thread (echoes the request).
+    pub thread_id: ThreadId,
+    /// Number of history items restored into the in-memory transcript.
+    pub items_restored: u32,
+    /// Number of turns the restored items spanned.
+    pub turns_restored: u32,
+}
+
+/// Reasons a [`Submission::ResumeThread`] dispatch failed inside the actor.
+///
+/// Hand-written `Display` + `Error` (matching [`ForkError`] / [`CompactError`])
+/// to keep the engine submission module's error style uniform.
+///
+/// # Examples
+///
+/// ```
+/// use zhive_core::engine::submission::ResumeError;
+///
+/// assert_eq!(
+///     ResumeError::ThreadNotFound.to_string(),
+///     "thread not found (no persisted history to resume)",
+/// );
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ResumeError {
+    /// No persistent storage is configured, so there is no rollout to resume
+    /// from (an in-memory engine cannot resume a historical thread).
+    StorageUnavailable,
+    /// The thread is not present in the persistent index.
+    ThreadNotFound,
+    /// Engine phase was not `Idle` at dispatch time; resume mutates the thread
+    /// store and so cannot race a live turn or compaction.
+    EngineBusy {
+        /// Observed phase.
+        current: EnginePhase,
+    },
+    /// Reading the thread's rollout failed (I/O or a corrupt rollout line).
+    ReplayFailed {
+        /// Human-readable cause.
+        message: String,
+    },
+}
+
+impl fmt::Display for ResumeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::StorageUnavailable => {
+                f.write_str("no persistent storage configured; cannot resume a thread")
+            }
+            Self::ThreadNotFound => {
+                f.write_str("thread not found (no persisted history to resume)")
+            }
+            Self::EngineBusy { current } => {
+                write!(f, "engine busy (phase {current:?}); resume requires Idle")
+            }
+            Self::ReplayFailed { message } => write!(f, "resume replay failed: {message}"),
+        }
+    }
+}
+
+impl std::error::Error for ResumeError {}
+
+/// Reasons a [`Submission::GetItems`] dispatch failed inside the actor.
+///
+/// # Examples
+///
+/// ```
+/// use zhive_core::engine::submission::GetItemsError;
+///
+/// assert_eq!(
+///     GetItemsError::StorageUnavailable.to_string(),
+///     "no persistent storage configured; cannot read items",
+/// );
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum GetItemsError {
+    /// No persistent storage is configured (an in-memory engine has no
+    /// item index to read).
+    StorageUnavailable,
+    /// Reading the items from the index failed (I/O or a corrupt payload).
+    ReadFailed {
+        /// Human-readable cause.
+        message: String,
+    },
+}
+
+impl fmt::Display for GetItemsError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::StorageUnavailable => {
+                f.write_str("no persistent storage configured; cannot read items")
+            }
+            Self::ReadFailed { message } => write!(f, "reading items failed: {message}"),
+        }
+    }
+}
+
+impl std::error::Error for GetItemsError {}
 
 /// One inbound command for the engine actor.
 ///
@@ -194,6 +439,58 @@ pub enum Submission {
         /// engine-initiated token/length threshold).
         trigger: CompactTrigger,
     },
+    /// Fork a new thread from a source thread's history at an optional point.
+    ///
+    /// Reads the source thread's rollout (the source of truth, including
+    /// history outside the in-memory window), allocates a fresh thread id, and
+    /// replays the source items into the new thread up to `up_to_item`
+    /// (inclusive) or in full when `None`. Records the fork origin so the new
+    /// thread can be resumed and rebuilt on its own.
+    Fork {
+        /// Thread whose history seeds the new thread.
+        source_thread_id: ThreadId,
+        /// Inclusive truncation point; `None` replays the full history.
+        up_to_item: Option<ItemId>,
+        /// When `true`, generate an LLM branch summary and prepend it as the
+        /// new thread's opening context.
+        summarize: bool,
+    },
+    /// List persisted threads (most-recently-updated first).
+    ///
+    /// Reads the queryable state-database projection; returns an empty list
+    /// when no persistent storage is configured. When `cwd` is `Some(path)`,
+    /// only threads created under that working directory are returned
+    /// (codex-style per-project listing); `None` lists every thread.
+    ListThreads {
+        /// Optional working-directory filter.
+        cwd: Option<String>,
+    },
+    /// Resume a persisted thread, making its history resident in memory.
+    ///
+    /// Reads the thread's full rollout (the source of truth, including history
+    /// outside any prior in-memory window), seeds the in-memory transcript so a
+    /// subsequent [`Submission::StartTurn`] includes the prior context, and
+    /// leaves the thread `Idle`.
+    ResumeThread {
+        /// Thread to resume from persistent storage.
+        thread_id: ThreadId,
+    },
+    /// Read persisted history items for a thread, for rendering a resumed
+    /// conversation.
+    ///
+    /// When `turn_id` is `Some`, the items of that single turn are returned
+    /// (paged by `offset` / `limit` when both are present). When `turn_id` is
+    /// `None`, the thread's full item history is returned in conversation order.
+    GetItems {
+        /// Thread whose items are read.
+        thread_id: ThreadId,
+        /// Optional single turn to scope the read to.
+        turn_id: Option<TurnId>,
+        /// Optional page offset (only applied with a `turn_id`).
+        offset: Option<i64>,
+        /// Optional page limit (only applied with a `turn_id`).
+        limit: Option<i64>,
+    },
     /// Gracefully stop the engine actor.
     Shutdown,
 }
@@ -240,7 +537,11 @@ impl std::error::Error for SubagentSpawnError {}
 /// One variant per submission kind that has a synchronous reply. A
 /// fire-and-forget envelope (no reply channel attached) never produces
 /// a `SubmissionReply`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Only [`PartialEq`] is derived (not [`Eq`]): the [`SubmissionReply::ListThreads`]
+/// payload carries [`zhive_proto::domain::Thread`], which is `PartialEq` but not
+/// `Eq` (its `cwd` / metadata make a total-equality contract undesirable).
+#[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum SubmissionReply {
     /// Reply to a [`Submission::StartTurn`].
@@ -253,6 +554,19 @@ pub enum SubmissionReply {
     SpawnSubagent(Result<ThreadId, SubagentSpawnError>),
     /// Reply to a [`Submission::Compact`].
     Compact(Result<CompactReply, CompactError>),
+    /// Reply to a [`Submission::Fork`].
+    Fork(Result<ForkReply, ForkError>),
+    /// Reply to a [`Submission::ListThreads`].
+    ///
+    /// `Vec<Thread>` is boxed so the enum stays small even though a thread list
+    /// can be large.
+    ListThreads(Box<Vec<zhive_proto::domain::Thread>>),
+    /// Reply to a [`Submission::ResumeThread`].
+    ResumeThread(Result<ResumeReply, ResumeError>),
+    /// Reply to a [`Submission::GetItems`].
+    ///
+    /// The item list is boxed so the enum stays small even for a large turn.
+    GetItems(Result<Box<Vec<Item>>, GetItemsError>),
     /// Reply to a [`Submission::Shutdown`].
     Shutdown,
 }

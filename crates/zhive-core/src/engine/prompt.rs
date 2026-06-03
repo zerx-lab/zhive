@@ -1,8 +1,8 @@
 //! Prompt construction for the LLM provider.
 //!
 //! Reconstructs a [`llmsdk::language_model::CallOptions`] from the thread's
-//! `items_tail` (the single source of truth) in item order.  Extracted from
-//! [`super::turn`] to keep both files under the 600-line soft limit.
+//! resident transcript (the single source of truth) in item order.  Extracted
+//! from [`super::turn`] to keep both files under the 600-line soft limit.
 //!
 //! ## Mapping rules
 //!
@@ -38,9 +38,9 @@ use crate::state::ThreadHandle;
 
 /// Reconstructs a [`llmsdk::language_model::CallOptions`] from the thread tail.
 ///
-/// Walks the thread's `items_tail` in order — the single source of truth —
-/// and maps each item to provider messages using the rules documented in the
-/// module header.
+/// Walks the thread's resident transcript in order — the single source of
+/// truth — and maps each item to provider messages using the rules documented
+/// in the module header.
 ///
 /// When `tools` is non-empty, the returned `CallOptions` advertises each
 /// registered tool via `tools = Some(vec![Tool::Function(..)])` and sets
@@ -78,7 +78,9 @@ pub(in crate::engine) async fn build_call_options(
     };
     use zhive_proto::domain::ToolCallStatus;
 
-    let tail = handle.items_tail.read().await;
+    // Flat snapshot of every resident item across completed + active turns
+    // (the single source of truth; see `ThreadHandle::items_snapshot`).
+    let tail = handle.items_snapshot().await;
     // Reserve room for the optional leading system message plus one entry per
     // item (tool-call items expand to two, but this is only a hint).
     let mut prompt: Vec<Message> = Vec::with_capacity(tail.len() + 1);
@@ -92,7 +94,7 @@ pub(in crate::engine) async fn build_call_options(
         });
     }
 
-    for item in tail.iter() {
+    for item in &tail {
         match item {
             Item::UserMessage { content, .. } => {
                 let text: String = content
@@ -313,6 +315,16 @@ mod tests {
     use super::build_call_options;
     use crate::state::ThreadHandle;
 
+    /// Builds an idle handle with one active turn so `push_item` has a turn to
+    /// append to (the engine seeds the turn before pushing in production).
+    async fn seeded_handle(id: &str) -> ThreadHandle {
+        let handle = ThreadHandle::new_idle(ThreadId(Arc::from(id)));
+        handle
+            .start_turn_buffer(zhive_proto::domain::TurnId(Arc::from("turn:test/0")), 0)
+            .await;
+        handle
+    }
+
     fn user_msg(id: &str, text: &str) -> Item {
         Item::UserMessage {
             id: ItemId(Arc::from(id)),
@@ -347,7 +359,7 @@ mod tests {
     /// using each item's `provider_tool_call_id`.
     #[tokio::test]
     async fn build_call_options_emits_id_pairs_for_every_iteration() {
-        let handle = ThreadHandle::new_idle(ThreadId(Arc::from("thread:native/multi")));
+        let handle = seeded_handle("thread:native/multi").await;
 
         handle.push_item(user_msg("item:u0", "go")).await;
         handle
@@ -420,7 +432,7 @@ mod tests {
     /// item id, and the assistant/tool pair still shares one id.
     #[tokio::test]
     async fn build_call_options_falls_back_to_item_id_when_provider_id_absent() {
-        let handle = ThreadHandle::new_idle(ThreadId(Arc::from("thread:native/fallback")));
+        let handle = seeded_handle("thread:native/fallback").await;
 
         handle
             .push_item(Item::ToolCall {
@@ -473,7 +485,7 @@ mod tests {
     /// pair so the provider sees a tool result for every request it made.
     #[tokio::test]
     async fn build_call_options_replays_failed_tool_call() {
-        let handle = ThreadHandle::new_idle(ThreadId(Arc::from("thread:native/failed")));
+        let handle = seeded_handle("thread:native/failed").await;
 
         handle
             .push_item(Item::ToolCall {
@@ -523,7 +535,7 @@ mod tests {
     /// the prompt never contains an orphan `tool_use` without a matching result.
     #[tokio::test]
     async fn build_call_options_skips_in_progress_tool_calls() {
-        let handle = ThreadHandle::new_idle(ThreadId(Arc::from("thread:native/inprog")));
+        let handle = seeded_handle("thread:native/inprog").await;
 
         handle.push_item(user_msg("item:u0", "hi")).await;
         handle
@@ -555,7 +567,7 @@ mod tests {
     /// ahead of the reconstructed conversation; `None`/empty adds nothing.
     #[tokio::test]
     async fn build_call_options_prepends_system_prompt() {
-        let handle = ThreadHandle::new_idle(ThreadId(Arc::from("thread:native/sys")));
+        let handle = seeded_handle("thread:native/sys").await;
         handle.push_item(user_msg("item:u0", "hi")).await;
 
         // With a system prompt: it is the first message, before the user turn.
@@ -613,7 +625,7 @@ mod tests {
 
         use crate::tools::{EchoTool, ToolRegistry};
 
-        let handle = ThreadHandle::new_idle(ThreadId(Arc::from("thread:native/advertise")));
+        let handle = seeded_handle("thread:native/advertise").await;
         handle.push_item(user_msg("item:u0", "go")).await;
 
         let mut reg = ToolRegistry::new();
@@ -642,7 +654,7 @@ mod tests {
 
         use crate::tools::{EchoTool, ToolRegistry};
 
-        let handle = ThreadHandle::new_idle(ThreadId(Arc::from("thread:native/scope")));
+        let handle = seeded_handle("thread:native/scope").await;
         handle.push_item(user_msg("item:u0", "go")).await;
 
         let mut reg = ToolRegistry::new();

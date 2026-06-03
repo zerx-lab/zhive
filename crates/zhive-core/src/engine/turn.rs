@@ -178,6 +178,42 @@ async fn run_turn_inner(
     // items within a turn.
     let mut item_seq: i64 = 0;
 
+    // ── Persist the turn's INPUT items (the data-loss fix) ───────────────────
+    //
+    // `start_turn` / `start_child_turn` push the input items (user message,
+    // next-turn seeds, subagent prompt) into the history buffer and broadcast
+    // `ItemAppended`, but they do NOT enqueue a `StorageWriteOp::ItemAppended`.
+    // Every other item the engine produces (agent messages, tool calls) is
+    // persisted from this function, so the input items were the ONLY items
+    // never written to the rollout / state.db — they silently vanished on
+    // resume and crash recovery.
+    //
+    // Centralising the input-item persistence here (rather than in each
+    // `start_*` site) keeps a single seq origin: these input items take seq
+    // `0..N-1` and every subsequent agent item continues from `item_seq == N`,
+    // so the `idx_items_turn (turn_id, seq)` ordering never collides.
+    //
+    // Ordering guarantee: `start_turn` enqueues `ThreadUpserted` (rollout
+    // header) and `TurnStarted` synchronously BEFORE spawning the task that
+    // runs this function, and the writer drains a single MPSC channel in send
+    // order, so these input-item ops always land after the header/turn-start
+    // ops. The same holds for the subagent path (`start_child_turn` enqueues
+    // both ops before `run_child_turn_and_deliver` is spawned).
+    //
+    // Snapshot ONLY the active turn's items: at this point (before any provider
+    // call) the active turn holds exactly the input items, while completed
+    // turns hold prior turns that were already persisted and must not be
+    // re-enqueued.
+    for item in handle.active_turn_items().await {
+        inner.enqueue_storage_op(StorageWriteOp::ItemAppended {
+            thread_id: thread_id.clone(),
+            turn_id: turn_id.clone(),
+            seq: item_seq,
+            item: Box::new(item),
+        });
+        item_seq += 1;
+    }
+
     // Fallback counter used ONLY when the provider did not supply a
     // tool_call_id (should not happen with conformant providers, but
     // protects against malformed streams in tests / Phase-1 scripted
@@ -223,6 +259,12 @@ async fn run_turn_inner(
             }
         }
 
+        // Save point #1 (prepare_next_turn semantics): flush any session
+        // writes that were buffered before this LLM request. Best-effort — a
+        // flush failure is swallowed inside `flush_pending_session_writes`
+        // because persistence must never abort the turn loop.
+        let _ = inner.flush_pending_session_writes(&handle);
+
         // 1. Build the prompt by reconstructing it from the thread's item tail
         //    (the single source of truth; see `build_call_options`).
         let call_options =
@@ -241,7 +283,7 @@ async fn run_turn_inner(
         let stream_result = tokio::select! {
             biased;
             () = cancel.cancelled() => {
-                inner.finish_turn(&handle, thread_id, turn_id, false).await;
+                inner.finish_turn(&handle, thread_id, turn_id, None).await;
                 return None;
             }
             r = inner.provider().do_stream(call_options) => r,
@@ -259,7 +301,11 @@ async fn run_turn_inner(
                     turn_id: turn_id.clone(),
                     error: turn_error.clone(),
                 });
-                inner.finish_turn(&handle, thread_id, turn_id, true).await;
+                // Pass the failure to finish_turn so its TurnEnded op records the
+                // error on the `turns` row; also return it for subagent callers.
+                inner
+                    .finish_turn(&handle, thread_id, turn_id, Some(turn_error.clone()))
+                    .await;
                 return Some(turn_error);
             }
         };
@@ -392,14 +438,27 @@ async fn run_turn_inner(
             }
         }
 
+        // Save point #4 (stream finally): flush deferred session writes once
+        // the provider stream has drained, before deciding the iteration's
+        // failure / cancel outcome.
+        //
+        // Skip the flush on the cancel path: cancellation is an abort, and the
+        // abort path must NOT flush buffered session writes (they survive to the
+        // next Idle save point). This matches `cancel_turn`, which also leaves
+        // the pending buffer intact. A *failed* (non-cancel) turn still flushes
+        // here so its buffered writes are not lost.
+        if !cancel.is_cancelled() {
+            let _ = inner.flush_pending_session_writes(&handle);
+        }
+
         if failure.is_some() || cancel.is_cancelled() {
-            // finish_turn handles the Turn→Idle rollback; pass failed=true
-            // when the stream errored so TurnCompleted is not emitted.
+            // finish_turn handles the Turn→Idle rollback; passing the captured
+            // failure (Some only on a stream error) suppresses TurnCompleted and
+            // records the error on the persisted TurnEnded op. On cancellation
+            // `failure` is None, so a cancelled turn is reported as non-failure.
             inner
-                .finish_turn(&handle, thread_id, turn_id, failure.is_some())
+                .finish_turn(&handle, thread_id, turn_id, failure.clone())
                 .await;
-            // `failure` is `Some` only on a stream error; on cancellation it
-            // stays `None`, so a cancelled turn is reported as non-failure.
             return failure;
         }
 
@@ -514,13 +573,18 @@ async fn run_turn_inner(
                 &tool_use_id,
                 &scope,
                 &cancel,
+                // A child (subagent) turn carries a `subagent_decision_tx`; its
+                // tool calls route every non-deny decision to the parent
+                // spawner for a second fold. A top-level turn has `None` here
+                // and runs its own `Ask` / `Defer` reverse-RPC directly.
+                handle.subagent_decision_tx.as_ref(),
             )
             .await;
 
             // A cancel observed during the (serial) permission wait means the
             // turn is being torn down. Finish without pushing any items.
             if cancel.is_cancelled() {
-                inner.finish_turn(&handle, thread_id, turn_id, false).await;
+                inner.finish_turn(&handle, thread_id, turn_id, None).await;
                 return None;
             }
 
@@ -604,7 +668,7 @@ async fn run_turn_inner(
         // or PostToolUse lost its select! race), every outcome is an abandoned
         // result. Do NOT push or broadcast any of them — finish and exit.
         if cancel.is_cancelled() {
-            inner.finish_turn(&handle, thread_id, turn_id, false).await;
+            inner.finish_turn(&handle, thread_id, turn_id, None).await;
             return None;
         }
 
@@ -664,9 +728,9 @@ async fn run_turn_inner(
     }
 
     // 5. finish_turn handles the Turn→Idle rollback and TurnCompleted
-    //    emission. Pass failed=false (normal completion).
+    //    emission. Pass `None` (normal, non-failing completion).
     inner
-        .finish_turn(&handle, thread_id.clone(), turn_id, false)
+        .finish_turn(&handle, thread_id.clone(), turn_id, None)
         .await;
 
     // 6. Auto-compaction: now that the engine is Idle again, fold the
@@ -680,7 +744,7 @@ async fn run_turn_inner(
     //    driving Idle→Compaction here would fight the parent's phase ownership.
     //    Child-thread compaction, if ever wanted, must be parent-coordinated.
     if handle.parent_thread_id.is_none() {
-        let item_count = handle.items_tail.read().await.len();
+        let item_count = handle.item_count().await;
         let last_input = inner.last_input_tokens();
         let token_threshold_hit = inner
             .compact_token_threshold()
@@ -693,6 +757,258 @@ async fn run_turn_inner(
         }
     }
     None
+}
+
+// ============================================================
+// Tests
+// ============================================================
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use llmsdk::language_model::StreamPart;
+    use tokio::sync::broadcast;
+    use zhive_proto::domain::{Item, ItemContent, ItemId, ThreadId, TurnId};
+
+    use crate::engine::event::EngineEvent;
+    use crate::engine::inner::EngineInner;
+    use crate::persistence::Storage;
+    use crate::persistence::writer::{PersistenceWriter, StorageWriteOp};
+    use crate::provider::{DynLanguageModel, ScriptedModel};
+
+    fn tid(s: &str) -> ThreadId {
+        ThreadId(Arc::from(s))
+    }
+
+    /// A scripted model that emits a single text block ("ok") so a driven turn
+    /// produces exactly one `AgentMessage` item after the input items.
+    fn text_provider() -> DynLanguageModel {
+        ScriptedModel::new(
+            "scripted",
+            "m",
+            vec![
+                StreamPart::TextStart {
+                    id: "b0".into(),
+                    provider_metadata: None,
+                },
+                StreamPart::TextDelta {
+                    id: "b0".into(),
+                    delta: "ok".into(),
+                    provider_metadata: None,
+                },
+                StreamPart::TextEnd {
+                    id: "b0".into(),
+                    provider_metadata: None,
+                },
+            ],
+        )
+        .into_dyn()
+    }
+
+    /// Builds an engine inner backed by a real on-disk `Storage` and the given
+    /// provider. Mirrors the scaffolding in `engine::fork` / `engine::resume`.
+    async fn inner_with_storage(
+        provider: DynLanguageModel,
+    ) -> (Arc<EngineInner>, tempfile::TempDir, Arc<Storage>) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = Arc::new(Storage::open(dir.path()).await.expect("open storage"));
+        let (tx, handle) = PersistenceWriter::spawn(Arc::clone(&storage));
+        let (events_tx, _) = broadcast::channel::<EngineEvent>(64);
+        let inner = Arc::new(EngineInner::new_with_hooks_tools_storage(
+            events_tx,
+            provider,
+            Arc::new(crate::hooks::HookHost::new()),
+            Arc::new(crate::tools::ToolRegistry::new()),
+            crate::engine::TurnLimits::default(),
+            None,
+            Some(tx),
+            Some(handle),
+            None,
+            Some(Arc::clone(&storage)),
+            std::path::PathBuf::from("/turn/cwd"),
+        ));
+        (inner, dir, storage)
+    }
+
+    fn user_message(id: &str, text: &str) -> Item {
+        Item::UserMessage {
+            id: ItemId(Arc::from(id)),
+            content: vec![ItemContent::Text {
+                text: text.to_owned(),
+                annotations: None,
+            }],
+        }
+    }
+
+    /// Drains the persistence writer deterministically: enqueue an ack'd
+    /// `Flush` on `thread_id` and await it. Because the writer applies ops in
+    /// order, the ack only fires once every op enqueued before it (including
+    /// the user-input `ItemAppended` and the `TurnEnded` fsync) has been
+    /// applied to live storage.
+    async fn drain_writer(inner: &EngineInner, thread_id: &ThreadId) {
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        inner.enqueue_storage_op(StorageWriteOp::Flush {
+            thread_id: thread_id.clone(),
+            ack: Some(ack_tx),
+        });
+        tokio::time::timeout(Duration::from_secs(5), ack_rx)
+            .await
+            .expect("flush ack must arrive")
+            .expect("flush ack channel must not drop");
+    }
+
+    /// Waits for the engine bus to report `TurnCompleted` for `turn_id`.
+    async fn await_turn_completed(rx: &mut broadcast::Receiver<EngineEvent>, turn_id: &TurnId) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let ev = tokio::time::timeout_at(deadline, rx.recv())
+                .await
+                .expect("turn must complete within timeout")
+                .expect("event bus must not lag/close");
+            if let EngineEvent::TurnCompleted { turn_id: t, .. } = ev
+                && &t == turn_id
+            {
+                return;
+            }
+        }
+    }
+
+    /// Regression for the input-item data-loss bug: a top-level turn that
+    /// carries a `UserMessage` must persist that item to BOTH the rollout
+    /// (`read_all`) and the SQL index (`get_turn_items`), with `seq` continuous
+    /// with the agent item that follows (user = 0, agent = 1).
+    #[tokio::test]
+    async fn user_message_persists_to_rollout_and_state_db() {
+        use crate::persistence::{RolloutEntry, read_all};
+
+        let (inner, _dir, storage) = inner_with_storage(text_provider()).await;
+        let thread_id = tid("thread:native/user-persist");
+        let mut events_rx = inner.events_tx().subscribe();
+
+        let reply = inner
+            .start_turn(
+                thread_id.clone(),
+                vec![user_message("item:user/0", "hello world")],
+                None,
+            )
+            .await
+            .expect("start_turn must accept the submission");
+        let turn_id = reply.turn_id;
+
+        await_turn_completed(&mut events_rx, &turn_id).await;
+        drain_writer(&inner, &thread_id).await;
+
+        // 1. SQL index: get_turn_items returns the user message FIRST, then the
+        //    agent message, proving the seq is continuous (user=0, agent=1).
+        let items = storage
+            .state
+            .get_turn_items(&turn_id)
+            .await
+            .expect("get_turn_items");
+        assert_eq!(
+            items.len(),
+            2,
+            "turn must persist the user message AND the agent reply, got {items:?}"
+        );
+        assert!(
+            matches!(&items[0], Item::UserMessage { .. }),
+            "the FIRST persisted item must be the user message (seq 0), got {:?}",
+            items[0]
+        );
+        assert!(
+            matches!(&items[1], Item::AgentMessage { .. }),
+            "the SECOND persisted item must be the agent reply (seq 1), got {:?}",
+            items[1]
+        );
+
+        // 2. Rollout JSONL (source of truth) also contains the user message.
+        let rollout = storage.rollout_path(&thread_id.0);
+        let entries = read_all(&rollout).await.expect("read_all rollout");
+        let has_user = entries.iter().any(|e| {
+            matches!(
+                e,
+                RolloutEntry::Item { item, .. } if matches!(item.as_ref(), Item::UserMessage { .. })
+            )
+        });
+        assert!(
+            has_user,
+            "rollout must contain the UserMessage item entry; entries = {entries:?}"
+        );
+
+        // 3. Resume path: get_items(None) replays the FULL thread history from
+        //    the rollout (source of truth), so a resumed session sees the user
+        //    message exactly as a fresh client would on reconnect.
+        let replayed = inner
+            .get_items(thread_id.clone(), None, None, None)
+            .await
+            .expect("get_items full-history read");
+        let replayed_user = replayed.iter().find_map(|i| match i {
+            Item::UserMessage { content, .. } => content.iter().find_map(|c| match c {
+                ItemContent::Text { text, .. } => Some(text.clone()),
+                _ => None,
+            }),
+            _ => None,
+        });
+        assert_eq!(
+            replayed_user.as_deref(),
+            Some("hello world"),
+            "resume (get_items) must return the persisted user message; got {replayed:?}"
+        );
+    }
+
+    /// A subagent child turn's spawn prompt (`UserMessage`) must also be
+    /// persisted to the child rollout — it was pushed in `start_child_turn`
+    /// and is now picked up by `run_turn`'s input-item persistence.
+    #[tokio::test]
+    async fn subagent_prompt_persists_to_child_rollout() {
+        use crate::persistence::{RolloutEntry, read_all};
+
+        let (inner, _dir, storage) = inner_with_storage(text_provider()).await;
+        let parent_id = tid("thread:native/sub-parent");
+        let _parent = inner.threads().get_or_init(&parent_id).await;
+
+        let definition: zhive_proto::permission::SubagentDefinition =
+            serde_json::from_value(serde_json::json!({
+                "name": "scout",
+                "description": "probe",
+                "prompt": "investigate the repo",
+            }))
+            .expect("definition fixture");
+
+        let (child_id, mut final_rx, _decision_rx) = inner
+            .spawn_subagent_awaitable(parent_id, definition)
+            .await
+            .expect("spawn must succeed");
+
+        // Await the child's final event so the child turn (and its finish_turn
+        // fsync) has run before we drain the writer.
+        tokio::time::timeout(Duration::from_secs(5), final_rx.recv())
+            .await
+            .expect("child final event must arrive")
+            .expect("child final channel must not close empty");
+        drain_writer(&inner, &child_id).await;
+
+        // The child rollout contains the prompt as a UserMessage item.
+        let rollout = storage.rollout_path(&child_id.0);
+        let entries = read_all(&rollout).await.expect("read_all child rollout");
+        let prompt_text = entries.iter().find_map(|e| match e {
+            RolloutEntry::Item { item, .. } => match item.as_ref() {
+                Item::UserMessage { content, .. } => content.iter().find_map(|c| match c {
+                    ItemContent::Text { text, .. } => Some(text.clone()),
+                    _ => None,
+                }),
+                _ => None,
+            },
+            _ => None,
+        });
+        assert_eq!(
+            prompt_text.as_deref(),
+            Some("investigate the repo"),
+            "child rollout must persist the subagent prompt UserMessage; entries = {entries:?}"
+        );
+    }
 }
 
 // Rust guideline compliant 2026-02-21

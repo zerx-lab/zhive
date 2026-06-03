@@ -130,6 +130,13 @@ pub struct Thread {
     /// Source thread id when this one was forked off another.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub forked_from: Option<ThreadId>,
+    /// Parent thread id when this one was spawned as a subagent.
+    ///
+    /// Distinct from `forked_from`: a fork branches an existing conversation,
+    /// whereas a subagent is a child task spawned by a running turn. Recorded
+    /// so resume/rebuild can recover the parent-child relationship.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent_parent: Option<ThreadId>,
     /// First user message excerpt, truncated to ~200 chars for list views.
     pub preview: String,
     /// When `true`, the thread is in-memory only and never written to JSONL.

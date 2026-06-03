@@ -18,7 +18,7 @@ use zhive_proto::domain::{
 };
 
 use crate::app::App;
-use crate::conversation::TurnLifecycle;
+use crate::conversation::{SubagentStatus, SubagentView, TurnLifecycle};
 use crate::theme::Palette;
 use crate::widgets::{self, Hint};
 use crate::{markdown, wrap};
@@ -166,17 +166,29 @@ fn render_body(frame: &mut Frame, app: &App, area: Rect) {
     );
 }
 
+/// The tool name the engine uses for a subagent spawn (drives summary inlining).
+const SUBAGENT_TOOL_NAME: &str = "agent";
+
 /// Builds the fully-wrapped, gutter-prefixed transcript lines.
 fn transcript_lines(app: &App, inner_width: u16) -> Vec<Line<'static>> {
     let p = &app.palette;
     let content_width = inner_width.saturating_sub(GUTTER);
     let mut out: Vec<Line<'static>> = Vec::new();
+    // Subagents are consumed in spawn order: each `agent` tool call in the main
+    // flow pulls the next registered subagent's live summary in beneath it.
+    let mut next_subagent = 0usize;
 
     for turn in &app.conversation.turns {
         for item in &turn.items {
             let (label, color) = role_of(item, p);
             let body = item_body(item, p, content_width);
             push_message(&mut out, label, color, body);
+            if is_subagent_call(item)
+                && let Some(sub) = app.conversation.subagents.get(next_subagent)
+            {
+                out.extend(subagent_summary_lines(sub, app.spinner_tick, p));
+                next_subagent += 1;
+            }
             out.push(Line::raw(""));
         }
         if let TurnLifecycle::Failed { message } = &turn.status {
@@ -216,6 +228,56 @@ fn transcript_lines(app: &App, inner_width: u16) -> Vec<Line<'static>> {
         push_message(&mut out, "zap", p.role_zap, body);
     }
     out
+}
+
+/// `true` when `item` is the `agent` tool call that spawns a subagent.
+fn is_subagent_call(item: &Item) -> bool {
+    matches!(item, Item::ToolCall { name, .. } if name == SUBAGENT_TOOL_NAME)
+}
+
+/// Builds the inline opencode-style live summary for one subagent.
+///
+/// Two indented rows under the parent's `agent` call: a status icon plus
+/// `agent_type · description`, then `↳ N toolcalls · <current tool | done>`.
+/// The icon is a spinner while running, `✓` on success, `✗` on failure.
+fn subagent_summary_lines(
+    sub: &SubagentView,
+    spinner_tick: usize,
+    p: &Palette,
+) -> Vec<Line<'static>> {
+    let (icon, icon_color) = match sub.status {
+        SubagentStatus::Running => (widgets::spinner(spinner_tick).to_owned(), p.warn),
+        SubagentStatus::Completed { .. } => ("✓".to_owned(), p.success),
+        SubagentStatus::Failed => ("✗".to_owned(), p.error),
+    };
+    let kind = sub.agent_type.as_deref().unwrap_or("subagent");
+    let header = if let Some(desc) = sub.description.as_deref().filter(|d| !d.is_empty()) {
+        format!("{kind} · {desc}")
+    } else {
+        kind.to_owned()
+    };
+
+    let count = sub.tool_call_count();
+    let tail = match sub.status {
+        SubagentStatus::Running => sub
+            .current_tool()
+            .map_or_else(|| "working".to_owned(), |t| format!("running {t}")),
+        SubagentStatus::Completed { .. } | SubagentStatus::Failed => "done".to_owned(),
+    };
+
+    vec![
+        Line::from(vec![
+            Span::styled(format!("  {icon} "), Style::new().fg(icon_color)),
+            Span::styled(
+                header,
+                Style::new().fg(p.role_zap).add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![Span::styled(
+            format!("    ↳ {count} toolcalls · {tail}"),
+            Style::new().fg(p.fg_dim),
+        )]),
+    ]
 }
 
 /// Appends a role-gutter-prefixed message (first row labeled, rest indented).

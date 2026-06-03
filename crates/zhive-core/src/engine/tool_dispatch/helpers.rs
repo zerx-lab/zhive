@@ -5,8 +5,13 @@
 //! are stateless and have no side-effects beyond allocating and returning
 //! values.
 
+use tokio_util::sync::CancellationToken;
 use zhive_proto::domain::{Item, ItemContent, ItemId, ItemToolCallContent, ToolCallStatus};
-use zhive_proto::permission::{PermissionOption, PermissionOptionKind, RequestPermissionRequest};
+use zhive_proto::permission::{
+    PermissionDecision, PermissionOption, PermissionOptionKind, RequestPermissionRequest,
+};
+
+use crate::subagent::{ParentVerdict, SubagentDecisionRequest};
 
 use super::DispatchOutcome;
 
@@ -165,6 +170,91 @@ pub(super) fn classify_option_id(
         OPT_REJECT_ONCE | "reject_once" => Some(PermissionOptionKind::RejectOnce),
         OPT_REJECT_ALWAYS | "reject_always" => Some(PermissionOptionKind::RejectAlways),
         _ => None,
+    }
+}
+
+/// Outcome of a child → parent permission handshake.
+///
+/// Returned by [`handshake_with_parent`] so the caller maps it onto the
+/// dispatch flow: `Allow` proceeds to execution, `Deny` blocks the call.
+pub(super) enum HandshakeVerdict {
+    /// The parent permitted the call; proceed to execute.
+    Allow,
+    /// The parent blocked the call (deny, cancel, or a broken channel).
+    Deny,
+}
+
+/// Reports a child tool-call decision to the parent and parks for the verdict.
+///
+/// Sends a [`SubagentDecisionRequest`] (carrying `tool_name` / `raw_args` so the
+/// parent can re-dispatch its own `PreToolUse` hooks) over `decision_tx`, then
+/// awaits the parent's [`ParentVerdict`] on a fresh reply oneshot — raced
+/// against the child turn's `cancel` token.
+///
+/// Every failure mode degrades to [`HandshakeVerdict::Deny`] so a child can
+/// never *widen* its own permission by losing the handshake:
+///
+/// * `cancel` fires first → deny (the turn is being torn down).
+/// * the reply oneshot is dropped (parent spawner exited / panicked) → deny.
+/// * `decision_tx.send` fails (parent dropped the receiver) → deny.
+///
+/// This mirrors codex `codex_delegate.rs`, where every approval is routed to
+/// the parent session and a lost/cancelled handshake resolves to a rejection.
+pub(super) async fn handshake_with_parent(
+    decision_tx: &tokio::sync::mpsc::Sender<SubagentDecisionRequest>,
+    tool_use_id: &str,
+    tool_name: &str,
+    raw_args: &serde_json::Value,
+    child_decision: PermissionDecision,
+    cancel: &CancellationToken,
+) -> HandshakeVerdict {
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel::<ParentVerdict>();
+    let request = SubagentDecisionRequest {
+        tool_use_id: tool_use_id.to_owned(),
+        tool_name: tool_name.to_owned(),
+        raw_args: raw_args.clone(),
+        child_decision,
+        reply: reply_tx,
+    };
+
+    if decision_tx.send(request).await.is_err() {
+        // Parent spawner already dropped its receiver (it exited the select
+        // loop). Deny conservatively rather than execute unsupervised.
+        tracing::warn!(
+            name: "zhive.subagent.handshake.send_failed",
+            tool = tool_name,
+            decision = "deny",
+            "parent decision channel closed; blocking child tool call"
+        );
+        return HandshakeVerdict::Deny;
+    }
+
+    // Park on the parent's verdict, biased so a cancel is observed first.
+    tokio::select! {
+        biased;
+        () = cancel.cancelled() => {
+            tracing::debug!(
+                name: "zhive.subagent.handshake.cancelled",
+                tool = tool_name,
+                decision = "deny",
+                "child turn cancelled while awaiting parent verdict; blocking tool call"
+            );
+            HandshakeVerdict::Deny
+        }
+        verdict = reply_rx => match verdict {
+            Ok(ParentVerdict::Allow) => HandshakeVerdict::Allow,
+            Ok(ParentVerdict::Deny) => HandshakeVerdict::Deny,
+            // Reply sender dropped (parent panicked / exited): deny, never widen.
+            Err(_recv_err) => {
+                tracing::warn!(
+                    name: "zhive.subagent.handshake.reply_dropped",
+                    tool = tool_name,
+                    decision = "deny",
+                    "parent verdict channel dropped; blocking child tool call"
+                );
+                HandshakeVerdict::Deny
+            }
+        },
     }
 }
 

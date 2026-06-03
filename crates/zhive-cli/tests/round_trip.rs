@@ -148,7 +148,7 @@ async fn user_turn_round_trips_into_conversation() {
     );
     assert!(!conv.busy, "a completed turn clears the busy flag");
 
-    client.shutdown();
+    let _ = client.shutdown().await;
     token.cancel();
     let _ = engine.shutdown().await;
 }

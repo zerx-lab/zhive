@@ -27,7 +27,7 @@
 use std::sync::Arc;
 
 use tokio::io::{AsyncRead, AsyncWrite, BufReader};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{Notify, broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 use zhive_proto::framing::{self, FramingError};
 use zhive_proto::{ErrorObject, Id, Message, Notification, Response};
@@ -61,6 +61,10 @@ pub(crate) struct ReaderArgs<R> {
     pub(crate) handler_slot: Arc<HandlerSlot>,
     /// Pending reverse-RPC join handles shared with the `Client`.
     pub(crate) pending_reverse: Arc<PendingReverse>,
+    /// Notified once when the reader task exits; polled by
+    /// [`crate::Client::shutdown`] to implement the 5-second drain
+    /// wait before aborting.
+    pub(crate) worker_done: Arc<Notify>,
 }
 
 /// Spawns the reader task that decodes inbound frames and routes
@@ -88,6 +92,7 @@ where
         notifications_tx,
         handler_slot,
         pending_reverse,
+        worker_done,
     } = args;
 
     tokio::spawn(async move {
@@ -152,6 +157,12 @@ where
         });
         // Step 4: drop `events_tx` — closing the broadcast channel so
         // subscribers see `None` after the Disconnected event.
+
+        // Step 5: signal to any waiting `shutdown().await` callers that
+        // the reader has fully exited.  This must be the last operation
+        // so that `Client::shutdown` only returns after all teardown
+        // steps above have completed.
+        worker_done.notify_one();
     });
 }
 

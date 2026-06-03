@@ -57,6 +57,13 @@ impl Host {
         // A stale socket from a crashed run would block binding.
         let _ = std::fs::remove_file(&socket);
 
+        // NOTE: do NOT remove_file here. serve_uds_with_events delegates to
+        // serve_uds_inner -> prepare_uds_path which correctly probes for a live
+        // server, removes stale sockets, and errors on non-socket paths.
+        // A bare remove_file before this probe would silently delete an active
+        // server's socket and cause the live-server check to mis-classify a
+        // running peer as "clean" (it would observe NotFound instead of
+        // AddrInUse), allowing two servers to share a socket path.
         let engine = Engine::spawn_with_config(EngineConfig {
             provider,
             tools: std::sync::Arc::clone(&runtime.registry),
@@ -65,6 +72,7 @@ impl Host {
             turn_limits: runtime.turn_limits,
             system_prompt: Some(std::sync::Arc::clone(&runtime.system_prompt)),
             compact_token_threshold: None,
+            cwd: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
         });
         let mut router = Router::new();
         register_engine_handlers(&mut router, engine.clone());
@@ -128,7 +136,9 @@ impl Host {
     pub async fn stop(mut self) {
         // `Host` implements `Drop`, so fields cannot be moved out of `self`;
         // a clone of the cheap `Arc`-backed client carries the shutdown signal.
-        self.client.clone().shutdown();
+        // `shutdown` is now async and returns Result; we ignore the value here
+        // since a timeout or Err at teardown is non-fatal.
+        let _ = self.client.clone().shutdown().await;
         // Close MCP connections before the engine that dispatches through them.
         if let Some(runtime) = self.runtime.take() {
             runtime.shutdown().await;

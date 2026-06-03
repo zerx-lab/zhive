@@ -9,12 +9,13 @@
 //! `impl EngineInner` block; Rust allows multiple `impl` blocks for a
 //! single type across different files in the same module tree.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use zhive_proto::domain::{Thread, ThreadId, ThreadSource, ThreadStatus, TurnId, TurnStatus};
+use zhive_proto::domain::{
+    Thread, ThreadId, ThreadSource, ThreadStatus, TurnError, TurnId, TurnStatus,
+};
 use zhive_proto::hook::EnginePhase;
 
 use crate::persistence::writer::StorageWriteOp;
@@ -83,6 +84,13 @@ impl EngineInner {
         let mut full_input: Vec<zhive_proto::domain::Item> = next_turn_seed;
         full_input.extend(user_input);
 
+        // Derive the thread preview from the first user message in this turn's
+        // input. Computed BEFORE the `for item in full_input` loop below moves
+        // `full_input`. The writer's upsert only overwrites the stored preview
+        // when this is non-empty (see `upsert_thread`'s ON CONFLICT clause), so
+        // a later idle snapshot carrying an empty preview never clears it.
+        let preview = derive_preview_from_items(&full_input);
+
         // Install the ActiveTurn (including its cancel token) and flip
         // the thread status to Active. Both happen before TurnStarted
         // is emitted so subscribers observing that event see a
@@ -119,8 +127,18 @@ impl EngineInner {
         };
         drop(status);
 
+        // Seed the history buffer's active turn so the pushes below land in a
+        // turn (the buffer is the single in-memory transcript; B2).
+        handle.start_turn_buffer(turn_id.clone(), started_at).await;
+        // Thread-scoped event layer, additive beside the engine bus.
+        let _ = handle.events.send(crate::state::ThreadEvent::TurnStarted {
+            turn_id: turn_id.clone(),
+            started_at,
+        });
+
         // Push the combined input items (next-turn seeds + user_input) and
-        // emit ItemAppended for each one.
+        // emit ItemAppended for each one. The thread-scoped
+        // `ThreadEvent::ItemAppended` is fanned out inside `push_item`.
         for item in full_input {
             handle.push_item(item.clone()).await;
             let _ = self.events_tx().send(EngineEvent::ItemAppended {
@@ -153,7 +171,8 @@ impl EngineInner {
             id: thread_id.clone(),
             session_id: None,
             forked_from: None,
-            preview: String::new(),
+            subagent_parent: subagent_parent_for_handle(&handle),
+            preview,
             ephemeral: false,
             model_provider: "unknown".to_owned(),
             created_at: started_at,
@@ -161,7 +180,7 @@ impl EngineInner {
             status: ThreadStatus::Active {
                 active_flags: vec![zhive_proto::domain::ThreadActiveFlag::TurnInProgress],
             },
-            cwd: PathBuf::from("."),
+            cwd: self.cwd().to_path_buf(),
             source,
             name: None,
             turns: vec![],
@@ -196,9 +215,12 @@ impl EngineInner {
     /// Completes the turn that `run_turn` put in flight.
     ///
     /// Thread status flips back to `Idle`, the engine phase rolls back to
-    /// `Idle`, and a `TurnCompleted` event is emitted — unless `failed` is
-    /// `true`, in which case `TurnCompleted` is suppressed because `TurnFailed`
-    /// was already broadcast (a turn has exactly one terminal event).
+    /// `Idle`, and a `TurnCompleted` event is emitted — unless `error` is
+    /// `Some`, in which case `TurnCompleted` is suppressed because `TurnFailed`
+    /// was already broadcast (a turn has exactly one terminal event). When
+    /// `error` is `Some`, its detail is also written to the persisted
+    /// `TurnEnded` op (so the `turns` row records `error_message` /
+    /// `error_details` rather than silently dropping the failure cause).
     ///
     /// If `cancel_turn` already took the `active_turn` slot
     /// (`we_owned_the_turn == false`), this method is a no-op so there is
@@ -211,8 +233,11 @@ impl EngineInner {
         handle: &Arc<crate::state::ThreadHandle>,
         thread_id: ThreadId,
         turn_id: TurnId,
-        failed: bool,
+        error: Option<TurnError>,
     ) {
+        // A turn with an error attached is a failed turn; the boolean drives the
+        // same TurnCompleted-suppression logic as before.
+        let failed = error.is_some();
         // Take the active turn slot only if it belongs to *this* turn.
         //
         // There are two cases where the slot no longer belongs to us:
@@ -251,6 +276,19 @@ impl EngineInner {
         *status = ThreadStatus::Idle;
         drop(status);
 
+        // Save point #2/#3/#5: flush this thread's deferred session writes
+        // BEFORE the phase rolls back to Idle and before the TurnEnded fsync,
+        // so any session metadata buffered during the turn is enqueued as part
+        // of this turn's durable boundary. The flush hangs on the shared
+        // finish_turn path (not a phase-specific match) so future suspended
+        // phases that route through finish_turn inherit it automatically.
+        // The abort path (`cancel_turn`) deliberately does NOT flush here.
+        let had_pending = self.flush_pending_session_writes(handle);
+        let _ = self.events_tx().send(EngineEvent::SavePoint {
+            thread_id: thread_id.clone(),
+            had_pending_mutations: had_pending,
+        });
+
         // Subagent (child) threads do NOT own a slot in the global
         // EnginePhase machine. The parent turn raised the phase to Turn
         // and will lower it when it finishes. Calling try_set_phase_atomic
@@ -283,30 +321,54 @@ impl EngineInner {
             }
         }
 
-        // Only emit TurnCompleted when the turn did not fail. A turn that
-        // already broadcast TurnFailed must not also emit TurnCompleted —
-        // each turn has exactly one terminal event.
+        let completed_at = unix_now();
+        let duration_ms = turn_started_at.map(|s| (completed_at - s).saturating_mul(1_000));
+        let terminal_status = if failed {
+            TurnStatus::Failed
+        } else {
+            TurnStatus::Completed
+        };
+
+        // Finalise the in-memory history turn FIRST, so any subscriber that
+        // wakes on the terminal events below observes the turn already moved
+        // out of the active window — never a "completed but still active" view.
+        // Previously `EngineEvent::TurnCompleted` was broadcast before this
+        // call, letting a subscriber that yields between receive and read see a
+        // turn that the event said was done but the buffer still listed active.
+        handle
+            .finish_turn_buffer(terminal_status, completed_at, duration_ms)
+            .await;
+
+        // Now broadcast the terminal events. Both fire after the buffer is
+        // finalised, so the engine-bus `TurnCompleted` and the thread-scoped
+        // `ThreadEvent::TurnCompleted` see a consistent post-turn history.
+        //
+        // Only emit `EngineEvent::TurnCompleted` when the turn did not fail: a
+        // turn that already broadcast `TurnFailed` must not also emit
+        // `TurnCompleted` — each turn has exactly one terminal event.
         if !failed {
             let _ = self.events_tx().send(EngineEvent::TurnCompleted {
                 thread_id: thread_id.clone(),
                 turn_id: turn_id.clone(),
             });
         }
+        let _ = handle
+            .events
+            .send(crate::state::ThreadEvent::TurnCompleted {
+                turn_id: turn_id.clone(),
+                status: terminal_status,
+            });
 
         // Enqueue persistence TurnEnded op and flip the thread row back to Idle.
         // Ordering: TurnEnded first (triggers fsync save point), then
-        // ThreadUpserted (updates the thread status column).
-        let completed_at = unix_now();
-        let duration_ms = turn_started_at.map(|s| (completed_at - s).saturating_mul(1_000));
+        // ThreadUpserted (updates the thread status column). The failure detail
+        // (when present) rides on the TurnEnded op so the `turns` row records
+        // `error_message` / `error_details` instead of dropping the cause.
         self.enqueue_storage_op(StorageWriteOp::TurnEnded {
             thread_id: thread_id.clone(),
             turn_id,
-            status: if failed {
-                TurnStatus::Failed
-            } else {
-                TurnStatus::Completed
-            },
-            error: None,
+            status: terminal_status,
+            error,
             completed_at,
             duration_ms,
         });
@@ -318,13 +380,16 @@ impl EngineInner {
             id: thread_id.clone(),
             session_id: None,
             forked_from: None,
+            subagent_parent: subagent_parent_for_handle(handle),
+            // Empty preview: the writer's upsert keeps the existing (non-empty)
+            // preview derived at `start_turn` rather than clearing it here.
             preview: String::new(),
             ephemeral: false,
             model_provider: "unknown".to_owned(),
             created_at: completed_at,
             updated_at: completed_at,
             status: ThreadStatus::Idle,
-            cwd: PathBuf::from("."),
+            cwd: self.cwd().to_path_buf(),
             source: idle_source,
             name: None,
             turns: vec![],
@@ -398,6 +463,17 @@ impl EngineInner {
         // duration_ms: wall time from turn start to cancellation, in ms.
         // saturating_mul(1_000) converts seconds to milliseconds.
         let duration_ms = Some((cancel_at - turn_started_at).saturating_mul(1_000));
+        // Finalise the in-memory history turn as Interrupted and fan out the
+        // thread-scoped event (additive beside the engine bus).
+        handle
+            .finish_turn_buffer(TurnStatus::Interrupted, cancel_at, duration_ms)
+            .await;
+        let _ = handle
+            .events
+            .send(crate::state::ThreadEvent::TurnCompleted {
+                turn_id: cancelled_turn_id.clone(),
+                status: TurnStatus::Interrupted,
+            });
         self.enqueue_storage_op(StorageWriteOp::TurnEnded {
             thread_id: thread_id.clone(),
             turn_id: cancelled_turn_id.clone(),
@@ -414,13 +490,16 @@ impl EngineInner {
             id: thread_id.clone(),
             session_id: None,
             forked_from: None,
+            subagent_parent: subagent_parent_for_handle(&handle),
+            // Empty preview: the writer's upsert keeps the existing (non-empty)
+            // preview derived at `start_turn` rather than clearing it here.
             preview: String::new(),
             ephemeral: false,
             model_provider: "unknown".to_owned(),
             created_at: cancel_at,
             updated_at: cancel_at,
             status: ThreadStatus::Idle,
-            cwd: PathBuf::from("."),
+            cwd: self.cwd().to_path_buf(),
             source: cancel_idle_source,
             name: None,
             turns: vec![],
@@ -502,6 +581,39 @@ fn thread_source_for_handle(handle: &crate::state::ThreadHandle) -> ThreadSource
     }
 }
 
+/// Returns the subagent parent thread id from a [`ThreadHandle`], if any.
+///
+/// A handle whose `parent_thread_id` is `Some(_)` was spawned as a subagent;
+/// the parent id is persisted in `Thread.subagent_parent` so resume / rebuild
+/// can recover the parent-child relationship. Top-level threads return `None`.
+///
+/// This is called at every shared persistence snapshot site (`finish_turn`,
+/// `cancel_turn`) so a subagent child never loses its parent link on upsert.
+fn subagent_parent_for_handle(handle: &crate::state::ThreadHandle) -> Option<ThreadId> {
+    handle.parent_thread_id.clone()
+}
+
+/// Derives a thread preview from the first user message in `items`.
+///
+/// Thin `pub(in crate::engine)` re-export of
+/// [`crate::persistence::preview::derive_preview_from_items`]: the canonical
+/// implementation lives in the persistence layer so the live turn path and the
+/// historical [`crate::persistence::Storage::backfill_thread_metadata`] derive
+/// identical previews. See that function for the full semantics.
+pub(in crate::engine) fn derive_preview_from_items(items: &[zhive_proto::domain::Item]) -> String {
+    crate::persistence::preview::derive_preview_from_items(items)
+}
+
+/// Trims and truncates `text` to the shared preview character cap.
+///
+/// Thin `pub(in crate::engine)` re-export of
+/// [`crate::persistence::preview::truncate_preview`]; used by
+/// [`super::subagent_spawn`], which derives a child preview from its prompt
+/// string rather than from items.
+pub(in crate::engine) fn truncate_preview(text: &str) -> String {
+    crate::persistence::preview::truncate_preview(text)
+}
+
 /// Returns the current time as seconds since the Unix epoch.
 ///
 /// Saturates to `0` on clock errors and to [`i64::MAX`] on overflow.
@@ -536,10 +648,72 @@ mod tests {
     use crate::engine::inner::EngineInner;
     use crate::provider::DynLanguageModel;
 
-    use super::unix_now;
+    use super::{derive_preview_from_items, truncate_preview, unix_now};
 
     fn tid(s: &str) -> ThreadId {
         ThreadId(Arc::from(s))
+    }
+
+    fn user_msg(parts: &[&str]) -> zhive_proto::domain::Item {
+        use zhive_proto::domain::{Item, ItemContent, ItemId};
+        Item::UserMessage {
+            id: ItemId(Arc::from("item:test/0")),
+            content: parts
+                .iter()
+                .map(|t| ItemContent::Text {
+                    text: (*t).to_owned(),
+                    annotations: None,
+                })
+                .collect(),
+        }
+    }
+
+    /// `derive_preview_from_items` joins the first user message's text parts,
+    /// trims, and returns the result (short input is unchanged).
+    #[test]
+    fn derive_preview_joins_first_user_message_text() {
+        let items = vec![user_msg(&["  hello", "world  "])];
+        assert_eq!(derive_preview_from_items(&items), "hello world");
+    }
+
+    /// `derive_preview_from_items` returns empty when there is no user message.
+    #[test]
+    fn derive_preview_empty_without_user_message() {
+        use zhive_proto::domain::{Item, ItemId};
+        let items = vec![Item::AgentMessage {
+            id: ItemId(Arc::from("item:test/0")),
+            text: "agent only".into(),
+        }];
+        assert!(derive_preview_from_items(&items).is_empty());
+    }
+
+    /// `derive_preview_from_items` picks the FIRST user message and ignores
+    /// later ones (and non-text content).
+    #[test]
+    fn derive_preview_uses_first_user_message() {
+        let items = vec![user_msg(&["first"]), user_msg(&["second"])];
+        assert_eq!(derive_preview_from_items(&items), "first");
+    }
+
+    /// `truncate_preview` caps the result at `PREVIEW_MAX_CHARS` characters on a
+    /// character boundary (multi-byte input is never split mid-codepoint).
+    #[test]
+    fn truncate_preview_caps_chars_on_boundary() {
+        // 200 multi-byte chars; the cap is 80, so 80 chars survive.
+        let long: String = "é".repeat(200);
+        let truncated = truncate_preview(&long);
+        assert_eq!(
+            truncated.chars().count(),
+            crate::persistence::preview::PREVIEW_MAX_CHARS
+        );
+        // Still valid UTF-8 made entirely of the same char.
+        assert!(truncated.chars().all(|c| c == 'é'));
+    }
+
+    /// `truncate_preview` trims surrounding whitespace.
+    #[test]
+    fn truncate_preview_trims() {
+        assert_eq!(truncate_preview("  spaced  "), "spaced");
     }
 
     fn ask_request() -> zhive_proto::permission::RequestPermissionRequest {
@@ -653,9 +827,9 @@ mod tests {
         let child_id = tid("thread:subagent/parent/0");
 
         // Register a *child* handle — it has parent_thread_id set.
-        // `new_child` returns `(handle, rx)`; the receiver is unused in
-        // this unit test (we only care about the phase-rollback behaviour).
-        let (child_handle_inner, _rx) =
+        // `new_child` returns `(handle, final_rx, decision_rx)`; both receivers
+        // are unused here (we only care about the phase-rollback behaviour).
+        let (child_handle_inner, _final_rx, _decision_rx) =
             crate::state::ThreadHandle::new_child(child_id.clone(), parent_id.clone());
         let child_handle = Arc::new(child_handle_inner);
         {
@@ -742,6 +916,165 @@ mod tests {
         );
     }
 
+    /// `finish_turn` flushes the thread's deferred session writes and
+    /// broadcasts a `SavePoint` with `had_pending_mutations = true` when the
+    /// buffer held writes.
+    #[tokio::test]
+    async fn finish_turn_flushes_pending_and_emits_save_point() {
+        use crate::state::PendingSessionWrite;
+        use zhive_proto::hook::EnginePhase;
+
+        let (events_tx, mut events_rx) = tokio::sync::broadcast::channel::<EngineEvent>(32);
+        let inner = Arc::new(EngineInner::new(events_tx, noop_provider()));
+        let thread_id = tid("thread:native/save-point");
+        let handle = inner.threads().get_or_init(&thread_id).await;
+
+        // Seed an active turn and the Turn phase.
+        let turn_id = inner.allocate_turn_id(&thread_id);
+        let mut active = handle.active_turn.lock().await;
+        *active = Some(crate::state::ActiveTurn::new(turn_id.clone(), unix_now()));
+        drop(active);
+        inner
+            .try_set_phase_atomic(EnginePhase::Idle, EnginePhase::Turn)
+            .expect("seed phase to Turn");
+
+        // Buffer a deferred write while the phase is Turn.
+        handle.pending_writes_lock().push_or_enqueue(
+            EnginePhase::Turn,
+            PendingSessionWrite::ModelChanged {
+                thread_id: thread_id.clone(),
+                provider: "anthropic".into(),
+                model_id: "claude-opus-4".into(),
+            },
+            |_w| {},
+        );
+        assert_eq!(handle.pending_writes_lock().len(), 1);
+
+        inner
+            .finish_turn(&handle, thread_id.clone(), turn_id, None)
+            .await;
+
+        // The buffer was flushed.
+        assert!(
+            handle.pending_writes_lock().is_empty(),
+            "finish_turn must flush the pending buffer"
+        );
+
+        // A SavePoint with had_pending_mutations=true was broadcast.
+        let mut saw_save_point = false;
+        while let Ok(ev) = events_rx.try_recv() {
+            if let EngineEvent::SavePoint {
+                thread_id: ev_tid,
+                had_pending_mutations,
+            } = ev
+            {
+                assert_eq!(ev_tid, thread_id);
+                assert!(had_pending_mutations);
+                saw_save_point = true;
+            }
+        }
+        assert!(
+            saw_save_point,
+            "finish_turn must broadcast a SavePoint event"
+        );
+    }
+
+    /// Regression: a subscriber that wakes on the terminal `TurnCompleted` event
+    /// must observe the turn already finalised in the history buffer — never a
+    /// "completed but still active" view. `finish_turn` now finalises the buffer
+    /// BEFORE broadcasting `TurnCompleted`; this test captures the buffer's
+    /// `active_turn_id()` at event-receive time and asserts it is `None`.
+    #[tokio::test]
+    async fn finish_turn_finalises_buffer_before_broadcasting_completed() {
+        use crate::state::ThreadEvent;
+
+        let inner = new_inner();
+        let thread_id = tid("thread:native/order");
+        let handle = inner.threads().get_or_init(&thread_id).await;
+
+        // Seed an active turn + buffer and the Turn phase.
+        let turn_id = inner.allocate_turn_id(&thread_id);
+        let mut active = handle.active_turn.lock().await;
+        *active = Some(crate::state::ActiveTurn::new(turn_id.clone(), unix_now()));
+        drop(active);
+        handle.start_turn_buffer(turn_id.clone(), unix_now()).await;
+        assert!(
+            handle.history.lock().await.active_turn_id().is_some(),
+            "buffer must have an active turn before finish_turn"
+        );
+        inner
+            .try_set_phase_atomic(EnginePhase::Idle, EnginePhase::Turn)
+            .expect("seed phase to Turn");
+
+        // A watcher task records the buffer's active-turn state the instant it
+        // receives the thread-scoped TurnCompleted. Because finish_turn releases
+        // the history lock (after finalisation) before sending, the watcher
+        // observes a finalised (None) buffer.
+        let mut thread_events = handle.subscribe_events();
+        let watcher_handle = Arc::clone(&handle);
+        let watcher = tokio::spawn(async move {
+            while let Ok(event) = thread_events.recv().await {
+                if matches!(event, ThreadEvent::TurnCompleted { .. }) {
+                    return watcher_handle.history.lock().await.active_turn_id();
+                }
+            }
+            None
+        });
+
+        inner
+            .finish_turn(&handle, thread_id.clone(), turn_id, None)
+            .await;
+
+        let active_at_event_time = tokio::time::timeout(std::time::Duration::from_secs(2), watcher)
+            .await
+            .expect("watcher must complete")
+            .expect("watcher task must not panic");
+
+        assert!(
+            active_at_event_time.is_none(),
+            "buffer must be finalised (no active turn) by the time TurnCompleted is observed"
+        );
+    }
+
+    /// The abort path (`cancel_turn`) must NOT flush the pending buffer; the
+    /// deferred writes survive to the next Idle save point.
+    #[tokio::test]
+    async fn cancel_turn_does_not_flush_pending_buffer() {
+        use crate::state::PendingSessionWrite;
+        use zhive_proto::hook::EnginePhase;
+
+        let inner = new_inner();
+        let thread_id = tid("thread:native/cancel-no-flush");
+        let handle = inner.threads().get_or_init(&thread_id).await;
+
+        let turn_id = inner.allocate_turn_id(&thread_id);
+        let mut active = handle.active_turn.lock().await;
+        *active = Some(crate::state::ActiveTurn::new(turn_id, unix_now()));
+        drop(active);
+        inner
+            .try_set_phase_atomic(EnginePhase::Idle, EnginePhase::Turn)
+            .expect("seed phase to Turn");
+
+        // Buffer a deferred write.
+        handle.pending_writes_lock().push_or_enqueue(
+            EnginePhase::Turn,
+            PendingSessionWrite::Leaf {
+                thread_id: thread_id.clone(),
+            },
+            |_w| {},
+        );
+        assert_eq!(handle.pending_writes_lock().len(), 1);
+
+        inner.cancel_turn(thread_id).await;
+
+        // The buffer is preserved across abort.
+        assert_eq!(
+            handle.pending_writes_lock().len(),
+            1,
+            "cancel_turn (abort path) must NOT flush the pending buffer"
+        );
+    }
+
     /// Regression test for the stale-turn clobber scenario:
     ///
     /// A cancelled turn's `run_turn` task may call `finish_turn` *after*
@@ -777,7 +1110,7 @@ mod tests {
         // Now the old (stale) run_turn calls finish_turn with its own id.
         // This must be a complete no-op.
         inner
-            .finish_turn(&handle, thread_id.clone(), old_turn_id, false)
+            .finish_turn(&handle, thread_id.clone(), old_turn_id, None)
             .await;
 
         // Engine phase must still be Turn (not rolled back to Idle).

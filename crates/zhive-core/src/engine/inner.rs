@@ -23,7 +23,7 @@
 //!
 //! ## Prompt mapping (Phase 1, documented deviations)
 //!
-//! `run_turn` maps the thread's `items_tail` to `llmsdk::Prompt` with
+//! `run_turn` maps the thread's resident transcript to `llmsdk::Prompt` with
 //! the following Phase-1 rules:
 //! - `Item::UserMessage` → `Message::User { content: [UserPart::Text(…)] }`
 //! - `Item::AgentMessage` → `Message::Assistant { content: [AssistantPart::Text(…)] }`
@@ -44,6 +44,7 @@ use zhive_proto::hook::EnginePhase;
 use crate::cancel::CancellationTree;
 use crate::hooks::HookHost;
 use crate::permission::{PermissionReducer, ReducerError};
+use crate::persistence::Storage;
 use crate::persistence::writer::StorageWriteOp;
 use crate::provider::DynLanguageModel;
 use crate::queues::QueueTarget;
@@ -145,6 +146,28 @@ pub(crate) struct EngineInner {
     /// engine-owned async task, so no cross-thread synchronisation beyond
     /// "last writer wins" is needed.
     last_input_tokens: AtomicU64,
+
+    /// Read handle to persistent storage, retained for cross-thread fork.
+    ///
+    /// `None` for a purely in-memory engine. Cross-thread fork reads the
+    /// source thread's JSONL rollout directly (the source of truth, including
+    /// history outside the in-memory window), so it requires storage; with
+    /// `None`, [`super::fork`] returns
+    /// [`super::submission::ForkError::SourceNotFound`].
+    ///
+    /// This is the engine's only **read** path into storage; writes still go
+    /// through the [`Self::storage_writer`] channel so the turn loop never
+    /// blocks on disk I/O.
+    storage: Option<Arc<Storage>>,
+
+    /// Working directory recorded on every thread this engine creates.
+    ///
+    /// Stamped onto every thread snapshot (`start_turn`, `finish_turn`,
+    /// `cancel_turn`, subagent spawn, fork) so the persisted `cwd` column is
+    /// stable across the upsert `ON CONFLICT` path. Defaults to `"."` for the
+    /// bare [`Self::new`] constructor; real paths arrive via
+    /// [`super::EngineConfig::cwd`].
+    cwd: std::path::PathBuf,
 }
 
 impl EngineInner {
@@ -162,6 +185,8 @@ impl EngineInner {
             None,
             None,
             None,
+            None,
+            std::path::PathBuf::from("."),
         )
     }
 
@@ -180,6 +205,8 @@ impl EngineInner {
         storage_tx: Option<mpsc::Sender<StorageWriteOp>>,
         storage_handle: Option<JoinHandle<()>>,
         compact_token_threshold: Option<u64>,
+        storage: Option<Arc<Storage>>,
+        cwd: std::path::PathBuf,
     ) -> Self {
         Self {
             threads: Arc::new(ThreadStore::new()),
@@ -199,6 +226,8 @@ impl EngineInner {
             }),
             compact_token_threshold,
             last_input_tokens: AtomicU64::new(0),
+            storage,
+            cwd,
         }
     }
 
@@ -231,6 +260,14 @@ impl EngineInner {
     /// Returns the configured system prompt for sibling modules, if any.
     pub(in crate::engine) fn system_prompt(&self) -> Option<&str> {
         self.system_prompt.as_deref()
+    }
+
+    /// Returns the engine's working directory for sibling modules.
+    ///
+    /// Stamped onto every thread snapshot so the persisted `cwd` column is
+    /// stable across the upsert `ON CONFLICT` path (see [`super::lifecycle`]).
+    pub(in crate::engine) fn cwd(&self) -> &std::path::Path {
+        &self.cwd
     }
 
     /// Returns the effective per-turn iteration cap for [`super::turn`].
@@ -285,6 +322,34 @@ impl EngineInner {
                 "persistence write op dropped; writer channel full or closed"
             );
         }
+    }
+
+    /// Flushes a thread's deferred session writes at a save point.
+    ///
+    /// Drains the thread's [`crate::state::PendingSessionWrites`] buffer in
+    /// FIFO order, forwarding each produced [`StorageWriteOp`] to
+    /// [`Self::enqueue_storage_op`].  Because `enqueue_storage_op` is itself
+    /// best-effort (it only logs on a full / closed channel), the wrapping
+    /// closure always reports success — the buffer is fully drained and a
+    /// dropped op never stalls the turn loop.
+    ///
+    /// Returns whether the buffer held any deferred writes before the flush,
+    /// so the caller can populate
+    /// [`super::event::EngineEvent::SavePoint::had_pending_mutations`].
+    ///
+    /// The buffer lock is a `std::sync::Mutex` taken and released without
+    /// crossing an `await` point, matching the engine's lock discipline.
+    pub(in crate::engine) fn flush_pending_session_writes(
+        &self,
+        handle: &crate::state::ThreadHandle,
+    ) -> bool {
+        let mut pending = handle.pending_writes_lock();
+        let had_pending = !pending.is_empty();
+        let _ = pending.flush(|op| {
+            self.enqueue_storage_op(op);
+            Ok(())
+        });
+        had_pending
     }
 
     /// Returns the turn counter for sibling modules (e.g. lifecycle).
@@ -404,6 +469,23 @@ impl EngineInner {
                     let _ = tx.send(SubmissionReply::Compact(outcome));
                 }
             }
+            Submission::Fork {
+                source_thread_id,
+                up_to_item,
+                summarize,
+            } => {
+                let outcome = self
+                    .fork_thread(source_thread_id, up_to_item, summarize)
+                    .await;
+                if let Some(tx) = reply {
+                    let _ = tx.send(SubmissionReply::Fork(outcome));
+                }
+            }
+            history @ (Submission::ListThreads { .. }
+            | Submission::ResumeThread { .. }
+            | Submission::GetItems { .. }) => {
+                self.dispatch_history(history, reply).await;
+            }
             other => {
                 tracing::debug!(
                     name: "zhive.engine.submission.unhandled",
@@ -415,6 +497,50 @@ impl EngineInner {
                 // `EngineError::ReplyDropped` instead of timing out.
                 drop(reply);
             }
+        }
+    }
+
+    /// Handles the read-mostly history submissions (`ListThreads`,
+    /// `ResumeThread`, `GetItems`).
+    ///
+    /// Split out of [`Self::dispatch`] so the main dispatch match stays under
+    /// the clippy line cap. Each arm calls the matching [`super::resume`] method
+    /// and discharges the reply oneshot. A submission outside this group is a
+    /// caller bug (the `dispatch` match only routes the three history variants
+    /// here) and the reply is dropped so the awaiter surfaces `ReplyDropped`.
+    async fn dispatch_history(
+        self: &Arc<Self>,
+        sub: Submission,
+        reply: Option<tokio::sync::oneshot::Sender<SubmissionReply>>,
+    ) {
+        match sub {
+            Submission::ListThreads { cwd } => {
+                let threads = self.list_threads(cwd.as_deref()).await;
+                if let Some(tx) = reply {
+                    let _ = tx.send(SubmissionReply::ListThreads(Box::new(threads)));
+                }
+            }
+            Submission::ResumeThread { thread_id } => {
+                let outcome = self.resume_thread(thread_id).await;
+                if let Some(tx) = reply {
+                    let _ = tx.send(SubmissionReply::ResumeThread(outcome));
+                }
+            }
+            Submission::GetItems {
+                thread_id,
+                turn_id,
+                offset,
+                limit,
+            } => {
+                let outcome = self
+                    .get_items(thread_id, turn_id, offset, limit)
+                    .await
+                    .map(Box::new);
+                if let Some(tx) = reply {
+                    let _ = tx.send(SubmissionReply::GetItems(outcome));
+                }
+            }
+            _ => drop(reply),
         }
     }
 
@@ -490,8 +616,26 @@ impl EngineInner {
         request_id: &PermissionRequestId,
         outcome: zhive_proto::permission::PermissionOutcome,
     ) -> ResumePermissionReply {
-        match self.permission.resolve_by_wire_id(request_id, outcome) {
-            Ok(()) => ResumePermissionReply::Resolved,
+        match self
+            .permission
+            .resolve_by_wire_id_with_context(request_id, outcome)
+        {
+            Ok(context) => {
+                // If the resolved request belonged to a suspended turn, emit a
+                // `TurnResumed` so subscribers learn the turn is live again.
+                // This runs on the engine actor task (the submission loop), not
+                // the parked turn task — that separation is what keeps the
+                // two-layer suspend/resume free of deadlock: the resolve is
+                // delivered by the actor while the turn task waits on the
+                // reducer's oneshot.
+                if let Some(ctx) = context {
+                    let _ = self.events_tx().send(EngineEvent::TurnResumed {
+                        thread_id: ctx.thread_id,
+                        turn_id: ctx.turn_id,
+                    });
+                }
+                ResumePermissionReply::Resolved
+            }
             Err(err) => {
                 let rid = std::sync::Arc::<str>::clone(&request_id.0);
                 let kind = error_kind(&err);
@@ -565,6 +709,15 @@ impl EngineInner {
 
     pub(crate) fn threads(&self) -> &Arc<ThreadStore> {
         &self.threads
+    }
+
+    /// Returns the retained read handle to persistent storage, if any.
+    ///
+    /// `None` for an in-memory engine. Used by [`super::fork`] to read a source
+    /// thread's rollout when forking; the write path uses
+    /// [`Self::enqueue_storage_op`] instead.
+    pub(in crate::engine) fn storage(&self) -> Option<&Arc<Storage>> {
+        self.storage.as_ref()
     }
 }
 

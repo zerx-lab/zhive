@@ -18,7 +18,9 @@ use std::sync::Arc;
 
 use thiserror::Error;
 use zhive_proto::domain::{Item, ThreadId, TurnError};
-use zhive_proto::permission::{PermissionMode, PermissionScope, ScopeError, SubagentDefinition};
+use zhive_proto::permission::{
+    PermissionDecision, PermissionMode, PermissionScope, ScopeError, SubagentDefinition,
+};
 
 /// Outcome variants for a finished subagent turn.
 ///
@@ -36,9 +38,12 @@ use zhive_proto::permission::{PermissionMode, PermissionScope, ScopeError, Subag
 ///    is always emitted for external observers regardless of whether the
 ///    in-process channel receiver was retained.
 ///
-/// `Suspended` is intentionally omitted from Phase 1 — the Defer /
-/// parent-suspended path is tracked as TODO B8-O6 and will land in a
-/// later increment.
+/// The [`SubagentFinalEvent::Suspended`] variant is reserved for a future
+/// child-suspends-independently path (B8-O6) and is NOT constructed today: under
+/// the current full-handshake architecture a deferring child routes its decision
+/// to the parent's second fold and the parent resolves it inline (Allow / Deny)
+/// before the child continues, so no terminal `Suspended` is emitted. See the
+/// variant's own docs for details.
 ///
 /// # Examples
 ///
@@ -53,6 +58,21 @@ use zhive_proto::permission::{PermissionMode, PermissionScope, ScopeError, Subag
 /// let final_msg = extract_final_message(&items);
 /// let event = SubagentFinalEvent::Completed { child_thread_id: tid, final_message: final_msg };
 /// assert!(matches!(event, SubagentFinalEvent::Completed { .. }));
+/// ```
+///
+/// Constructing a `Suspended` event:
+///
+/// ```
+/// use std::sync::Arc;
+/// use zhive_proto::domain::ThreadId;
+/// use zhive_core::subagent::SubagentFinalEvent;
+///
+/// let tid = ThreadId(Arc::from("thread:subagent/child/0"));
+/// let event = SubagentFinalEvent::Suspended {
+///     child_thread_id: tid,
+///     child_request_id: "perm:7".to_owned(),
+/// };
+/// assert!(matches!(event, SubagentFinalEvent::Suspended { .. }));
 /// ```
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -81,6 +101,89 @@ pub enum SubagentFinalEvent {
         /// Failure detail from the turn.
         error: TurnError,
     },
+    /// The subagent turn parked on a deferred permission request.
+    ///
+    /// NOT CONSTRUCTED under the current full-handshake architecture: a child
+    /// tool call that folds to [`PermissionDecision::Defer`] routes the decision
+    /// to the parent's second fold over the in-process `subagent_decision_tx`
+    /// channel, and the parent resolves it (Allow / Deny) inline before the
+    /// child continues — so a child never emits a terminal `Suspended` event.
+    /// The variant is retained for a future architecture where a child could
+    /// suspend independently of its parent (the spawner already has a forwarding
+    /// path for it; see `EngineSubagentSpawner::spawn_and_await`). When that
+    /// path is reached today, the spawner logs a `warn` rather than silently
+    /// dropping the event.
+    ///
+    /// `child_request_id` is the wire-form pending request id the client passes
+    /// back to resume; resuming it discharges the request on the shared engine
+    /// reducer (request ids are globally unique).
+    Suspended {
+        /// Stable id of the suspended child thread.
+        child_thread_id: ThreadId,
+        /// Wire-form pending request id the client passes back to resume.
+        child_request_id: String,
+    },
+}
+
+/// Parent-side verdict returned to a child tool call after the parent's
+/// second fold.
+///
+/// Sent back over the [`SubagentDecisionRequest::reply`] oneshot. The enum is
+/// deliberately limited to terminal states: any `Ask` / `Defer` the parent
+/// raises is resolved inside the spawner's reverse-RPC loop before a verdict
+/// is returned, so the child only ever sees `Allow` or `Deny`. This is the
+/// type-level guarantee that a child never re-enters a reverse-RPC of its own.
+///
+/// # Examples
+///
+/// ```ignore
+/// use zhive_core::subagent::ParentVerdict;
+/// let v = ParentVerdict::Deny;
+/// assert!(matches!(v, ParentVerdict::Deny));
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub(crate) enum ParentVerdict {
+    /// The parent permits the child tool call; the child executes it.
+    Allow,
+    /// The parent blocks the child tool call; the child records a failure.
+    Deny,
+}
+
+/// One child → parent permission handshake request.
+///
+/// A child turn sends this over `ThreadHandle::subagent_decision_tx` after it
+/// folds a non-`Deny` decision for a tool call, then parks on `reply` until
+/// the parent's second fold returns a [`ParentVerdict`]. `tool_name` and
+/// `raw_args` are carried so the parent can re-dispatch its own `PreToolUse`
+/// hooks with full tool context (the parent's second review must see what the
+/// child is about to do, not just the decision).
+///
+/// The `reply` oneshot makes the struct non-`Clone`; a hand-written `Debug`
+/// skips it. The value only ever flows over an in-process channel and never
+/// enters an [`crate::engine::event::EngineEvent`] (which requires `Clone`).
+pub(crate) struct SubagentDecisionRequest {
+    /// Provider-side stable id for the child's tool call.
+    pub tool_use_id: String,
+    /// Name of the tool the child wants to call.
+    pub tool_name: String,
+    /// Effective (possibly hook-mutated) input arguments.
+    pub raw_args: serde_json::Value,
+    /// The child's own folded decision (never `Deny`; that short-circuits).
+    pub child_decision: PermissionDecision,
+    /// Channel the parent uses to return its terminal verdict to the child.
+    pub reply: tokio::sync::oneshot::Sender<ParentVerdict>,
+}
+
+impl std::fmt::Debug for SubagentDecisionRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SubagentDecisionRequest")
+            .field("tool_use_id", &self.tool_use_id)
+            .field("tool_name", &self.tool_name)
+            .field("raw_args", &self.raw_args)
+            .field("child_decision", &self.child_decision)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Reasons a subagent cannot be spawned.

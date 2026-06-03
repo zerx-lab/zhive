@@ -177,6 +177,38 @@ async fn open_storage() -> Option<Arc<zhive_core::persistence::Storage>> {
                 path = %base.display(),
                 "storage.opened: persistent storage at {{path}}"
             );
+            // Best-effort metadata backfill for sessions recorded before the
+            // live turn path filled `preview` / `cwd` (idempotent). A failure
+            // here must never block startup — log and continue with the opened
+            // storage regardless.
+            match storage.backfill_thread_metadata().await {
+                Ok(stats) if stats.scanned > 0 => {
+                    // Bind the counts to locals so the structured-logging macro
+                    // sees simple identifiers on the value side (a dotted field
+                    // access there triggers a macro parse ambiguity).
+                    let scanned = stats.scanned;
+                    let previews_filled = stats.previews_filled;
+                    let cwds_filled = stats.cwds_filled;
+                    tracing::info!(
+                        name: "zhive.storage.backfill.done",
+                        scanned,
+                        previews_filled,
+                        cwds_filled,
+                        "storage.backfill: scanned {{scanned}} thread(s), \
+                         filled {{previews_filled}} preview(s) and {{cwds_filled}} cwd(s)"
+                    );
+                }
+                Ok(_) => {
+                    // Nothing to backfill (no empty-preview rows); stay quiet.
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        name: "zhive.storage.backfill.failed",
+                        error = %err,
+                        "storage backfill failed; continuing without it"
+                    );
+                }
+            }
             Some(Arc::new(storage))
         }
         Err(err) => {

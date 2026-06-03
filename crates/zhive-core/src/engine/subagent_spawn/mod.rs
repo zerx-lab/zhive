@@ -23,6 +23,10 @@
 //! [`EnginePhase`]: zhive_proto::hook::EnginePhase
 //! [`SubagentFinalEvent`]: crate::subagent::SubagentFinalEvent
 
+mod spawner;
+
+pub(crate) use spawner::EngineSubagentSpawner;
+
 use std::sync::Arc;
 
 use tracing::Instrument as _;
@@ -31,11 +35,25 @@ use zhive_proto::permission::{PermissionScope, SubagentDefinition, ToolName};
 
 use crate::persistence::writer::StorageWriteOp;
 use crate::state::{ActiveTurn, ThreadHandle};
-use crate::subagent::{SubagentError, SubagentFinalEvent, prepare_child_scope};
+use crate::subagent::{
+    SubagentDecisionRequest, SubagentError, SubagentFinalEvent, prepare_child_scope,
+};
 
 use super::event::EngineEvent;
 use super::inner::EngineInner;
 use super::submission::SubagentSpawnError;
+
+/// The spawn results returned by [`EngineInner::spawn_subagent_awaitable`].
+///
+/// Bundles the child thread id with the two in-process channels the parent
+/// spawner needs: the final-result receiver and the per-tool-call permission
+/// handshake receiver. Aliased so the long tuple does not repeat across the
+/// `spawn_subagent` / `spawn_subagent_awaitable` / `spawner` boundary.
+pub(crate) type AwaitableSpawn = (
+    ThreadId,
+    tokio::sync::mpsc::Receiver<SubagentFinalEvent>,
+    tokio::sync::mpsc::Receiver<SubagentDecisionRequest>,
+);
 
 impl EngineInner {
     /// Spawns a subagent child thread and starts its first turn.
@@ -72,11 +90,15 @@ impl EngineInner {
         parent_thread_id: ThreadId,
         definition: SubagentDefinition,
     ) -> Result<ThreadId, SubagentSpawnError> {
-        let (child_thread_id, _subagent_rx) = self
+        let (child_thread_id, _final_rx, _decision_rx) = self
             .spawn_subagent_awaitable(parent_thread_id, definition)
             .await?;
         // The actor-dispatch path does not await the child result; external
         // observers consume the broadcast `SubagentCompleted` event instead.
+        // Both in-process receivers are dropped: with no parent select loop
+        // consuming `decision_rx`, the child's per-tool-call handshake `send`
+        // fails and its dispatch falls back to a conservative deny — which is
+        // the correct behaviour for an unsupervised actor-dispatch spawn.
         Ok(child_thread_id)
     }
 
@@ -97,8 +119,7 @@ impl EngineInner {
         self: &Arc<Self>,
         parent_thread_id: ThreadId,
         definition: SubagentDefinition,
-    ) -> Result<(ThreadId, tokio::sync::mpsc::Receiver<SubagentFinalEvent>), SubagentSpawnError>
-    {
+    ) -> Result<AwaitableSpawn, SubagentSpawnError> {
         // (a) Look up the parent thread.
         let parent_handle = self
             .threads()
@@ -173,7 +194,7 @@ impl EngineInner {
         // tool-call handler (the `agent` tool). Callers that only care about
         // the broadcast bus (the actor-dispatch `spawn_subagent`) simply drop
         // it.
-        let (child_handle_inner, subagent_rx) =
+        let (child_handle_inner, subagent_rx, decision_rx) =
             ThreadHandle::new_child(child_thread_id.clone(), parent_thread_id.clone());
         let child_handle = Arc::new(child_handle_inner);
         self.threads()
@@ -200,6 +221,21 @@ impl EngineInner {
         )
         .await;
 
+        // Broadcast `SubagentStarted` so external observers learn the
+        // parent ↔ child relationship up front and can route the child
+        // thread's subsequent `ItemAppended` / `TurnStarted` events (which
+        // carry the child thread id) back to the parent. `agent_type` and
+        // `description` are mirrored from the definition; empty strings are
+        // normalised to `None` so the wire payload omits blank fields.
+        let agent_type = Some(definition.name.clone()).filter(|s| !s.is_empty());
+        let description = Some(definition.description.clone()).filter(|s| !s.is_empty());
+        let _ = self.events_tx().send(EngineEvent::SubagentStarted {
+            parent_thread_id: parent_thread_id.clone(),
+            child_thread_id: child_thread_id.clone(),
+            agent_type,
+            description,
+        });
+
         // Spawn the task that runs the child turn and delivers its final event.
         let inner = Arc::clone(self);
         let child_tid = child_thread_id.clone();
@@ -220,7 +256,7 @@ impl EngineInner {
             "subagent child thread spawned"
         );
 
-        Ok((child_thread_id, subagent_rx))
+        Ok((child_thread_id, subagent_rx, decision_rx))
     }
 
     /// Installs an active turn on the child handle, pushes the initial
@@ -254,9 +290,19 @@ impl EngineInner {
             scope,
         );
         *child_handle.active_turn.lock().await = Some(child_active_turn);
+        // Seed the history buffer's active turn so `push_item` below has a turn
+        // to append to (mirrors `start_turn` in lifecycle.rs).
+        child_handle
+            .start_turn_buffer(child_turn_id.clone(), started_at)
+            .await;
         *child_handle.status.write().await = zhive_proto::domain::ThreadStatus::Active {
             active_flags: vec![zhive_proto::domain::ThreadActiveFlag::TurnInProgress],
         };
+
+        // Derive the child preview from its spawn prompt (deterministic, no
+        // LLM) BEFORE `prompt` is moved into the UserMessage item below. This
+        // mirrors the top-level `start_turn` preview derivation.
+        let child_preview = crate::engine::lifecycle::truncate_preview(&prompt);
 
         // Build and broadcast the prompt as a UserMessage item.
         if !prompt.is_empty() {
@@ -290,11 +336,15 @@ impl EngineInner {
         //
         // ThreadUpserted first — ensures the JSONL rollout header is
         // written before TurnStarted so the writer can open the file.
+        //
+        // The parent link (`subagent_parent`) is taken from the child handle so
+        // resume / rebuild can recover the parent-child relationship.
         let child_snapshot = zhive_proto::domain::Thread {
             id: child_thread_id.clone(),
             session_id: None,
             forked_from: None,
-            preview: String::new(),
+            subagent_parent: child_handle.parent_thread_id.clone(),
+            preview: child_preview,
             ephemeral: false,
             model_provider: "unknown".to_owned(),
             created_at: started_at,
@@ -302,7 +352,7 @@ impl EngineInner {
             status: zhive_proto::domain::ThreadStatus::Active {
                 active_flags: vec![zhive_proto::domain::ThreadActiveFlag::TurnInProgress],
             },
-            cwd: std::path::PathBuf::from("."),
+            cwd: self.cwd().to_path_buf(),
             source: zhive_proto::domain::ThreadSource::Subagent,
             name: None,
             turns: vec![],
@@ -416,8 +466,7 @@ impl EngineInner {
                 .await;
                 return;
             };
-            let tail: Vec<zhive_proto::domain::Item> =
-                child_h.items_tail.read().await.iter().cloned().collect();
+            let tail: Vec<zhive_proto::domain::Item> = child_h.items_snapshot().await;
             crate::subagent::extract_final_message(&tail)
         };
 
@@ -471,94 +520,6 @@ impl EngineInner {
             child_thread_id: child_tid,
             final_message: final_msg,
         });
-    }
-}
-
-// ============================================================
-// EngineSubagentSpawner
-// ============================================================
-
-/// Bridges the model-callable `agent` tool to [`EngineInner`] subagent spawns.
-///
-/// Holds a handle to the engine and the parent thread id so the tool can
-/// delegate a sub-task to a child agent and `await` its final message. One
-/// instance is created per tool execution in the dispatch loop; cloning the
-/// `Arc<EngineInner>` is cheap (shared-ownership handle).
-pub(crate) struct EngineSubagentSpawner {
-    /// Shared engine handle used to drive the child turn.
-    inner: Arc<EngineInner>,
-    /// Thread that owns the tool call requesting the spawn.
-    parent_thread_id: ThreadId,
-}
-
-// `EngineInner` does not implement `Debug` (it holds non-Debug runtime
-// handles), so derive cannot be used. The `SubagentSpawner` trait requires
-// `Debug`; render only the parent thread id, which is the useful identifier.
-impl std::fmt::Debug for EngineSubagentSpawner {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("EngineSubagentSpawner")
-            .field("parent_thread_id", &self.parent_thread_id)
-            .finish_non_exhaustive()
-    }
-}
-
-impl EngineSubagentSpawner {
-    /// Builds a spawner bound to `inner` and `parent_thread_id`.
-    pub(crate) fn new(inner: Arc<EngineInner>, parent_thread_id: ThreadId) -> Self {
-        Self {
-            inner,
-            parent_thread_id,
-        }
-    }
-}
-
-#[async_trait::async_trait]
-impl crate::tools::SubagentSpawner for EngineSubagentSpawner {
-    async fn spawn_and_await(
-        &self,
-        name: String,
-        description: String,
-        prompt: String,
-    ) -> Result<String, String> {
-        // Inherit the parent's tool allowlist and permission mode: `tools`,
-        // `disallowed_tools`, and `permission_mode` are left at their defaults
-        // so `prepare_child_scope` resolves them against the parent scope.
-        let definition: SubagentDefinition = serde_json::from_value(serde_json::json!({
-            "name": name,
-            "description": description,
-            "prompt": prompt,
-        }))
-        .map_err(|err| format!("failed to build subagent definition: {err}"))?;
-
-        let (_child_thread_id, mut rx) = self
-            .inner
-            .spawn_subagent_awaitable(self.parent_thread_id.clone(), definition)
-            .await
-            .map_err(|err| err.to_string())?;
-
-        match rx.recv().await {
-            Some(SubagentFinalEvent::Completed { final_message, .. }) => {
-                Ok(final_message_text(final_message.as_deref()))
-            }
-            Some(SubagentFinalEvent::Errored { error, .. }) => Err(error.message),
-            // The sender is dropped only if the child task panicked or the
-            // engine shut down before delivering the outcome.
-            None => Err("subagent channel closed without result".to_owned()),
-        }
-    }
-}
-
-/// Extracts the displayable text of a subagent's final message.
-///
-/// The final item is the child's last [`zhive_proto::domain::Item::AgentMessage`]
-/// (or [`Item::SystemNotice`] fallback). Returns an empty string when there is
-/// no final message or it carries no text, matching the Claude Code contract
-/// that an empty subagent result is delivered verbatim rather than as an error.
-fn final_message_text(final_message: Option<&zhive_proto::domain::Item>) -> String {
-    match final_message {
-        Some(zhive_proto::domain::Item::AgentMessage { text, .. }) => text.clone(),
-        Some(zhive_proto::domain::Item::SystemNotice { message, .. }) => message.clone(),
-        _ => String::new(),
     }
 }
 
@@ -625,7 +586,7 @@ mod tests {
 
         // Register a child handle to simulate a subagent parent.
         let fake_parent_id = tid("thread:subagent/native/root/0");
-        let (child_handle_inner, _rx) = crate::state::ThreadHandle::new_child(
+        let (child_handle_inner, _final_rx, _decision_rx) = crate::state::ThreadHandle::new_child(
             fake_parent_id.clone(),
             tid("thread:native/root"),
         );
@@ -659,7 +620,7 @@ mod tests {
         let inner = new_inner();
 
         let fake_parent_id = tid("thread:subagent/native/root/0");
-        let (child_handle_inner, _rx) = crate::state::ThreadHandle::new_child(
+        let (child_handle_inner, _final_rx, _decision_rx) = crate::state::ThreadHandle::new_child(
             fake_parent_id.clone(),
             tid("thread:native/root"),
         );
@@ -686,7 +647,7 @@ mod tests {
                 Err(crate::engine::submission::SubagentSpawnError::RecursionForbidden)
             ),
             "spawn_subagent_awaitable must reject recursion, got {:?}",
-            result.as_ref().map(|(id, _)| id.clone())
+            result.as_ref().map(|(id, _, _)| id.clone())
         );
     }
 
@@ -699,7 +660,7 @@ mod tests {
 
         let inner = new_inner();
         let fake_parent_id = tid("thread:subagent/native/root/0");
-        let (child_handle_inner, _rx) = crate::state::ThreadHandle::new_child(
+        let (child_handle_inner, _final_rx, _decision_rx) = crate::state::ThreadHandle::new_child(
             fake_parent_id.clone(),
             tid("thread:native/root"),
         );
@@ -769,6 +730,54 @@ mod tests {
         );
     }
 
+    /// `spawn_subagent` must broadcast `SubagentStarted` carrying the parent ↔
+    /// child relationship plus the definition's name / description, so external
+    /// observers can route the child thread's later events back to the parent.
+    #[tokio::test]
+    async fn spawn_subagent_broadcasts_subagent_started() {
+        let (events_tx, mut events_rx) = broadcast::channel::<EngineEvent>(64);
+        let inner = Arc::new(EngineInner::new(events_tx, noop_provider()));
+
+        let parent_id = tid("thread:native/parent-started");
+        let _parent_handle = inner.threads().get_or_init(&parent_id).await;
+
+        let definition: zhive_proto::permission::SubagentDefinition =
+            serde_json::from_value(serde_json::json!({
+                "name": "scout",
+                "description": "read-only scout",
+                "prompt": "Check the environment.",
+            }))
+            .expect("fixture");
+
+        let child_id = inner
+            .spawn_subagent(parent_id.clone(), definition)
+            .await
+            .expect("spawn_subagent must succeed");
+
+        // Scan the broadcast for the SubagentStarted event.
+        let mut saw_started = false;
+        while let Ok(ev) = events_rx.try_recv() {
+            if let EngineEvent::SubagentStarted {
+                parent_thread_id,
+                child_thread_id,
+                agent_type,
+                description,
+            } = ev
+            {
+                assert_eq!(parent_thread_id, parent_id);
+                assert_eq!(child_thread_id, child_id);
+                assert_eq!(agent_type.as_deref(), Some("scout"));
+                assert_eq!(description.as_deref(), Some("read-only scout"));
+                saw_started = true;
+                break;
+            }
+        }
+        assert!(
+            saw_started,
+            "spawn_subagent must broadcast SubagentStarted for the child"
+        );
+    }
+
     /// A failing child turn must surface its **real** `TurnError` message to
     /// the parent via `SubagentFinalEvent::Errored` — not the old sentinel
     /// `"subagent turn failed"`.
@@ -780,7 +789,7 @@ mod tests {
         let inner = new_inner();
         let child_tid = tid("thread:subagent/native/root/0");
         let parent_tid = tid("thread:native/root");
-        let (child_handle, mut rx) =
+        let (child_handle, mut rx, _decision_rx) =
             crate::state::ThreadHandle::new_child(child_tid.clone(), parent_tid.clone());
         let child_handle = Arc::new(child_handle);
 
@@ -818,7 +827,7 @@ mod tests {
         let inner = new_inner();
         let child_tid = tid("thread:subagent/native/root/1");
         let parent_tid = tid("thread:native/root");
-        let (child_handle, mut rx) =
+        let (child_handle, mut rx, _decision_rx) =
             crate::state::ThreadHandle::new_child(child_tid.clone(), parent_tid.clone());
         let child_handle = Arc::new(child_handle);
 
@@ -892,6 +901,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            std::path::PathBuf::from("."),
         ));
 
         let parent_id = tid("thread:native/parent-tool-filter");
@@ -905,7 +916,7 @@ mod tests {
             }))
             .expect("fixture");
 
-        let (child_id, _rx) = inner
+        let (child_id, _final_rx, _decision_rx) = inner
             .spawn_subagent_awaitable(parent_id.clone(), definition)
             .await
             .expect("spawn must succeed");

@@ -33,6 +33,7 @@ use super::submission::{CompactError, CompactReply};
 use crate::provider::{DynLanguageModel, ProviderError};
 use crate::state::ThreadHandle;
 use zhive_proto::hook::EnginePhase;
+use zhive_proto::permission::{HookSpecificOutput, PermissionDecision};
 
 /// Transcript length (item count) at or above which a completed turn triggers
 /// automatic compaction.
@@ -43,8 +44,8 @@ use zhive_proto::hook::EnginePhase;
 /// through the engine, and `ScriptedModel` reports `Usage::default()` (zero),
 /// so a token threshold would never fire. Item count is a real proxy for
 /// context growth; a token-based refinement lands when providers surface
-/// usage and the context window is reachable. Chosen below the 256-item
-/// `items_tail` cap so it fires before eviction loses history.
+/// usage and the context window is reachable. Item-count compaction stays a
+/// useful safety valve before the history buffer evicts old turns.
 pub(in crate::engine) const AUTO_COMPACT_ITEM_THRESHOLD: usize = 50;
 
 /// Prefix stamped on the summary item so UI / event consumers can tell a
@@ -97,7 +98,7 @@ impl EngineInner {
         trigger: CompactTrigger,
     ) -> Result<CompactReply, CompactError> {
         // 1. Snapshot the transcript. Nothing to do on an empty thread.
-        let snapshot: Vec<Item> = handle.items_tail.read().await.iter().cloned().collect();
+        let snapshot: Vec<Item> = handle.items_snapshot().await;
         if snapshot.is_empty() {
             return Ok(CompactReply::NothingToCompact);
         }
@@ -115,10 +116,16 @@ impl EngineInner {
             to: EnginePhase::Compaction,
         });
 
-        // 3. PreCompact hook (internal maintenance: log-and-proceed on error;
-        //    a failing hook must NOT swallow the compaction).
-        self.dispatch_compact_hook(true, &thread_id, trigger, entries)
-            .await;
+        // 3. PreCompact hook — may block (FULL §exit-code contract).
+        //    A hook that returns a blocking decision (continue_loop=false or
+        //    Deny) aborts the compaction cleanly; the phase is rolled back.
+        if let Err(blocked) = self
+            .dispatch_compact_hook(true, &thread_id, trigger, entries)
+            .await
+        {
+            self.leave_compaction(&thread_id);
+            return Err(blocked);
+        }
 
         // 4. Summarise via the provider, inside the `zhive.compaction` span.
         //    Use `.instrument()` (not `.enter()`) so the span is correctly
@@ -146,13 +153,14 @@ impl EngineInner {
             id: compaction_item_id(&thread_id, "summary"),
             text: format!("{SUMMARY_PREFIX}{summary}"),
         };
-        let mut tail = handle.items_tail.write().await;
-        tail.clear();
-        tail.push_back(marker.clone());
-        tail.push_back(summary_item.clone());
-        drop(tail);
-        // Broadcast for live observers (UI). Not persisted.
         let compaction_turn = TurnId(Arc::from(format!("{}::compaction", thread_id.0)));
+        handle
+            .replace_history_with_compaction(
+                compaction_turn.clone(),
+                vec![marker.clone(), summary_item.clone()],
+            )
+            .await;
+        // Broadcast for live observers (UI). Not persisted.
         for item in [marker, summary_item] {
             let _ = self.events_tx().send(EngineEvent::ItemAppended {
                 thread_id: thread_id.clone(),
@@ -161,8 +169,11 @@ impl EngineInner {
             });
         }
 
-        // 6. PostCompact hook (log-and-proceed).
-        self.dispatch_compact_hook(false, &thread_id, trigger, entries)
+        // 6. PostCompact hook (log-and-proceed; a block here cannot undo
+        //    the completed compaction — dispatch_compact_hook logs and
+        //    returns Ok regardless for the post case).
+        let _ = self
+            .dispatch_compact_hook(false, &thread_id, trigger, entries)
             .await;
 
         // 7. Compaction → Idle.
@@ -191,15 +202,26 @@ impl EngineInner {
     }
 
     /// Dispatches the `PreCompact` (`pre = true`) or `PostCompact`
-    /// (`pre = false`) hook. Errors are logged and ignored — compaction is
-    /// internal maintenance, not a permissioned action.
+    /// (`pre = false`) hook.
+    ///
+    /// For `PreCompact` (`pre = true`): if any hook output signals a blocking
+    /// decision — `continue_loop == Some(false)` or
+    /// `HookSpecificOutput::PreToolUse { permission_decision: Deny }` — the
+    /// method returns `Err(CompactError::BlockedByHook { reason })` so the
+    /// caller can abort the compaction before it begins. Hook dispatch errors
+    /// and event-build failures are logged and treated as "proceed" to match
+    /// the internal-maintenance semantics.
+    ///
+    /// For `PostCompact` (`pre = false`): outputs are inspected for the same
+    /// block signals, but a block at this stage cannot undo the already-completed
+    /// compaction, so `Ok(())` is returned regardless (logged at WARN).
     async fn dispatch_compact_hook(
         &self,
         pre: bool,
         thread_id: &ThreadId,
         trigger: CompactTrigger,
         entries: u32,
-    ) {
+    ) -> Result<(), CompactError> {
         let (name, count_field) = if pre {
             ("PreCompact", "entriesCount")
         } else {
@@ -218,17 +240,8 @@ impl EngineInner {
             "trigger": trigger_str,
             count_field: entries,
         }));
-        match event {
-            Ok(ev) => {
-                if let Err(err) = self.hook_host().dispatch(&ev).await {
-                    tracing::warn!(
-                        name: "zhive.compaction.hook_failed",
-                        hook = name,
-                        error = %err,
-                        "compaction hook dispatch failed; proceeding (maintenance action)"
-                    );
-                }
-            }
+        let ev = match event {
+            Ok(ev) => ev,
             Err(err) => {
                 tracing::warn!(
                     name: "zhive.compaction.hook_build_failed",
@@ -236,8 +249,71 @@ impl EngineInner {
                     error = %err,
                     "failed to build compaction hook event; skipping hook"
                 );
+                return Ok(());
+            }
+        };
+
+        let outputs = match self.hook_host().dispatch(&ev).await {
+            Ok(outputs) => outputs,
+            Err(err) => {
+                tracing::warn!(
+                    name: "zhive.compaction.hook_failed",
+                    hook = name,
+                    error = %err,
+                    "compaction hook dispatch failed; proceeding (maintenance action)"
+                );
+                return Ok(());
+            }
+        };
+
+        // Inspect every output for a blocking decision.
+        for output in &outputs {
+            // `continue_loop = Some(false)` is the general "stop" signal.
+            let loop_blocked = output.continue_loop == Some(false);
+            // `PreToolUse { Deny }` may appear when the subprocess hook
+            // dispatched a PreCompact event and synthesized a PreToolUse-typed
+            // block (historic behaviour before the block_output fix).
+            let deny_blocked = matches!(
+                &output.hook_specific_output,
+                Some(HookSpecificOutput::PreToolUse {
+                    permission_decision: PermissionDecision::Deny,
+                    ..
+                })
+            );
+
+            if loop_blocked || deny_blocked {
+                let reason = output.system_message.clone().or_else(|| {
+                    if let Some(HookSpecificOutput::PreToolUse {
+                        permission_decision_reason,
+                        ..
+                    }) = &output.hook_specific_output
+                    {
+                        permission_decision_reason.clone()
+                    } else {
+                        None
+                    }
+                });
+
+                if pre {
+                    tracing::info!(
+                        name: "zhive.compaction.blocked_by_hook",
+                        hook = name,
+                        reason = ?reason,
+                        "PreCompact hook blocked compaction; aborting"
+                    );
+                    return Err(CompactError::BlockedByHook { reason });
+                }
+                // PostCompact block cannot undo the compaction; log only.
+                tracing::warn!(
+                    name: "zhive.compaction.post_hook_blocked_too_late",
+                    hook = name,
+                    reason = ?reason,
+                    "PostCompact hook signaled a block after compaction completed; ignored"
+                );
             }
         }
+
+        Ok(())
     }
 }
 
@@ -246,7 +322,8 @@ impl EngineInner {
 /// TODO(durable-compaction): once compaction is persisted to the rollout, this
 /// must incorporate a monotonic counter or timestamp — otherwise repeated
 /// compactions of the same thread emit duplicate-key `Item`s into the JSONL
-/// log. In-memory this is safe because `items_tail.clear()` precedes the push.
+/// log. In-memory this is safe because the history is replaced wholesale
+/// (`replace_history_with_compaction`) before the summary turn is installed.
 fn compaction_item_id(thread_id: &ThreadId, suffix: &str) -> ItemId {
     ItemId(Arc::from(format!("{}::compaction-{suffix}", thread_id.0)))
 }
@@ -256,11 +333,18 @@ fn compaction_item_id(thread_id: &ThreadId, suffix: &str) -> ItemId {
 /// Collects every `TextDelta` from the streamed response into a single
 /// string. Returns the trimmed summary text.
 ///
+/// Shared with [`super::fork`], which reuses the same provider summarisation
+/// path for the optional branch-summary step rather than building a parallel
+/// one.
+///
 /// # Errors
 ///
 /// Returns a [`ProviderError`] if the provider call fails or the stream
 /// yields an error part.
-async fn summarize(provider: &DynLanguageModel, items: &[Item]) -> Result<String, ProviderError> {
+pub(in crate::engine) async fn summarize(
+    provider: &DynLanguageModel,
+    items: &[Item],
+) -> Result<String, ProviderError> {
     let mut transcript = String::new();
     for item in items {
         match item {
@@ -357,6 +441,9 @@ mod tests {
         let inner = inner_with_summary("SUMMARY");
         let tid = ThreadId(Arc::from("thread:native/c1"));
         let handle = inner.threads().get_or_init(&tid).await;
+        handle
+            .start_turn_buffer(TurnId(Arc::from("turn:c1/0")), 0)
+            .await;
         handle.push_item(user("u0", "hello")).await;
         handle.push_item(user("u1", "world")).await;
 
@@ -371,7 +458,7 @@ mod tests {
             }
         ));
 
-        let tail: Vec<Item> = handle.items_tail.read().await.iter().cloned().collect();
+        let tail: Vec<Item> = handle.items_snapshot().await;
         assert_eq!(
             tail.len(),
             2,
@@ -413,6 +500,9 @@ mod tests {
         let inner = inner_with_summary("x");
         let tid = ThreadId(Arc::from("thread:native/c3"));
         let handle = inner.threads().get_or_init(&tid).await;
+        handle
+            .start_turn_buffer(TurnId(Arc::from("turn:c3/0")), 0)
+            .await;
         handle.push_item(user("u0", "hi")).await;
         // Simulate a live turn holding the phase.
         inner
@@ -425,7 +515,7 @@ mod tests {
             .expect_err("compaction must refuse when busy");
         assert!(matches!(err, CompactError::EngineBusy { .. }));
         // History must be untouched.
-        assert_eq!(handle.items_tail.read().await.len(), 1);
+        assert_eq!(handle.item_count().await, 1);
     }
 }
 
