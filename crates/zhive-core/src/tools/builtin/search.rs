@@ -1,4 +1,4 @@
-//! [`GrepTool`], [`GlobTool`], and [`ListDirTool`]: directory-search tools.
+//! [`GrepTool`] and [`GlobTool`]: directory-search tools.
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -279,102 +279,6 @@ fn glob_expand(base: &std::path::Path, pattern: &str) -> Result<Vec<String>, Str
 }
 
 // ============================================================
-// ListDirTool
-// ============================================================
-
-/// Lists directory entries with type, size, and name.
-///
-/// Arguments:
-///
-/// ```json
-/// { "path": "/opt/project" }
-/// ```
-///
-/// `path` defaults to `cwd`. Each line is `<type> <size_bytes> <name>` where
-/// type is `d` (directory), `f` (file), or `l` (symlink). Entries are sorted
-/// by name.
-///
-/// # Examples
-///
-/// ```
-/// use zhive_core::tools::builtin::ListDirTool;
-/// use zhive_core::tools::Tool;
-/// assert_eq!(ListDirTool.name(), "ls");
-/// ```
-#[derive(Debug, Clone, Copy)]
-pub struct ListDirTool;
-
-#[async_trait]
-impl Tool for ListDirTool {
-    fn name(&self) -> &'static str {
-        "ls"
-    }
-
-    fn kind(&self) -> ToolKind {
-        ToolKind::Read
-    }
-
-    fn description(&self) -> Option<String> {
-        Some("List directory entries with type, size, and name.".to_owned())
-    }
-
-    fn input_schema(&self) -> Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "path": { "type": "string", "description": "Directory to list (default: cwd)." }
-            },
-            "additionalProperties": false
-        })
-    }
-
-    /// Executes the directory listing.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ToolError::Execution`] when `path` is not a readable
-    /// directory.
-    async fn execute(&self, args: Value, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
-        let dir = args["path"].as_str().map_or_else(
-            || std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
-            resolve_path,
-        );
-
-        let mut entries = tokio::fs::read_dir(&dir)
-            .await
-            .map_err(|e| ToolError::Execution(format!("cannot list `{}`: {e}", dir.display())))?;
-
-        let mut rows: Vec<(String, String, u64)> = Vec::new(); // (type, name, size)
-
-        while let Some(entry) = entries
-            .next_entry()
-            .await
-            .map_err(|e| ToolError::Execution(format!("error reading directory entry: {e}")))?
-        {
-            let meta = entry.metadata().await;
-            let (type_char, size) = match meta {
-                Ok(m) if m.is_dir() => ("d", 0u64),
-                Ok(m) if m.is_symlink() => ("l", m.len()),
-                Ok(m) => ("f", m.len()),
-                Err(_) => ("?", 0u64),
-            };
-            let name = entry.file_name().to_string_lossy().into_owned();
-            rows.push((type_char.to_owned(), name, size));
-        }
-
-        rows.sort_by(|a, b| a.1.cmp(&b.1));
-
-        let text = rows.iter().fold(String::new(), |mut acc, (t, name, sz)| {
-            use std::fmt::Write as _;
-            let _ = writeln!(acc, "{t} {sz:>10} {name}");
-            acc
-        });
-
-        Ok(ToolOutput::text(clamp_output(text)))
-    }
-}
-
-// ============================================================
 // Tests
 // ============================================================
 
@@ -505,28 +409,6 @@ mod tests {
             "first should be a.rs, got {}",
             lines[0]
         );
-    }
-
-    // ---- ListDirTool tests ----
-
-    #[tokio::test]
-    async fn ls_lists_entries() {
-        let dir = TempDir::new().unwrap();
-        std::fs::write(dir.path().join("file.txt"), "content").unwrap();
-        std::fs::create_dir(dir.path().join("subdir")).unwrap();
-        let args = serde_json::json!({ "path": dir.path().to_str().unwrap() });
-        let out = ListDirTool.execute(args, &ctx()).await.unwrap();
-        assert!(out.text.contains("file.txt"));
-        assert!(out.text.contains("subdir"));
-        assert!(out.text.contains('f'));
-        assert!(out.text.contains('d'));
-    }
-
-    #[tokio::test]
-    async fn ls_nonexistent_dir_returns_error() {
-        let args = serde_json::json!({ "path": "/tmp/__zhive_nonexistent_dir_abc" });
-        let err = ListDirTool.execute(args, &ctx()).await.unwrap_err();
-        assert!(matches!(err, ToolError::Execution(_)));
     }
 }
 

@@ -87,7 +87,7 @@ impl RuntimeTools {
 
 /// Builds the engine runtime tools from `cfg`.
 ///
-/// Registers the built-in coding tools (read/write/edit/grep/glob/ls/bash) as
+/// Registers the built-in coding tools (read/write/edit/grep/glob/bash) as
 /// the base layer so the engine is usable out of the box. When the `mcp`
 /// feature is enabled and `[mcp.servers]` is non-empty, connects to every
 /// server in parallel and registers their tools (failing servers are skipped
@@ -124,7 +124,7 @@ impl RuntimeTools {
 pub async fn build_runtime(cfg: &Config) -> anyhow::Result<RuntimeTools> {
     let mut registry = ToolRegistry::new();
 
-    // The built-in coding tools (read/write/edit/grep/glob/ls/bash) are the
+    // The built-in coding tools (read/write/edit/grep/glob/bash) are the
     // base layer that makes the engine usable out of the box. MCP server tools
     // and on-disk skills are layered on afterwards and may override by name.
     zhive_core::tools::builtin::register_builtins(

@@ -652,7 +652,7 @@ mod tests {
     }
 }
 
-/// Built-in coding tools (read / write / edit / grep / glob / ls / bash).
+/// Built-in coding tools (read / write / edit / grep / glob / bash).
 ///
 /// Gated behind the `tools` feature so consumers that inject their own tools
 /// do not pull in `ignore` / `regex` / `glob`.

@@ -13,7 +13,6 @@
 //! | `edit`  | Edit    | Replace a substring inside a file      |
 //! | `grep`  | Read    | Regex search across a directory tree   |
 //! | `glob`  | Read    | Expand a glob pattern to file paths    |
-//! | `ls`    | Read    | List directory entries                 |
 //! | `bash`  | Execute | Run a shell command with a timeout     |
 //! | `agent` | Other   | Delegate a sub-task to a child agent   |
 //!
@@ -49,7 +48,7 @@ pub use bash::BashTool;
 #[doc(inline)]
 pub use read::ReadFileTool;
 #[doc(inline)]
-pub use search::{GlobTool, GrepTool, ListDirTool};
+pub use search::{GlobTool, GrepTool};
 #[doc(inline)]
 pub use write::{EditFileTool, WriteFileTool};
 
@@ -234,7 +233,7 @@ impl Default for BuiltinToolsConfig {
 
 /// Registers the built-in tools into `registry` according to `config`.
 ///
-/// Read, write, edit, grep, glob, ls, and agent are always registered. The
+/// Read, write, edit, grep, glob, and agent are always registered. The
 /// `bash` tool is registered only when [`BuiltinToolsConfig::enable_bash`] is
 /// `true`. The `agent` tool is registered unconditionally: when no subagent
 /// spawner is wired into the [`crate::tools::ToolContext`] (e.g. outside a real
@@ -253,7 +252,6 @@ impl Default for BuiltinToolsConfig {
 /// assert!(reg.get("edit").is_some());
 /// assert!(reg.get("grep").is_some());
 /// assert!(reg.get("glob").is_some());
-/// assert!(reg.get("ls").is_some());
 /// assert!(reg.get("bash").is_some());
 /// assert!(reg.get("agent").is_some());
 /// ```
@@ -263,7 +261,6 @@ pub fn register_builtins(registry: &mut ToolRegistry, config: &BuiltinToolsConfi
     registry.register(Arc::new(EditFileTool));
     registry.register(Arc::new(GrepTool));
     registry.register(Arc::new(GlobTool));
-    registry.register(Arc::new(ListDirTool));
     registry.register(Arc::new(AgentTool));
     if config.enable_bash {
         registry.register(Arc::new(BashTool::with_sandbox(Arc::clone(
