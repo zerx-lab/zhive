@@ -37,7 +37,9 @@ pub use theme::{Accent, Density, Theme};
 
 use std::time::Duration;
 
-use crossterm::event::{Event, EventStream, KeyEventKind, MouseEventKind};
+use crossterm::event::{
+    DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyEventKind, MouseEventKind,
+};
 use futures::StreamExt;
 use zhive_client_native::{Client, ClientEvent};
 
@@ -54,6 +56,18 @@ const TICK: Duration = Duration::from_millis(90);
 enum LoopMsg {
     /// Show a transient one-line status in the footer.
     Flash(String),
+    /// A submitted turn failed to start: requeue the message and halt draining.
+    ///
+    /// `Action::Submit` marks the conversation busy before the RPC resolves so
+    /// the queue drainer cannot re-fire. If the call never starts a turn, the
+    /// un-sent `text` is pushed back to the front of the queue and draining is
+    /// halted so a transient failure cannot cascade; the error is surfaced.
+    SubmitFailed {
+        /// Human-readable error for the footer flash.
+        error: String,
+        /// The message that failed to send, to requeue at the front.
+        text: String,
+    },
     /// Populate and open the `/session` picker with the fetched threads.
     ///
     /// Carries the scope the listing was fetched under so the re-opened overlay
@@ -112,7 +126,12 @@ pub async fn run(
         app.set_extra_commands(
             extra_commands
                 .into_iter()
-                .map(|(name, help)| crate::app::SlashCommand { name, help })
+                .map(|(name, help)| crate::app::SlashCommand {
+                    name,
+                    help,
+                    // Skill/host commands take free-form input after the name.
+                    takes_args: false,
+                })
                 .collect(),
         );
     }
@@ -121,7 +140,16 @@ pub async fn run(
     let mut engine_events = client.subscribe_events();
     let mut ticker = tokio::time::interval(TICK);
 
+    // Install the mouse-release panic guard before ratatui::init so ratatui's
+    // own restore hook ends up outermost (it runs first on panic, restoring the
+    // terminal before our guard releases the mouse — a benign no-op in cooked
+    // mode).
+    install_mouse_panic_guard();
     let mut terminal = ratatui::init();
+    // Capture the mouse so the scroll wheel scrolls the transcript viewport
+    // rather than the terminal's own scrollback (and never the input history).
+    // Best-effort: a terminal that rejects it just keeps default wheel handling.
+    let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture);
     let outcome = event_loop(
         &mut terminal,
         &client,
@@ -131,8 +159,32 @@ pub async fn run(
         &mut ticker,
     )
     .await;
+    // Release the mouse before restoring so the terminal regains native
+    // click-drag text selection on exit.
+    let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
     outcome
+}
+
+/// Augments the panic hook to disable mouse capture before unwinding.
+///
+/// [`ratatui::init`] installs a hook that restores the terminal (raw mode and
+/// the alternate screen) but is unaware of our mouse capture. Without this, a
+/// panic would leave the terminal emitting mouse escape sequences and unable to
+/// select text. We wrap the existing hook to release the mouse first.
+fn install_mouse_panic_guard() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    // Install at most once per process so repeated `run()` calls cannot stack
+    // panic hooks (`run` is public; a host could call it more than once).
+    static INSTALLED: AtomicBool = AtomicBool::new(false);
+    if INSTALLED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
+        prev(info);
+    }));
 }
 
 /// The core select loop, factored out so the terminal is always restored.
@@ -187,7 +239,16 @@ async fn event_loop(
                 engine_alive = handle_engine(app, maybe_event);
             }
             Some(msg) = cmd_rx.recv() => apply_loop_msg(app, msg),
-            _ = ticker.tick() => app.tick(),
+            // Only animate while busy; an idle TUI parks the timer so it burns
+            // zero CPU until the next input or engine event arrives.
+            _ = ticker.tick(), if app.conversation.busy => app.tick(),
+        }
+
+        // After any event, dispatch one queued message when idle following a
+        // completed turn (one-per-turn drain; `perform` re-marks the app busy
+        // so a 90ms tick cannot fire the same message twice).
+        if let Some(text) = app.take_next_queued() {
+            perform(client, app, Action::Submit(text), &cmd_tx);
         }
     }
 }
@@ -239,12 +300,21 @@ fn perform(
             app.reset_thread(id::new_thread_id());
             app.flash = Some("started a new thread".to_owned());
         }
-        Action::Submit(text) => spawn_rpc(client, cmd_tx, move |client, _tx| async move {
-            rpc::start_turn(&client, &thread, &text)
-                .await
-                .err()
-                .map(|e| LoopMsg::Flash(format!("send failed: {e}")))
-        }),
+        Action::Submit(text) => {
+            // Optimistically mark busy so the queue drainer won't re-fire on the
+            // next tick before `TurnStarted` arrives; reset by `SubmitFailed`.
+            app.conversation.busy = true;
+            spawn_rpc(client, cmd_tx, move |client, _tx| async move {
+                let failed = text.clone();
+                rpc::start_turn(&client, &thread, &text)
+                    .await
+                    .err()
+                    .map(|e| LoopMsg::SubmitFailed {
+                        error: format!("send failed: {e}"),
+                        text: failed,
+                    })
+            });
+        }
         Action::Cancel => spawn_rpc(client, cmd_tx, move |client, _tx| async move {
             rpc::cancel_turn(&client, &thread)
                 .await
@@ -316,6 +386,18 @@ fn perform(
 fn apply_loop_msg(app: &mut App, msg: LoopMsg) {
     match msg {
         LoopMsg::Flash(text) => app.flash = Some(text),
+        LoopMsg::SubmitFailed { error, text } => {
+            // The optimistic busy flag never got a real turn. Reset it, put the
+            // un-sent message back at the front, and halt draining so a
+            // transient failure cannot cascade through (and drop) the queue.
+            app.conversation.busy = false;
+            app.message_queue.push_front(text);
+            app.queue_halted = true;
+            app.flash = Some(format!(
+                "{error} · {} queued (↵ retry)",
+                app.message_queue.len()
+            ));
+        }
         LoopMsg::ShowSessions { entries, filter } => {
             let count = entries.len();
             app.overlay = Some(crate::app::Overlay::SessionList {

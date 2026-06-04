@@ -63,12 +63,33 @@ pub(crate) fn render_select_list(
     selected: usize,
     hint: &str,
 ) {
+    // Chrome rows consumed by the query line, a blank, and the hint line. The
+    // rest is the scrollable row viewport.
+    const CHROME_ROWS: usize = 3;
+    let selected = selected.min(rows.len().saturating_sub(1));
+    let viewport = usize::from(inner.height).saturating_sub(CHROME_ROWS).max(1);
+    // Scroll the window so the selected row stays visible even when the list is
+    // taller than the popup (otherwise the selection is clipped off-screen).
+    let start = if selected >= viewport {
+        selected + 1 - viewport
+    } else {
+        0
+    };
+    let end = (start + viewport).min(rows.len());
+
     let mut lines: Vec<Line<'static>> = Vec::new();
-    // Filter query line so the user sees what they are matching against.
+    // Filter query line, plus a `current/total` counter so the user keeps their
+    // place even when the list scrolls past the viewport.
+    let counter = if rows.is_empty() {
+        String::new()
+    } else {
+        format!("  {}/{}", selected + 1, rows.len())
+    };
     lines.push(Line::from(vec![
         Span::styled("/ ", Style::new().fg(p.fg_mute)),
         Span::styled(query.to_owned(), Style::new().fg(p.fg)),
         Span::styled("▌", Style::new().fg(p.accent)),
+        Span::styled(counter, Style::new().fg(p.fg_mute)),
     ]));
 
     if rows.is_empty() {
@@ -77,16 +98,26 @@ pub(crate) fn render_select_list(
             Style::new().fg(p.fg_mute),
         ));
     }
-    let selected = selected.min(rows.len().saturating_sub(1));
-    for (i, row) in rows.iter().enumerate() {
+    for (i, row) in rows.iter().enumerate().skip(start).take(end - start) {
         let is_sel = i == selected;
         let primary_style = if is_sel {
             Style::new().fg(p.accent).add_modifier(Modifier::BOLD)
         } else {
             Style::new().fg(p.fg)
         };
+        // The selected row gets `▸`; the edge rows show `▲`/`▼` when more rows
+        // exist off-screen above/below.
+        let marker = if is_sel {
+            "▸ "
+        } else if i == start && start > 0 {
+            "▲ "
+        } else if i + 1 == end && end < rows.len() {
+            "▼ "
+        } else {
+            "  "
+        };
         let line = Line::from(vec![
-            Span::styled(if is_sel { "▸ " } else { "  " }, Style::new().fg(p.accent)),
+            Span::styled(marker, Style::new().fg(p.accent)),
             Span::styled(row.prefix.clone(), Style::new().fg(p.success)),
             Span::styled(row.primary.clone(), primary_style),
             Span::raw("  "),
@@ -125,15 +156,17 @@ fn hint_row(key: &str, desc: &str, p: &Palette) -> Line<'static> {
 /// Renders the help overlay (keybindings and commands).
 fn render_help(frame: &mut Frame, app: &App, area: Rect) {
     let p = &app.palette;
-    let popup = area.centered(Constraint::Length(58), Constraint::Length(16));
+    let popup = area.centered(Constraint::Length(60), Constraint::Length(18));
     let inner = open_popup(frame, popup, "⌘ help", p);
     let lines = vec![
-        hint_row("↵", "send message", p),
+        hint_row("↵", "send · queue while busy · run command", p),
         hint_row("⌥↵ / ⌃J", "insert newline", p),
-        hint_row("esc", "interrupt the running turn", p),
+        hint_row("esc", "interrupt the turn · clear the queue", p),
+        hint_row("⌃X", "pull last queued message back to edit", p),
         hint_row("↑↓ (single-line)", "browse input history", p),
-        hint_row("PgUp PgDn", "scroll transcript", p),
+        hint_row("PgUp PgDn · wheel", "scroll transcript", p),
         hint_row("⌃← ⌃→", "word-left / word-right", p),
+        hint_row("/ then ⌃N ⌃P", "navigate the command palette", p),
         hint_row("/clear", "start a fresh thread", p),
         hint_row("/compact", "summarize the conversation", p),
         hint_row("/theme, /accent", "restyle the UI", p),
@@ -352,12 +385,16 @@ fn relative_time(now: i64, then: i64) -> String {
 
 /// Renders the slash-command palette popup anchored above the composer.
 pub(crate) fn render_palette(frame: &mut Frame, app: &App, composer: Rect) {
+    // Show at most MAX_ROWS at once; the window scrolls to keep the selection
+    // visible when more commands match than fit.
+    const MAX_ROWS: usize = 8;
     let p = &app.palette;
     let matches = app.palette_matches();
     if matches.is_empty() {
         return;
     }
-    let rows = u16::try_from(matches.len()).unwrap_or(8).min(8);
+    let visible = matches.len().min(MAX_ROWS);
+    let rows = u16::try_from(visible).unwrap_or(8);
     let height = rows + 2;
     let width = composer.width.min(58);
     let popup = Rect {
@@ -372,9 +409,16 @@ pub(crate) fn render_palette(frame: &mut Frame, app: &App, composer: Rect) {
     frame.render_widget(block, popup);
 
     let selected = app.palette_index.min(matches.len().saturating_sub(1));
+    let start = if selected >= visible {
+        selected + 1 - visible
+    } else {
+        0
+    };
     let lines: Vec<Line<'static>> = matches
         .iter()
         .enumerate()
+        .skip(start)
+        .take(visible)
         .map(|(i, cmd)| {
             let is_sel = i == selected;
             let name_style = if is_sel {

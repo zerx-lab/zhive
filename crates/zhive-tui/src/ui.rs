@@ -2,7 +2,7 @@
 //!
 //! Follows the `zap-tui-design` three-part shell — a branded top bar with a
 //! `cwd · branch · session` breadcrumb and a right-aligned model pill, the
-//! conversation body (an 8-cell role gutter beside each message), the composer
+//! conversation body (a 2-cell role-glyph gutter beside each message), the composer
 //! panel, and a bottom key-hint strip. Messages are pre-wrapped with
 //! [`crate::wrap`] so continuation rows stay indented under the gutter. Modal
 //! overlays ([`Overlay`]) draw over a [`Clear`]ed centered rect.
@@ -12,6 +12,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::Paragraph;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use zhive_proto::domain::{
     CommandExecutionStatus, FileUpdateChange, Item, ItemContent, ItemToolCallContent, NoticeLevel,
     PatchChangeKind, PlanStepStatus, ToolCallStatus,
@@ -23,8 +24,11 @@ use crate::theme::Palette;
 use crate::widgets::{self, Hint};
 use crate::{markdown, wrap};
 
-/// Width of the left role-label gutter, in cells.
-const GUTTER: u16 = 8;
+/// Width of the left role-glyph gutter, in cells (1 glyph + 1 space).
+const GUTTER: u16 = 2;
+
+/// Maximum queued-message preview rows shown above the composer.
+const QUEUE_PREVIEW_ROWS: usize = 3;
 
 /// Maximum lines of tool-call input/output shown before truncation.
 ///
@@ -51,9 +55,11 @@ pub fn draw(frame: &mut Frame, app: &App) {
     frame.render_widget(Paragraph::new("").style(Style::new().bg(p.bg)), area);
 
     let composer_h = composer_height(app);
-    let [top, body, composer, footer] = Layout::vertical([
+    let queue_h = queue_height(app);
+    let [top, body, queue, composer, footer] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Fill(1),
+        Constraint::Length(queue_h),
         Constraint::Length(composer_h),
         Constraint::Length(1),
     ])
@@ -61,6 +67,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
 
     render_top_bar(frame, app, top);
     render_body(frame, app, body);
+    render_queue(frame, app, queue);
     let composer_inner = render_composer(frame, app, composer);
     render_footer(frame, app, footer);
 
@@ -90,6 +97,18 @@ pub fn draw(frame: &mut Frame, app: &App) {
 fn composer_height(app: &App) -> u16 {
     let rows = u16::try_from(app.input.value().split('\n').count()).unwrap_or(1);
     rows.clamp(1, 6) + 2
+}
+
+/// Rows reserved for the queued-message preview (0 when the queue is empty).
+///
+/// One header row plus up to [`QUEUE_PREVIEW_ROWS`] preview rows.
+fn queue_height(app: &App) -> u16 {
+    let shown = app.message_queue.len().min(QUEUE_PREVIEW_ROWS);
+    if shown == 0 {
+        0
+    } else {
+        u16::try_from(shown).unwrap_or(3) + 1
+    }
 }
 
 /// Renders the branded top bar with breadcrumb and model pill.
@@ -143,7 +162,8 @@ fn render_body(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         format!("idle · {} msgs", app.conversation.item_count())
     };
-    let block = widgets::panel("⌬ conversation", Some(&status), !app.conversation.busy, p);
+    // Border carries the activity signal: accent while busy, dim when idle.
+    let block = widgets::panel("conversation", Some(&status), app.conversation.busy, p);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -164,6 +184,24 @@ fn render_body(frame: &mut Frame, app: &App, area: Rect) {
         Paragraph::new(Text::from(lines)).scroll((scroll_y, 0)),
         inner,
     );
+
+    // Scroll-to-bottom affordance when the view is not pinned to the tail.
+    if scrollback > 0 && inner.height > 0 {
+        let hint = " ↓ end ";
+        let hw = u16::try_from(UnicodeWidthStr::width(hint)).unwrap_or(0);
+        if inner.width > hw {
+            let hint_area = Rect {
+                x: inner.x + inner.width - hw,
+                y: inner.y + inner.height - 1,
+                width: hw,
+                height: 1,
+            };
+            frame.render_widget(
+                Paragraph::new(Line::styled(hint, Style::new().fg(p.fg_mute).bg(p.bg_elev))),
+                hint_area,
+            );
+        }
+    }
 }
 
 /// The tool name the engine uses for a subagent spawn (drives summary inlining).
@@ -196,7 +234,7 @@ fn transcript_lines(app: &App, inner_width: u16) -> Vec<Line<'static>> {
             // full message is visible across rows instead of being clipped.
             push_message(
                 &mut out,
-                "sys",
+                "✗",
                 p.error,
                 wrap_plain(
                     &format!("turn failed: {message}"),
@@ -225,7 +263,7 @@ fn transcript_lines(app: &App, inner_width: u16) -> Vec<Line<'static>> {
             }
             lines
         };
-        push_message(&mut out, "zap", p.role_zap, body);
+        push_message(&mut out, "", p.role_zap, body);
     }
     out
 }
@@ -280,7 +318,7 @@ fn subagent_summary_lines(
     ]
 }
 
-/// Appends a role-gutter-prefixed message (first row labeled, rest indented).
+/// Appends a role-gutter-prefixed message (glyph on row 0, blank on the rest).
 fn push_message(
     out: &mut Vec<Line<'static>>,
     label: &str,
@@ -292,14 +330,17 @@ fn push_message(
     } else {
         body
     };
+    let pad = usize::from(GUTTER);
     for (i, line) in body.into_iter().enumerate() {
         let gutter = if i == 0 {
+            // Role glyph (or blank), left-padded to the gutter width.
             Span::styled(
-                format!("{label:<8}"),
+                format!("{label:<pad$}"),
                 Style::new().fg(color).add_modifier(Modifier::BOLD),
             )
         } else {
-            Span::raw("        ")
+            // Continuation rows: blank gutter keeps the body left edge aligned.
+            Span::raw(" ".repeat(pad))
         };
         let mut spans = vec![gutter];
         spans.extend(line.spans);
@@ -307,14 +348,17 @@ fn push_message(
     }
 }
 
-/// Returns the `(label, color)` for an item's role gutter.
+/// Returns the `(glyph, color)` for an item's 2-cell role gutter.
+///
+/// User messages get a colored `❯`; agent messages carry no glyph (role shown
+/// by color alone); system notices get a thin `·`.
 fn role_of(item: &Item, p: &Palette) -> (&'static str, ratatui::style::Color) {
     match item {
-        Item::UserMessage { .. } => ("you", p.role_you),
+        Item::UserMessage { .. } => ("❯", p.role_you),
         Item::AgentMessage { .. } | Item::AgentThought { .. } | Item::Reasoning { .. } => {
-            ("zap", p.role_zap)
+            ("", p.role_zap)
         }
-        Item::SystemNotice { .. } => ("sys", p.role_system),
+        Item::SystemNotice { .. } => ("·", p.role_system),
         _ => ("", p.fg_dim),
     }
 }
@@ -921,19 +965,30 @@ fn render_welcome(frame: &mut Frame, app: &App, area: Rect) {
 /// Renders the composer panel and returns its inner rect (for the caret).
 fn render_composer(frame: &mut Frame, app: &App, area: Rect) -> Rect {
     let p = &app.palette;
-    let (title, dot) = if app.conversation.busy {
+    let busy = app.conversation.busy;
+    let (status, dot) = if busy {
         ("◐ working", p.warn)
     } else {
         ("● ready", p.success)
     };
-    let title = Span::styled(title, Style::new().fg(dot));
-    let block = widgets::panel("", None, !app.conversation.busy, p).title(Line::from(title));
+    // Border carries the activity signal (inverse of the old logic): accent
+    // while executing, neutral with a pending draft, dim when idle and empty.
+    let border_style = if busy {
+        Style::new().fg(p.accent).add_modifier(Modifier::BOLD)
+    } else if !app.input.is_blank() {
+        Style::new().fg(p.fg)
+    } else {
+        Style::new().fg(p.border)
+    };
+    let block = widgets::panel("composer", None, busy, p)
+        .border_style(border_style)
+        .title(Line::from(Span::styled(status, Style::new().fg(dot))).right_aligned());
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let text = if app.input.value().is_empty() && !app.conversation.busy {
+    let text = if app.input.value().is_empty() && !busy {
         Text::from(Line::styled(
-            "message zap…  (↵ send · ⌥↵ newline · /help)",
+            composer_placeholder(app),
             Style::new().fg(p.fg_mute),
         ))
     } else {
@@ -941,6 +996,68 @@ fn render_composer(frame: &mut Frame, app: &App, area: Rect) -> Rect {
     };
     frame.render_widget(Paragraph::new(text), inner);
     inner
+}
+
+/// A rotating composer placeholder, varied by the number of turns so far.
+fn composer_placeholder(app: &App) -> &'static str {
+    /// Inviting prompts cycled as the conversation grows (codex-style).
+    const PLACEHOLDERS: [&str; 4] = [
+        "message zap…  (↵ send · ⌥↵ newline · /help)",
+        "ask zap to explain this codebase…",
+        "describe a change and press ↵…",
+        "summarize recent commits…  (/help for commands)",
+    ];
+    PLACEHOLDERS[app.conversation.turns.len() % PLACEHOLDERS.len()]
+}
+
+/// Renders the queued-message preview rows between the body and composer.
+///
+/// A dim header plus up to [`QUEUE_PREVIEW_ROWS`] italic `↳`-prefixed previews,
+/// foreshadowing input that is sent once the current turn completes.
+fn render_queue(frame: &mut Frame, app: &App, area: Rect) {
+    if app.message_queue.is_empty() || area.height == 0 {
+        return;
+    }
+    let p = &app.palette;
+    // Frame the header for the actual state: in-flight turn vs. a stalled queue.
+    let tail = if app.conversation.busy {
+        "sent after this turn"
+    } else {
+        "↵ to continue"
+    };
+    let mut lines = vec![Line::styled(
+        format!("queued {} — {tail}", app.message_queue.len()),
+        Style::new().fg(p.fg_mute),
+    )];
+    for text in app.message_queue.iter().take(QUEUE_PREVIEW_ROWS) {
+        let preview = truncate_one_line(text, 60);
+        lines.push(Line::from(Span::styled(
+            format!("  ↳ {preview}"),
+            Style::new().fg(p.fg_dim).add_modifier(Modifier::ITALIC),
+        )));
+    }
+    frame.render_widget(Paragraph::new(Text::from(lines)), area);
+}
+
+/// Collapses `text` to one line and truncates to `max` display cells with `…`.
+fn truncate_one_line(text: &str, max: usize) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if UnicodeWidthStr::width(flat.as_str()) <= max {
+        return flat;
+    }
+    // Accumulate by display width so CJK/emoji don't overrun the queue row.
+    let mut out = String::new();
+    let mut width = 0usize;
+    for c in flat.chars() {
+        let w = UnicodeWidthChar::width(c).unwrap_or(0);
+        if width + w > max {
+            break;
+        }
+        width += w;
+        out.push(c);
+    }
+    out.push('…');
+    out
 }
 
 /// Renders the bottom key-hint strip (plus any transient flash or persistent disconnect banner).
@@ -963,6 +1080,21 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     if let Some(flash) = &app.flash {
         frame.render_widget(
             Paragraph::new(Line::styled(flash.clone(), Style::new().fg(p.warn))).style(bar_bg),
+            area,
+        );
+        return;
+    }
+    // Queued-message status supersedes the static hints while messages pend.
+    if !app.message_queue.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                format!(
+                    "  queued {} · ⌃X cancel · ↵ continue",
+                    app.message_queue.len()
+                ),
+                Style::new().fg(p.warn),
+            ))
+            .style(bar_bg),
             area,
         );
         return;

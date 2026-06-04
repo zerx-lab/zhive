@@ -69,8 +69,9 @@ fn renders_user_and_agent_messages() {
     terminal.draw(|frame| ui::draw(frame, &app)).expect("draw");
 
     let text = screen_text(&terminal);
-    assert!(text.contains("you"), "user role gutter present");
-    assert!(text.contains("zap"), "agent role gutter present");
+    // The user message carries the `❯` role glyph; the agent message has no
+    // glyph (role shown by color), so its presence is asserted via its text.
+    assert!(text.contains('❯'), "user role glyph present");
     assert!(text.contains("hello world"), "user text rendered");
     assert!(text.contains("hi there"), "agent text rendered");
     assert!(text.contains("zap"), "model pill / brand present");
@@ -150,4 +151,26 @@ fn renders_welcome_when_empty() {
     let text = screen_text(&terminal);
     assert!(text.contains("zap"), "brand shown on welcome");
     assert!(text.contains("/help"), "welcome lists commands");
+}
+
+#[test]
+fn renders_queued_messages_preview() {
+    let mut app = App::new(TuiConfig::default(), thread());
+    // A turn is in flight and the user has queued a follow-up message.
+    app.on_engine(&EngineNotification::TurnStarted {
+        thread_id: thread(),
+        turn_id: turn(),
+    });
+    app.message_queue
+        .push_back("queued message text".to_owned());
+
+    let mut terminal = Terminal::new(TestBackend::new(70, 20)).expect("terminal");
+    terminal.draw(|frame| ui::draw(frame, &app)).expect("draw");
+
+    let text = screen_text(&terminal);
+    assert!(text.contains("queued"), "queue header shown; got: {text}");
+    assert!(
+        text.contains("queued message text"),
+        "queued preview shown; got: {text}"
+    );
 }

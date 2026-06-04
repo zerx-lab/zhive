@@ -130,23 +130,32 @@ pub struct SlashCommand {
     pub name: String,
     /// One-line description for the palette.
     pub help: String,
+    /// Whether the command consumes a trailing argument (e.g. `/theme dark`).
+    ///
+    /// Drives palette Enter: an arg-taking command completes the input to
+    /// `/name ` and waits for the argument; the rest dispatch immediately.
+    pub takes_args: bool,
 }
 
 impl SlashCommand {
     /// Builds a [`SlashCommand`] from static string literals.
     ///
+    /// `takes_args` marks commands like `/theme` that expect a trailing value.
+    ///
     /// # Examples
     ///
     /// ```
     /// use zhive_tui::app::SlashCommand;
-    /// let cmd = SlashCommand::from_static("help", "show keybindings");
+    /// let cmd = SlashCommand::from_static("help", "show keybindings", false);
     /// assert_eq!(cmd.name, "help");
+    /// assert!(!cmd.takes_args);
     /// ```
     #[must_use]
-    pub fn from_static(name: &'static str, help: &'static str) -> Self {
+    pub fn from_static(name: &'static str, help: &'static str, takes_args: bool) -> Self {
         Self {
             name: name.to_owned(),
             help: help.to_owned(),
+            takes_args,
         }
     }
 }
@@ -158,18 +167,22 @@ impl SlashCommand {
 #[must_use]
 pub fn builtin_commands() -> Vec<SlashCommand> {
     [
-        ("help", "show keybindings and commands"),
-        ("model", "show the current provider and model"),
-        ("settings", "show theme, accent, and keys"),
-        ("theme", "switch theme — dark | light | mono"),
-        ("accent", "switch accent — cyan | amber | lime | magenta"),
-        ("compact", "summarize and condense the conversation"),
-        ("session", "list and resume past sessions"),
-        ("clear", "start a fresh thread"),
-        ("quit", "exit zap"),
+        ("help", "show keybindings and commands", false),
+        ("model", "show the current provider and model", false),
+        ("settings", "show theme, accent, and keys", false),
+        ("theme", "switch theme — dark | light | mono", true),
+        (
+            "accent",
+            "switch accent — cyan | amber | lime | magenta",
+            true,
+        ),
+        ("compact", "summarize and condense the conversation", false),
+        ("session", "list and resume past sessions", false),
+        ("clear", "start a fresh thread", false),
+        ("quit", "exit zap", false),
     ]
     .into_iter()
-    .map(|(n, h)| SlashCommand::from_static(n, h))
+    .map(|(n, h, a)| SlashCommand::from_static(n, h, a))
     .collect()
 }
 
@@ -215,6 +228,19 @@ pub struct App {
     /// These are merged with the built-in commands at palette-match time.
     /// Populate via [`App::set_extra_commands`] or [`App::new_with_extra`].
     pub extra_commands: Vec<SlashCommand>,
+    /// Messages composed while a turn was in flight, awaiting dispatch.
+    ///
+    /// FIFO: each is sent as its own turn once the previous turn finishes
+    /// normally (see [`App::take_next_queued`]). Cleared on interrupt,
+    /// `/clear`, and disconnect so stale input is never sent silently.
+    pub message_queue: std::collections::VecDeque<String>,
+    /// Pauses automatic queue draining after a failed or rejected submit.
+    ///
+    /// A transient RPC failure or engine rejection leaves the prior turn
+    /// `Completed`, which would otherwise let the drainer cascade through (and
+    /// silently drop) the whole queue. While set, [`App::take_next_queued`]
+    /// yields nothing; the user resumes with a blank Enter (which clears it).
+    pub queue_halted: bool,
 }
 
 impl App {
@@ -250,6 +276,8 @@ impl App {
             last_usage: None,
             disconnected: false,
             extra_commands: Vec::new(),
+            message_queue: std::collections::VecDeque::new(),
+            queue_halted: false,
             config,
         }
     }
@@ -267,7 +295,7 @@ impl App {
     /// use zhive_tui::TuiConfig;
     /// use zhive_proto::domain::ThreadId;
     /// let mut app = App::new(TuiConfig::default(), ThreadId(Arc::from("thread:native/t")));
-    /// app.set_extra_commands(vec![SlashCommand::from_static("deploy", "deploy to staging")]);
+    /// app.set_extra_commands(vec![SlashCommand::from_static("deploy", "deploy to staging", false)]);
     /// assert_eq!(app.extra_commands.len(), 1);
     /// ```
     pub fn set_extra_commands(&mut self, commands: Vec<SlashCommand>) {
@@ -316,6 +344,48 @@ impl App {
         }
     }
 
+    /// Moves the palette highlight one step, wrapping around the match list.
+    ///
+    /// A negative `delta` moves toward the top (and wraps to the bottom); a
+    /// positive `delta` moves down (and wraps to the top). Only the sign is
+    /// used — callers pass `-1` / `1`.
+    fn palette_move(&mut self, delta: i32) {
+        let len = self.palette_matches().len();
+        if len == 0 {
+            self.palette_index = 0;
+            return;
+        }
+        // `+ len - 1` is a wrapping decrement without an unsigned underflow.
+        self.palette_index = if delta < 0 {
+            (self.palette_index + len - 1) % len
+        } else {
+            (self.palette_index + 1) % len
+        };
+    }
+
+    /// Dispatches the highlighted palette command on a single Enter.
+    ///
+    /// Arg-taking commands (e.g. `/theme`) complete the input to `/name ` and
+    /// wait for a second Enter; the rest run immediately. With no match it falls
+    /// back to submitting the typed text (which surfaces `unknown command`).
+    fn palette_submit(&mut self) -> Action {
+        let matches = self.palette_matches();
+        let Some(cmd) = matches
+            .get(self.palette_index)
+            .or_else(|| matches.first())
+            .cloned()
+        else {
+            return self.submit();
+        };
+        if cmd.takes_args {
+            self.palette_autocomplete();
+            return Action::None;
+        }
+        self.input.clear();
+        self.palette_index = 0;
+        self.run_slash(&cmd.name)
+    }
+
     /// Advances the spinner; called on each redraw tick.
     pub fn tick(&mut self) {
         if self.conversation.busy {
@@ -323,10 +393,15 @@ impl App {
         }
     }
 
-    /// Re-binds the conversation to a fresh thread (after `/clear`).
+    /// Re-binds the conversation to a fresh thread (after `/clear` or resume).
+    ///
+    /// Also drops any queued messages: they belonged to the old thread and must
+    /// not leak into the new one.
     pub fn reset_thread(&mut self, thread: zhive_proto::domain::ThreadId) {
         self.conversation = Conversation::new(thread);
         self.scrollback = 0;
+        self.message_queue.clear();
+        self.queue_halted = false;
     }
 
     /// Records that the engine connection was lost.
@@ -336,6 +411,10 @@ impl App {
     pub fn on_disconnected(&mut self) {
         self.disconnected = true;
         self.conversation.busy = false;
+        // Drop the queue so a reconnect cannot silently fire stale input. The
+        // persistent footer banner supersedes any flash, so none is set here.
+        self.message_queue.clear();
+        self.queue_halted = false;
     }
 
     /// Folds an engine notification into state, opening overlays as needed.
@@ -365,6 +444,35 @@ impl App {
             EngineNotification::ItemAppended { .. } | EngineNotification::ItemDelta { .. }
         ) {
             self.scrollback = 0;
+        }
+        // Queue behaviour at terminal turn states: a failure keeps the queue but
+        // surfaces it (the user resumes with Enter); an interrupt drops it. A
+        // normal completion auto-drains via `take_next_queued` in the loop.
+        match event {
+            EngineNotification::TurnFailed { .. } if !self.message_queue.is_empty() => {
+                // Keep the queue but halt auto-drain; resume with a blank Enter.
+                self.queue_halted = true;
+                self.flash = Some(format!(
+                    "turn failed · {} still queued (↵ to continue)",
+                    self.message_queue.len()
+                ));
+            }
+            EngineNotification::TurnRejected { .. } if !self.message_queue.is_empty() => {
+                // A rejection (e.g. rate limit) must not silently re-fire the
+                // queue; halt and let the user resume deliberately.
+                self.queue_halted = true;
+                self.flash = Some(format!(
+                    "turn rejected · {} still queued (↵ to continue)",
+                    self.message_queue.len()
+                ));
+            }
+            EngineNotification::SessionAborted(_) if !self.message_queue.is_empty() => {
+                let n = self.message_queue.len();
+                self.message_queue.clear();
+                self.queue_halted = false;
+                self.flash = Some(format!("stopped · cleared {n} queued"));
+            }
+            _ => {}
         }
     }
 
@@ -426,6 +534,14 @@ impl App {
             }
             KeyCode::Up => selected = selected.saturating_sub(1),
             KeyCode::Down => selected = (selected + 1).min(max),
+            // Ctrl+P / Ctrl+N mirror Up / Down so navigation is consistent with
+            // the slash palette. They must precede the `Char(c)` filter arm.
+            KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                selected = selected.saturating_sub(1);
+            }
+            KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                selected = (selected + 1).min(max);
+            }
             KeyCode::Enter => {
                 if let Some(entry) = filtered.get(selected) {
                     return Action::ResumeSession {
@@ -514,30 +630,58 @@ impl App {
             KeyCode::Char('d') if ctrl && self.input.is_blank() => Action::Quit,
             KeyCode::Esc => {
                 if self.conversation.busy {
+                    // Interrupt the turn; an interrupt also discards the queue
+                    // (a stop means stop — never fire pending input afterwards).
+                    if !self.message_queue.is_empty() {
+                        let n = self.message_queue.len();
+                        self.message_queue.clear();
+                        self.queue_halted = false;
+                        self.flash = Some(format!("stopped · cleared {n} queued"));
+                    }
                     Action::Cancel
+                } else if !self.message_queue.is_empty() {
+                    // Idle with a leftover queue (e.g. after a failed turn): Esc
+                    // clears it rather than interrupting nothing.
+                    let n = self.message_queue.len();
+                    self.message_queue.clear();
+                    self.queue_halted = false;
+                    self.flash = Some(format!("cleared {n} queued"));
+                    Action::None
                 } else {
                     Action::None
                 }
             }
-            // Palette navigation takes Up/Down/Tab while composing a command.
+            // Palette navigation: arrows or Ctrl+P/Ctrl+N wrap around the list;
+            // Tab completes; Enter dispatches the highlighted command.
             KeyCode::Up if palette => {
-                self.palette_index = self.palette_index.saturating_sub(1);
+                self.palette_move(-1);
+                Action::None
+            }
+            KeyCode::Char('p') if ctrl && palette => {
+                self.palette_move(-1);
                 Action::None
             }
             KeyCode::Down if palette => {
-                let max = self.palette_matches().len().saturating_sub(1);
-                self.palette_index = (self.palette_index + 1).min(max);
+                self.palette_move(1);
+                Action::None
+            }
+            KeyCode::Char('n') if ctrl && palette => {
+                self.palette_move(1);
                 Action::None
             }
             KeyCode::Tab if palette => {
                 self.palette_autocomplete();
                 Action::None
             }
+            // Alt+Enter always inserts a newline, even with the palette open.
+            KeyCode::Enter if palette && !alt => self.palette_submit(),
             KeyCode::Enter if alt => {
                 self.input.insert_newline();
                 Action::None
             }
-            KeyCode::Char('j') if ctrl => {
+            // Ctrl+J newline is suppressed while the palette is open (a newline
+            // would terminate the command name and dismiss the palette).
+            KeyCode::Char('j') if ctrl && !palette => {
                 self.input.insert_newline();
                 Action::None
             }
@@ -550,6 +694,10 @@ impl App {
             KeyCode::Char('w') if ctrl => {
                 self.input.delete_word();
                 self.palette_index = 0;
+                Action::None
+            }
+            KeyCode::Char('x') if ctrl => {
+                self.unqueue();
                 Action::None
             }
             KeyCode::Char(c) if !ctrl => {
@@ -628,9 +776,21 @@ impl App {
         }
     }
 
-    /// Submits the composer buffer, dispatching slash commands locally.
+    /// Submits the composer buffer, queuing or dispatching as appropriate.
+    ///
+    /// A blank buffer resumes the queue when the engine is idle (the
+    /// `↵ to continue` affordance after a failed turn). Slash commands always
+    /// run immediately; a plain message typed while the engine is busy is
+    /// enqueued instead of racing the in-flight turn.
     fn submit(&mut self) -> Action {
         if self.input.is_blank() {
+            // Empty Enter resumes a stalled queue (e.g. after a failed turn).
+            if !self.conversation.busy
+                && let Some(next) = self.message_queue.pop_front()
+            {
+                self.queue_halted = false;
+                return Action::Submit(next);
+            }
             return Action::None;
         }
         let text = self.input.take();
@@ -639,7 +799,64 @@ impl App {
         if let Some(cmd) = text.strip_prefix('/') {
             return self.run_slash(cmd);
         }
+        if self.conversation.busy {
+            // Queue rather than race the in-flight turn; flushed one-per-turn.
+            self.message_queue.push_back(text);
+            self.flash = Some(format!("queued · {} pending", self.message_queue.len()));
+            return Action::None;
+        }
+        // A fresh idle submit clears any halt so the queue resumes after it.
+        self.queue_halted = false;
         Action::Submit(text)
+    }
+
+    /// Pops the next queued message when idle after a normally-completed turn.
+    ///
+    /// Returns `Some(text)` only when the engine is not busy, the queue is
+    /// non-empty, and the most recent turn finished normally — a failed or
+    /// interrupted turn does not auto-drain (the user resumes with Enter).
+    /// Called by the event loop after each iteration to dispatch one per turn.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use zhive_tui::app::App;
+    /// use zhive_tui::TuiConfig;
+    /// use zhive_proto::domain::ThreadId;
+    /// let mut app = App::new(TuiConfig::default(), ThreadId(Arc::from("t")));
+    /// assert!(app.take_next_queued().is_none()); // empty queue → nothing to drain
+    /// ```
+    #[must_use]
+    pub fn take_next_queued(&mut self) -> Option<String> {
+        if self.queue_halted || self.conversation.busy || self.message_queue.is_empty() {
+            return None;
+        }
+        match self.conversation.turns.last().map(|t| &t.status) {
+            Some(crate::conversation::TurnLifecycle::Completed) => self.message_queue.pop_front(),
+            _ => None,
+        }
+    }
+
+    /// Cancels queued messages: pull the last back to edit, or clear the rest.
+    ///
+    /// First `Ctrl+X` pops the most recent queued message back into the composer
+    /// (replacing the draft). A second `Ctrl+X` (composer already holds that
+    /// draft and more remain) clears the remaining queue.
+    fn unqueue(&mut self) {
+        if !self.input.is_blank() && !self.message_queue.is_empty() {
+            let n = self.message_queue.len();
+            self.message_queue.clear();
+            self.queue_halted = false;
+            self.flash = Some(format!("cleared {n} queued"));
+        } else if let Some(last) = self.message_queue.pop_back() {
+            self.input.clear();
+            self.input.insert_str(&last);
+            self.palette_index = 0;
+            self.flash = Some(format!("unqueued · {} pending", self.message_queue.len()));
+        } else {
+            self.flash = Some("nothing queued".to_owned());
+        }
     }
 
     /// Interprets a `/command [args]` string.
@@ -779,6 +996,198 @@ mod tests {
 
     fn ctrl(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::CONTROL)
+    }
+
+    // ---- message-queue helpers ----
+
+    fn turn_id(s: &str) -> zhive_proto::domain::TurnId {
+        zhive_proto::domain::TurnId(Arc::from(s))
+    }
+
+    /// Starts a turn on the app's thread (sets `busy`) and returns its id.
+    fn start_turn(app: &mut App) -> zhive_proto::domain::TurnId {
+        let turn = turn_id("turn:native/t/0");
+        app.on_engine(&EngineNotification::TurnStarted {
+            thread_id: app.conversation.thread_id.clone(),
+            turn_id: turn.clone(),
+        });
+        turn
+    }
+
+    fn complete_turn(app: &mut App, turn: &zhive_proto::domain::TurnId) {
+        app.on_engine(&EngineNotification::TurnCompleted {
+            thread_id: app.conversation.thread_id.clone(),
+            turn_id: turn.clone(),
+        });
+    }
+
+    /// Types `text` into the composer one key at a time.
+    fn type_text(app: &mut App, text: &str) {
+        for c in text.chars() {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+    }
+
+    #[test]
+    fn busy_enter_enqueues_instead_of_submitting() {
+        let mut app = app();
+        start_turn(&mut app);
+        assert!(app.conversation.busy);
+        type_text(&mut app, "later");
+        assert_eq!(app.on_key(key(KeyCode::Enter)), Action::None);
+        assert_eq!(app.message_queue.len(), 1);
+        // Busy → nothing drains yet.
+        assert!(app.take_next_queued().is_none());
+    }
+
+    #[test]
+    fn queue_drains_one_per_turn_with_busy_gate() {
+        let mut app = app();
+        let turn = start_turn(&mut app);
+        type_text(&mut app, "one");
+        app.on_key(key(KeyCode::Enter));
+        type_text(&mut app, "two");
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.message_queue.len(), 2);
+        complete_turn(&mut app, &turn);
+        // Completion drains exactly one (FIFO).
+        assert_eq!(app.take_next_queued().as_deref(), Some("one"));
+        // Simulate the loop's perform() re-marking the app busy.
+        app.conversation.busy = true;
+        // One-per-turn: the second does not drain while busy.
+        assert!(app.take_next_queued().is_none());
+        assert_eq!(app.message_queue.len(), 1);
+    }
+
+    #[test]
+    fn failed_turn_keeps_queue_and_blank_enter_resumes() {
+        let mut app = app();
+        let turn = start_turn(&mut app);
+        type_text(&mut app, "keep");
+        app.on_key(key(KeyCode::Enter));
+        app.on_engine(&EngineNotification::TurnFailed {
+            thread_id: app.conversation.thread_id.clone(),
+            turn_id: turn,
+            error: zhive_proto::domain::TurnError {
+                message: "boom".to_owned(),
+                additional_details: None,
+            },
+        });
+        assert_eq!(app.message_queue.len(), 1, "failure keeps the queue");
+        assert!(
+            app.take_next_queued().is_none(),
+            "a failed turn does not auto-drain"
+        );
+        // Blank Enter manually resumes the queue.
+        assert_eq!(
+            app.on_key(key(KeyCode::Enter)),
+            Action::Submit("keep".to_owned())
+        );
+        assert!(app.message_queue.is_empty());
+    }
+
+    #[test]
+    fn esc_while_busy_clears_queue() {
+        let mut app = app();
+        start_turn(&mut app);
+        type_text(&mut app, "drop");
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.message_queue.len(), 1);
+        assert_eq!(app.on_key(key(KeyCode::Esc)), Action::Cancel);
+        assert!(app.message_queue.is_empty());
+    }
+
+    #[test]
+    fn ctrl_x_unqueues_last_into_composer() {
+        let mut app = app();
+        start_turn(&mut app);
+        type_text(&mut app, "edit me");
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.message_queue.len(), 1);
+        assert!(app.input.is_blank());
+        app.on_key(ctrl(KeyCode::Char('x')));
+        assert!(app.message_queue.is_empty());
+        assert_eq!(app.input.value(), "edit me");
+    }
+
+    #[test]
+    fn slash_command_runs_immediately_even_while_busy() {
+        let mut app = app();
+        start_turn(&mut app);
+        // A slash command is a local control op — it must not be queued.
+        type_text(&mut app, "/clear");
+        assert_eq!(app.on_key(key(KeyCode::Enter)), Action::Clear);
+        assert!(app.message_queue.is_empty());
+    }
+
+    #[test]
+    fn palette_enter_executes_highlighted_command() {
+        let mut app = app();
+        type_text(&mut app, "/he");
+        // Single Enter dispatches the highlighted no-arg command (opens Help).
+        assert_eq!(app.on_key(key(KeyCode::Enter)), Action::None);
+        assert!(matches!(app.overlay, Some(Overlay::Help)));
+    }
+
+    #[test]
+    fn palette_enter_on_arg_command_completes_without_dispatch() {
+        let mut app = app();
+        type_text(&mut app, "/th");
+        // /theme takes an arg → Enter completes to "/theme " and waits.
+        assert_eq!(app.on_key(key(KeyCode::Enter)), Action::None);
+        assert_eq!(app.input.value(), "/theme ");
+        assert!(app.overlay.is_none());
+    }
+
+    #[test]
+    fn ctrl_n_p_wrap_palette_selection() {
+        let mut app = app();
+        app.on_key(key(KeyCode::Char('/')));
+        let n = app.palette_matches().len();
+        assert!(n > 1, "several builtins match an empty query");
+        // Ctrl+P from the top wraps to the bottom.
+        app.on_key(ctrl(KeyCode::Char('p')));
+        assert_eq!(app.palette_index, n - 1);
+        // Ctrl+N wraps back to the top.
+        app.on_key(ctrl(KeyCode::Char('n')));
+        assert_eq!(app.palette_index, 0);
+    }
+
+    #[test]
+    fn halted_queue_does_not_auto_drain_then_blank_enter_resumes() {
+        let mut app = app();
+        let turn = start_turn(&mut app);
+        type_text(&mut app, "a");
+        app.on_key(key(KeyCode::Enter));
+        complete_turn(&mut app, &turn);
+        // Simulate a failed/rejected submit halting the queue (as the loop does).
+        app.queue_halted = true;
+        assert!(
+            app.take_next_queued().is_none(),
+            "a halted queue must not auto-drain even after a completed turn"
+        );
+        // Blank Enter clears the halt and resumes the queue.
+        assert_eq!(
+            app.on_key(key(KeyCode::Enter)),
+            Action::Submit("a".to_owned())
+        );
+        assert!(!app.queue_halted, "resuming clears the halt");
+    }
+
+    #[test]
+    fn rejected_turn_halts_queue_instead_of_auto_resending() {
+        let mut app = app();
+        start_turn(&mut app);
+        type_text(&mut app, "x");
+        app.on_key(key(KeyCode::Enter));
+        app.on_engine(&EngineNotification::TurnRejected {
+            reason: "rate limited".to_owned(),
+        });
+        assert!(app.queue_halted, "a rejection halts the queue");
+        assert!(
+            app.take_next_queued().is_none(),
+            "rejected turn must not auto-resend the queue"
+        );
     }
 
     #[test]
@@ -926,6 +1335,7 @@ mod tests {
         app.set_extra_commands(vec![SlashCommand::from_static(
             "deploy",
             "deploy to staging",
+            false,
         )]);
         // Simulate typing "/de"
         for c in "/de".chars() {
@@ -941,7 +1351,7 @@ mod tests {
     #[test]
     fn builtin_commands_still_work_with_extra_commands() {
         let mut app = app();
-        app.set_extra_commands(vec![SlashCommand::from_static("xfoo", "extra foo")]);
+        app.set_extra_commands(vec![SlashCommand::from_static("xfoo", "extra foo", false)]);
         for c in "/help".chars() {
             app.on_key(key(KeyCode::Char(c)));
         }
@@ -956,7 +1366,11 @@ mod tests {
     fn extra_command_does_not_shadow_builtin() {
         let mut app = app();
         // An extra command with a matching prefix must not hide the builtin.
-        app.set_extra_commands(vec![SlashCommand::from_static("helpx", "extended help")]);
+        app.set_extra_commands(vec![SlashCommand::from_static(
+            "helpx",
+            "extended help",
+            false,
+        )]);
         for c in "/help".chars() {
             app.on_key(key(KeyCode::Char(c)));
         }
@@ -1108,6 +1522,39 @@ mod tests {
         // Down past the end clamps to the last row.
         app.on_key(key(KeyCode::Down));
         app.on_key(key(KeyCode::Down));
+        match &app.overlay {
+            Some(Overlay::SessionList { selected, .. }) => assert_eq!(*selected, 1),
+            other => panic!("overlay must remain open, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn session_list_ctrl_n_p_navigate_like_arrows() {
+        let mut app = app();
+        app.overlay = Some(Overlay::SessionList {
+            entries: vec![
+                session_entry("thread:native/a", "alpha", "first"),
+                session_entry("thread:native/b", "beta", "second"),
+                session_entry("thread:native/c", "gamma", "third"),
+            ],
+            selected: 0,
+            query: String::new(),
+            filter_mode: SessionFilter::All,
+        });
+        // Ctrl+N steps down like Down (and must not type 'n' into the filter).
+        app.on_key(ctrl(KeyCode::Char('n')));
+        app.on_key(ctrl(KeyCode::Char('n')));
+        match &app.overlay {
+            Some(Overlay::SessionList {
+                selected, query, ..
+            }) => {
+                assert_eq!(*selected, 2);
+                assert!(query.is_empty(), "Ctrl+N must navigate, not filter");
+            }
+            other => panic!("overlay must remain open, got {other:?}"),
+        }
+        // Ctrl+P steps back up like Up.
+        app.on_key(ctrl(KeyCode::Char('p')));
         match &app.overlay {
             Some(Overlay::SessionList { selected, .. }) => assert_eq!(*selected, 1),
             other => panic!("overlay must remain open, got {other:?}"),
