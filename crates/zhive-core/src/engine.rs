@@ -204,6 +204,15 @@ pub struct EngineConfig {
     /// the prior behaviour.
     pub system_prompt: Option<Arc<str>>,
 
+    /// Optional instruction prefix used when summarizing for compaction / fork.
+    ///
+    /// When `Some`, this opaque text is prepended to the rendered transcript as
+    /// the summarization request sent to the provider (see
+    /// [`super::engine::compaction::summarize`]); the engine treats it as
+    /// opaque, so hosts may render it from a template. `None` (the default)
+    /// uses the engine's built-in instruction, preserving the prior behaviour.
+    pub compaction_prompt: Option<Arc<str>>,
+
     /// Optional token-based automatic compaction threshold.
     ///
     /// When `Some(n)`, a completed turn whose `input_tokens` meets or exceeds
@@ -234,6 +243,7 @@ impl Default for EngineConfig {
             storage: None,
             turn_limits: TurnLimits::default(),
             system_prompt: None,
+            compaction_prompt: None,
             compact_token_threshold: None,
             cwd: PathBuf::from("."),
         }
@@ -406,6 +416,7 @@ impl Engine {
     ///     storage: None,
     ///     turn_limits: Default::default(),
     ///     system_prompt: None,
+    ///     compaction_prompt: None,
     ///     compact_token_threshold: None,
     ///     cwd: std::path::PathBuf::from("."),
     /// };
@@ -468,6 +479,7 @@ impl Engine {
             config.tools,
             config.turn_limits,
             config.system_prompt,
+            config.compaction_prompt,
             maybe_tx,
             maybe_handle,
             config.compact_token_threshold,
@@ -2050,6 +2062,7 @@ mod inc3_tests {
             storage: None,
             turn_limits: TurnLimits::default(),
             system_prompt: None,
+            compaction_prompt: None,
             compact_token_threshold: None,
             cwd: std::path::PathBuf::from("."),
         };
@@ -2145,6 +2158,7 @@ mod inc3_tests {
             storage: None,
             turn_limits: TurnLimits::default(),
             system_prompt: None,
+            compaction_prompt: None,
             compact_token_threshold: None,
             cwd: std::path::PathBuf::from("."),
         };
@@ -2252,6 +2266,7 @@ mod inc3_tests {
             storage: None,
             turn_limits: TurnLimits::default(),
             system_prompt: None,
+            compaction_prompt: None,
             compact_token_threshold: None,
             cwd: std::path::PathBuf::from("."),
         };
@@ -2354,6 +2369,7 @@ mod inc3_tests {
             storage: None,
             turn_limits: TurnLimits::default(),
             system_prompt: None,
+            compaction_prompt: None,
             compact_token_threshold: None,
             cwd: std::path::PathBuf::from("."),
         };
@@ -2453,6 +2469,7 @@ mod inc3_tests {
             storage: None,
             turn_limits: TurnLimits::default(),
             system_prompt: None,
+            compaction_prompt: None,
             compact_token_threshold: None,
             cwd: std::path::PathBuf::from("."),
         };
@@ -2536,6 +2553,7 @@ mod inc3_tests {
             storage: None,
             turn_limits: TurnLimits::default(),
             system_prompt: None,
+            compaction_prompt: None,
             compact_token_threshold: None,
             cwd: std::path::PathBuf::from("."),
         };
@@ -2658,6 +2676,7 @@ mod inc3_tests {
             storage: None,
             turn_limits: TurnLimits::default(),
             system_prompt: None,
+            compaction_prompt: None,
             compact_token_threshold: None,
             cwd: std::path::PathBuf::from("."),
         };
@@ -2817,6 +2836,7 @@ mod inc3_tests {
             storage: None,
             turn_limits: TurnLimits::default(),
             system_prompt: None,
+            compaction_prompt: None,
             compact_token_threshold: None,
             cwd: std::path::PathBuf::from("."),
         };
@@ -2919,6 +2939,7 @@ mod inc3_tests {
             storage: None,
             turn_limits: TurnLimits::default(),
             system_prompt: None,
+            compaction_prompt: None,
             compact_token_threshold: None,
             cwd: std::path::PathBuf::from("."),
         };
@@ -3128,6 +3149,7 @@ mod inc3_tests {
                 max_iterations: Some(4),
             },
             system_prompt: None,
+            compaction_prompt: None,
             compact_token_threshold: None,
             cwd: std::path::PathBuf::from("."),
         };
@@ -3194,6 +3216,7 @@ mod inc3_tests {
             storage: None,
             turn_limits: TurnLimits::default(),
             system_prompt: None,
+            compaction_prompt: None,
             compact_token_threshold: None,
             cwd: std::path::PathBuf::from("."),
         };
@@ -3271,6 +3294,7 @@ mod inc3_tests {
             storage: None,
             turn_limits: TurnLimits::default(),
             system_prompt: None,
+            compaction_prompt: None,
             compact_token_threshold: None,
             cwd: std::path::PathBuf::from("."),
         };
@@ -3540,6 +3564,7 @@ mod post_hook_dispatch_tests {
             storage: None,
             turn_limits: TurnLimits::default(),
             system_prompt: None,
+            compaction_prompt: None,
             compact_token_threshold: None,
             cwd: std::path::PathBuf::from("."),
         };
@@ -3620,6 +3645,7 @@ mod post_hook_dispatch_tests {
             storage: None,
             turn_limits: TurnLimits::default(),
             system_prompt: None,
+            compaction_prompt: None,
             compact_token_threshold: None,
             cwd: std::path::PathBuf::from("."),
         };
@@ -4382,6 +4408,7 @@ mod inc5_tests {
             storage: Some(Arc::clone(&storage)),
             turn_limits: TurnLimits::default(),
             system_prompt: None,
+            compaction_prompt: None,
             compact_token_threshold: None,
             cwd: std::path::PathBuf::from("."),
         };
@@ -4481,6 +4508,7 @@ mod inc5_tests {
             storage: Some(Arc::clone(&storage)),
             turn_limits: TurnLimits::default(),
             system_prompt: None,
+            compaction_prompt: None,
             compact_token_threshold: None,
             cwd: std::path::PathBuf::from("/work/myproject"),
         };
@@ -4631,6 +4659,7 @@ mod inc5_tests {
             storage: Some(Arc::clone(&storage)),
             turn_limits: TurnLimits::default(),
             system_prompt: None,
+            compaction_prompt: None,
             compact_token_threshold: None,
             cwd: std::path::PathBuf::from("."),
         };
@@ -4771,6 +4800,7 @@ mod inc5_tests {
             storage: Some(Arc::clone(&storage)),
             turn_limits: TurnLimits::default(),
             system_prompt: None,
+            compaction_prompt: None,
             compact_token_threshold: None,
             cwd: std::path::PathBuf::from("."),
         };
@@ -5259,6 +5289,7 @@ mod inc6_tests {
             storage: None,
             turn_limits: TurnLimits::default(),
             system_prompt: None,
+            compaction_prompt: None,
             compact_token_threshold: None,
             cwd: std::path::PathBuf::from("."),
         };
@@ -5727,6 +5758,7 @@ mod inc6_tests {
             storage: Some(Arc::clone(&storage)),
             turn_limits: TurnLimits::default(),
             system_prompt: None,
+            compaction_prompt: None,
             compact_token_threshold: None,
             cwd: std::path::PathBuf::from("."),
         };
@@ -5829,6 +5861,7 @@ mod inc6_tests {
             storage: None,
             turn_limits: TurnLimits::default(),
             system_prompt: None,
+            compaction_prompt: None,
             compact_token_threshold: None,
             cwd: std::path::PathBuf::from("."),
         };
@@ -5922,6 +5955,7 @@ mod inc6_tests {
             storage: None,
             turn_limits: TurnLimits::default(),
             system_prompt: None,
+            compaction_prompt: None,
             compact_token_threshold: Some(1),
             cwd: std::path::PathBuf::from("."),
         };
@@ -5999,6 +6033,7 @@ mod inc6_tests {
             storage: None,
             turn_limits: TurnLimits::default(),
             system_prompt: None,
+            compaction_prompt: None,
             compact_token_threshold: None,
             cwd: std::path::PathBuf::from("."),
         };

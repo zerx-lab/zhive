@@ -74,7 +74,7 @@ fn renders_user_and_agent_messages() {
     assert!(text.contains('❯'), "user role glyph present");
     assert!(text.contains("hello world"), "user text rendered");
     assert!(text.contains("hi there"), "agent text rendered");
-    assert!(text.contains("zap"), "model pill / brand present");
+    assert!(text.contains("demo"), "model label present in top bar");
 }
 
 #[test]
@@ -149,7 +149,7 @@ fn renders_welcome_when_empty() {
     terminal.draw(|frame| ui::draw(frame, &app)).expect("draw");
 
     let text = screen_text(&terminal);
-    assert!(text.contains("zap"), "brand shown on welcome");
+    assert!(text.contains("demo"), "model label shown in top bar");
     assert!(text.contains("/help"), "welcome lists commands");
 }
 

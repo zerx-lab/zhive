@@ -71,6 +71,7 @@ impl Host {
             storage: runtime.storage.clone(),
             turn_limits: runtime.turn_limits,
             system_prompt: Some(std::sync::Arc::clone(&runtime.system_prompt)),
+            compaction_prompt: runtime.compaction_prompt.clone(),
             compact_token_threshold: None,
             cwd: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
         });

@@ -1,0 +1,10 @@
+{% include persona_template %}
+
+# Environment
+- Working directory: {{ cwd }}
+- Operating system: {{ os }}
+{% if project_instructions %}
+# Project instructions
+Source: {{ project_instructions.source }}
+
+{{ project_instructions.body }}{% endif %}

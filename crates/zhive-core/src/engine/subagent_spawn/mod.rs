@@ -1002,6 +1002,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             std::path::PathBuf::from("."),
         ));
 

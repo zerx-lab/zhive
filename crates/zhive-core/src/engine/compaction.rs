@@ -129,7 +129,7 @@ const SUMMARY_PREFIX: &str = "[context summary]\n";
 
 /// Instruction handed to the model when summarising. Mirrors the handoff
 /// structure used by codex `core/templates/compact/prompt.md`.
-const SUMMARY_INSTRUCTION: &str = "\
+pub(in crate::engine) const SUMMARY_INSTRUCTION: &str = "\
 You are performing a CONTEXT CHECKPOINT COMPACTION. Write a concise handoff \
 summary for another assistant that will resume this task. Include: current \
 progress and key decisions, important context / constraints / user \
@@ -205,7 +205,7 @@ impl EngineInner {
         // 4. Summarise via the provider, inside the `zhive.compaction` span.
         //    Use `.instrument()` (not `.enter()`) so the span is correctly
         //    attached across the await on a multi-thread runtime.
-        let summary = summarize(self.provider(), &snapshot)
+        let summary = summarize(self.provider(), &snapshot, self.compaction_instruction())
             .instrument(tracing::info_span!("zhive.compaction", "session.id" = %thread_id.0))
             .await;
         let summary = match summary {
@@ -432,6 +432,9 @@ fn compaction_item_id(thread_id: &ThreadId, seq: u64, suffix: &str) -> ItemId {
 
 /// Renders `items` to plain text and asks `provider` for a handoff summary.
 ///
+/// `instruction` is the summarization request prepended to the rendered
+/// transcript; callers pass [`super::inner::EngineInner::compaction_instruction`],
+/// which is the host-configured prompt or the built-in [`SUMMARY_INSTRUCTION`].
 /// Collects every `TextDelta` from the streamed response into a single
 /// string. Returns the trimmed summary text.
 ///
@@ -446,6 +449,7 @@ fn compaction_item_id(thread_id: &ThreadId, seq: u64, suffix: &str) -> ItemId {
 pub(in crate::engine) async fn summarize(
     provider: &DynLanguageModel,
     items: &[Item],
+    instruction: &str,
 ) -> Result<String, ProviderError> {
     let mut transcript = String::new();
     for item in items {
@@ -473,7 +477,7 @@ pub(in crate::engine) async fn summarize(
 
     let prompt = vec![Message::User {
         content: vec![UserPart::Text(TextPart {
-            text: format!("{SUMMARY_INSTRUCTION}{transcript}"),
+            text: format!("{instruction}{transcript}"),
             provider_options: None,
         })],
         provider_options: None,

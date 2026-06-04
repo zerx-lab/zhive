@@ -34,6 +34,10 @@ pub struct RuntimeTools {
     /// System prompt assembled by [`crate::system_prompt`], ready to hand to
     /// `EngineConfig::system_prompt`.
     pub system_prompt: Arc<str>,
+    /// Compaction summarization instruction rendered from the `compaction/summary`
+    /// template, or `None` to let the engine use its built-in default. Handed to
+    /// `EngineConfig::compaction_prompt`.
+    pub compaction_prompt: Option<Arc<str>>,
     /// Persistent storage for the engine, or `None` when it could not be
     /// opened (the engine then runs purely in-memory). See [`open_storage`].
     pub storage: Option<Arc<zhive_core::persistence::Storage>>,
@@ -140,7 +144,19 @@ pub async fn build_runtime(cfg: &Config) -> anyhow::Result<RuntimeTools> {
     // directory and the project's instruction file. A failed `current_dir`
     // (e.g. the directory was removed) degrades to ".".
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let system_prompt = crate::system_prompt::assemble(&cwd);
+    // The active provider's name (user-chosen label) and kind (backend type)
+    // select the per-provider persona; kind is empty only if the configured
+    // default does not match any `[provider.<name>]` entry.
+    let provider_name = cfg.provider.default.as_str();
+    let active_entry = cfg.provider.providers.get(&cfg.provider.default);
+    let provider_kind = active_entry.map_or("", |entry| entry.kind.as_str());
+    // An empty model (e.g. the scripted demo) is treated as "unknown".
+    let model = active_entry
+        .map(|entry| entry.model.as_str())
+        .filter(|m| !m.is_empty());
+    let system_prompt = crate::system_prompt::assemble(&cwd, provider_name, provider_kind, model);
+    let compaction_prompt =
+        crate::system_prompt::assemble_compaction(&cwd, provider_name, provider_kind, model);
 
     // Open persistent storage so threads, turns, and items survive restarts
     // (D-011). Best-effort: a failure degrades to an in-memory engine.
@@ -150,6 +166,7 @@ pub async fn build_runtime(cfg: &Config) -> anyhow::Result<RuntimeTools> {
         registry: Arc::new(registry),
         turn_limits: turn_limits_from(cfg),
         system_prompt,
+        compaction_prompt,
         storage,
         slash_commands,
         #[cfg(feature = "mcp")]

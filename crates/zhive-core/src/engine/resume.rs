@@ -548,6 +548,7 @@ mod tests {
             Arc::new(crate::tools::ToolRegistry::new()),
             crate::engine::TurnLimits::default(),
             None,
+            None,
             Some(tx),
             Some(handle),
             None,

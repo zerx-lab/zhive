@@ -115,6 +115,19 @@ tracing-opentelemetry = { version = "0.33", default-features = false }
 opentelemetry         = { version = "0.32", default-features = false, features = ["trace"] }
 opentelemetry_sdk     = { version = "0.32", default-features = false, features = ["trace", "rt-tokio"] }
 
+# ---- prompt templating (user-approved 2026-06-04) ----
+# minijinja renders the system / compaction prompts from `.j2` (Jinja2)
+# templates so prompt text lives in editable files instead of hardcoded Rust
+# string constants, supports per-provider persona selection, dynamic-variable
+# injection, and on-disk overrides. Chosen over tera/askama because it is the
+# only candidate that combines Jinja2 syntax, runtime disk loading, and a
+# minimal dependency footprint (only `memo-map` is newly pulled in; serde et
+# al. are already in the lockfile). Consumed only by `zhive-cli`. `loader`
+# enables `set_loader` / `add_template_owned` for the embed + disk-override
+# loader; `multi_template` enables `{% include %}`; `builtins` provides the
+# default filters/tests; `serde` enables `context!` / `Value::from_serialize`.
+minijinja = { version = "2", default-features = false, features = ["builtins", "loader", "multi_template", "serde"] }
+
 # ---- dev / test ----
 tempfile = "3"
 

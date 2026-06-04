@@ -1,9 +1,11 @@
-//! Rendering of the conversation shell: top bar, transcript, composer, footer.
+//! Rendering of the conversation shell: top bar, transcript, and composer.
 //!
-//! Follows the `zap-tui-design` three-part shell — a branded top bar with a
-//! `cwd · branch · session` breadcrumb and a right-aligned model pill, the
-//! conversation body (a 2-cell role-glyph gutter beside each message), the composer
-//! panel, and a bottom key-hint strip. Messages are pre-wrapped with
+//! Follows the `zap-tui-design` shell — a top status bar (brand, `cwd · branch
+//! · session` breadcrumb, right-aligned model pill), shown in every state, the
+//! conversation body
+//! (a 2-cell role-glyph gutter beside each message), and the composer panel
+//! whose right-aligned status slot carries the ready / working / disconnected
+//! signal (there is no bottom key-hint bar). Messages are pre-wrapped with
 //! [`crate::wrap`] so continuation rows stay indented under the gutter. Modal
 //! overlays ([`Overlay`]) draw over a [`Clear`]ed centered rect.
 
@@ -21,7 +23,7 @@ use zhive_proto::domain::{
 use crate::app::App;
 use crate::conversation::{SubagentStatus, SubagentView, TurnLifecycle};
 use crate::theme::Palette;
-use crate::widgets::{self, Hint};
+use crate::widgets;
 use crate::{markdown, wrap};
 
 /// Width of the left role-glyph gutter, in cells (1 glyph + 1 space).
@@ -56,12 +58,11 @@ pub fn draw(frame: &mut Frame, app: &App) {
 
     let composer_h = composer_height(app);
     let queue_h = queue_height(app);
-    let [top, body, queue, composer, footer] = Layout::vertical([
+    let [top, body, queue, composer] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Fill(1),
         Constraint::Length(queue_h),
         Constraint::Length(composer_h),
-        Constraint::Length(1),
     ])
     .areas(area);
 
@@ -69,7 +70,6 @@ pub fn draw(frame: &mut Frame, app: &App) {
     render_body(frame, app, body);
     render_queue(frame, app, queue);
     let composer_inner = render_composer(frame, app, composer);
-    render_footer(frame, app, footer);
 
     // Place the caret in the composer when no overlay is capturing input.
     if app.overlay.is_none() {
@@ -111,17 +111,21 @@ fn queue_height(app: &App) -> u16 {
     }
 }
 
-/// Renders the branded top bar with breadcrumb and model pill.
+/// Renders the top status bar: brand, `cwd · branch · session` breadcrumb, and
+/// a right-aligned model pill (with a token count once a turn has run).
+///
+/// Shown in every state, including the welcome screen, so the header always
+/// carries the brand and working directory — the welcome card stays lean and
+/// does not repeat them.
 fn render_top_bar(frame: &mut Frame, app: &App, area: Rect) {
     let p = &app.palette;
+    let bar_bg = Style::new().bg(p.bg_elev);
     let sep = || Span::styled(" · ", Style::new().fg(p.fg_mute));
+    // The bar leads with the working directory; a single leading space keeps
+    // it off the edge.
     let mut left = vec![
-        Span::styled(
-            "⚡ zap",
-            Style::new().fg(p.accent).add_modifier(Modifier::BOLD),
-        ),
-        Span::raw("  "),
-        Span::styled(app.config.cwd_display(), Style::new().fg(p.fg)),
+        Span::raw(" "),
+        Span::styled(app.config.cwd_display(), Style::new().fg(p.fg_dim)),
     ];
     if let Some(branch) = &app.config.branch {
         left.push(sep());
@@ -140,16 +144,14 @@ fn render_top_bar(frame: &mut Frame, app: &App, area: Rect) {
             Style::new().fg(p.fg_dim),
         ));
     }
+    // Muted model label — a single brand accent (the `⚡ zap` mark) is enough;
+    // a highlighted pill here reads as loud next to it.
     right_spans.push(Span::styled(
-        format!(
-            " {} · {} ",
-            app.config.provider_label, app.config.model_label
-        ),
-        Style::new().fg(p.accent).bg(p.bg_elev),
+        format!("{} · {}", app.config.provider_label, app.config.model_label),
+        Style::new().fg(p.fg_dim),
     ));
     let pill = Line::from(right_spans).right_aligned();
 
-    let bar_bg = Style::new().bg(p.bg_elev);
     frame.render_widget(Paragraph::new(Line::from(left)).style(bar_bg), area);
     frame.render_widget(Paragraph::new(pill).style(bar_bg), area);
 }
@@ -157,6 +159,14 @@ fn render_top_bar(frame: &mut Frame, app: &App, area: Rect) {
 /// Renders the conversation body (or the welcome view when empty).
 fn render_body(frame: &mut Frame, app: &App, area: Rect) {
     let p = &app.palette;
+
+    // The welcome screen draws on the bare body area — no `conversation` panel
+    // frame — so the guidance floats on open whitespace below the top bar.
+    if app.conversation.is_empty() {
+        render_welcome(frame, p, area);
+        return;
+    }
+
     let status = if app.conversation.busy {
         format!("{} working", widgets::spinner(app.spinner_tick))
     } else {
@@ -166,11 +176,6 @@ fn render_body(frame: &mut Frame, app: &App, area: Rect) {
     let block = widgets::panel("conversation", Some(&status), app.conversation.busy, p);
     let inner = block.inner(area);
     frame.render_widget(block, area);
-
-    if app.conversation.is_empty() {
-        render_welcome(frame, app, inner);
-        return;
-    }
 
     let lines = transcript_lines(app, inner.width);
     let total = u16::try_from(lines.len()).unwrap_or(u16::MAX);
@@ -921,42 +926,34 @@ fn wrap_plain(text: &str, style: Style, width: u16) -> Vec<Line<'static>> {
     out
 }
 
-/// Renders the welcome view shown before the first message.
-fn render_welcome(frame: &mut Frame, app: &App, area: Rect) {
-    let p = &app.palette;
+/// Renders the welcome guidance shown before the first message.
+///
+/// A thin rule under the top bar, then two `▸` hint rows for the slash commands
+/// and how to begin — indented with top margin so the block breathes.
+fn render_welcome(frame: &mut Frame, p: &Palette, area: Rect) {
+    // Thin rule directly under the top bar, spanning the body width.
+    let rule = "─".repeat(usize::from(area.width));
+    // Common left indent so the hint rows sit with a small margin.
+    let indent = || Span::raw("   ");
     let lines = vec![
-        Line::raw(""),
-        Line::styled(
-            "⚡ zap",
-            Style::new().fg(p.accent).add_modifier(Modifier::BOLD),
-        ),
-        Line::styled(
-            "terminal copilot · talk to your codebase",
-            Style::new().fg(p.fg_dim),
-        ),
+        Line::styled(rule, Style::new().fg(p.fg_mute)),
         Line::raw(""),
         Line::from(vec![
-            Span::styled("▸ ", Style::new().fg(p.accent)),
-            Span::styled("type a message and press ", Style::new().fg(p.fg)),
-            Span::styled("↵", Style::new().fg(p.fg_bright)),
-            Span::styled(" to start", Style::new().fg(p.fg)),
-        ]),
-        Line::from(vec![
+            indent(),
             Span::styled("▸ ", Style::new().fg(p.accent)),
             Span::styled("/help", Style::new().fg(p.fg_bright)),
-            Span::styled("  commands · ", Style::new().fg(p.fg)),
+            Span::styled(" commands · ", Style::new().fg(p.fg)),
             Span::styled("/theme", Style::new().fg(p.fg_bright)),
             Span::styled(" dark|light|mono · ", Style::new().fg(p.fg)),
             Span::styled("/accent", Style::new().fg(p.fg_bright)),
             Span::styled(" cyan|amber|lime|magenta", Style::new().fg(p.fg)),
         ]),
         Line::from(vec![
+            indent(),
             Span::styled("▸ ", Style::new().fg(p.accent)),
-            Span::styled("model: ", Style::new().fg(p.fg)),
-            Span::styled(
-                format!("{} · {}", app.config.provider_label, app.config.model_label),
-                Style::new().fg(p.accent),
-            ),
+            Span::styled("type a message and press ", Style::new().fg(p.fg)),
+            Span::styled("↵", Style::new().fg(p.fg_bright)),
+            Span::styled(" to start", Style::new().fg(p.fg)),
         ]),
     ];
     frame.render_widget(Paragraph::new(Text::from(lines)), area);
@@ -966,10 +963,17 @@ fn render_welcome(frame: &mut Frame, app: &App, area: Rect) {
 fn render_composer(frame: &mut Frame, app: &App, area: Rect) -> Rect {
     let p = &app.palette;
     let busy = app.conversation.busy;
-    let (status, dot) = if busy {
-        ("◐ working", p.warn)
+    // Right-aligned status carries the most important signal: a persistent
+    // disconnect notice, then a transient flash, then the busy/ready dot. The
+    // bottom key-hint bar was removed, so this is where those signals surface.
+    let (status, dot) = if app.disconnected {
+        ("⚠ disconnected".to_owned(), p.error)
+    } else if let Some(flash) = &app.flash {
+        (flash.clone(), p.warn)
+    } else if busy {
+        ("◐ working".to_owned(), p.warn)
     } else {
-        ("● ready", p.success)
+        ("● ready".to_owned(), p.success)
     };
     // Border carries the activity signal (inverse of the old logic): accent
     // while executing, neutral with a pending draft, dim when idle and empty.
@@ -980,7 +984,9 @@ fn render_composer(frame: &mut Frame, app: &App, area: Rect) -> Rect {
     } else {
         Style::new().fg(p.border)
     };
-    let block = widgets::panel("composer", None, busy, p)
+    // Empty title keeps the input panel unlabeled (Claude-style); the right
+    // status dot still carries the ready/working signal.
+    let block = widgets::panel("", None, busy, p)
         .border_style(border_style)
         .title(Line::from(Span::styled(status, Style::new().fg(dot))).right_aligned());
     let inner = block.inner(area);
@@ -1002,8 +1008,8 @@ fn render_composer(frame: &mut Frame, app: &App, area: Rect) -> Rect {
 fn composer_placeholder(app: &App) -> &'static str {
     /// Inviting prompts cycled as the conversation grows (codex-style).
     const PLACEHOLDERS: [&str; 4] = [
-        "message zap…  (↵ send · ⌥↵ newline · /help)",
-        "ask zap to explain this codebase…",
+        "message…  (↵ send · ⌥↵ newline · /help)",
+        "ask about this codebase…",
         "describe a change and press ↵…",
         "summarize recent commits…  (/help for commands)",
     ];
@@ -1058,58 +1064,6 @@ fn truncate_one_line(text: &str, max: usize) -> String {
     }
     out.push('…');
     out
-}
-
-/// Renders the bottom key-hint strip (plus any transient flash or persistent disconnect banner).
-fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
-    let p = &app.palette;
-    let bar_bg = Style::new().bg(p.bg_elev);
-    // Persistent disconnect banner takes highest priority; it is never cleared
-    // by flash so the user always sees it even after subsequent flash messages.
-    if app.disconnected {
-        frame.render_widget(
-            Paragraph::new(Line::styled(
-                "  engine disconnected — press Ctrl+C to exit",
-                Style::new().fg(p.error).add_modifier(Modifier::BOLD),
-            ))
-            .style(bar_bg),
-            area,
-        );
-        return;
-    }
-    if let Some(flash) = &app.flash {
-        frame.render_widget(
-            Paragraph::new(Line::styled(flash.clone(), Style::new().fg(p.warn))).style(bar_bg),
-            area,
-        );
-        return;
-    }
-    // Queued-message status supersedes the static hints while messages pend.
-    if !app.message_queue.is_empty() {
-        frame.render_widget(
-            Paragraph::new(Line::styled(
-                format!(
-                    "  queued {} · ⌃X cancel · ↵ continue",
-                    app.message_queue.len()
-                ),
-                Style::new().fg(p.warn),
-            ))
-            .style(bar_bg),
-            area,
-        );
-        return;
-    }
-    let hints = [
-        Hint::new("↵", "send"),
-        Hint::new("⌥↵", "newline"),
-        Hint::new("esc", "stop"),
-        Hint::new("/help", "cmds"),
-        Hint::new("⌃C", "quit"),
-    ];
-    frame.render_widget(
-        Paragraph::new(widgets::kbd_hints(&hints, p)).style(bar_bg),
-        area,
-    );
 }
 
 #[cfg(test)]
@@ -1205,7 +1159,9 @@ mod tests {
 
     fn test_app_with_usage(usage: Option<(u64, u64)>) -> crate::app::App {
         use std::sync::Arc;
+
         use zhive_proto::domain::ThreadId;
+
         let mut app = crate::app::App::new(crate::TuiConfig::default(), ThreadId(Arc::from("t")));
         app.last_usage = usage;
         app
@@ -1253,17 +1209,20 @@ mod tests {
         );
     }
 
-    // ---- footer disconnected banner ----
+    // ---- composer disconnect status ----
+    //
+    // The bottom key-hint bar was removed; the disconnect notice now surfaces in
+    // the composer's right-aligned status slot, so it is asserted there instead.
 
-    fn render_footer_text(app: &crate::app::App) -> String {
+    fn render_composer_text(app: &crate::app::App) -> String {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
         let backend = TestBackend::new(60, 3);
         let mut terminal = Terminal::new(backend).expect("test terminal");
         terminal
             .draw(|frame| {
-                let area = ratatui::layout::Rect::new(0, 0, 60, 1);
-                render_footer(frame, app, area);
+                let area = ratatui::layout::Rect::new(0, 0, 60, 3);
+                render_composer(frame, app, area);
             })
             .expect("draw");
         terminal
@@ -1276,23 +1235,23 @@ mod tests {
     }
 
     #[test]
-    fn footer_shows_disconnect_banner_when_disconnected() {
+    fn composer_shows_disconnect_status_when_disconnected() {
         let mut app = test_app_with_usage(None);
         app.disconnected = true;
-        let text = render_footer_text(&app);
+        let text = render_composer_text(&app);
         assert!(
             text.to_lowercase().contains("disconnected"),
-            "footer must show disconnect banner; got: {text:?}"
+            "composer status must show disconnect notice; got: {text:?}"
         );
     }
 
     #[test]
-    fn footer_does_not_show_disconnect_banner_when_connected() {
+    fn composer_hides_disconnect_status_when_connected() {
         let app = test_app_with_usage(None);
-        let text = render_footer_text(&app);
+        let text = render_composer_text(&app);
         assert!(
             !text.to_lowercase().contains("disconnected"),
-            "footer must not show disconnect banner when connected; got: {text:?}"
+            "composer status must not show disconnect notice when connected; got: {text:?}"
         );
     }
 }

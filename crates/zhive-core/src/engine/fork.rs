@@ -222,7 +222,13 @@ impl EngineInner {
         // Optional branch summary: reuse the compaction provider path so we do
         // not build a parallel summariser.
         let summary_item = if summarize {
-            match super::compaction::summarize(self.provider(), &replayed).await {
+            match super::compaction::summarize(
+                self.provider(),
+                &replayed,
+                self.compaction_instruction(),
+            )
+            .await
+            {
                 Ok(text) => Some(Item::AgentMessage {
                     id: ItemId(Arc::from(format!(
                         "item:{}{FORK_TURN_SUFFIX}/summary",
@@ -483,6 +489,7 @@ mod tests {
             Arc::new(crate::hooks::HookHost::new()),
             Arc::new(crate::tools::ToolRegistry::new()),
             crate::engine::TurnLimits::default(),
+            None,
             None,
             Some(tx),
             Some(handle),

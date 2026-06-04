@@ -119,6 +119,11 @@ pub(crate) struct EngineInner {
     /// Cloned cheaply (`Arc`) into each [`super::prompt::build_call_options`]
     /// call; see [`super::EngineConfig::system_prompt`].
     system_prompt: Option<Arc<str>>,
+    /// Optional summarization instruction for compaction / fork.
+    ///
+    /// `None` falls back to the built-in [`super::compaction::SUMMARY_INSTRUCTION`];
+    /// see [`super::EngineConfig::compaction_prompt`] and [`Self::compaction_instruction`].
+    compaction_prompt: Option<Arc<str>>,
     /// Engine-wide cancellation hierarchy.
     ///
     /// The root token represents engine shutdown.  Each turn gets a child
@@ -195,6 +200,7 @@ impl EngineInner {
             None,
             None,
             None,
+            None,
             std::path::PathBuf::from("."),
         )
     }
@@ -211,6 +217,7 @@ impl EngineInner {
         tools: Arc<ToolRegistry>,
         turn_limits: super::TurnLimits,
         system_prompt: Option<Arc<str>>,
+        compaction_prompt: Option<Arc<str>>,
         storage_tx: Option<mpsc::Sender<StorageWriteOp>>,
         storage_handle: Option<JoinHandle<()>>,
         compact_token_threshold: Option<u64>,
@@ -229,6 +236,7 @@ impl EngineInner {
             tools,
             turn_limits,
             system_prompt,
+            compaction_prompt,
             cancel_tree: CancellationTree::new(),
             storage_writer: Mutex::new(StorageWriterState {
                 tx: storage_tx,
@@ -270,6 +278,17 @@ impl EngineInner {
     /// Returns the configured system prompt for sibling modules, if any.
     pub(in crate::engine) fn system_prompt(&self) -> Option<&str> {
         self.system_prompt.as_deref()
+    }
+
+    /// Returns the summarization instruction for compaction / fork.
+    ///
+    /// Falls back to the built-in [`super::compaction::SUMMARY_INSTRUCTION`]
+    /// when no host instruction was configured, so behaviour is unchanged
+    /// unless a host injects [`super::EngineConfig::compaction_prompt`].
+    pub(in crate::engine) fn compaction_instruction(&self) -> &str {
+        self.compaction_prompt
+            .as_deref()
+            .unwrap_or(super::compaction::SUMMARY_INSTRUCTION)
     }
 
     /// Returns the engine's working directory for sibling modules.

@@ -19,6 +19,8 @@ mod boot;
 #[cfg(feature = "engine")]
 mod engine_host;
 #[cfg(feature = "engine")]
+mod prompt_template;
+#[cfg(feature = "engine")]
 mod provider;
 #[cfg(feature = "engine")]
 mod system_prompt;

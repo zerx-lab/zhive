@@ -401,6 +401,7 @@ mod span_emission_tests {
             storage: None,
             turn_limits: TurnLimits::default(),
             system_prompt: None,
+            compaction_prompt: None,
             compact_token_threshold: None,
             cwd: std::path::PathBuf::from("."),
         };
@@ -574,6 +575,7 @@ mod span_emission_tests {
             storage: Some(storage),
             turn_limits: TurnLimits::default(),
             system_prompt: None,
+            compaction_prompt: None,
             compact_token_threshold: None,
             cwd: std::path::PathBuf::from("."),
         };

@@ -62,6 +62,7 @@ llmsdk = { workspace = true, features = ["amazon-bedrock", "anthropic", "anthrop
 async-trait.workspace = true
 futures.workspace = true
 serde_json.workspace = true
+minijinja = { workspace = true }
 
 [dev-dependencies]
 serde_json.workspace = true
