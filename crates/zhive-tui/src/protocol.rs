@@ -166,7 +166,17 @@ pub fn decode(method: &str, params: Option<Value>) -> EngineNotification {
                 turn_id: p.turn_id,
                 item: Box::new(p.item),
             },
-            Err(_) => unhandled(),
+            // A decode failure here silently drops a record (e.g. a tool call)
+            // from the live view, so make it visible rather than swallowing it.
+            Err(err) => {
+                tracing::warn!(
+                    name: "zhive.tui.decode_failed",
+                    method = m::EVENT_ITEM_APPENDED,
+                    error = %err,
+                    "dropped events/item_appended: payload failed to decode",
+                );
+                unhandled()
+            }
         };
     }
 
@@ -350,6 +360,38 @@ mod tests {
                 assert!(matches!(*item, Item::AgentMessage { .. }));
             }
             other => panic!("expected ItemAppended, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decodes_item_appended_tool_call() {
+        // The exact wire shape the engine emits for a completed bash tool call
+        // (snake_case fields, `itemKind` discriminator). Must NOT collapse to
+        // Unhandled — otherwise the tool record is silently dropped live.
+        let n = decode(
+            "events/item_appended",
+            Some(serde_json::json!({
+                "threadId": "thread:native/a",
+                "turnId": "turn:thread:native/a/0",
+                "itemId": "item:turn:thread:native/a/0/0",
+                "item": {
+                    "itemKind": "tool_call",
+                    "id": "item:turn:thread:native/a/0/0",
+                    "name": "bash",
+                    "kind": "execute",
+                    "status": "completed",
+                    "content": [
+                        { "type": "content", "content": { "type": "text", "text": "Exit code: 0\nREADME.md" } }
+                    ],
+                    "raw_input": { "command": "ls", "cwd": "/repo" }
+                }
+            })),
+        );
+        match n {
+            EngineNotification::ItemAppended { item, .. } => {
+                assert!(matches!(*item, Item::ToolCall { .. }), "got {item:?}");
+            }
+            other => panic!("expected ItemAppended(ToolCall), got {other:?}"),
         }
     }
 

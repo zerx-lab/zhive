@@ -7,15 +7,24 @@
 //!
 //! # Root search order
 //!
-//! 1. **User root** — `$XDG_CONFIG_HOME/zhive/skills` (or
-//!    `~/.config/zhive/skills` when `$XDG_CONFIG_HOME` is unset).
-//! 2. **Project root** — `./.zhive/skills` relative to the current working
-//!    directory.
-//! 3. **Extra roots** — the `extra_roots` list in [`SkillDiscoveryConfig`],
-//!    searched in order.
+//! Roots are searched low-priority first so that, on a name collision, the
+//! **last** matching root wins (more specific / more local beats more general):
 //!
-//! Missing roots and read errors are silently ignored so a missing
-//! `~/.config/zhive/skills` directory does not abort startup.
+//! 1. **Home external** — `~/.claude/skills` then `~/.agents/skills`. These are
+//!    the cross-tool Agent-Skills conventions shared with Claude Code, codex,
+//!    opencode, and pi, so skills installed for those tools are picked up too.
+//! 2. **Home native** — `$XDG_CONFIG_HOME/zhive/skills` (or
+//!    `~/.config/zhive/skills` when `$XDG_CONFIG_HOME` is unset).
+//! 3. **Project external (ancestor chain)** — for every directory from the
+//!    repository root down to the current working directory, `<dir>/.claude/skills`
+//!    then `<dir>/.agents/skills`. When the cwd is not inside a Git repository
+//!    only the cwd itself is scanned (the walk never escapes into `$HOME`).
+//! 4. **Project native** — `./.zhive/skills` relative to the cwd.
+//! 5. **Extra roots** — the `extra_roots` list in [`SkillDiscoveryConfig`],
+//!    searched in order (highest priority).
+//!
+//! Missing roots and read errors are silently ignored so an absent directory
+//! never aborts startup.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -84,6 +93,92 @@ fn project_skill_root() -> PathBuf {
     PathBuf::from(".zhive").join("skills")
 }
 
+/// Returns the user's home directory from `$HOME`, or `None` when unset.
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from)
+}
+
+/// Returns the nearest ancestor of `start` that contains a `.git` entry.
+///
+/// Used to bound the project ancestor-chain scan so it never walks up into
+/// `$HOME`. Returns `None` when `start` is not inside a Git working tree.
+fn git_root(start: &Path) -> Option<PathBuf> {
+    start
+        .ancestors()
+        .find(|dir| dir.join(".git").exists())
+        .map(Path::to_path_buf)
+}
+
+/// Returns `<base>/.claude/skills` then `<base>/.agents/skills`.
+///
+/// The cross-tool Agent-Skills external roots, emitted low priority first.
+fn external_roots_under(base: &Path) -> Vec<PathBuf> {
+    vec![
+        base.join(".claude").join("skills"),
+        base.join(".agents").join("skills"),
+    ]
+}
+
+/// Returns the cross-tool external skill roots under `$HOME`, or empty when unset.
+fn home_external_roots() -> Vec<PathBuf> {
+    home_dir()
+        .map(|h| external_roots_under(&h))
+        .unwrap_or_default()
+}
+
+/// Returns the project-local external skill roots along the ancestor chain.
+///
+/// For every directory from the repository root down to the current working
+/// directory, yields `<dir>/.claude/skills` then `<dir>/.agents/skills`, ordered
+/// so the cwd (most specific) comes last and therefore wins on a name collision.
+/// When the cwd is not inside a Git repository, only the cwd is scanned so the
+/// walk cannot reach `$HOME` and double-scan the home external roots.
+fn project_external_roots() -> Vec<PathBuf> {
+    let Ok(cwd) = std::env::current_dir() else {
+        return Vec::new();
+    };
+    let stop = git_root(&cwd);
+    ancestor_external_roots(&cwd, stop.as_deref())
+}
+
+/// Pure ancestor-chain expansion: from `cwd` up to `stop` (inclusive).
+///
+/// Emits `<dir>/.claude/skills` then `<dir>/.agents/skills` for each directory,
+/// with the repository root (least specific) first and `cwd` (most specific)
+/// last. When `stop` is `None`, only `cwd` is scanned.
+fn ancestor_external_roots(cwd: &Path, stop: Option<&Path>) -> Vec<PathBuf> {
+    let mut chain: Vec<&Path> = Vec::new();
+    for dir in cwd.ancestors() {
+        chain.push(dir);
+        if stop == Some(dir) || stop.is_none() {
+            break;
+        }
+    }
+
+    let mut roots = Vec::with_capacity(chain.len() * 2);
+    for dir in chain.iter().rev() {
+        roots.extend(external_roots_under(dir));
+    }
+    roots
+}
+
+/// Builds the full ordered list of skill roots, low priority first.
+///
+/// This is the single source of truth shared by [`discover`] and
+/// [`discover_priority_ordered`] so the two never drift out of sync. See the
+/// module-level docs for the documented search order.
+fn skill_roots(cfg: &SkillDiscoveryConfig) -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    roots.extend(home_external_roots());
+    if let Some(user) = user_skill_root() {
+        roots.push(user);
+    }
+    roots.extend(project_external_roots());
+    roots.push(project_skill_root());
+    roots.extend(cfg.extra_roots.iter().cloned());
+    roots
+}
+
 // ============================================================
 // discover
 // ============================================================
@@ -111,13 +206,8 @@ fn project_skill_root() -> PathBuf {
 /// ```
 #[must_use]
 pub fn discover(cfg: &SkillDiscoveryConfig) -> Vec<PathBuf> {
-    // Build an ordered list of roots: user → project → extras.
-    let mut roots: Vec<PathBuf> = Vec::new();
-    if let Some(user) = user_skill_root() {
-        roots.push(user);
-    }
-    roots.push(project_skill_root());
-    roots.extend(cfg.extra_roots.iter().cloned());
+    // Shared low-to-high priority root list (see `skill_roots`).
+    let roots = skill_roots(cfg);
 
     // Map from skill name → SKILL.md path; later roots overwrite earlier ones.
     let mut by_name: HashMap<String, PathBuf> = HashMap::new();
@@ -145,13 +235,8 @@ pub fn discover(cfg: &SkillDiscoveryConfig) -> Vec<PathBuf> {
 /// still resolved here via last-root-wins, matching the documented rule.
 #[must_use]
 pub(super) fn discover_priority_ordered(cfg: &SkillDiscoveryConfig) -> Vec<PathBuf> {
-    // Build an ordered list of roots: user → project → extras.
-    let mut roots: Vec<PathBuf> = Vec::new();
-    if let Some(user) = user_skill_root() {
-        roots.push(user);
-    }
-    roots.push(project_skill_root());
-    roots.extend(cfg.extra_roots.iter().cloned());
+    // Shared low-to-high priority root list (see `skill_roots`).
+    let roots = skill_roots(cfg);
 
     // We need to preserve both deduplication by directory name AND insertion
     // order (root priority).  Use an IndexMap-like approach: a HashMap for
@@ -308,6 +393,65 @@ mod tests {
             shared[0].starts_with(tmp2.path()),
             "expected winner from tmp2, got {shared:?}"
         );
+    }
+
+    #[test]
+    fn external_roots_under_yields_claude_then_agents() {
+        let roots = external_roots_under(Path::new("/home/u"));
+        assert_eq!(
+            roots,
+            vec![
+                PathBuf::from("/home/u/.claude/skills"),
+                PathBuf::from("/home/u/.agents/skills"),
+            ]
+        );
+    }
+
+    #[test]
+    fn ancestor_chain_walks_repo_root_first_cwd_last() {
+        // cwd = /repo/a/b, git root = /repo → scan /repo, /repo/a, /repo/a/b.
+        let cwd = Path::new("/repo/a/b");
+        let roots = ancestor_external_roots(cwd, Some(Path::new("/repo")));
+        assert_eq!(
+            roots,
+            vec![
+                // Repository root first (lowest priority).
+                PathBuf::from("/repo/.claude/skills"),
+                PathBuf::from("/repo/.agents/skills"),
+                PathBuf::from("/repo/a/.claude/skills"),
+                PathBuf::from("/repo/a/.agents/skills"),
+                // cwd last (highest priority).
+                PathBuf::from("/repo/a/b/.claude/skills"),
+                PathBuf::from("/repo/a/b/.agents/skills"),
+            ]
+        );
+    }
+
+    #[test]
+    fn ancestor_chain_without_git_root_scans_cwd_only() {
+        // No Git root → only the cwd is scanned (never escapes into $HOME).
+        let cwd = Path::new("/home/u/scratch");
+        let roots = ancestor_external_roots(cwd, None);
+        assert_eq!(
+            roots,
+            vec![
+                PathBuf::from("/home/u/scratch/.claude/skills"),
+                PathBuf::from("/home/u/scratch/.agents/skills"),
+            ]
+        );
+    }
+
+    #[test]
+    fn skill_roots_orders_extra_roots_last() {
+        let extra = std::path::PathBuf::from("/opt/skills");
+        let cfg = SkillDiscoveryConfig {
+            extra_roots: vec![extra.clone()],
+        };
+        let roots = skill_roots(&cfg);
+        // Extra roots are the highest priority → emitted last.
+        assert_eq!(roots.last(), Some(&extra));
+        // The project-native root is always present just before the extras.
+        assert!(roots.contains(&project_skill_root()));
     }
 
     #[test]

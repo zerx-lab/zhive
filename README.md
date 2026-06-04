@@ -15,7 +15,7 @@
 
 zhive 是一个用 Rust 编写的终端 AI 协作 agent。它的核心不是某一个界面,而是一台 **daemon 式的 agent 引擎**:`zhive-core` 负责 Thread / Turn / Item 状态机、工具分发、权限审批、持久化与取消传播;所有能力凝结成 `zhive-proto` 这一套 **JSON-RPC harness API**,作为访问引擎的**唯一边界**。
 
-> **设计轴心**:`zhive-core` 是内核 → 凝结成 `zhive-proto` 统一 harness API → 基于它可以长出任意产品形态。终端 UI(`zhive-tui`)只是第一个消费者,与未来的 Web / IDE / 远程客户端**完全同级**——没有内存捷径,谁都只能走协议。
+> **设计轴心**:`zhive-core` 是内核 → 凝结成 `zhive-proto` 统一 harness API → 基于它可以产出任意产品形态。终端 UI(`zhive-tui`)只是第一个消费者,与未来的 Web / IDE / 远程客户端**完全同级**——没有内存捷径,谁都只能走协议。
 
 完整的分层架构、依赖方向、运行时数据流(4 张图)见 **[ARCHITECTURE.md](ARCHITECTURE.md)**;所有架构决策的权威来源是 **[research/99-decisions](research/99-decisions/)**(D-001 ~ D-015)。
 

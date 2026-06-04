@@ -402,6 +402,13 @@ async fn run_turn_inner(
     // Read once so every comparison below uses a single stable value.
     let max_iterations = inner.max_turn_iterations();
 
+    // Next item-id sequence number, carried across iterations so each fold
+    // continues numbering rather than resetting to 0. Without this, iteration
+    // 1's reply would reuse iteration 0's tool-call id (`item:<turn>/0`) and
+    // overwrite it on every id-keyed store — the tool record would vanish once
+    // the reply arrives.
+    let mut item_id_seq: u64 = 0;
+
     'outer: for iteration in 0..max_iterations {
         // ── Steer drain (Pi model §3.1): drain BEFORE each LLM request ────────
         //
@@ -476,8 +483,10 @@ async fn run_turn_inner(
                 }
             };
 
-        // 3. Stream loop with per-turn cancellation.
-        let mut fold = StreamFold::new(&turn_id);
+        // 3. Stream loop with per-turn cancellation. The fold resumes id
+        //    numbering from the running counter so ids stay unique across the
+        //    whole turn (see `item_id_seq`).
+        let mut fold = StreamFold::resuming_at(&turn_id, item_id_seq);
         // Captures the real error when the stream errors mid-flight, so it can
         // be threaded out of the function. Stays `None` on cancellation (cancel
         // is not a failure); `failure.is_some()` is the single source of truth
@@ -603,6 +612,10 @@ async fn run_turn_inner(
                 item_seq += 1;
             }
         }
+
+        // Carry the fold's id counter into the next iteration so item ids stay
+        // unique across the whole turn (the fold has minted all its ids by now).
+        item_id_seq = fold.next_seq();
 
         // Save point #4 (stream finally): flush deferred session writes once
         // the provider stream has drained, before deciding the iteration's

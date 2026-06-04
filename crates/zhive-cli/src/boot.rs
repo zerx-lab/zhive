@@ -20,6 +20,34 @@ use zhive_core::tools::ToolRegistry;
 
 use crate::config::Config;
 
+/// A discovered skill prepared for the host UI (name, description, invocation).
+///
+/// A plain owned-`String` handoff type so [`RuntimeTools`] stays free of the
+/// feature-gated `zhive_core::skills` types and of any TUI dependency. The
+/// `invocation` is the rendered `<skill>` block injected as a user message when
+/// the skill is run from a slash command or the picker.
+///
+/// # Examples
+///
+/// ```
+/// # use zhive_cli::boot::RuntimeSkill;
+/// let s = RuntimeSkill {
+///     name: "demo".to_owned(),
+///     description: "Does a thing".to_owned(),
+///     invocation: "<skill name=\"demo\" location=\"/x/SKILL.md\">\n…\n</skill>".to_owned(),
+/// };
+/// assert_eq!(s.name, "demo");
+/// ```
+#[derive(Debug, Clone)]
+pub struct RuntimeSkill {
+    /// Skill identifier (the frontmatter `name`).
+    pub name: String,
+    /// One-line description for the picker; empty when none was declared.
+    pub description: String,
+    /// Pre-rendered `<skill>` invocation block (append `\n\n<args>` for args).
+    pub invocation: String,
+}
+
 /// The engine's tool registry plus any owned capability handles.
 ///
 /// `registry` is ready to hand to `EngineConfig::tools`. `mcp` (present only
@@ -41,21 +69,21 @@ pub struct RuntimeTools {
     /// Persistent storage for the engine, or `None` when it could not be
     /// opened (the engine then runs purely in-memory). See [`open_storage`].
     pub storage: Option<Arc<zhive_core::persistence::Storage>>,
-    /// Slash-only skill names discovered during boot (skills with
-    /// `disable-model-invocation: true`).  These cannot be called by the LLM
-    /// but can be surfaced in the TUI command palette.  Empty when the
-    /// `skills` feature is absent or `skills.enabled` is false.
+    /// All skills discovered during boot, each with a rendered `<skill>`
+    /// invocation block. Drives the TUI's `/skills` picker and `/skill:<name>`
+    /// slash execution. Empty when the `skills` feature is absent or
+    /// `skills.enabled` is false.
     ///
-    /// Consumed by `run_tui` to inject these into the TUI command palette
-    /// (via `zhive_tui::run`'s `extra_commands`). Unused in non-tui builds.
+    /// Consumed by `run_tui`, which maps these to the TUI's own skill type
+    /// (the TUI must not depend on `zhive_core`). Unused in non-tui builds.
     #[cfg_attr(
         not(feature = "tui"),
         expect(
             dead_code,
-            reason = "only consumed by run_tui for the TUI palette; unused in non-tui builds"
+            reason = "only consumed by run_tui for the TUI skill picker/slash; unused in non-tui builds"
         )
     )]
-    pub slash_commands: Vec<String>,
+    pub skills: Vec<RuntimeSkill>,
     /// Live MCP manager whose tools were registered, if any.
     #[cfg(feature = "mcp")]
     pub mcp: Option<zhive_mcp::McpManager>,
@@ -92,8 +120,10 @@ impl RuntimeTools {
 /// feature is enabled and `[mcp.servers]` is non-empty, connects to every
 /// server in parallel and registers their tools (failing servers are skipped
 /// with a warning by the manager). When the `skills` feature is enabled and
-/// `[skills].enabled` is true, discovers on-disk skills and registers the
-/// model-invocable ones. MCP and skill tools may override built-ins by name.
+/// `[skills].enabled` is true, discovers on-disk skills and folds the
+/// model-invocable ones into the system prompt as an `<available_skills>`
+/// catalogue the model reads on demand (they are no longer registered as
+/// tools). MCP tools may override built-ins by name.
 ///
 /// # Errors
 ///
@@ -136,9 +166,9 @@ pub async fn build_runtime(cfg: &Config) -> anyhow::Result<RuntimeTools> {
     let mcp = build_mcp(cfg, &mut registry).await;
 
     #[cfg(feature = "skills")]
-    let slash_commands = register_skills(cfg, &mut registry);
+    let (skills, skills_section) = prepare_skills(cfg);
     #[cfg(not(feature = "skills"))]
-    let slash_commands: Vec<String> = Vec::new();
+    let (skills, skills_section): (Vec<RuntimeSkill>, Option<String>) = (Vec::new(), None);
 
     // The system prompt is a host (process) concern: it folds in the working
     // directory and the project's instruction file. A failed `current_dir`
@@ -154,7 +184,13 @@ pub async fn build_runtime(cfg: &Config) -> anyhow::Result<RuntimeTools> {
     let model = active_entry
         .map(|entry| entry.model.as_str())
         .filter(|m| !m.is_empty());
-    let system_prompt = crate::system_prompt::assemble(&cwd, provider_name, provider_kind, model);
+    let system_prompt = crate::system_prompt::assemble(
+        &cwd,
+        provider_name,
+        provider_kind,
+        model,
+        skills_section.as_deref(),
+    );
     let compaction_prompt =
         crate::system_prompt::assemble_compaction(&cwd, provider_name, provider_kind, model);
 
@@ -168,7 +204,7 @@ pub async fn build_runtime(cfg: &Config) -> anyhow::Result<RuntimeTools> {
         system_prompt,
         compaction_prompt,
         storage,
-        slash_commands,
+        skills,
         #[cfg(feature = "mcp")]
         mcp,
     })
@@ -311,26 +347,46 @@ async fn build_mcp(cfg: &Config, registry: &mut ToolRegistry) -> Option<zhive_mc
     Some(manager)
 }
 
-/// Discovers on-disk skills, registers the model-invocable ones, and returns
-/// the names of slash-only skills (those with `disable-model-invocation: true`).
+/// Discovers on-disk skills and prepares them for the host.
 ///
-/// Returns an empty `Vec` when `cfg.skills.enabled` is false.
+/// Returns `(skills, available_skills)`:
+/// * `skills` — every discovered skill as a [`RuntimeSkill`] (name, description,
+///   rendered `<skill>` block), driving the TUI `/skills` picker and
+///   `/skill:<name>` slash execution. Includes slash-only skills.
+/// * `available_skills` — the `<available_skills>` catalogue folded into the
+///   system prompt for model auto-discovery (excludes slash-only skills), or
+///   `None` when no model-invocable skill exists.
+///
+/// Returns `(Vec::new(), None)` when `cfg.skills.enabled` is false. Skills are
+/// **not** registered as tools: the model discovers them from the prompt list
+/// and reads each `SKILL.md` on demand via the `read` tool (progressive
+/// disclosure), so the tool surface stays flat regardless of skill count.
 #[cfg(feature = "skills")]
-fn register_skills(cfg: &Config, registry: &mut ToolRegistry) -> Vec<String> {
+fn prepare_skills(cfg: &Config) -> (Vec<RuntimeSkill>, Option<String>) {
     if !cfg.skills.enabled {
-        return Vec::new();
+        return (Vec::new(), None);
     }
     let discovery = zhive_core::skills::SkillDiscoveryConfig {
         extra_roots: cfg.skills.extra_roots.clone(),
     };
     let set = zhive_core::skills::SkillSet::discover_and_load(&discovery);
-    let slash_only = set.register_invocable(registry);
+    let available = set.render_available_skills();
+    let skills: Vec<RuntimeSkill> = set
+        .catalogue()
+        .into_iter()
+        .map(|entry| RuntimeSkill {
+            name: entry.name,
+            description: entry.description.unwrap_or_default(),
+            invocation: entry.invocation,
+        })
+        .collect();
+    let invocable = available.is_some();
     tracing::info!(
-        skill.loaded = set.loaded.len(),
-        skill.slash_only = slash_only.len(),
-        "skills.registered: {{skill.loaded}} skills loaded, {{skill.slash_only}} slash-only",
+        skill.loaded = skills.len(),
+        skill.has_invocable = invocable,
+        "skills.prepared: {{skill.loaded}} skills loaded, prompt section: {{skill.has_invocable}}",
     );
-    slash_only
+    (skills, available)
 }
 
 // Rust guideline compliant 2026-02-21

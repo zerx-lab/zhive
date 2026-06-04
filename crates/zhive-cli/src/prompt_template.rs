@@ -115,6 +115,9 @@ pub(crate) struct PromptContext {
     pub model: Option<String>,
     /// Nearest project instruction file, if any (`{{ project_instructions }}`).
     pub project_instructions: Option<ProjectInstructions>,
+    /// Rendered `<available_skills>` catalogue for discovered skills, if any
+    /// (`{{ skills }}`). `None` omits the skills section entirely.
+    pub skills: Option<String>,
 }
 
 /// The nearest project instruction file folded into the system prompt.
@@ -331,6 +334,7 @@ mod tests {
             provider_kind: "anthropic".to_owned(),
             model: None,
             project_instructions: project,
+            skills: None,
         }
     }
 
@@ -357,6 +361,30 @@ mod tests {
             "{ORACLE_PERSONA}\n\n# Environment\n- Working directory: /work\n- Operating system: macos\n\n# Project instructions\nSource: /work/AGENTS.md\n\nFollow the house style."
         );
         assert_eq!(rendered, expected);
+    }
+
+    #[test]
+    fn embedded_render_includes_skills_section_when_present() {
+        let mut ctx = context("/work", "linux", None);
+        ctx.skills = Some(
+            "# Skills\n\n<available_skills>\n  <skill>\n    <name>demo</name>\n  </skill>\n</available_skills>"
+                .to_owned(),
+        );
+        let rendered = render_system(false, &ctx).expect("render with skills");
+        assert!(rendered.contains("<available_skills>"));
+        assert!(rendered.contains("<name>demo</name>"));
+        // The skills section follows the environment block.
+        let env_pos = rendered.find("# Environment").expect("environment present");
+        let skills_pos = rendered.find("<available_skills>").expect("skills present");
+        assert!(skills_pos > env_pos, "skills must come after environment");
+    }
+
+    #[test]
+    fn embedded_render_omits_skills_section_when_absent() {
+        // A None `skills` must render byte-for-byte as before (no stray markers).
+        let rendered =
+            render_system(false, &context("/work", "linux", None)).expect("render without skills");
+        assert!(!rendered.contains("available_skills"));
     }
 
     #[test]

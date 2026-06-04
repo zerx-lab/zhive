@@ -344,9 +344,13 @@ impl McpSection {
 
 /// The `[skills]` section: on-disk Agent-Skills discovery settings.
 ///
-/// When `enabled` (the default), the engine discovers `SKILL.md` files under
-/// the built-in roots (`~/.config/zhive/skills`, `./.zhive/skills`) plus any
-/// `extra_roots`, registering model-invocable skills as tools.
+/// When `enabled` (the default), the engine discovers `SKILL.md` files under a
+/// layered set of roots — the cross-tool external roots (`~/.claude/skills`,
+/// `~/.agents/skills`, and their per-project `.claude`/`.agents` counterparts
+/// along the repo ancestor chain), the zhive roots (`~/.config/zhive/skills`,
+/// `./.zhive/skills`), and any `extra_roots` — then folds the model-invocable
+/// ones into the system prompt as a read-on-demand `<available_skills>`
+/// catalogue (they are not registered as tools).
 ///
 /// # Examples
 ///
@@ -531,8 +535,11 @@ density = \"default\" # lean | default | airy
 # # auth_token = \"...\"            # inline (discouraged)
 # # auth_token_env = \"MCP_TOKEN\"  # or read from an env var
 
-# On-disk Agent-Skills (SKILL.md) discovery. Built-in roots are
-# ~/.config/zhive/skills and ./.zhive/skills.
+# On-disk Agent-Skills (SKILL.md) discovery. Built-in roots include the
+# cross-tool ~/.claude/skills and ~/.agents/skills (plus per-project .claude/
+# .agents along the repo ancestor chain) and the zhive ~/.config/zhive/skills
+# and ./.zhive/skills. Model-invocable skills are folded into the system prompt
+# and read on demand (not registered as tools).
 [skills]
 enabled = true
 # extra_roots = [\"/opt/zhive/skills\"]

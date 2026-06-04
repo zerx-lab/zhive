@@ -44,9 +44,11 @@ const TRUNCATION_MARKER: &str = "\n\n[… instruction file truncated by zhive]";
 ///
 /// Builds the template [`PromptContext`] from the live environment — the
 /// working directory, host OS, the active `provider_name` / `provider_kind` /
-/// `model`, and the nearest project instruction file (see [`find_instructions`])
-/// — then renders the `system/base` template. The text is returned as an
-/// [`Arc<str>`] so it can be cloned cheaply into `EngineConfig::system_prompt`.
+/// `model`, the nearest project instruction file (see [`find_instructions`]),
+/// and the optional rendered `skills` catalogue (the `<available_skills>` block
+/// from `SkillSet::render_available_skills`, or `None` to omit it) — then renders
+/// the `system/base` template. The text is returned as an [`Arc<str>`] so it can
+/// be cloned cheaply into `EngineConfig::system_prompt`.
 ///
 /// `provider_kind` (the backend type, e.g. `openai`) is more stable than
 /// `provider_name` (a user-chosen label) and is the preferred key for selecting
@@ -61,8 +63,9 @@ pub(crate) fn assemble(
     provider_name: &str,
     provider_kind: &str,
     model: Option<&str>,
+    skills: Option<&str>,
 ) -> Arc<str> {
-    let ctx = build_prompt_context(cwd, provider_name, provider_kind, model);
+    let ctx = build_prompt_context(cwd, provider_name, provider_kind, model, skills);
 
     match crate::prompt_template::render_system(true, &ctx) {
         Ok(text) => Arc::from(text),
@@ -102,7 +105,8 @@ pub(crate) fn assemble_compaction(
     provider_kind: &str,
     model: Option<&str>,
 ) -> Option<Arc<str>> {
-    let ctx = build_prompt_context(cwd, provider_name, provider_kind, model);
+    // Compaction never advertises skills; the summarizer does not invoke them.
+    let ctx = build_prompt_context(cwd, provider_name, provider_kind, model, None);
 
     match crate::prompt_template::render_compaction(true, &ctx) {
         Ok(text) => Some(Arc::from(text)),
@@ -136,6 +140,7 @@ fn build_prompt_context(
     provider_name: &str,
     provider_kind: &str,
     model: Option<&str>,
+    skills: Option<&str>,
 ) -> PromptContext {
     let project_instructions =
         find_instructions(cwd).map(|(path, body, truncated)| ProjectInstructions {
@@ -151,6 +156,7 @@ fn build_prompt_context(
         provider_kind: provider_kind.to_owned(),
         model: model.map(str::to_owned),
         project_instructions,
+        skills: skills.map(str::to_owned),
     }
 }
 
@@ -242,6 +248,7 @@ mod tests {
             "my-proxy",
             "openai",
             Some("gpt-5"),
+            None,
         );
         assert_eq!(ctx.cwd, "/tmp/zhive-nonexistent-xyz");
         assert_eq!(ctx.os, std::env::consts::OS);
@@ -249,6 +256,7 @@ mod tests {
         assert_eq!(ctx.provider_kind, "openai");
         assert_eq!(ctx.model.as_deref(), Some("gpt-5"));
         assert!(ctx.project_instructions.is_none());
+        assert!(ctx.skills.is_none());
     }
 
     #[test]
@@ -260,6 +268,7 @@ mod tests {
             "anthropic",
             "anthropic",
             Some("claude-opus-4-8"),
+            None,
         );
         assert!(!prompt.is_empty());
     }

@@ -1,39 +1,46 @@
 //! On-disk Agent-Skills discovery and loading.
 //!
 //! Skills are `SKILL.md` files (YAML front-matter + Markdown body) discovered
-//! under user/project skill roots.  Model-invocable skills are adapted into
-//! [`crate::tools::Tool`] objects ([`SkillTool`]) and registered into a
-//! [`crate::tools::ToolRegistry`], so invoking a skill delivers its
-//! instructions to the model through the normal tool-dispatch path.
+//! under a layered set of user/project roots (see [`discovery`]).
 //!
 //! Gated by the `skills` cargo feature (pulls the `serde_norway` YAML parser).
 //!
-//! # Skill roots (search order, last wins)
+//! # Skill roots (low priority first, last wins)
 //!
-//! 1. `$XDG_CONFIG_HOME/zhive/skills` (or `~/.config/zhive/skills`)
-//! 2. `./.zhive/skills` (project-local)
-//! 3. `SkillDiscoveryConfig::extra_roots` (CLI-configurable)
+//! 1. `~/.claude/skills`, `~/.agents/skills` (cross-tool external roots)
+//! 2. `$XDG_CONFIG_HOME/zhive/skills` (or `~/.config/zhive/skills`)
+//! 3. `<repo>…<cwd>/.claude/skills` and `…/.agents/skills` (project ancestor chain)
+//! 4. `./.zhive/skills` (project-local zhive root)
+//! 5. `SkillDiscoveryConfig::extra_roots` (CLI-configurable, highest priority)
 //!
-//! # Boot sequence for `zhive-cli`
+//! See [`discovery`] for the full search-order contract.
+//!
+//! # Surfacing skills to the model (two strategies)
+//!
+//! **Default (prompt-list injection).** The zhive CLI renders a compact
+//! `<available_skills>` catalogue with [`SkillSet::render_available_skills`] and
+//! folds it into the system prompt. The model sees only each skill's `name` +
+//! `description` + `SKILL.md` location, and reads the file with the `read` tool
+//! when a task matches — classic *progressive disclosure* that keeps the prompt
+//! flat regardless of how many skills are discovered.
 //!
 //! ```no_run
 //! # use zhive_core::skills::{SkillDiscoveryConfig, SkillSet};
-//! # use zhive_core::tools::ToolRegistry;
 //! let cfg = SkillDiscoveryConfig::new();
 //! let skill_set = SkillSet::discover_and_load(&cfg);
 //!
-//! let mut registry = ToolRegistry::new();
-//! let slash_only = skill_set.register_invocable(&mut registry);
-//! // `registry` now contains all model-invocable skills as Tool objects.
-//! // `slash_only` lists names of skills with `disable-model-invocation: true`.
+//! // Fold this section into the host's system prompt (None when no skills).
+//! let available = skill_set.render_available_skills();
+//! // Slash-only skills (`disable-model-invocation: true`) for the palette.
+//! let slash_only = skill_set.slash_only_names();
+//! let _ = (available, slash_only);
 //! ```
 //!
-//! # Progressive disclosure
-//!
-//! The model only sees each skill's `name` + `description` in the advertised
-//! tool list.  The full Markdown body is delivered only when the model calls
-//! the tool.  Bundled resource files are returned as relative-path pointers so
-//! the model can read them on demand via a file tool.
+//! **Alternative (tool registration).** Embedders that prefer skills as callable
+//! tools use [`SkillSet::register_invocable`], which adapts each model-invocable
+//! skill into a [`SkillTool`] ([`crate::tools::Tool`]) and registers it into a
+//! [`crate::tools::ToolRegistry`]; invoking the tool then delivers the body
+//! through the normal tool-dispatch path.
 
 pub mod discovery;
 pub mod error;
@@ -49,8 +56,57 @@ pub use loader::{LoadedSkill, load};
 #[doc(inline)]
 pub use tool::SkillTool;
 
+use std::path::Path;
+
 use crate::tools::ToolRegistry;
 use tracing::{info, warn};
+
+// ============================================================
+// SkillEntry
+// ============================================================
+
+/// A single discovered skill, ready for host-side slash invocation.
+///
+/// Returned by [`SkillSet::catalogue`]. `invocation` is the fully-rendered
+/// `<skill>…</skill>` block a host injects as a user message when the user runs
+/// the skill from a slash command or picker; append `\n\n<args>` for trailing
+/// arguments. The body is a boot-time snapshot — edits to `SKILL.md` after
+/// discovery are not reflected until the next launch.
+///
+/// # Examples
+///
+/// ```
+/// use zhive_core::skills::{SkillDiscoveryConfig, SkillSet};
+///
+/// let set = SkillSet::discover_and_load(&SkillDiscoveryConfig::new());
+/// for entry in set.catalogue() {
+///     assert!(entry.invocation.contains("<skill"));
+/// }
+/// ```
+#[derive(Debug, Clone)]
+pub struct SkillEntry {
+    /// Skill identifier (matches the frontmatter `name`).
+    pub name: String,
+    /// Model-facing description, if the frontmatter declared one.
+    pub description: Option<String>,
+    /// Pre-rendered `<skill>…</skill>` invocation block (no trailing args).
+    pub invocation: String,
+}
+
+/// Renders the `<skill>` invocation block in the agent-skills convention.
+///
+/// Mirrors the format pi and codex inject: the skill name and `SKILL.md`
+/// location as attributes, a note that bundled paths resolve against the skill
+/// directory, then the (frontmatter-stripped) body.
+fn render_invocation(name: &str, location: &Path, base_dir: &Path, body: &str) -> String {
+    format!(
+        "<skill name=\"{name}\" location=\"{loc}\">\n\
+         References are relative to {base}.\n\n\
+         {body}\n</skill>",
+        loc = location.display(),
+        base = base_dir.display(),
+    )
+}
 
 // ============================================================
 // SkillSet
@@ -220,6 +276,128 @@ impl SkillSet {
 
         slash_only
     }
+
+    /// Renders the model-facing skills catalogue for the system prompt.
+    ///
+    /// Produces a compact `<available_skills>` block listing each
+    /// model-invocable skill's name, description, and on-disk `SKILL.md`
+    /// location. This is the *progressive disclosure* list the model consults:
+    /// it reads a skill's file with the `read` tool only when a task matches the
+    /// description, so the full body never bloats the prompt. Returns `None`
+    /// when no model-invocable skills were loaded, letting the caller skip an
+    /// empty section.
+    ///
+    /// This is the default strategy for the zhive CLI (skills as a prompt list);
+    /// embedders that prefer skills as callable tools use
+    /// [`SkillSet::register_invocable`] instead. Slash-only skills are excluded
+    /// here — surface those via [`SkillSet::slash_only_names`].
+    ///
+    /// Note: `disable-in-subagent` is **not** honored by this list, because the
+    /// host system prompt is shared by parent and subagent threads; the flag
+    /// only takes effect on the [`SkillSet::register_invocable`] (tool) path.
+    /// This matches how codex shares its skill catalogue across subagents.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use zhive_core::skills::{SkillDiscoveryConfig, SkillSet};
+    ///
+    /// let set = SkillSet::discover_and_load(&SkillDiscoveryConfig::new());
+    /// // `Some(section)` when any model-invocable skill exists, else `None`.
+    /// let _: Option<String> = set.render_available_skills();
+    /// ```
+    #[must_use]
+    pub fn render_available_skills(&self) -> Option<String> {
+        use std::fmt::Write as _;
+
+        let mut body = String::new();
+        for loaded in &self.loaded {
+            if !loaded.skill.model_invocable {
+                continue;
+            }
+            let location = loaded.root.join("SKILL.md");
+            // Infallible: writing to a `String` never returns `Err`.
+            let _ = writeln!(body, "  <skill>");
+            let _ = writeln!(body, "    <name>{}</name>", loaded.name);
+            if let Some(desc) = &loaded.description {
+                let _ = writeln!(body, "    <description>{desc}</description>");
+            }
+            let _ = writeln!(body, "    <location>{}</location>", location.display());
+            let _ = writeln!(body, "  </skill>");
+        }
+
+        if body.is_empty() {
+            return None;
+        }
+
+        Some(format!(
+            "# Skills\n\n\
+             The following skills provide specialized instructions for specific \
+             tasks. When a task matches a skill's description, read its `SKILL.md` \
+             with the read tool and follow it. Paths referenced inside a skill are \
+             relative to that skill's directory.\n\n\
+             <available_skills>\n{body}</available_skills>"
+        ))
+    }
+
+    /// Returns the names of slash-only skills (`disable-model-invocation: true`).
+    ///
+    /// These are excluded from [`SkillSet::render_available_skills`] but can be
+    /// surfaced in a host command palette for explicit `/skill:<name>` dispatch.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use zhive_core::skills::{SkillDiscoveryConfig, SkillSet};
+    ///
+    /// let set = SkillSet::discover_and_load(&SkillDiscoveryConfig::new());
+    /// let _: Vec<String> = set.slash_only_names();
+    /// ```
+    #[must_use]
+    pub fn slash_only_names(&self) -> Vec<String> {
+        self.loaded
+            .iter()
+            .filter(|loaded| !loaded.skill.model_invocable)
+            .map(|loaded| loaded.name.clone())
+            .collect()
+    }
+
+    /// Returns every loaded skill as a host-invocable [`SkillEntry`].
+    ///
+    /// Unlike [`SkillSet::render_available_skills`], this includes slash-only
+    /// skills: a host command palette or picker can run **any** discovered
+    /// skill, mirroring pi and opencode (`disable-model-invocation` only hides a
+    /// skill from the model's auto-discovery list, not from explicit slash use).
+    /// Each entry's `invocation` is the rendered `<skill>` block, ready to inject
+    /// as a user message.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use zhive_core::skills::{SkillDiscoveryConfig, SkillSet};
+    ///
+    /// let set = SkillSet::discover_and_load(&SkillDiscoveryConfig::new());
+    /// let _: Vec<zhive_core::skills::SkillEntry> = set.catalogue();
+    /// ```
+    #[must_use]
+    pub fn catalogue(&self) -> Vec<SkillEntry> {
+        self.loaded
+            .iter()
+            .map(|loaded| {
+                let location = loaded.root.join("SKILL.md");
+                SkillEntry {
+                    name: loaded.name.clone(),
+                    description: loaded.description.clone(),
+                    invocation: render_invocation(
+                        &loaded.name,
+                        &location,
+                        &loaded.root,
+                        &loaded.body,
+                    ),
+                }
+            })
+            .collect()
+    }
 }
 
 // ============================================================
@@ -277,7 +455,10 @@ mod tests {
             extra_roots: vec![tmp.path().to_owned()],
         };
         let set = SkillSet::discover_and_load(&cfg);
-        assert_eq!(set.loaded.len(), 2, "expected 2 loaded skills");
+        // Robust against real `$HOME` skills also discovered (e.g. ~/.agents):
+        // assert our two are present rather than asserting an exact count.
+        assert!(set.loaded.iter().any(|s| s.name == "invocable-skill"));
+        assert!(set.loaded.iter().any(|s| s.name == "slash-only-skill"));
 
         let mut registry = ToolRegistry::new();
         let slash_only = set.register_invocable(&mut registry);
@@ -294,6 +475,67 @@ mod tests {
             slash_only.contains(&"slash-only-skill".to_owned()),
             "slash-only list should contain slash-only-skill"
         );
+    }
+
+    // These build `SkillSet` directly from hand-loaded skills rather than via
+    // `discover_and_load`, which scans the real `$HOME` (e.g. `~/.agents/skills`)
+    // and would make exact assertions non-hermetic.
+    #[test]
+    fn render_available_skills_lists_only_model_invocable() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let shown = load(&write_skill_md(tmp.path(), "shown-skill", false)).unwrap();
+        let hidden = load(&write_skill_md(tmp.path(), "hidden-skill", true)).unwrap();
+        let set = SkillSet {
+            loaded: vec![shown, hidden],
+        };
+
+        let section = set
+            .render_available_skills()
+            .expect("a model-invocable skill exists");
+        assert!(section.contains("<available_skills>"));
+        assert!(section.contains("<name>shown-skill</name>"));
+        assert!(
+            section.contains("SKILL.md"),
+            "the location pointer must reference the SKILL.md file"
+        );
+        // Slash-only skills must not leak into the model-facing catalogue.
+        assert!(!section.contains("hidden-skill"));
+
+        // …but they are reported separately for the command palette.
+        assert_eq!(set.slash_only_names(), vec!["hidden-skill".to_owned()]);
+    }
+
+    #[test]
+    fn render_available_skills_is_none_without_invocable_skills() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let only_slash = load(&write_skill_md(tmp.path(), "only-slash", true)).unwrap();
+        let set = SkillSet {
+            loaded: vec![only_slash],
+        };
+        assert!(set.render_available_skills().is_none());
+    }
+
+    #[test]
+    fn catalogue_includes_slash_only_skills_with_rendered_invocation() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let invocable = load(&write_skill_md(tmp.path(), "do-thing", false)).unwrap();
+        let slash = load(&write_skill_md(tmp.path(), "slash-thing", true)).unwrap();
+        let set = SkillSet {
+            loaded: vec![invocable, slash],
+        };
+
+        let cat = set.catalogue();
+        // Both kinds appear — slash-only skills are still slash-invocable.
+        let names: Vec<&str> = cat.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"do-thing"));
+        assert!(names.contains(&"slash-thing"));
+
+        let entry = cat.iter().find(|e| e.name == "do-thing").unwrap();
+        // The invocation is the agent-skills `<skill>` block carrying the body.
+        assert!(entry.invocation.starts_with("<skill name=\"do-thing\""));
+        assert!(entry.invocation.contains("SKILL.md"));
+        assert!(entry.invocation.contains("References are relative to"));
+        assert!(entry.invocation.ends_with("</skill>"));
     }
 
     #[test]
@@ -313,9 +555,10 @@ mod tests {
         };
         let set = SkillSet::discover_and_load(&cfg);
 
-        // Only the good skill survives.
-        assert_eq!(set.loaded.len(), 1);
-        assert_eq!(set.loaded[0].name, "good-skill");
+        // The good skill loads; the malformed one is skipped. (Other real
+        // `$HOME` skills may also be present, so assert by name, not by count.)
+        assert!(set.loaded.iter().any(|s| s.name == "good-skill"));
+        assert!(!set.loaded.iter().any(|s| s.name == "bad-skill"));
     }
 
     #[test]
@@ -358,18 +601,23 @@ mod tests {
 
         let set = SkillSet::discover_and_load(&cfg);
 
-        // Exactly one skill must survive.
+        // Exactly one `shared-skill` must survive the collision. Filter by name
+        // so unrelated real `$HOME` skills do not perturb the assertion.
+        let shared: Vec<_> = set
+            .loaded
+            .iter()
+            .filter(|s| s.name == "shared-skill")
+            .collect();
         assert_eq!(
-            set.loaded.len(),
+            shared.len(),
             1,
-            "only one skill must survive the name collision; got: {:?}",
-            set.loaded.iter().map(|s| &s.name).collect::<Vec<_>>()
+            "only one 'shared-skill' must survive the name collision; got: {:?}",
+            shared.iter().map(|s| &s.name).collect::<Vec<_>>()
         );
-        assert_eq!(set.loaded[0].name, "shared-skill");
 
         // The winner's description must come from root2 (the higher-priority root).
         assert_eq!(
-            set.loaded[0].description.as_deref(),
+            shared[0].description.as_deref(),
             Some("Skill from skill-beta"),
             "winner must come from the higher-priority root (root2/skill-beta)"
         );

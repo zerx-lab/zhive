@@ -29,6 +29,9 @@ pub(crate) fn render_overlay(frame: &mut Frame, app: &App, overlay: &Overlay, ar
             query,
             filter_mode,
         } => render_session_list(frame, app, area, entries, *selected, query, *filter_mode),
+        Overlay::SkillList { selected, query } => {
+            render_skill_list(frame, app, area, *selected, query);
+        }
     }
 }
 
@@ -342,6 +345,29 @@ fn render_session_list(
 fn short_id(id: &str) -> String {
     let tail = id.rsplit('/').next().unwrap_or(id);
     truncate(tail, 24)
+}
+
+/// Renders the `/skills` picker: a filterable list of skill name + description.
+///
+/// Reuses [`render_select_list`]; filters [`App::skills`] live by the typed
+/// query. Selecting a row fills the composer with `/skill:<name> ` (handled in
+/// the app key reducer, not here).
+fn render_skill_list(frame: &mut Frame, app: &App, area: Rect, selected: usize, query: &str) {
+    let p = &app.palette;
+    let popup = area.centered(Constraint::Percentage(70), Constraint::Percentage(70));
+    let inner = open_popup(frame, popup, "✦ run skill", p);
+
+    let rows: Vec<SelectRow> = crate::app::filter_skills(&app.skills, query)
+        .into_iter()
+        .map(|s| SelectRow {
+            prefix: "  ".to_owned(),
+            primary: s.name.clone(),
+            secondary: truncate(&s.description, 56),
+        })
+        .collect();
+
+    let hint = "↑↓ select · ↵ pick · esc cancel · type to filter";
+    render_select_list(frame, p, inner, query, &rows, selected, hint);
 }
 
 /// Truncates `s` to at most `max` chars, appending `…` when shortened.

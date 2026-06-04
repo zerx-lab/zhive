@@ -19,6 +19,7 @@ pub mod conversation;
 pub mod error;
 pub mod id;
 pub mod input;
+mod logo;
 pub mod markdown;
 mod overlays;
 pub mod protocol;
@@ -38,7 +39,8 @@ pub use theme::{Accent, Density, Theme};
 use std::time::Duration;
 
 use crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyEventKind, MouseEventKind,
+    DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyEventKind, MouseButton,
+    MouseEventKind,
 };
 use futures::StreamExt;
 use zhive_client_native::{Client, ClientEvent};
@@ -87,6 +89,18 @@ enum LoopMsg {
         /// Historical subagent children to reattach as nested summaries.
         subagents: Vec<crate::rpc::SubagentRestore>,
     },
+    /// Re-synced history for the *current* thread after a dropped-event gap.
+    ///
+    /// A broadcast lag can swallow `ItemAppended` events (e.g. a tool call) that
+    /// are never re-broadcast, so the view must be rebuilt from the persisted
+    /// source of truth. Unlike [`LoopMsg::Resumed`] this does **not** rebind the
+    /// thread or clear the message queue — the session is still live.
+    Resynced {
+        /// The current thread's full history, in conversation order.
+        items: Vec<zhive_proto::domain::Item>,
+        /// Its subagent children, to reattach as nested summaries.
+        subagents: Vec<crate::rpc::SubagentRestore>,
+    },
 }
 
 /// Reports this crate's package version.
@@ -110,30 +124,36 @@ pub fn version() -> &'static str {
 /// Returns [`TuiError::Io`] on terminal failures or [`TuiError::Client`] if the
 /// initial subscription cannot be established.
 ///
-/// `extra_commands` are host-supplied palette entries (`(name, help)` pairs,
-/// e.g. slash-only skills discovered at boot) merged with the built-in slash
-/// commands.
+/// `skills` are the Agent-Skills discovered at boot, surfaced through the
+/// `/skills` picker and `/skill:<name>` slash execution.
 pub async fn run(
     client: Client,
     config: TuiConfig,
-    extra_commands: Vec<(String, String)>,
+    skills: Vec<crate::app::SkillCommand>,
 ) -> Result<()> {
     let thread = id::new_thread_id();
     let mut app = App::new(config, thread);
-    // Surface host-discovered slash commands (e.g. slash-only skills) in the
-    // palette alongside the built-ins.
-    if !extra_commands.is_empty() {
-        app.set_extra_commands(
-            extra_commands
-                .into_iter()
-                .map(|(name, help)| crate::app::SlashCommand {
-                    name,
-                    help,
-                    // Skill/host commands take free-form input after the name.
-                    takes_args: false,
-                })
-                .collect(),
-        );
+    // Register discovered skills: stored for `/skill:<name>` execution and the
+    // `/skills` picker, and surfaced in the `/` palette as bare-name commands
+    // (deduped against built-ins, which win on a clash) so `/commit` both
+    // autocompletes and runs directly — opencode-style bare names plus pi-style
+    // `/skill:<name>`.
+    if !skills.is_empty() {
+        let builtin: std::collections::HashSet<String> = crate::app::builtin_commands()
+            .into_iter()
+            .map(|c| c.name)
+            .collect();
+        let palette: Vec<crate::app::SlashCommand> = skills
+            .iter()
+            .filter(|s| !builtin.contains(&s.name))
+            .map(|s| crate::app::SlashCommand {
+                name: s.name.clone(),
+                help: s.description.clone(),
+                takes_args: false,
+            })
+            .collect();
+        app.set_extra_commands(palette);
+        app.set_skills(skills);
     }
 
     let mut term_events = EventStream::new();
@@ -226,7 +246,26 @@ async fn event_loop(
                         MouseEventKind::ScrollDown => {
                             app.scrollback = app.scrollback.saturating_sub(3);
                         }
-                        _ => {} // clicks / moves: redraw next loop
+                        // A left click on the welcome logo sends a ripple from
+                        // the click point. The hit-rect is only honored while
+                        // the welcome screen is live, so a stale rect cannot
+                        // fire a phantom ripple.
+                        MouseEventKind::Down(MouseButton::Left) => {
+                            let hit = app.logo_hit.get();
+                            if app.welcome_active()
+                                && let Some(rect) = hit
+                                && rect.contains(ratatui::layout::Position {
+                                    x: mouse.column,
+                                    y: mouse.row,
+                                })
+                            {
+                                app.trigger_logo_pulse(
+                                    mouse.column.saturating_sub(rect.x),
+                                    mouse.row.saturating_sub(rect.y),
+                                );
+                            }
+                        }
+                        _ => {} // other clicks / moves: redraw next loop
                     }
                 }
                 Some(Ok(_)) => {}            // resize / focus: redraw next loop
@@ -236,12 +275,14 @@ async fn event_loop(
                 None => return Ok(()),        // stdin closed
             },
             maybe_event = engine_events.next_event(), if engine_alive => {
-                engine_alive = handle_engine(app, maybe_event);
+                engine_alive = handle_engine(app, maybe_event, client, &cmd_tx);
             }
             Some(msg) = cmd_rx.recv() => apply_loop_msg(app, msg),
-            // Only animate while busy; an idle TUI parks the timer so it burns
-            // zero CPU until the next input or engine event arrives.
-            _ = ticker.tick(), if app.conversation.busy => app.tick(),
+            // Animate while busy (the spinner) or while a logo ripple is
+            // playing. Any other idle TUI — including the static welcome
+            // screen — parks the timer so it burns zero CPU until the next
+            // input or engine event arrives.
+            _ = ticker.tick(), if app.conversation.busy || app.logo_pulse > 0 => app.tick(),
         }
 
         // After any event, dispatch one queued message when idle following a
@@ -254,7 +295,12 @@ async fn event_loop(
 }
 
 /// Applies one engine stream item; returns `false` once the stream has ended.
-fn handle_engine(app: &mut App, event: Option<ClientEvent>) -> bool {
+fn handle_engine(
+    app: &mut App,
+    event: Option<ClientEvent>,
+    client: &Client,
+    cmd_tx: &tokio::sync::mpsc::Sender<LoopMsg>,
+) -> bool {
     match event {
         Some(ClientEvent::Notification(notif)) => {
             let decoded = protocol::decode(&notif.method, notif.params);
@@ -268,11 +314,21 @@ fn handle_engine(app: &mut App, event: Option<ClientEvent>) -> bool {
             false
         }
         Some(ClientEvent::Lagged(n)) => {
-            // A gap may have swallowed a terminal event; recover conservatively
-            // so the UI cannot wedge in the busy state. Live events re-derive it.
+            // A gap swallowed events the engine will NOT re-broadcast (e.g. a
+            // tool-call `ItemAppended`), so live events cannot re-derive them.
+            // Reset the busy/stream state immediately, then re-sync the view
+            // from the persisted history so dropped records reappear.
             app.conversation.busy = false;
             app.conversation.streaming.clear();
-            app.flash = Some(format!("dropped {n} events (slow render)"));
+            app.flash = Some(format!("dropped {n} events (slow render) · re-syncing"));
+            let thread = app.conversation.thread_id.clone();
+            spawn_rpc(client, cmd_tx, move |client, _tx| async move {
+                let items = rpc::get_thread_items(&client, &thread).await.ok()?;
+                let subagents = rpc::resume_subagent_children(&client, &thread)
+                    .await
+                    .unwrap_or_default();
+                Some(LoopMsg::Resynced { items, subagents })
+            });
             true
         }
         // Stream closed with no terminal event: stop polling this branch.
@@ -418,22 +474,8 @@ fn apply_loop_msg(app: &mut App, msg: LoopMsg) {
             app.reset_thread(thread_id);
             app.conversation.load_history(items);
             // Reattach historical subagent children as nested summaries (after
-            // load_history, which clears any existing subagents). Each restored
-            // child becomes a completed `SubagentView` built from its history.
-            if !subagents.is_empty() {
-                let views = subagents
-                    .into_iter()
-                    .map(|s| {
-                        crate::conversation::SubagentView::from_history(
-                            s.child_thread_id,
-                            s.agent_type,
-                            s.description,
-                            s.items,
-                        )
-                    })
-                    .collect();
-                app.conversation.restore_subagents(views);
-            }
+            // load_history, which clears any existing subagents).
+            restore_subagent_views(app, subagents);
             app.scrollback = 0;
             app.flash = if sub_count > 0 {
                 Some(format!("resumed · {count} items · {sub_count} subagent(s)"))
@@ -441,7 +483,36 @@ fn apply_loop_msg(app: &mut App, msg: LoopMsg) {
                 Some(format!("resumed · {count} items"))
             };
         }
+        LoopMsg::Resynced { items, subagents } => {
+            // Rebuild the current thread's view from persisted history after a
+            // dropped-event gap. No `reset_thread`: the thread binding and the
+            // pending message queue must survive a mid-session re-sync.
+            app.conversation.load_history(items);
+            restore_subagent_views(app, subagents);
+        }
     }
+}
+
+/// Reattaches restored subagent children as completed nested summaries.
+///
+/// Call after [`crate::conversation::Conversation::load_history`], which clears
+/// any existing subagents. A no-op when there are none.
+fn restore_subagent_views(app: &mut App, subagents: Vec<crate::rpc::SubagentRestore>) {
+    if subagents.is_empty() {
+        return;
+    }
+    let views = subagents
+        .into_iter()
+        .map(|s| {
+            crate::conversation::SubagentView::from_history(
+                s.child_thread_id,
+                s.agent_type,
+                s.description,
+                s.items,
+            )
+        })
+        .collect();
+    app.conversation.restore_subagents(views);
 }
 
 /// Spawns `f` on a detached task, forwarding any returned message to `cmd_tx`.

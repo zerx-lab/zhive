@@ -47,18 +47,22 @@ async fn run_tui(config_path: Option<std::path::PathBuf>, args: crate::cli::TuiA
 
     let provider = crate::provider::build(&cfg)?;
     let runtime = crate::boot::build_runtime(&cfg).await?;
-    // Surface slash-only skills (discovered at boot) in the TUI palette. Taken
-    // before `runtime` is moved into the host.
-    let slash_cmds: Vec<(String, String)> = runtime
-        .slash_commands
+    // Map the boot-discovered skills to the TUI's own type (D-002: the TUI must
+    // not depend on `zhive_core`). Taken before `runtime` moves into the host.
+    let skills: Vec<zhive_tui::app::SkillCommand> = runtime
+        .skills
         .iter()
-        .map(|name| (name.clone(), format!("skill: {name}")))
+        .map(|s| zhive_tui::app::SkillCommand {
+            name: s.name.clone(),
+            description: s.description.clone(),
+            invocation: s.invocation.clone(),
+        })
         .collect();
     let socket = crate::engine_host::tui_socket_path();
     let host = crate::engine_host::Host::start(provider, runtime, socket).await?;
 
     let tui_config = build_tui_config(&cfg);
-    let result = zhive_tui::run(host.client.clone(), tui_config, slash_cmds).await;
+    let result = zhive_tui::run(host.client.clone(), tui_config, skills).await;
     host.stop().await;
     Ok(result?)
 }

@@ -6,7 +6,10 @@
 //! client. Keeping side effects out of `App` (no `Client` here) makes the whole
 //! reducer unit-testable without a running engine.
 
+use std::cell::Cell;
+
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::layout::Rect;
 use zhive_proto::permission::{
     PermissionOption, PermissionOptionKind, PermissionOutcome, RequestPermissionRequest,
 };
@@ -118,6 +121,17 @@ pub enum Overlay {
         /// Whether the listing is scoped to the current cwd or lists all.
         filter_mode: SessionFilter,
     },
+    /// The skill picker (`/skills`): a filterable list of all discovered skills.
+    ///
+    /// Filters against [`App::skills`] (held on the app, not duplicated here);
+    /// selecting an entry fills the composer with `/skill:<name> ` so the user
+    /// can add arguments before submitting.
+    SkillList {
+        /// Index of the highlighted entry among the filtered rows.
+        selected: usize,
+        /// Live fuzzy-filter query typed by the user.
+        query: String,
+    },
 }
 
 /// A slash command shown in the palette and dispatched on submit.
@@ -160,6 +174,35 @@ impl SlashCommand {
     }
 }
 
+/// A discovered skill the user can run from `/skill:<name>` or the `/skills`
+/// picker.
+///
+/// Host-supplied at startup. `invocation` is the fully-rendered `<skill>` block
+/// (produced by the engine host); running the skill submits that block as a
+/// user message, with any trailing args appended after a blank line. The TUI
+/// keeps this type local so it never depends on `zhive_core` (D-002).
+///
+/// # Examples
+///
+/// ```
+/// use zhive_tui::app::SkillCommand;
+/// let s = SkillCommand {
+///     name: "commit".to_owned(),
+///     description: "create a git commit".to_owned(),
+///     invocation: "<skill name=\"commit\" location=\"/x/SKILL.md\">\n…\n</skill>".to_owned(),
+/// };
+/// assert_eq!(s.name, "commit");
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillCommand {
+    /// Skill identifier (the bare name, e.g. `commit`).
+    pub name: String,
+    /// One-line description shown in the `/skills` picker.
+    pub description: String,
+    /// Pre-rendered `<skill>` block injected as a user message when run.
+    pub invocation: String,
+}
+
 /// The built-in slash commands the conversation screen always understands.
 ///
 /// Extra runtime commands (e.g. skill slash-commands discovered at startup) are
@@ -178,6 +221,7 @@ pub fn builtin_commands() -> Vec<SlashCommand> {
         ),
         ("compact", "summarize and condense the conversation", false),
         ("session", "list and resume past sessions", false),
+        ("skills", "browse and run a skill", false),
         ("clear", "start a fresh thread", false),
         ("quit", "exit zap", false),
     ]
@@ -188,6 +232,11 @@ pub fn builtin_commands() -> Vec<SlashCommand> {
 
 /// The whole TUI state for the conversation experience.
 #[derive(Debug)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent UI toggles (quit/disconnect/queue-halt/skill-expand); \
+              a state machine would couple unrelated concerns"
+)]
 pub struct App {
     /// Host-supplied presentation config (also drives the top bar).
     pub config: TuiConfig,
@@ -209,6 +258,12 @@ pub struct App {
     pub spinner_tick: usize,
     /// Lines scrolled up from the bottom of the transcript (0 = follow tail).
     pub scrollback: u16,
+    /// Whether collapsible detail blocks show their full content (ctrl+o).
+    ///
+    /// A single global toggle covering `/skill:<name>` chips, tool-call output,
+    /// and command output: ctrl+o expands/collapses all of them at once (the
+    /// transcript has no per-message focus).
+    pub details_expanded: bool,
     /// Highlighted entry in the slash-command palette.
     pub palette_index: usize,
     /// Set once the user asks to quit.
@@ -228,6 +283,9 @@ pub struct App {
     /// These are merged with the built-in commands at palette-match time.
     /// Populate via [`App::set_extra_commands`] or [`App::new_with_extra`].
     pub extra_commands: Vec<SlashCommand>,
+    /// All discovered skills, for `/skill:<name>` execution and the `/skills`
+    /// picker. Populate via [`App::set_skills`]; empty when none were found.
+    pub skills: Vec<SkillCommand>,
     /// Messages composed while a turn was in flight, awaiting dispatch.
     ///
     /// FIFO: each is sent as its own turn once the previous turn finishes
@@ -241,6 +299,18 @@ pub struct App {
     /// silently drop) the whole queue. While set, [`App::take_next_queued`]
     /// yields nothing; the user resumes with a blank Enter (which clears it).
     pub queue_halted: bool,
+    /// Remaining frames of the click-triggered logo ripple (0 = at rest).
+    ///
+    /// The welcome wordmark is static at rest, so this is the only logo
+    /// animation state; the render loop ticks only while it is nonzero.
+    pub logo_pulse: u16,
+    /// Wordmark cell `(col, row)` a ripple expands from (the click point).
+    pub logo_origin: (u16, u16),
+    /// Screen rect of the welcome logo, recorded each render for click hit-tests.
+    ///
+    /// Set by the welcome renderer (which only borrows `&App`) and read by the
+    /// event loop on a left click; honored only while [`Self::welcome_active`].
+    pub logo_hit: Cell<Option<Rect>>,
 }
 
 impl App {
@@ -271,13 +341,18 @@ impl App {
             flash: None,
             spinner_tick: 0,
             scrollback: 0,
+            details_expanded: false,
             palette_index: 0,
             should_quit: false,
             last_usage: None,
             disconnected: false,
             extra_commands: Vec::new(),
+            skills: Vec::new(),
             message_queue: std::collections::VecDeque::new(),
             queue_halted: false,
+            logo_pulse: 0,
+            logo_origin: (0, 0),
+            logo_hit: Cell::new(None),
             config,
         }
     }
@@ -300,6 +375,30 @@ impl App {
     /// ```
     pub fn set_extra_commands(&mut self, commands: Vec<SlashCommand>) {
         self.extra_commands = commands;
+    }
+
+    /// Registers the discovered skills for `/skill:<name>` and the `/skills`
+    /// picker.
+    ///
+    /// Replaces any previously registered skills.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use zhive_tui::app::{App, SkillCommand};
+    /// use zhive_tui::TuiConfig;
+    /// use zhive_proto::domain::ThreadId;
+    /// let mut app = App::new(TuiConfig::default(), ThreadId(Arc::from("thread:native/t")));
+    /// app.set_skills(vec![SkillCommand {
+    ///     name: "commit".to_owned(),
+    ///     description: "create a git commit".to_owned(),
+    ///     invocation: "<skill name=\"commit\" location=\"/x/SKILL.md\">\nbody\n</skill>".to_owned(),
+    /// }]);
+    /// assert_eq!(app.skills.len(), 1);
+    /// ```
+    pub fn set_skills(&mut self, skills: Vec<SkillCommand>) {
+        self.skills = skills;
     }
 
     /// The slash query (text after `/`) when the palette should be shown.
@@ -386,11 +485,42 @@ impl App {
         self.run_slash(&cmd.name)
     }
 
-    /// Advances the spinner; called on each redraw tick.
+    /// Advances animation clocks; called on each redraw tick.
+    ///
+    /// A running logo ripple counts down, and the spinner only moves while a
+    /// turn is in flight. At rest neither moves, so the loop parks the timer.
     pub fn tick(&mut self) {
+        self.logo_pulse = self.logo_pulse.saturating_sub(1);
         if self.conversation.busy {
             self.spinner_tick = self.spinner_tick.wrapping_add(1);
         }
+    }
+
+    /// Returns `true` while the welcome screen is the active view.
+    ///
+    /// The welcome wordmark is shown only before the first turn and when no
+    /// overlay is capturing the screen, so the loop accepts logo clicks exactly
+    /// then.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use zhive_tui::app::App;
+    /// use zhive_tui::TuiConfig;
+    /// use zhive_proto::domain::ThreadId;
+    /// let app = App::new(TuiConfig::default(), ThreadId(Arc::from("thread:native/t")));
+    /// assert!(app.welcome_active());
+    /// ```
+    #[must_use]
+    pub fn welcome_active(&self) -> bool {
+        self.conversation.is_empty() && self.overlay.is_none()
+    }
+
+    /// Starts a click ripple from wordmark cell `(col, row)`.
+    pub fn trigger_logo_pulse(&mut self, col: u16, row: u16) {
+        self.logo_pulse = crate::logo::SWEEP_FRAMES;
+        self.logo_origin = (col, row);
     }
 
     /// Re-binds the conversation to a fresh thread (after `/clear` or resume).
@@ -500,7 +630,57 @@ impl App {
                 query,
                 filter_mode,
             }) => self.on_session_list_key(key, entries, selected, query, filter_mode),
+            Some(Overlay::SkillList { selected, query }) => {
+                self.on_skill_list_key(key, selected, query)
+            }
         }
+    }
+
+    /// Key handling for the `/skills` picker: navigate, filter, fill the
+    /// composer with `/skill:<name> ` on Enter, or cancel on Esc.
+    ///
+    /// The overlay was `take`n by the caller; this re-installs it (with updated
+    /// state) for every key except Enter (fills the composer and stays closed so
+    /// the user can add arguments) and Esc (cancel). Navigation and filtering
+    /// keep the highlight within the filtered rows.
+    fn on_skill_list_key(&mut self, key: KeyEvent, selected: usize, mut query: String) -> Action {
+        let filtered = filter_skills(&self.skills, &query);
+        let max = filtered.len().saturating_sub(1);
+        let mut selected = selected.min(max);
+        match key.code {
+            KeyCode::Esc => return Action::None,
+            KeyCode::Up => selected = selected.saturating_sub(1),
+            KeyCode::Down => selected = (selected + 1).min(max),
+            // Ctrl+P / Ctrl+N mirror Up / Down (consistent with the palette).
+            KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                selected = selected.saturating_sub(1);
+            }
+            KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                selected = (selected + 1).min(max);
+            }
+            KeyCode::Enter => {
+                // Bind the name (ends the `filtered` borrow) before mutating self.
+                let chosen = filtered.get(selected).map(|s| s.name.clone());
+                if let Some(name) = chosen {
+                    self.input.clear();
+                    self.input.insert_str(&format!("/skill:{name} "));
+                    self.palette_index = 0;
+                }
+                // Stay closed regardless: the composer now holds the command.
+                return Action::None;
+            }
+            KeyCode::Backspace => {
+                query.pop();
+                selected = 0;
+            }
+            KeyCode::Char(c) => {
+                query.push(c);
+                selected = 0;
+            }
+            _ => {}
+        }
+        self.overlay = Some(Overlay::SkillList { selected, query });
+        Action::None
     }
 
     /// Key handling for the `/session` picker: navigate, filter, resume, toggle
@@ -700,6 +880,11 @@ impl App {
                 self.unqueue();
                 Action::None
             }
+            // Toggle expansion of every `/skill:<name>` invocation chip.
+            KeyCode::Char('o') if ctrl => {
+                self.details_expanded = !self.details_expanded;
+                Action::None
+            }
             KeyCode::Char(c) if !ctrl => {
                 self.input.insert_char(c);
                 self.palette_index = 0;
@@ -892,11 +1077,70 @@ impl App {
                 self.set_accent(arg);
                 Action::None
             }
+            // Open the skill picker.
+            "skills" => {
+                self.open_skill_list();
+                Action::None
+            }
+            // A bare skill name (`/commit`, opencode-style) or the explicit
+            // `/skill:<name>` form (pi-style) runs the skill directly. Built-in
+            // commands above take precedence on a name clash; the `skill:` prefix
+            // forces the skill even when a built-in shares the name. Args are
+            // everything after the first whitespace.
             other => {
+                let skill_name = other.strip_prefix("skill:").unwrap_or(other);
+                if self.skills.iter().any(|s| s.name == skill_name) {
+                    let args = cmd
+                        .split_once(char::is_whitespace)
+                        .map_or("", |(_, rest)| rest.trim());
+                    return self.run_skill(skill_name, args);
+                }
                 self.flash = Some(format!("unknown command: /{other}"));
                 Action::None
             }
         }
+    }
+
+    /// Runs a discovered skill by injecting its `<skill>` block as a user
+    /// message, with any `args` appended after a blank line.
+    ///
+    /// Queues the message when the engine is busy, mirroring [`Self::submit`],
+    /// so a skill run never races an in-flight turn. Flashes a notice when the
+    /// name is unknown.
+    fn run_skill(&mut self, name: &str, args: &str) -> Action {
+        let Some(invocation) = self
+            .skills
+            .iter()
+            .find(|s| s.name == name)
+            .map(|s| s.invocation.clone())
+        else {
+            self.flash = Some(format!("unknown skill: {name}"));
+            return Action::None;
+        };
+        let text = if args.is_empty() {
+            invocation
+        } else {
+            format!("{invocation}\n\n{args}")
+        };
+        if self.conversation.busy {
+            self.message_queue.push_back(text);
+            self.flash = Some(format!("queued · {} pending", self.message_queue.len()));
+            return Action::None;
+        }
+        self.queue_halted = false;
+        Action::Submit(text)
+    }
+
+    /// Opens the `/skills` picker overlay, or flashes when no skills exist.
+    fn open_skill_list(&mut self) {
+        if self.skills.is_empty() {
+            self.flash = Some("no skills discovered".to_owned());
+            return;
+        }
+        self.overlay = Some(Overlay::SkillList {
+            selected: 0,
+            query: String::new(),
+        });
     }
 
     /// Applies a `/theme <name>` change, re-resolving the palette.
@@ -977,6 +1221,37 @@ pub fn filter_sessions<'a>(
         .collect()
 }
 
+/// Filters skills by a case-insensitive substring over name + description.
+///
+/// An empty query keeps every skill in registration order.
+///
+/// # Examples
+///
+/// ```
+/// use zhive_tui::app::{filter_skills, SkillCommand};
+/// let skills = vec![SkillCommand {
+///     name: "commit".to_owned(),
+///     description: "create a git commit".to_owned(),
+///     invocation: String::new(),
+/// }];
+/// assert_eq!(filter_skills(&skills, "git").len(), 1);
+/// assert_eq!(filter_skills(&skills, "deploy").len(), 0);
+/// ```
+#[must_use]
+pub fn filter_skills<'a>(skills: &'a [SkillCommand], query: &str) -> Vec<&'a SkillCommand> {
+    if query.is_empty() {
+        return skills.iter().collect();
+    }
+    let needle = query.to_lowercase();
+    skills
+        .iter()
+        .filter(|s| {
+            s.name.to_lowercase().contains(&needle)
+                || s.description.to_lowercase().contains(&needle)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -996,6 +1271,182 @@ mod tests {
 
     fn ctrl(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::CONTROL)
+    }
+
+    // ---- skill slash / picker ----
+
+    fn app_with_skills() -> App {
+        let mut a = app();
+        let skills = vec![
+            SkillCommand {
+                name: "commit".to_owned(),
+                description: "make a git commit".to_owned(),
+                invocation: "<skill name=\"commit\" location=\"/x/SKILL.md\">\nbody\n</skill>"
+                    .to_owned(),
+            },
+            SkillCommand {
+                name: "review".to_owned(),
+                description: "review the code".to_owned(),
+                invocation: "<skill name=\"review\" location=\"/y/SKILL.md\">\nrbody\n</skill>"
+                    .to_owned(),
+            },
+        ];
+        // Mirror `lib::run`'s palette registration so tests exercise the real
+        // `/`-palette dispatch (`palette_submit`), not just `run_slash` directly.
+        a.set_extra_commands(
+            skills
+                .iter()
+                .map(|s| SlashCommand {
+                    name: s.name.clone(),
+                    help: s.description.clone(),
+                    takes_args: false,
+                })
+                .collect(),
+        );
+        a.set_skills(skills);
+        a
+    }
+
+    #[test]
+    fn slash_skill_submits_invocation_block() {
+        let mut a = app_with_skills();
+        match a.run_slash("skill:commit") {
+            Action::Submit(text) => {
+                assert!(text.contains("<skill name=\"commit\""));
+                assert!(text.contains("body"));
+            }
+            other => panic!("expected Submit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn slash_skill_appends_trailing_args() {
+        let mut a = app_with_skills();
+        match a.run_slash("skill:commit fix the bug") {
+            Action::Submit(text) => assert!(text.ends_with("</skill>\n\nfix the bug")),
+            other => panic!("expected Submit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn slash_bare_skill_name_executes() {
+        // opencode-style: `/commit` (no `skill:` prefix) runs the skill directly.
+        let mut a = app_with_skills();
+        match a.run_slash("commit") {
+            Action::Submit(text) => assert!(text.contains("<skill name=\"commit\"")),
+            other => panic!("expected Submit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn typing_bare_skill_then_enter_runs_it_through_palette() {
+        // Real keystroke path: `/commit` is a registered (takes_args=false)
+        // palette command, so Enter dispatches via `palette_submit → run_slash`.
+        let mut a = app_with_skills();
+        for c in "/commit".chars() {
+            a.on_key(key(KeyCode::Char(c)));
+        }
+        match a.on_key(key(KeyCode::Enter)) {
+            Action::Submit(text) => assert!(text.contains("<skill name=\"commit\"")),
+            other => panic!("expected Submit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn typing_bare_skill_with_args_then_enter_runs_it() {
+        // With a trailing arg the palette closes (space typed), so Enter routes
+        // through `submit → run_slash`; the arg lands after the block.
+        let mut a = app_with_skills();
+        for c in "/commit fix the bug".chars() {
+            a.on_key(key(KeyCode::Char(c)));
+        }
+        match a.on_key(key(KeyCode::Enter)) {
+            Action::Submit(text) => assert!(text.ends_with("</skill>\n\nfix the bug")),
+            other => panic!("expected Submit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn slash_bare_skill_name_with_args() {
+        let mut a = app_with_skills();
+        match a.run_slash("commit polish the docs") {
+            Action::Submit(text) => assert!(text.ends_with("</skill>\n\npolish the docs")),
+            other => panic!("expected Submit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn slash_unknown_skill_flashes_and_does_not_submit() {
+        let mut a = app_with_skills();
+        assert_eq!(a.run_slash("skill:nonexistent"), Action::None);
+        assert!(a.flash.is_some());
+        // A bare unknown name is likewise rejected (not executed).
+        let mut b = app_with_skills();
+        assert_eq!(b.run_slash("definitely-not-a-skill"), Action::None);
+        assert!(b.flash.is_some());
+    }
+
+    #[test]
+    fn slash_skill_queues_when_busy() {
+        let mut a = app_with_skills();
+        a.conversation.busy = true;
+        assert_eq!(a.run_slash("skill:commit"), Action::None);
+        assert_eq!(a.message_queue.len(), 1);
+    }
+
+    #[test]
+    fn slash_skills_opens_picker_when_skills_exist() {
+        let mut a = app_with_skills();
+        assert_eq!(a.run_slash("skills"), Action::None);
+        assert!(matches!(a.overlay, Some(Overlay::SkillList { .. })));
+    }
+
+    #[test]
+    fn slash_skills_flashes_when_none_discovered() {
+        let mut a = app(); // no skills registered
+        a.run_slash("skills");
+        assert!(a.overlay.is_none());
+        assert!(a.flash.is_some());
+    }
+
+    #[test]
+    fn skill_picker_enter_fills_composer_with_command() {
+        let mut a = app_with_skills();
+        a.run_slash("skills"); // highlight defaults to the first skill (commit)
+        assert_eq!(a.on_overlay_key(key(KeyCode::Enter)), Action::None);
+        assert!(a.overlay.is_none());
+        assert_eq!(a.input.value(), "/skill:commit ");
+    }
+
+    #[test]
+    fn skill_picker_filters_by_query() {
+        let mut a = app_with_skills();
+        a.run_slash("skills");
+        // Type "rev" → only "review" matches; Enter fills it.
+        for c in "rev".chars() {
+            a.on_overlay_key(key(KeyCode::Char(c)));
+        }
+        a.on_overlay_key(key(KeyCode::Enter));
+        assert_eq!(a.input.value(), "/skill:review ");
+    }
+
+    #[test]
+    fn ctrl_o_toggles_skill_chip_expansion() {
+        let mut a = app();
+        assert!(!a.details_expanded);
+        assert_eq!(a.on_key(ctrl(KeyCode::Char('o'))), Action::None);
+        assert!(a.details_expanded);
+        a.on_key(ctrl(KeyCode::Char('o')));
+        assert!(!a.details_expanded);
+    }
+
+    #[test]
+    fn skill_picker_esc_cancels() {
+        let mut a = app_with_skills();
+        a.run_slash("skills");
+        assert_eq!(a.on_overlay_key(key(KeyCode::Esc)), Action::None);
+        assert!(a.overlay.is_none());
+        assert!(a.input.is_blank());
     }
 
     // ---- message-queue helpers ----

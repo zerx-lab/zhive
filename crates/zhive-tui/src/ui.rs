@@ -22,6 +22,7 @@ use zhive_proto::domain::{
 
 use crate::app::App;
 use crate::conversation::{SubagentStatus, SubagentView, TurnLifecycle};
+use crate::logo;
 use crate::theme::Palette;
 use crate::widgets;
 use crate::{markdown, wrap};
@@ -43,6 +44,12 @@ const TOOL_PREVIEW_LINES: usize = 8;
 /// Long argument values (e.g. full file paths or multi-kb content) would
 /// otherwise overflow the content column on a standard 80-column terminal.
 const TOOL_ARG_SUMMARY_MAX: usize = 120;
+
+/// Maximum characters of the inline primary argument shown in a tool header.
+///
+/// Shorter than [`TOOL_ARG_SUMMARY_MAX`] so the `name arg   status` header
+/// stays on one line beside the status label.
+const TOOL_HEADER_ARG_MAX: usize = 56;
 
 /// Maximum lines of command output shown before truncation.
 ///
@@ -163,7 +170,7 @@ fn render_body(frame: &mut Frame, app: &App, area: Rect) {
     // The welcome screen draws on the bare body area — no `conversation` panel
     // frame — so the guidance floats on open whitespace below the top bar.
     if app.conversation.is_empty() {
-        render_welcome(frame, p, area);
+        render_welcome(frame, app, area);
         return;
     }
 
@@ -224,7 +231,7 @@ fn transcript_lines(app: &App, inner_width: u16) -> Vec<Line<'static>> {
     for turn in &app.conversation.turns {
         for item in &turn.items {
             let (label, color) = role_of(item, p);
-            let body = item_body(item, p, content_width);
+            let body = item_body(item, app.details_expanded, p, content_width);
             push_message(&mut out, label, color, body);
             if is_subagent_call(item)
                 && let Some(sub) = app.conversation.subagents.get(next_subagent)
@@ -369,12 +376,12 @@ fn role_of(item: &Item, p: &Palette) -> (&'static str, ratatui::style::Color) {
 }
 
 /// Renders an item's body into wrapped lines (no gutter).
-fn item_body(item: &Item, p: &Palette, width: u16) -> Vec<Line<'static>> {
+///
+/// `expanded` controls whether a `/skill:<name>` invocation message shows its
+/// full injected block (ctrl+o) or a one-line `[skill] <name>` chip.
+fn item_body(item: &Item, expanded: bool, p: &Palette, width: u16) -> Vec<Line<'static>> {
     match item {
-        Item::UserMessage { content, .. } => {
-            let text = user_text(content);
-            wrap_plain(&text, Style::new().fg(p.fg), width)
-        }
+        Item::UserMessage { content, .. } => user_message_lines(content, expanded, p, width),
         Item::AgentMessage { text, .. } => {
             let mut out = Vec::new();
             for line in markdown::render(text, p) {
@@ -405,6 +412,7 @@ fn item_body(item: &Item, p: &Palette, width: u16) -> Vec<Line<'static>> {
             raw_input.as_ref(),
             raw_output.as_ref(),
             content,
+            expanded,
             p,
             width,
         ),
@@ -421,6 +429,7 @@ fn item_body(item: &Item, p: &Palette, width: u16) -> Vec<Line<'static>> {
             *exit_code,
             aggregated_output.as_deref(),
             *duration_ms,
+            expanded,
             p,
             width,
         ),
@@ -472,44 +481,122 @@ fn item_body(item: &Item, p: &Palette, width: u16) -> Vec<Line<'static>> {
     }
 }
 
-/// Renders a tool-call block: header, argument summary, and output preview.
+/// Renders a user message: a `/skill:<name>` invocation as a chip, else plain text.
+///
+/// A `/skill:<name>` run injects a `<skill>…</skill>` block as the user message;
+/// it is shown like a tool call (a collapsible `[skill] <name>` chip) rather than
+/// as raw XML.
+fn user_message_lines(
+    content: &[ItemContent],
+    expanded: bool,
+    p: &Palette,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let text = user_text(content);
+    if let Some(name) = skill_invocation_name(&text) {
+        skill_invocation_lines(name, &text, expanded, p, width)
+    } else {
+        wrap_plain(&text, Style::new().fg(p.fg), width)
+    }
+}
+
+/// Extracts the skill name when `text` is a `<skill name="…">…</skill>` block.
+///
+/// This is the invocation block injected by a `/skill:<name>` run; ordinary user
+/// messages return `None` and render verbatim.
+fn skill_invocation_name(text: &str) -> Option<&str> {
+    let rest = text.strip_prefix("<skill name=\"")?;
+    let (name, _) = rest.split_once('"')?;
+    // Require the closing tag so arbitrary text that merely starts with the
+    // prefix is not mistaken for a skill block.
+    if text.contains("</skill>") {
+        Some(name)
+    } else {
+        None
+    }
+}
+
+/// Renders a skill invocation as a collapsible chip, like a tool call.
+///
+/// Collapsed (default): a one-line `[skill] <name> (ctrl+o to expand)`.
+/// Expanded: the same header plus the full injected block, dimmed.
+fn skill_invocation_lines(
+    name: &str,
+    raw: &str,
+    expanded: bool,
+    p: &Palette,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let hint = if expanded {
+        "ctrl+o to collapse"
+    } else {
+        "ctrl+o to expand"
+    };
+    let header = Line::from(vec![
+        Span::styled(
+            "[skill] ",
+            Style::new().fg(p.role_zap).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(name.to_owned(), Style::new().fg(p.fg)),
+        Span::styled(format!("  ({hint})"), Style::new().fg(p.fg_dim)),
+    ]);
+    if !expanded {
+        return vec![header];
+    }
+    let mut out = vec![header];
+    out.extend(wrap_plain(raw, Style::new().fg(p.fg_dim), width));
+    out
+}
+
+/// Renders a tool-call block: header, argument summary, and output.
+///
+/// `expanded` (the global ctrl+o toggle) shows the full output; otherwise the
+/// output is capped at [`TOOL_PREVIEW_LINES`] with a `ctrl+o to expand` hint.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "leaf renderer: each argument is distinct display data"
+)]
 fn tool_call_lines(
     name: &str,
     status: ToolCallStatus,
     raw_input: Option<&serde_json::Value>,
     raw_output: Option<&serde_json::Value>,
     content: &[ItemToolCallContent],
+    expanded: bool,
     p: &Palette,
     width: u16,
 ) -> Vec<Line<'static>> {
+    // An active call draws attention (accent + bold); a finished one recedes
+    // into muted history, like a skill chip. A failure keeps its red status so
+    // it stays noticeable even when dimmed.
+    let active = matches!(status, ToolCallStatus::Pending | ToolCallStatus::InProgress);
     let (status_label, status_color) = match status {
         ToolCallStatus::Pending => ("pending", p.fg_dim),
         ToolCallStatus::InProgress => ("running", p.warn),
-        ToolCallStatus::Completed => ("ok", p.success),
+        ToolCallStatus::Completed => ("ok", p.fg_mute),
         ToolCallStatus::Failed => ("failed", p.error),
         _ => ("…", p.fg_dim),
     };
 
-    let mut out = vec![Line::from(vec![
-        Span::styled(
-            format!("▸ {name}"),
-            Style::new().fg(p.accent).add_modifier(Modifier::BOLD),
-        ),
-        Span::raw("  "),
-        Span::styled(status_label.to_owned(), Style::new().fg(status_color)),
-    ])];
-
-    // Argument summary from raw_input (JSON → compact one-liner, truncated).
-    if let Some(input) = raw_input {
-        let summary = json_summary(input);
-        if !summary.is_empty() {
-            out.extend(wrap_plain(
-                &format!("  args: {summary}"),
-                Style::new().fg(p.fg_dim),
-                width,
-            ));
-        }
+    // Compact single-line header (pi-style): `▸ name primary-arg   status`. The
+    // most salient argument (command / path / pattern) sits inline beside the
+    // name instead of on a separate verbose `args: {json}` row.
+    let name_style = if active {
+        Style::new().fg(p.accent).add_modifier(Modifier::BOLD)
+    } else {
+        Style::new().fg(p.fg_dim)
+    };
+    let arg_style = Style::new().fg(if active { p.fg } else { p.fg_mute });
+    let mut header = vec![Span::styled(format!("▸ {name}"), name_style)];
+    if let Some(arg) = raw_input.and_then(primary_arg_summary) {
+        header.push(Span::styled(format!(" {arg}"), arg_style));
     }
+    header.push(Span::raw("  "));
+    header.push(Span::styled(
+        status_label.to_owned(),
+        Style::new().fg(status_color),
+    ));
+    let mut out = wrap::wrap_line(&Line::from(header), width);
 
     // Output: prefer structured `content` list, fall back to raw_output JSON.
     let output_text = if !content.is_empty() {
@@ -522,23 +609,65 @@ fn tool_call_lines(
     };
 
     if let Some(text) = output_text {
-        let lines: Vec<&str> = text.lines().collect();
-        let visible = lines.len().min(TOOL_PREVIEW_LINES);
-        let truncated = lines.len() > TOOL_PREVIEW_LINES;
-        for line in &lines[..visible] {
-            out.push(Line::from(vec![
-                Span::styled("  ", Style::new()),
-                Span::styled((*line).to_owned(), Style::new().fg(p.fg).bg(p.bg_overlay)),
-            ]));
-        }
-        if truncated {
-            out.push(Line::styled(
-                format!("  … ({} more lines)", lines.len() - TOOL_PREVIEW_LINES),
-                Style::new().fg(p.fg_mute),
-            ));
-        }
+        out.extend(detail_output_lines(
+            &text,
+            TOOL_PREVIEW_LINES,
+            expanded,
+            !active,
+            p,
+        ));
     }
 
+    out
+}
+
+/// Renders captured output as indented lines, collapsed or expanded.
+///
+/// Collapsed: at most `preview` lines, then `… N more lines · ctrl+o to expand`.
+/// Expanded: every line, then `ctrl+o to collapse` when it had been truncatable.
+/// `dimmed` mutes the result text once the call has finished so a completed
+/// tool block recedes into history. Shared by [`tool_call_lines`] and
+/// [`command_lines`].
+fn detail_output_lines(
+    text: &str,
+    preview: usize,
+    expanded: bool,
+    dimmed: bool,
+    p: &Palette,
+) -> Vec<Line<'static>> {
+    let lines: Vec<&str> = text.lines().collect();
+    let visible = if expanded {
+        lines.len()
+    } else {
+        lines.len().min(preview)
+    };
+
+    let text_fg = if dimmed { p.fg_dim } else { p.fg };
+    let mut out: Vec<Line<'static>> = lines[..visible]
+        .iter()
+        .map(|line| {
+            Line::from(vec![
+                Span::raw("  "),
+                Span::styled(
+                    (*line).to_owned(),
+                    Style::new().fg(text_fg).bg(p.bg_overlay),
+                ),
+            ])
+        })
+        .collect();
+
+    let hidden = lines.len() - visible;
+    if hidden > 0 {
+        out.push(Line::styled(
+            format!("  … {hidden} more lines · ctrl+o to expand"),
+            Style::new().fg(p.fg_mute),
+        ));
+    } else if expanded && lines.len() > preview {
+        out.push(Line::styled(
+            "  ctrl+o to collapse".to_owned(),
+            Style::new().fg(p.fg_mute),
+        ));
+    }
     out
 }
 
@@ -558,6 +687,48 @@ fn tool_content_text(content: &[ItemToolCallContent]) -> String {
     parts.join("\n")
 }
 
+/// Extracts the most salient argument from a tool's `raw_input` for the inline
+/// header.
+///
+/// Prefers a known primary key (command / path / pattern / …); otherwise falls
+/// back to a compact JSON summary. Returns `None` for argument-less or empty
+/// inputs so the header omits the slot entirely.
+fn primary_arg_summary(input: &serde_json::Value) -> Option<String> {
+    const KEYS: [&str; 7] = [
+        "command",
+        "path",
+        "file_path",
+        "pattern",
+        "query",
+        "url",
+        "name",
+    ];
+    for key in KEYS {
+        if let Some(s) = input.get(key).and_then(serde_json::Value::as_str)
+            && !s.is_empty()
+        {
+            return Some(clip(s, TOOL_HEADER_ARG_MAX));
+        }
+    }
+    let summary = json_summary(input);
+    if summary.is_empty() || summary == "{}" {
+        None
+    } else {
+        Some(clip(&summary, TOOL_HEADER_ARG_MAX))
+    }
+}
+
+/// Clips `s` to at most `max` characters, appending `…` when shortened.
+fn clip(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_owned()
+    } else {
+        let mut out: String = s.chars().take(max).collect();
+        out.push('…');
+        out
+    }
+}
+
 /// Produces a compact one-line summary of a JSON value, truncated at
 /// [`TOOL_ARG_SUMMARY_MAX`] characters.
 fn json_summary(value: &serde_json::Value) -> String {
@@ -570,12 +741,20 @@ fn json_summary(value: &serde_json::Value) -> String {
 }
 
 /// Renders a command-execution block: `$ cmd`, optional output, status + timing.
+///
+/// `expanded` (the global ctrl+o toggle) shows the full output; otherwise it is
+/// capped at [`CMD_OUTPUT_LINES`] with a `ctrl+o to expand` hint.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "leaf renderer: each argument is distinct display data"
+)]
 fn command_lines(
     command: &str,
     status: CommandExecutionStatus,
     exit_code: Option<i32>,
     aggregated_output: Option<&str>,
     duration_ms: Option<i64>,
+    expanded: bool,
     p: &Palette,
     width: u16,
 ) -> Vec<Line<'static>> {
@@ -586,23 +765,20 @@ fn command_lines(
     ]);
     out.extend(wrap::wrap_line(&head, width));
 
-    // Show the first N lines of captured output.
     if let Some(output) = aggregated_output {
-        let lines: Vec<&str> = output.lines().collect();
-        let visible = lines.len().min(CMD_OUTPUT_LINES);
-        let truncated = lines.len() > CMD_OUTPUT_LINES;
-        for line in &lines[..visible] {
-            out.push(Line::from(vec![
-                Span::styled("  ", Style::new()),
-                Span::styled((*line).to_owned(), Style::new().fg(p.fg).bg(p.bg_overlay)),
-            ]));
-        }
-        if truncated {
-            out.push(Line::styled(
-                format!("  … (truncated, {} total lines)", lines.len()),
-                Style::new().fg(p.fg_mute),
-            ));
-        }
+        // Mute the captured output once the command has finished, matching the
+        // tool-call treatment so completed blocks recede into history.
+        let done = matches!(
+            status,
+            CommandExecutionStatus::Completed | CommandExecutionStatus::Failed
+        );
+        out.extend(detail_output_lines(
+            output,
+            CMD_OUTPUT_LINES,
+            expanded,
+            done,
+            p,
+        ));
     }
 
     let (status_label, color) = match status {
@@ -926,37 +1102,52 @@ fn wrap_plain(text: &str, style: Style, width: u16) -> Vec<Line<'static>> {
     out
 }
 
-/// Renders the welcome guidance shown before the first message.
+/// One-line tagline shown under the welcome wordmark.
+const WELCOME_TAGLINE: &str = "the terminal coding agent";
+
+/// Renders the welcome screen: a centered `ZAP` wordmark over a tagline.
 ///
-/// A thin rule under the top bar, then two `▸` hint rows for the slash commands
-/// and how to begin — indented with top margin so the block breathes.
-fn render_welcome(frame: &mut Frame, p: &Palette, area: Rect) {
-    // Thin rule directly under the top bar, spanning the body width.
-    let rule = "─".repeat(usize::from(area.width));
-    // Common left indent so the hint rows sit with a small margin.
-    let indent = || Span::raw("   ");
-    let lines = vec![
-        Line::styled(rule, Style::new().fg(p.fg_mute)),
-        Line::raw(""),
-        Line::from(vec![
-            indent(),
-            Span::styled("▸ ", Style::new().fg(p.accent)),
-            Span::styled("/help", Style::new().fg(p.fg_bright)),
-            Span::styled(" commands · ", Style::new().fg(p.fg)),
-            Span::styled("/theme", Style::new().fg(p.fg_bright)),
-            Span::styled(" dark|light|mono · ", Style::new().fg(p.fg)),
-            Span::styled("/accent", Style::new().fg(p.fg_bright)),
-            Span::styled(" cyan|amber|lime|magenta", Style::new().fg(p.fg)),
-        ]),
-        Line::from(vec![
-            indent(),
-            Span::styled("▸ ", Style::new().fg(p.accent)),
-            Span::styled("type a message and press ", Style::new().fg(p.fg)),
-            Span::styled("↵", Style::new().fg(p.fg_bright)),
-            Span::styled(" to start", Style::new().fg(p.fg)),
-        ]),
-    ];
-    frame.render_widget(Paragraph::new(Text::from(lines)), area);
+/// The block-letter logo carries a blue→violet gradient and plays a white
+/// ripple from the click point on a left click (see [`crate::logo`]); a muted
+/// tagline sits one row below. The logo's screen rect is recorded in
+/// [`App::logo_hit`] so the event loop can hit-test clicks; it is cleared first
+/// and only re-set when the group fits, so a too-small body never leaves a
+/// stale rect behind.
+fn render_welcome(frame: &mut Frame, app: &App, area: Rect) {
+    let p = &app.palette;
+    // Clear any prior hit-rect; re-set below only if the logo is placed.
+    app.logo_hit.set(None);
+    let tag_w = u16::try_from(UnicodeWidthStr::width(WELCOME_TAGLINE)).unwrap_or(0);
+    let group_w = logo::WIDTH.max(tag_w);
+    // Logo rows, a blank spacer row, then the tagline.
+    let group_h = logo::HEIGHT + 2;
+    if area.width < group_w || area.height < group_h {
+        return; // body too small to place the wordmark cleanly
+    }
+    // Center the group as a whole, both axes.
+    let top = area.y + area.height.saturating_sub(group_h) / 2;
+    let logo_x = area.x + area.width.saturating_sub(logo::WIDTH) / 2;
+    let logo_area = Rect {
+        x: logo_x,
+        y: top,
+        width: logo::WIDTH,
+        height: logo::HEIGHT,
+    };
+    let lines = logo::render(app.logo_pulse, app.logo_origin.0, app.logo_origin.1);
+    frame.render_widget(Paragraph::new(Text::from(lines)), logo_area);
+    app.logo_hit.set(Some(logo_area));
+
+    let tag_x = area.x + area.width.saturating_sub(tag_w) / 2;
+    let tag_area = Rect {
+        x: tag_x,
+        y: top + logo::HEIGHT + 1,
+        width: tag_w,
+        height: 1,
+    };
+    frame.render_widget(
+        Paragraph::new(Line::styled(WELCOME_TAGLINE, Style::new().fg(p.fg_dim))),
+        tag_area,
+    );
 }
 
 /// Renders the composer panel and returns its inner rect (for the caret).
@@ -1092,6 +1283,33 @@ mod tests {
         let scrollback: u16 = 40;
         let clamped = scrollback.min(max_scroll);
         assert_eq!(clamped, 40);
+    }
+
+    // ---- skill invocation chip ----
+
+    #[test]
+    fn skill_invocation_name_detects_block() {
+        let block = "<skill name=\"commit\" location=\"/x/SKILL.md\">\nbody\n</skill>";
+        assert_eq!(skill_invocation_name(block), Some("commit"));
+    }
+
+    #[test]
+    fn skill_invocation_name_rejects_non_blocks() {
+        assert_eq!(skill_invocation_name("just a normal message"), None);
+        // Starts like a block but never closes → not a skill block.
+        assert_eq!(skill_invocation_name("<skill name=\"x\"> unclosed"), None);
+    }
+
+    #[test]
+    fn skill_chip_collapsed_is_one_line_expanded_shows_body() {
+        let p = Palette::resolve(crate::theme::Theme::Dark, crate::theme::Accent::default());
+        let raw = "<skill name=\"commit\" location=\"/x/SKILL.md\">\nthe full body\n</skill>";
+
+        let collapsed = skill_invocation_lines("commit", raw, false, &p, 80);
+        assert_eq!(collapsed.len(), 1, "collapsed chip is a single line");
+
+        let expanded = skill_invocation_lines("commit", raw, true, &p, 80);
+        assert!(expanded.len() > 1, "expanded shows the header plus body");
     }
 
     // ---- diff classification ----

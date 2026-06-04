@@ -162,6 +162,54 @@ impl StreamFold {
         }
     }
 
+    /// Creates a fold that continues minting item ids from `start_seq`.
+    ///
+    /// A turn drives the provider in a loop, building a fresh fold per
+    /// iteration, but item ids must stay unique across the **whole turn**. A
+    /// per-iteration reset to 0 would collide — e.g. iteration 0's tool call and
+    /// iteration 1's reply would both be `item:<turn>/0`, so the reply would
+    /// overwrite the tool call on every id-keyed store. Callers thread
+    /// [`StreamFold::next_seq`] from one iteration into the next.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use zhive_core::provider::StreamFold;
+    /// use zhive_proto::domain::TurnId;
+    ///
+    /// let turn = TurnId(Arc::from("turn:t/0"));
+    /// let fold = StreamFold::resuming_at(&turn, 5);
+    /// assert_eq!(fold.next_seq(), 5);
+    /// ```
+    #[must_use]
+    pub fn resuming_at(turn_id: &TurnId, start_seq: u64) -> Self {
+        let mut fold = Self::new(turn_id);
+        fold.seq = start_seq;
+        fold
+    }
+
+    /// Returns the next item-id sequence number this fold will mint.
+    ///
+    /// Thread this into [`StreamFold::resuming_at`] for the next turn iteration
+    /// so item ids stay unique across the whole turn.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use zhive_core::provider::StreamFold;
+    /// use zhive_proto::domain::TurnId;
+    ///
+    /// let turn = TurnId(Arc::from("turn:t/0"));
+    /// let fold = StreamFold::new(&turn);
+    /// assert_eq!(fold.next_seq(), 0);
+    /// ```
+    #[must_use]
+    pub fn next_seq(&self) -> u64 {
+        self.seq
+    }
+
     /// Token-usage summary, available after a [`StreamPart::Finish`] is folded.
     #[must_use]
     pub fn usage(&self) -> Option<&llmsdk::language_model::Usage> {
@@ -527,6 +575,29 @@ mod tests {
 
     fn turn_id(s: &str) -> TurnId {
         TurnId(Arc::from(s))
+    }
+
+    // ---- item-id sequence carry across turn iterations ----
+
+    /// Regression: a turn's later iterations must NOT reuse earlier item ids.
+    ///
+    /// Each iteration builds a fresh fold; resuming from the prior fold's
+    /// `next_seq` keeps ids unique so a reply cannot overwrite an earlier
+    /// tool call (`item:<turn>/0`) on an id-keyed store.
+    #[test]
+    fn resuming_at_keeps_item_ids_unique_across_iterations() {
+        let turn = turn_id("turn:thread:native/x/1");
+
+        // Iteration 0 mints the tool call's id at seq 0.
+        let mut fold0 = StreamFold::new(&turn);
+        let id0 = fold0.next_item_id();
+        assert_eq!(id0.0.as_ref(), "item:turn:thread:native/x/1/0");
+
+        // Iteration 1 resumes from where iteration 0 left off.
+        let mut fold1 = StreamFold::resuming_at(&turn, fold0.next_seq());
+        let id1 = fold1.next_item_id();
+        assert_eq!(id1.0.as_ref(), "item:turn:thread:native/x/1/1");
+        assert_ne!(id0, id1, "iteration 1 must not reuse iteration 0's id");
     }
 
     // ---- StreamFold text path ----

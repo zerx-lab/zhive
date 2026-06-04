@@ -666,6 +666,24 @@ mod tests {
     }
 
     #[test]
+    fn load_history_restores_tool_calls_into_their_turn() {
+        // A resumed thread must bring back tool-call records, not just messages.
+        let mut conv = Conversation::new(tid());
+        conv.load_history(vec![
+            agent_item("item:turn:test/0/0", "run ls"),
+            tool_call_item("item:turn:test/0/1", "bash", ToolCallStatus::Completed),
+            agent_item("item:turn:test/0/2", "here is the listing"),
+        ]);
+        assert_eq!(conv.turns.len(), 1, "all items regroup into the one turn");
+        let items = &conv.turns[0].items;
+        assert_eq!(items.len(), 3, "the tool call survives alongside messages");
+        assert!(
+            items.iter().any(|i| matches!(i, Item::ToolCall { .. })),
+            "the restored turn keeps the tool-call record"
+        );
+    }
+
+    #[test]
     fn load_history_falls_back_for_unparseable_ids() {
         let mut conv = Conversation::new(tid());
         conv.load_history(vec![agent_item("weird-id", "no turn encoded")]);

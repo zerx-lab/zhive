@@ -78,6 +78,211 @@ fn renders_user_and_agent_messages() {
 }
 
 #[test]
+fn renders_skill_invocation_as_collapsible_chip() {
+    let mut app = App::new(TuiConfig::default(), thread());
+    app.on_engine(&EngineNotification::TurnStarted {
+        thread_id: thread(),
+        turn_id: turn(),
+    });
+    // A `/skill:commit` run submits this block as the user message.
+    let block = "<skill name=\"commit\" location=\"/x/SKILL.md\">\nthe full body\n</skill>";
+    app.on_engine(&EngineNotification::ItemAppended {
+        thread_id: thread(),
+        turn_id: turn(),
+        item: Box::new(Item::UserMessage {
+            id: ItemId(Arc::from("item:s0")),
+            content: vec![ItemContent::Text {
+                text: block.to_owned(),
+                annotations: None,
+            }],
+        }),
+    });
+    app.on_engine(&EngineNotification::TurnCompleted {
+        thread_id: thread(),
+        turn_id: turn(),
+    });
+
+    let mut terminal = Terminal::new(TestBackend::new(70, 20)).expect("terminal");
+    terminal.draw(|frame| ui::draw(frame, &app)).expect("draw");
+    let collapsed = screen_text(&terminal);
+    assert!(collapsed.contains("[skill]"), "skill chip marker present");
+    assert!(collapsed.contains("commit"), "skill name present");
+    assert!(collapsed.contains("ctrl+o"), "expand hint present");
+    assert!(
+        !collapsed.contains("<skill name="),
+        "raw XML hidden when collapsed; got: {collapsed}"
+    );
+    assert!(
+        !collapsed.contains("the full body"),
+        "body hidden when collapsed"
+    );
+
+    // ctrl+o (global toggle) expands every chip → the body becomes visible.
+    app.details_expanded = true;
+    terminal.draw(|frame| ui::draw(frame, &app)).expect("draw");
+    let expanded = screen_text(&terminal);
+    assert!(
+        expanded.contains("the full body"),
+        "body shown when expanded; got: {expanded}"
+    );
+}
+
+#[test]
+fn command_output_collapses_by_default_and_expands_on_ctrl_o() {
+    let mut app = App::new(TuiConfig::default(), thread());
+    app.on_engine(&EngineNotification::TurnStarted {
+        thread_id: thread(),
+        turn_id: turn(),
+    });
+    // 12 output lines; the collapsed preview caps at 8 (CMD_OUTPUT_LINES).
+    let output = (1..=12)
+        .map(|n| format!("file{n}.txt"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    app.on_engine(&EngineNotification::ItemAppended {
+        thread_id: thread(),
+        turn_id: turn(),
+        item: Box::new(Item::CommandExecution {
+            id: ItemId(Arc::from("item:c0")),
+            command: "ls".to_owned(),
+            cwd: std::path::PathBuf::from("/repo"),
+            status: zhive_proto::domain::CommandExecutionStatus::Completed,
+            exit_code: Some(0),
+            aggregated_output: Some(output),
+            duration_ms: Some(5),
+        }),
+    });
+    app.on_engine(&EngineNotification::TurnCompleted {
+        thread_id: thread(),
+        turn_id: turn(),
+    });
+
+    let mut terminal = Terminal::new(TestBackend::new(70, 30)).expect("terminal");
+    terminal.draw(|frame| ui::draw(frame, &app)).expect("draw");
+    let collapsed = screen_text(&terminal);
+    assert!(collapsed.contains("file1.txt"), "first output line shown");
+    assert!(
+        collapsed.contains("ctrl+o to expand"),
+        "expand hint present; got: {collapsed}"
+    );
+    assert!(
+        !collapsed.contains("file12.txt"),
+        "later lines hidden when collapsed"
+    );
+
+    // ctrl+o reveals the full output.
+    app.details_expanded = true;
+    terminal.draw(|frame| ui::draw(frame, &app)).expect("draw");
+    let expanded = screen_text(&terminal);
+    assert!(
+        expanded.contains("file12.txt"),
+        "all lines shown when expanded; got: {expanded}"
+    );
+}
+
+#[test]
+fn tool_call_header_is_compact_with_inline_arg() {
+    let mut app = App::new(TuiConfig::default(), thread());
+    app.on_engine(&EngineNotification::TurnStarted {
+        thread_id: thread(),
+        turn_id: turn(),
+    });
+    app.on_engine(&EngineNotification::ItemAppended {
+        thread_id: thread(),
+        turn_id: turn(),
+        item: Box::new(Item::ToolCall {
+            id: ItemId(Arc::from("item:turn:render/0/0")),
+            name: "bash".to_owned(),
+            kind: ToolKind::default(),
+            status: ToolCallStatus::Completed,
+            content: Vec::new(),
+            locations: Vec::new(),
+            raw_input: Some(serde_json::json!({ "command": "ls", "cwd": "/repo" })),
+            raw_output: None,
+            provider_tool_call_id: None,
+        }),
+    });
+    app.on_engine(&EngineNotification::TurnCompleted {
+        thread_id: thread(),
+        turn_id: turn(),
+    });
+
+    let mut terminal = Terminal::new(TestBackend::new(70, 20)).expect("terminal");
+    terminal.draw(|frame| ui::draw(frame, &app)).expect("draw");
+    let text = screen_text(&terminal);
+    assert!(text.contains("bash"), "tool name shown; got: {text}");
+    assert!(text.contains("ls"), "primary command arg inline in header");
+    assert!(text.contains("ok"), "status shown");
+    assert!(
+        !text.contains("args:"),
+        "the verbose `args: {{json}}` line is gone; got: {text}"
+    );
+}
+
+#[test]
+fn tool_call_persists_in_view_after_turn_completes_with_agent_reply() {
+    // Repro for the reported "tool block vanishes after the turn": a turn with
+    // user → tool_call → agent_message must keep ALL three visible once done.
+    let mut app = App::new(TuiConfig::default(), thread());
+    app.on_engine(&EngineNotification::TurnStarted {
+        thread_id: thread(),
+        turn_id: turn(),
+    });
+    app.on_engine(&EngineNotification::ItemAppended {
+        thread_id: thread(),
+        turn_id: turn(),
+        item: Box::new(Item::UserMessage {
+            id: ItemId(Arc::from("item:turn:render/0/0")),
+            content: vec![ItemContent::Text {
+                text: "run ls".to_owned(),
+                annotations: None,
+            }],
+        }),
+    });
+    app.on_engine(&EngineNotification::ItemAppended {
+        thread_id: thread(),
+        turn_id: turn(),
+        item: Box::new(Item::ToolCall {
+            id: ItemId(Arc::from("item:turn:render/0/1")),
+            name: "bash".to_owned(),
+            kind: ToolKind::default(),
+            status: ToolCallStatus::Completed,
+            content: Vec::new(),
+            locations: Vec::new(),
+            raw_input: Some(serde_json::json!({ "command": "ls" })),
+            raw_output: None,
+            provider_tool_call_id: None,
+        }),
+    });
+    app.on_engine(&EngineNotification::ItemDelta {
+        thread_id: thread(),
+        turn_id: turn(),
+        delta: "the listing".to_owned(),
+    });
+    app.on_engine(&EngineNotification::ItemAppended {
+        thread_id: thread(),
+        turn_id: turn(),
+        item: Box::new(Item::AgentMessage {
+            id: ItemId(Arc::from("item:turn:render/0/2")),
+            text: "here is the listing".to_owned(),
+        }),
+    });
+    app.on_engine(&EngineNotification::TurnCompleted {
+        thread_id: thread(),
+        turn_id: turn(),
+    });
+
+    let mut terminal = Terminal::new(TestBackend::new(70, 20)).expect("terminal");
+    terminal.draw(|frame| ui::draw(frame, &app)).expect("draw");
+    let text = screen_text(&terminal);
+    assert!(
+        text.contains("bash"),
+        "the tool call must remain visible after the turn; got: {text}"
+    );
+    assert!(text.contains("here is the listing"), "agent reply shown");
+}
+
+#[test]
 fn renders_subagent_summary_under_agent_tool_call() {
     let mut app = App::new(TuiConfig::default(), thread());
     app.on_engine(&EngineNotification::TurnStarted {
@@ -150,7 +355,10 @@ fn renders_welcome_when_empty() {
 
     let text = screen_text(&terminal);
     assert!(text.contains("demo"), "model label shown in top bar");
-    assert!(text.contains("/help"), "welcome lists commands");
+    assert!(
+        text.contains('█'),
+        "welcome screen renders the zap wordmark; got: {text}"
+    );
 }
 
 #[test]
