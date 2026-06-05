@@ -69,6 +69,30 @@ pub struct ExtensionRef {
     pub source: ExtensionSource,
 }
 
+impl ExtensionRef {
+    /// Builds a provenance record from its parts.
+    ///
+    /// Hosts mint this from the manifest that owns a registration so every
+    /// contribution carries `registered_by` (red line 10), without resorting
+    /// to a JSON round-trip for the `#[non_exhaustive]` struct.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use zhive_proto::hook::{ExtensionRef, ExtensionSource};
+    /// let r = ExtensionRef::new("git-helper", "0.1.0", ExtensionSource::Project);
+    /// assert_eq!(r.to_string(), "git-helper@0.1.0");
+    /// ```
+    #[must_use]
+    pub fn new(id: impl Into<String>, version: impl Into<String>, source: ExtensionSource) -> Self {
+        Self {
+            id: id.into(),
+            version: version.into(),
+            source,
+        }
+    }
+}
+
 impl std::fmt::Display for ExtensionRef {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}@{}", self.id, self.version)

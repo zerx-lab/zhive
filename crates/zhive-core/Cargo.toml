@@ -17,11 +17,15 @@ workspace = true
 #   * `sandbox`     -> Landlock / Seatbelt / Job Object adapters (Phase 3)
 #   * `skills`      -> on-disk Agent-Skills discovery (SKILL.md loader). Gated
 #                      so pure-engine consumers do not compile the YAML parser.
+#   * `extensions`  -> unified `.zhive/extensions/*/manifest.json` discovery +
+#                      load. Implies `skills` because the unified registry
+#                      aggregates skill contributions alongside extensions.
 #   * `tools`       -> built-in coding tools (read/write/edit/grep/glob/ls/bash).
 #                      Gated so a host that injects its own tools does not pull
 #                      `ignore` / `regex` / `glob`.
 [features]
 default = []
+extensions = ["skills"]
 # Enable the real OpenTelemetry SDK tracer-provider and the tracing bridge.
 # Disabled by default (decision-diffs §2.6 method b); Phase 2 will activate
 # this once an OTLP exporter target is confirmed.

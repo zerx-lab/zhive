@@ -10,6 +10,9 @@
 
 pub mod cancel;
 pub mod engine;
+/// Unified extension-manifest discovery and loading (gated by `extensions`).
+#[cfg(feature = "extensions")]
+pub mod extensions;
 pub mod hooks;
 pub mod observability;
 pub mod permission;
