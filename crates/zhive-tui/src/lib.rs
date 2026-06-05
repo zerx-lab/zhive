@@ -14,16 +14,23 @@
 #![forbid(unsafe_code)]
 
 pub mod app;
+mod clipboard;
 pub mod config;
 pub mod conversation;
+mod diff;
 pub mod error;
+mod farewell;
+mod heal;
 pub mod id;
 pub mod input;
 mod logo;
 pub mod markdown;
+mod math;
 mod overlays;
 pub mod protocol;
+mod render_cache;
 pub mod rpc;
+mod table;
 pub mod theme;
 pub mod ui;
 pub mod widgets;
@@ -159,11 +166,19 @@ pub async fn run(
     let mut term_events = EventStream::new();
     let mut engine_events = client.subscribe_events();
     let mut ticker = tokio::time::interval(TICK);
+    // The tick arm is gated off while idle, so the interval can sit unpolled for
+    // a long time; Skip (not the default Burst) makes it fire once on re-enable
+    // instead of replaying every missed deadline in a tight burst.
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     // Install the mouse-release panic guard before ratatui::init so ratatui's
     // own restore hook ends up outermost (it runs first on panic, restoring the
     // terminal before our guard releases the mouse — a benign no-op in cooked
     // mode).
+    // Eagerly load the syntax-highlighter assets before the first frame so the
+    // first streamed code block does not pay the one-time deserialization on
+    // the render path.
+    markdown::prewarm();
     install_mouse_panic_guard();
     let mut terminal = ratatui::init();
     // Capture the mouse so the scroll wheel scrolls the transcript viewport
@@ -183,6 +198,16 @@ pub async fn run(
     // click-drag text selection on exit.
     let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
+    // After the alternate screen is gone, print a compact farewell to the normal
+    // terminal (opencode-style) on a deliberate quit, so the session id and how
+    // to resume it stay in scrollback. Skipped on stdin close or error exits,
+    // where `should_quit` was never set. An empty conversation was never
+    // persisted, so it prints the wordmark only — never a thread id `/session`
+    // could not find.
+    if app.should_quit {
+        let session = (!app.conversation.is_empty()).then(|| app.conversation.thread_id.0.as_ref());
+        farewell::print(&app.palette, session);
+    }
     outcome
 }
 
@@ -224,65 +249,100 @@ async fn event_loop(
     // never freezes input or rendering; their user-facing outcome flows back
     // here as a [`LoopMsg`]. The loop keeps a sender so `recv()` never ends.
     let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel::<LoopMsg>(16);
+    // Repaint only when state changed. Streaming `ItemDelta`s deliberately do
+    // NOT mark dirty: the reveal cursor surfaces buffered text on the next tick,
+    // so per-delta repaints coalesce to the 90ms tick instead of one draw per
+    // token. `dirty` starts true so the first frame always paints.
+    let mut dirty = true;
     loop {
-        terminal.draw(|frame| ui::draw(frame, app))?;
+        if dirty {
+            terminal.draw(|frame| ui::draw(frame, app))?;
+            dirty = false;
+        }
         if app.should_quit {
             return Ok(());
         }
 
         tokio::select! {
-            maybe_input = term_events.next() => match maybe_input {
-                Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
-                    let action = app.on_key(key);
-                    perform(client, app, action, &cmd_tx);
-                }
-                Some(Ok(Event::Paste(text))) => app.input.insert_str(&text),
-                Some(Ok(Event::Mouse(mouse))) => {
-                    // Scroll wheel adjusts the transcript scrollback.
-                    match mouse.kind {
-                        MouseEventKind::ScrollUp => {
-                            app.scrollback = app.scrollback.saturating_add(3);
-                        }
-                        MouseEventKind::ScrollDown => {
-                            app.scrollback = app.scrollback.saturating_sub(3);
-                        }
-                        // A left click on the welcome logo sends a ripple from
-                        // the click point. The hit-rect is only honored while
-                        // the welcome screen is live, so a stale rect cannot
-                        // fire a phantom ripple.
-                        MouseEventKind::Down(MouseButton::Left) => {
-                            let hit = app.logo_hit.get();
-                            if app.welcome_active()
-                                && let Some(rect) = hit
-                                && rect.contains(ratatui::layout::Position {
-                                    x: mouse.column,
-                                    y: mouse.row,
-                                })
-                            {
-                                app.trigger_logo_pulse(
-                                    mouse.column.saturating_sub(rect.x),
-                                    mouse.row.saturating_sub(rect.y),
-                                );
-                            }
-                        }
-                        _ => {} // other clicks / moves: redraw next loop
+            maybe_input = term_events.next() => {
+                match maybe_input {
+                    Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
+                        let action = app.on_key(key);
+                        perform(client, app, action, &cmd_tx);
                     }
+                    Some(Ok(Event::Paste(text))) => app.input.insert_str(&text),
+                    Some(Ok(Event::Mouse(mouse))) => {
+                        // Scroll wheel adjusts the transcript scrollback.
+                        match mouse.kind {
+                            MouseEventKind::ScrollUp => {
+                                app.scrollback = app.scrollback.saturating_add(3);
+                            }
+                            MouseEventKind::ScrollDown => {
+                                app.scrollback = app.scrollback.saturating_sub(3);
+                            }
+                            // A left click on the welcome logo sends a ripple from
+                            // the click point. The hit-rect is only honored while
+                            // the welcome screen is live, so a stale rect cannot
+                            // fire a phantom ripple. Off the welcome screen, a
+                            // left press begins a transcript text selection.
+                            MouseEventKind::Down(MouseButton::Left) => {
+                                let hit = app.logo_hit.get();
+                                if app.welcome_active()
+                                    && let Some(rect) = hit
+                                    && rect.contains(ratatui::layout::Position {
+                                        x: mouse.column,
+                                        y: mouse.row,
+                                    })
+                                {
+                                    app.spawn_logo_ripple(
+                                        mouse.column.saturating_sub(rect.x),
+                                        mouse.row.saturating_sub(rect.y),
+                                    );
+                                } else if !app.welcome_active() {
+                                    app.selection_start(mouse.column, mouse.row);
+                                }
+                            }
+                            // Drag extends the selection; release ends the drag
+                            // (the selection persists for a subsequent Ctrl+C).
+                            MouseEventKind::Drag(MouseButton::Left) => {
+                                app.selection_update(mouse.column, mouse.row);
+                            }
+                            MouseEventKind::Up(MouseButton::Left) => {
+                                app.selection_finish();
+                            }
+                            _ => {} // other clicks / moves
+                        }
+                    }
+                    Some(Ok(_)) => {}            // resize / focus
+                    Some(Err(err)) => {
+                        app.flash = Some(format!("input error: {err}"));
+                    }
+                    None => return Ok(()),        // stdin closed
                 }
-                Some(Ok(_)) => {}            // resize / focus: redraw next loop
-                Some(Err(err)) => {
-                    app.flash = Some(format!("input error: {err}"));
-                }
-                None => return Ok(()),        // stdin closed
-            },
-            maybe_event = engine_events.next_event(), if engine_alive => {
-                engine_alive = handle_engine(app, maybe_event, client, &cmd_tx);
+                // Any handled terminal event warrants a repaint.
+                dirty = true;
             }
-            Some(msg) = cmd_rx.recv() => apply_loop_msg(app, msg),
-            // Animate while busy (the spinner) or while a logo ripple is
-            // playing. Any other idle TUI — including the static welcome
-            // screen — parks the timer so it burns zero CPU until the next
-            // input or engine event arrives.
-            _ = ticker.tick(), if app.conversation.busy || app.logo_pulse > 0 => app.tick(),
+            maybe_event = engine_events.next_event(), if engine_alive => {
+                let (alive, redraw) = handle_engine(app, maybe_event, client, &cmd_tx);
+                engine_alive = alive;
+                dirty |= redraw;
+            }
+            Some(msg) = cmd_rx.recv() => {
+                apply_loop_msg(app, msg);
+                dirty = true;
+            }
+            // Animate while busy (the spinner), while a logo ripple plays, or
+            // while streamed text is still being revealed. A fully idle TUI —
+            // including the static welcome screen — parks the timer so it burns
+            // zero CPU until the next input or engine event arrives.
+            _ = ticker.tick(),
+                if app.conversation.busy
+                    || app.logo.is_active()
+                    || app.conversation.is_revealing() =>
+            {
+                app.tick();
+                dirty = true;
+            }
         }
 
         // After any event, dispatch one queued message when idle following a
@@ -290,28 +350,36 @@ async fn event_loop(
         // so a 90ms tick cannot fire the same message twice).
         if let Some(text) = app.take_next_queued() {
             perform(client, app, Action::Submit(text), &cmd_tx);
+            dirty = true;
         }
     }
 }
 
-/// Applies one engine stream item; returns `false` once the stream has ended.
+/// Applies one engine stream item, returning `(engine_alive, dirty)`.
+///
+/// `engine_alive` is `false` once the stream has ended. `dirty` is `false` only
+/// for an `ItemDelta` — whose repaint is coalesced to the next reveal tick — and
+/// `true` for every other event, so finalized items and lifecycle changes paint
+/// immediately.
 fn handle_engine(
     app: &mut App,
     event: Option<ClientEvent>,
     client: &Client,
     cmd_tx: &tokio::sync::mpsc::Sender<LoopMsg>,
-) -> bool {
+) -> (bool, bool) {
     match event {
         Some(ClientEvent::Notification(notif)) => {
             let decoded = protocol::decode(&notif.method, notif.params);
+            // Delta repaints are deferred to the reveal tick (see event loop).
+            let redraw = !matches!(decoded, protocol::EngineNotification::ItemDelta { .. });
             app.on_engine(&decoded);
-            true
+            (true, redraw)
         }
         Some(ClientEvent::Disconnected { reason }) => {
             app.on_disconnected();
             app.conversation.last_error = Some(format!("engine disconnected: {reason}"));
             // No flash here: the persistent banner in the footer supersedes it.
-            false
+            (false, true)
         }
         Some(ClientEvent::Lagged(n)) => {
             // A gap swallowed events the engine will NOT re-broadcast (e.g. a
@@ -319,7 +387,7 @@ fn handle_engine(
             // Reset the busy/stream state immediately, then re-sync the view
             // from the persisted history so dropped records reappear.
             app.conversation.busy = false;
-            app.conversation.streaming.clear();
+            app.conversation.clear_streaming();
             app.flash = Some(format!("dropped {n} events (slow render) · re-syncing"));
             let thread = app.conversation.thread_id.clone();
             spawn_rpc(client, cmd_tx, move |client, _tx| async move {
@@ -329,12 +397,12 @@ fn handle_engine(
                     .unwrap_or_default();
                 Some(LoopMsg::Resynced { items, subagents })
             });
-            true
+            (true, true)
         }
         // Stream closed with no terminal event: stop polling this branch.
-        None => false,
+        None => (false, true),
         // Reverse requests are not used on the events-forwarding path; ignore.
-        _ => true,
+        _ => (true, true),
     }
 }
 
@@ -414,6 +482,11 @@ fn perform(
         // Resume restores the thread in the engine, then pulls its history for
         // replay plus any historical subagent children. All round-trips run
         // off-thread; the loop folds the result in.
+        Action::Copy(text) => {
+            // OSC 52 (+ best-effort native fallback). Out-of-band, so writing it
+            // mid-frame between draws cannot corrupt the alternate screen.
+            clipboard::copy(&text);
+        }
         Action::ResumeSession { thread_id } => {
             spawn_rpc(client, cmd_tx, move |client, _tx| async move {
                 if let Err(e) = rpc::resume_thread(&client, &thread_id).await {
@@ -489,6 +562,8 @@ fn apply_loop_msg(app: &mut App, msg: LoopMsg) {
             // pending message queue must survive a mid-session re-sync.
             app.conversation.load_history(items);
             restore_subagent_views(app, subagents);
+            // History was rebuilt, so any selection's line indices are stale.
+            app.clear_selection();
         }
     }
 }

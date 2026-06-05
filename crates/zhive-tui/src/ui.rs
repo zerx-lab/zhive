@@ -16,8 +16,8 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::Paragraph;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use zhive_proto::domain::{
-    CommandExecutionStatus, FileUpdateChange, Item, ItemContent, ItemToolCallContent, NoticeLevel,
-    PatchChangeKind, PlanStepStatus, ToolCallStatus,
+    CommandExecutionStatus, Item, ItemContent, ItemToolCallContent, NoticeLevel, PlanStepStatus,
+    ToolCallStatus,
 };
 
 use crate::app::App;
@@ -28,7 +28,10 @@ use crate::widgets;
 use crate::{markdown, wrap};
 
 /// Width of the left role-glyph gutter, in cells (1 glyph + 1 space).
-const GUTTER: u16 = 2;
+///
+/// Crate-visible because the selection mapping in [`crate::app`] subtracts it to
+/// translate a mouse column into a content-relative cell.
+pub(crate) const GUTTER: u16 = 2;
 
 /// Maximum queued-message preview rows shown above the composer.
 const QUEUE_PREVIEW_ROWS: usize = 3;
@@ -151,7 +154,7 @@ fn render_top_bar(frame: &mut Frame, app: &App, area: Rect) {
             Style::new().fg(p.fg_dim),
         ));
     }
-    // Muted model label — a single brand accent (the `⚡ zap` mark) is enough;
+    // Muted model label — a single brand accent (the `⚡ zhive` mark) is enough;
     // a highlighted pill here reads as loud next to it.
     right_spans.push(Span::styled(
         format!("{} · {}", app.config.provider_label, app.config.model_label),
@@ -195,10 +198,31 @@ fn render_body(frame: &mut Frame, app: &App, area: Rect) {
     // get stuck above it when the transcript shrinks (e.g. after /clear).
     let scrollback = app.scrollback.min(max_scroll);
     let scroll_y = max_scroll.saturating_sub(scrollback);
+
+    // Capture geometry + per-line body text for mouse selection. The text clone
+    // is gated on an active selection (there is always a redraw between
+    // mouse-down and copy), so an idle transcript pays nothing.
+    //
+    // LOAD-BEARING: the lines are already wrapped to `inner.width`, so the
+    // `Paragraph` below must NOT call `.wrap()` — one transcript line is exactly
+    // one screen row, which is what makes `scroll_y + row` an exact line index
+    // for both the hit-test and the highlight. Adding wrapping breaks selection.
+    app.sel_geom.set(crate::app::SelGeom::new(inner, scroll_y));
+    if app.selection.is_some() {
+        let mut body = app.sel_lines.borrow_mut();
+        body.clear();
+        body.extend(lines.iter().map(line_body_text));
+    }
+
     frame.render_widget(
         Paragraph::new(Text::from(lines)).scroll((scroll_y, 0)),
         inner,
     );
+
+    // Overpaint the selection background on top of the rendered text.
+    if let Some(sel) = app.selection {
+        paint_selection(frame, app, inner, scroll_y, sel);
+    }
 
     // Scroll-to-bottom affordance when the view is not pinned to the tail.
     if scrollback > 0 && inner.height > 0 {
@@ -219,6 +243,68 @@ fn render_body(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
+/// Plain body text of a transcript line, with the role gutter removed.
+///
+/// Concatenates the line's spans and drops the leading [`GUTTER`] display
+/// columns (the role glyph + pad, or the blank continuation gutter) so copied
+/// text never carries the gutter.
+fn line_body_text(line: &Line<'_>) -> String {
+    let full: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+    drop_leading_cells(&full, GUTTER).to_owned()
+}
+
+/// Returns `text` with its first `cells` display columns removed.
+///
+/// Width-aware so a wide leading glyph is skipped by its true column span.
+fn drop_leading_cells(text: &str, cells: u16) -> &str {
+    let target = u32::from(cells);
+    let mut col: u32 = 0;
+    for (idx, ch) in text.char_indices() {
+        if col >= target {
+            return text.get(idx..).unwrap_or("");
+        }
+        col += u32::try_from(ch.width().unwrap_or(0)).unwrap_or(0);
+    }
+    ""
+}
+
+/// Overpaints the selection background onto the visible transcript rows.
+///
+/// Sets the background of each selected content cell to `sel_bg`. Uses
+/// [`ratatui::buffer::Buffer::cell_mut`] so an out-of-bounds cell is skipped
+/// rather than panicking.
+fn paint_selection(
+    frame: &mut Frame,
+    app: &App,
+    body: Rect,
+    scroll_y: u16,
+    sel: crate::app::Selection,
+) {
+    let sel_bg = app.palette.sel_bg;
+    let lines = app.sel_lines.borrow();
+    let content_x0 = body.x.saturating_add(GUTTER);
+    let right = body.x.saturating_add(body.width);
+    let buf = frame.buffer_mut();
+    for row in 0..body.height {
+        let line_idx = usize::from(scroll_y) + usize::from(row);
+        let Some(text) = lines.get(line_idx) else {
+            break;
+        };
+        let line_width = u16::try_from(UnicodeWidthStr::width(text.as_str())).unwrap_or(u16::MAX);
+        let Some((from, to)) = crate::app::cell_range_for_line(sel, line_idx, line_width) else {
+            continue;
+        };
+        let y = body.y.saturating_add(row);
+        let start = content_x0.saturating_add(from);
+        let end = content_x0.saturating_add(to).min(right);
+        for x in start..end {
+            if let Some(cell) = buf.cell_mut((x, y)) {
+                cell.set_bg(sel_bg);
+            }
+        }
+    }
+}
+
 /// The tool name the engine uses for a subagent spawn (drives summary inlining).
 const SUBAGENT_TOOL_NAME: &str = "agent";
 
@@ -234,7 +320,13 @@ fn transcript_lines(app: &App, inner_width: u16) -> Vec<Line<'static>> {
     for turn in &app.conversation.turns {
         for item in &turn.items {
             let (label, color) = role_of(item, p);
-            let body = item_body(item, app.details_expanded, p, content_width);
+            let body = item_body(
+                item,
+                app.details_expanded,
+                p,
+                content_width,
+                &app.render_cache,
+            );
             push_message(&mut out, label, color, body);
             if is_subagent_call(item)
                 && let Some(sub) = app.conversation.subagents.get(next_subagent)
@@ -262,15 +354,18 @@ fn transcript_lines(app: &App, inner_width: u16) -> Vec<Line<'static>> {
     }
 
     if app.conversation.busy {
-        let body = if app.conversation.streaming.is_empty() {
+        let body = if app.conversation.revealed_streaming().is_empty() {
             vec![Line::styled(
                 format!("{} thinking…", widgets::spinner(app.spinner_tick)),
                 Style::new().fg(p.fg_dim),
             )]
         } else {
             // Render the live partial text as markdown with a trailing cursor.
+            // Heal the tail first so an unclosed marker mid-stream renders in its
+            // eventual style instead of flashing a literal `**` / `` ` `` / `[`.
+            let healed = crate::heal::heal_tail(app.conversation.revealed_streaming());
             let mut lines = Vec::new();
-            for line in markdown::render(&app.conversation.streaming, p) {
+            for line in markdown::render(&healed, p) {
                 lines.extend(wrap::wrap_line(&line, content_width));
             }
             if let Some(last) = lines.last_mut() {
@@ -382,12 +477,22 @@ fn role_of(item: &Item, p: &Palette) -> (&'static str, ratatui::style::Color) {
 ///
 /// `expanded` controls whether a `/skill:<name>` invocation message shows its
 /// full injected block (ctrl+o) or a one-line `[skill] <name>` chip.
-fn item_body(item: &Item, expanded: bool, p: &Palette, width: u16) -> Vec<Line<'static>> {
+#[expect(
+    clippy::too_many_lines,
+    reason = "exhaustive per-Item-variant dispatch; splitting would scatter related arms"
+)]
+fn item_body(
+    item: &Item,
+    expanded: bool,
+    p: &Palette,
+    width: u16,
+    cache: &crate::render_cache::MarkdownCache,
+) -> Vec<Line<'static>> {
     match item {
         Item::UserMessage { content, .. } => user_message_lines(content, expanded, p, width),
         Item::AgentMessage { text, .. } => {
             let mut out = Vec::new();
-            for line in markdown::render(text, p) {
+            for line in cache.render(text, p) {
                 out.extend(wrap::wrap_line(&line, width));
             }
             out
@@ -441,14 +546,21 @@ fn item_body(item: &Item, expanded: bool, p: &Palette, width: u16) -> Vec<Line<'
             old_text,
             new_text,
             ..
-        } => diff_lines(
+        } => crate::diff::render_file_diff(
             path.to_string_lossy().as_ref(),
             old_text.as_deref(),
-            new_text,
+            Some(new_text.as_str()),
+            expanded,
             p,
             width,
         ),
-        Item::FileEdit { changes, .. } => file_edit_lines(changes, p),
+        Item::FileEdit { changes, .. } => {
+            let mut out = Vec::new();
+            for change in changes {
+                out.extend(crate::diff::render_file_change(change, expanded, p, width));
+            }
+            out
+        }
         Item::Plan { steps, .. } => steps
             .iter()
             .map(|s| {
@@ -803,270 +915,6 @@ fn command_lines(
     out
 }
 
-/// Renders a unified-diff view for `Item::Diff`, coloring +/- lines with
-/// the theme's `diff_add_bg` / `diff_del_bg` tokens.
-fn diff_lines(
-    path: &str,
-    old_text: Option<&str>,
-    new_text: &str,
-    p: &Palette,
-    width: u16,
-) -> Vec<Line<'static>> {
-    let mut out = Vec::new();
-
-    // File header line.
-    out.push(Line::from(vec![
-        Span::styled("± ", Style::new().fg(p.info)),
-        Span::styled(
-            path.to_owned(),
-            Style::new().fg(p.info).add_modifier(Modifier::BOLD),
-        ),
-    ]));
-
-    // Generate and render unified diff lines.
-    let unified = build_unified_diff(old_text.unwrap_or(""), new_text);
-    for diff_line in unified {
-        let styled = style_diff_line(&diff_line, p, width);
-        out.push(styled);
-    }
-
-    out
-}
-
-/// A single classified diff output line.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DiffLineKind {
-    /// A line added in the new version (`+` prefix).
-    Add,
-    /// A line removed from the old version (`-` prefix).
-    Del,
-    /// An unchanged context line (` ` prefix).
-    Context,
-    /// A hunk header (`@@` range line).
-    Header,
-}
-
-/// Classifies a raw diff output line by its leading character.
-#[must_use]
-fn classify_diff_line(line: &str) -> DiffLineKind {
-    if line.starts_with('+') {
-        DiffLineKind::Add
-    } else if line.starts_with('-') {
-        DiffLineKind::Del
-    } else if line.starts_with("@@") {
-        DiffLineKind::Header
-    } else {
-        DiffLineKind::Context
-    }
-}
-
-/// Converts a raw diff line into a styled ratatui [`Line`].
-fn style_diff_line(raw: &str, p: &Palette, _width: u16) -> Line<'static> {
-    match classify_diff_line(raw) {
-        DiffLineKind::Add => Line::from(vec![Span::styled(
-            raw.to_owned(),
-            Style::new().fg(p.diff_add_fg).bg(p.diff_add_bg),
-        )]),
-        DiffLineKind::Del => Line::from(vec![Span::styled(
-            raw.to_owned(),
-            Style::new().fg(p.diff_del_fg).bg(p.diff_del_bg),
-        )]),
-        DiffLineKind::Header => Line::from(vec![Span::styled(
-            raw.to_owned(),
-            Style::new().fg(p.accent).add_modifier(Modifier::BOLD),
-        )]),
-        DiffLineKind::Context => Line::from(vec![Span::styled(
-            raw.to_owned(),
-            Style::new().fg(p.diff_ctx_fg),
-        )]),
-    }
-}
-
-/// Builds a minimal unified-diff between `old` and `new`.
-///
-/// Uses a simple LCS-based diff limited to 3-line context windows.
-/// Does not introduce any external dependency — the diff is computed
-/// entirely with stdlib slices.
-fn build_unified_diff(old: &str, new_text: &str) -> Vec<String> {
-    /// Lines of context to show around each changed hunk.
-    const CONTEXT: usize = 3;
-
-    let old_lines: Vec<&str> = old.lines().collect();
-    let new_lines: Vec<&str> = new_text.lines().collect();
-
-    // Compute edit script via Myers-style shortest-edit-sequence.
-    let edits = compute_edits(&old_lines, &new_lines);
-
-    // Group edits into hunks with context.
-    group_into_hunks(&old_lines, &new_lines, &edits, CONTEXT)
-}
-
-/// Edit operation for one line in the old/new sequence.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Edit {
-    /// Keep line at `old_idx` (appears in both sides).
-    Keep { old_idx: usize, new_idx: usize },
-    /// Delete line `old_idx` (only in old).
-    Delete { old_idx: usize },
-    /// Insert line `new_idx` (only in new).
-    Insert { new_idx: usize },
-}
-
-/// Computes the edit script between two line slices using a greedy LCS.
-///
-/// Returns an ordered list of [`Edit`] operations.
-fn compute_edits(old: &[&str], new_s: &[&str]) -> Vec<Edit> {
-    // Build the longest-common-subsequence table.
-    let m = old.len();
-    let n = new_s.len();
-    // `dp[i][j]` = LCS length of `old[..i]` vs `new[..j]`.
-    let mut dp = vec![vec![0usize; n + 1]; m + 1];
-    for i in (0..m).rev() {
-        for j in (0..n).rev() {
-            dp[i][j] = if old[i] == new_s[j] {
-                dp[i + 1][j + 1] + 1
-            } else {
-                dp[i + 1][j].max(dp[i][j + 1])
-            };
-        }
-    }
-
-    // Trace back the edit script.
-    let mut edits = Vec::new();
-    let (mut i, mut j) = (0usize, 0usize);
-    while i < m || j < n {
-        if i < m && j < n && old[i] == new_s[j] {
-            edits.push(Edit::Keep {
-                old_idx: i,
-                new_idx: j,
-            });
-            i += 1;
-            j += 1;
-        } else if j < n && (i >= m || dp[i + 1][j] <= dp[i][j + 1]) {
-            edits.push(Edit::Insert { new_idx: j });
-            j += 1;
-        } else {
-            edits.push(Edit::Delete { old_idx: i });
-            i += 1;
-        }
-    }
-    edits
-}
-
-/// Emits unified-diff output strings from an edit script.
-fn group_into_hunks(old: &[&str], new_s: &[&str], edits: &[Edit], context: usize) -> Vec<String> {
-    if edits.is_empty() {
-        return Vec::new();
-    }
-
-    // Identify changed positions in the edit list.
-    let changed: Vec<usize> = edits
-        .iter()
-        .enumerate()
-        .filter(|(_, e)| !matches!(e, Edit::Keep { .. }))
-        .map(|(i, _)| i)
-        .collect();
-
-    if changed.is_empty() {
-        return Vec::new();
-    }
-
-    // Build hunk ranges [start, end) with context padding.
-    let mut hunk_ranges: Vec<(usize, usize)> = Vec::new();
-    let mut start = changed[0].saturating_sub(context);
-    let mut end = (changed[0] + context + 1).min(edits.len());
-    for &ci in &changed[1..] {
-        if ci.saturating_sub(context) <= end {
-            end = (ci + context + 1).min(edits.len());
-        } else {
-            hunk_ranges.push((start, end));
-            start = ci.saturating_sub(context);
-            end = (ci + context + 1).min(edits.len());
-        }
-    }
-    hunk_ranges.push((start, end));
-
-    let mut out = Vec::new();
-    for (hstart, hend) in hunk_ranges {
-        // Compute old/new line number ranges for the @@ header.
-        let old_start = hunk_old_start(&edits[hstart..hend]);
-        let new_start = hunk_new_start(&edits[hstart..hend]);
-        let old_count = edits[hstart..hend]
-            .iter()
-            .filter(|e| matches!(e, Edit::Keep { .. } | Edit::Delete { .. }))
-            .count();
-        let new_count = edits[hstart..hend]
-            .iter()
-            .filter(|e| matches!(e, Edit::Keep { .. } | Edit::Insert { .. }))
-            .count();
-        out.push(format!(
-            "@@ -{old_start},{old_count} +{new_start},{new_count} @@"
-        ));
-        for edit in &edits[hstart..hend] {
-            match edit {
-                Edit::Keep { old_idx, .. } => out.push(format!(" {}", old[*old_idx])),
-                Edit::Delete { old_idx } => out.push(format!("-{}", old[*old_idx])),
-                Edit::Insert { new_idx } => out.push(format!("+{}", new_s[*new_idx])),
-            }
-        }
-    }
-    out
-}
-
-/// First old-file line number (1-based) referenced in a hunk's edit slice.
-fn hunk_old_start(slice: &[Edit]) -> usize {
-    for e in slice {
-        match e {
-            Edit::Keep { old_idx, .. } | Edit::Delete { old_idx } => {
-                return old_idx + 1;
-            }
-            Edit::Insert { .. } => {}
-        }
-    }
-    1
-}
-
-/// First new-file line number (1-based) referenced in a hunk's edit slice.
-fn hunk_new_start(slice: &[Edit]) -> usize {
-    for e in slice {
-        match e {
-            Edit::Keep { new_idx, .. } | Edit::Insert { new_idx } => {
-                return new_idx + 1;
-            }
-            Edit::Delete { .. } => {}
-        }
-    }
-    1
-}
-
-/// Renders a `FileEdit` as one line per changed file.
-fn file_edit_lines(changes: &[FileUpdateChange], p: &Palette) -> Vec<Line<'static>> {
-    if changes.is_empty() {
-        return vec![Line::styled(
-            "✎ file edit · no changes",
-            Style::new().fg(p.info),
-        )];
-    }
-    let mut out = Vec::new();
-    for change in changes {
-        let (mark, color) = match change.kind {
-            PatchChangeKind::Create => ("+", p.diff_add_fg),
-            PatchChangeKind::Delete => ("-", p.diff_del_fg),
-            PatchChangeKind::Rename => ("↷", p.warn),
-            PatchChangeKind::Update | _ => ("~", p.info),
-        };
-        let path = change.path.to_string_lossy();
-        out.push(Line::from(vec![
-            Span::styled(
-                format!("{mark} "),
-                Style::new().fg(color).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(path.into_owned(), Style::new().fg(p.fg)),
-        ]));
-    }
-    out
-}
-
 /// Short stable name for an item kind, for fallback rendering.
 fn item_kind_name(item: &Item) -> &'static str {
     match item {
@@ -1108,10 +956,10 @@ fn wrap_plain(text: &str, style: Style, width: u16) -> Vec<Line<'static>> {
 /// One-line tagline shown under the welcome wordmark.
 const WELCOME_TAGLINE: &str = "the terminal coding agent";
 
-/// Renders the welcome screen: a centered `ZAP` wordmark over a tagline.
+/// Renders the welcome screen: a centered `ZHIVE` wordmark over a tagline.
 ///
-/// The block-letter logo carries a blue→violet gradient and plays a white
-/// ripple from the click point on a left click (see [`crate::logo`]); a muted
+/// The block-letter logo is a single muted gray and plays a white ripple from
+/// the click point on a left click (see [`crate::logo`]); a muted
 /// tagline sits one row below. The logo's screen rect is recorded in
 /// [`App::logo_hit`] so the event loop can hit-test clicks; it is cleared first
 /// and only re-set when the group fits, so a too-small body never leaves a
@@ -1136,7 +984,7 @@ fn render_welcome(frame: &mut Frame, app: &App, area: Rect) {
         width: logo::WIDTH,
         height: logo::HEIGHT,
     };
-    let lines = logo::render(app.logo_pulse, app.logo_origin.0, app.logo_origin.1);
+    let lines = app.logo.render();
     frame.render_widget(Paragraph::new(Text::from(lines)), logo_area);
     app.logo_hit.set(Some(logo_area));
 
@@ -1313,50 +1161,6 @@ mod tests {
 
         let expanded = skill_invocation_lines("commit", raw, true, &p, 80);
         assert!(expanded.len() > 1, "expanded shows the header plus body");
-    }
-
-    // ---- diff classification ----
-
-    #[test]
-    fn diff_classify_add() {
-        assert_eq!(classify_diff_line("+new line"), DiffLineKind::Add);
-    }
-
-    #[test]
-    fn diff_classify_del() {
-        assert_eq!(classify_diff_line("-old line"), DiffLineKind::Del);
-    }
-
-    #[test]
-    fn diff_classify_context() {
-        assert_eq!(classify_diff_line(" ctx line"), DiffLineKind::Context);
-    }
-
-    #[test]
-    fn diff_classify_header() {
-        assert_eq!(classify_diff_line("@@ -1,3 +1,4 @@"), DiffLineKind::Header);
-    }
-
-    // ---- unified diff generation ----
-
-    #[test]
-    fn build_unified_diff_identical_files_empty() {
-        let diff = build_unified_diff("a\nb\n", "a\nb\n");
-        assert!(diff.is_empty(), "no diff for identical content");
-    }
-
-    #[test]
-    fn build_unified_diff_added_line() {
-        let diff = build_unified_diff("a\n", "a\nb\n");
-        let has_add = diff.iter().any(|l| l.starts_with('+'));
-        assert!(has_add);
-    }
-
-    #[test]
-    fn build_unified_diff_deleted_line() {
-        let diff = build_unified_diff("a\nb\n", "a\n");
-        let has_del = diff.iter().any(|l| l.starts_with('-'));
-        assert!(has_del);
     }
 
     #[test]

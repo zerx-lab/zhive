@@ -6,7 +6,7 @@
 //! client. Keeping side effects out of `App` (no `Client` here) makes the whole
 //! reducer unit-testable without a running engine.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
@@ -55,6 +55,11 @@ pub enum Action {
         /// The thread to resume.
         thread_id: zhive_proto::domain::ThreadId,
     },
+    /// Write `text` to the system clipboard (transcript selection or `/copy`).
+    ///
+    /// The event loop performs the actual OSC 52 / native clipboard write; the
+    /// reducer only decides *what* to copy so it stays free of terminal I/O.
+    Copy(String),
 }
 
 /// Which set of persisted sessions the `/session` picker lists.
@@ -91,6 +96,168 @@ impl SessionFilter {
             Self::Cwd => "cwd",
         }
     }
+}
+
+/// A transcript text selection, in content-relative coordinates.
+///
+/// Each endpoint is `(line_idx, cell_x)`, where `line_idx` indexes the fully
+/// wrapped transcript lines — so the selection survives scrolling — and `cell_x`
+/// is the display column counted from the first *body* cell (after the role
+/// gutter). `anchor` is where the drag began; `cursor` follows the pointer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Selection {
+    /// Where the drag started.
+    anchor: (usize, u16),
+    /// Where the pointer currently is.
+    cursor: (usize, u16),
+    /// `true` while the mouse button is held (a drag is in progress).
+    dragging: bool,
+}
+
+impl Selection {
+    /// Returns the endpoints ordered so the first is `<=` the second.
+    ///
+    /// `(usize, u16)` orders lexicographically — by line, then column — which is
+    /// exactly reading order.
+    fn ordered(self) -> ((usize, u16), (usize, u16)) {
+        if self.anchor <= self.cursor {
+            (self.anchor, self.cursor)
+        } else {
+            (self.cursor, self.anchor)
+        }
+    }
+}
+
+/// Transcript render geometry captured each frame for mouse→line mapping.
+///
+/// Set by the body renderer (which only borrows `&App`) and read by the event
+/// loop when translating a mouse position into a selection endpoint. Mirrors the
+/// [`App::logo_hit`] render-to-handler hand-off.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct SelGeom {
+    /// Inner rect of the conversation body (excludes the panel border).
+    body: Rect,
+    /// Index of the transcript line shown at the top row of `body`.
+    scroll_y: u16,
+}
+
+impl SelGeom {
+    /// Builds geometry from the body rect and top-line index.
+    pub(crate) fn new(body: Rect, scroll_y: u16) -> Self {
+        Self { body, scroll_y }
+    }
+}
+
+/// Maps a mouse cell to a content-relative `(line_idx, cell_x)`, if inside `body`.
+///
+/// Clicks landing in the role gutter clamp to column 0. Returns `None` when the
+/// position is outside the transcript body.
+fn hit_to_content(geom: SelGeom, col: u16, row: u16) -> Option<(usize, u16)> {
+    let body = geom.body;
+    if body.width == 0 || body.height == 0 {
+        return None;
+    }
+    let inside = col >= body.x
+        && col < body.x.saturating_add(body.width)
+        && row >= body.y
+        && row < body.y.saturating_add(body.height);
+    if !inside {
+        return None;
+    }
+    let line_idx = usize::from(geom.scroll_y) + usize::from(row - body.y);
+    let content_x0 = body.x.saturating_add(crate::ui::GUTTER);
+    let cell_x = col.saturating_sub(content_x0);
+    Some((line_idx, cell_x))
+}
+
+/// Like [`hit_to_content`] but clamps the position into `body` first.
+///
+/// Used while dragging so the selection keeps tracking when the pointer strays
+/// just past the body's edges.
+fn hit_to_content_clamped(geom: SelGeom, col: u16, row: u16) -> Option<(usize, u16)> {
+    let body = geom.body;
+    if body.width == 0 || body.height == 0 {
+        return None;
+    }
+    let col = col.clamp(body.x, body.x.saturating_add(body.width).saturating_sub(1));
+    let row = row.clamp(body.y, body.y.saturating_add(body.height).saturating_sub(1));
+    hit_to_content(geom, col, row)
+}
+
+/// Returns the content-cell range `[from, to)` selected on `line_idx`, if any.
+///
+/// `line_width` bounds full-line rows (interior lines of a multi-line
+/// selection). Returns `None` for lines outside the selection or with an empty
+/// range (e.g. a blank line), so the highlight paints nothing there.
+pub(crate) fn cell_range_for_line(
+    sel: Selection,
+    line_idx: usize,
+    line_width: u16,
+) -> Option<(u16, u16)> {
+    let (lo, hi) = sel.ordered();
+    if line_idx < lo.0 || line_idx > hi.0 {
+        return None;
+    }
+    let from = if line_idx == lo.0 { lo.1 } else { 0 };
+    let to = if line_idx == hi.0 { hi.1 } else { line_width };
+    let from = from.min(line_width);
+    let to = to.min(line_width);
+    if to <= from {
+        return None;
+    }
+    Some((from, to))
+}
+
+/// Extracts the selected text from the per-line body texts.
+///
+/// Joins the sliced lines with `\n`. Line indices are clamped to `lines` as a
+/// backstop against a stale selection. A zero-width selection yields `""`.
+fn extract_selection(sel: Selection, lines: &[String]) -> String {
+    if lines.is_empty() {
+        return String::new();
+    }
+    let (lo, hi) = sel.ordered();
+    let last = lines.len() - 1;
+    let lo_line = lo.0.min(last);
+    let hi_line = hi.0.min(last);
+    let mut out = String::new();
+    for line_idx in lo_line..=hi_line {
+        let text = lines.get(line_idx).map_or("", String::as_str);
+        let from = if line_idx == lo_line { lo.1 } else { 0 };
+        let to = if line_idx == hi_line { hi.1 } else { u16::MAX };
+        out.push_str(slice_by_cells(text, from, to));
+        if line_idx != hi_line {
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// Returns the substring of `text` whose display columns fall in `[from, to)`.
+///
+/// Width-aware: a char is included when its *starting* column is within range,
+/// so the selection snaps to character boundaries. Returns `""` when the range
+/// is empty or starts past the text.
+fn slice_by_cells(text: &str, from_cell: u16, to_cell: u16) -> &str {
+    use unicode_width::UnicodeWidthChar;
+    if to_cell <= from_cell {
+        return "";
+    }
+    let from = u32::from(from_cell);
+    let to = u32::from(to_cell);
+    let mut col: u32 = 0;
+    let mut start_byte: Option<usize> = None;
+    for (idx, ch) in text.char_indices() {
+        if start_byte.is_none() && col >= from {
+            start_byte = Some(idx);
+        }
+        if start_byte.is_some() && col >= to {
+            // First char at or past `to` ends the slice (exclusive).
+            return start_byte.map_or("", |s| text.get(s..idx).unwrap_or(""));
+        }
+        col += u32::try_from(ch.width().unwrap_or(0)).unwrap_or(0);
+    }
+    start_byte.map_or("", |s| text.get(s..).unwrap_or(""))
 }
 
 /// A modal overlay layered above the conversation.
@@ -220,10 +387,11 @@ pub fn builtin_commands() -> Vec<SlashCommand> {
             true,
         ),
         ("compact", "summarize and condense the conversation", false),
+        ("copy", "copy the last assistant message", false),
         ("session", "list and resume past sessions", false),
         ("skills", "browse and run a skill", false),
         ("clear", "start a fresh thread", false),
-        ("quit", "exit zap", false),
+        ("quit", "exit zhive", false),
     ]
     .into_iter()
     .map(|(n, h, a)| SlashCommand::from_static(n, h, a))
@@ -306,18 +474,32 @@ pub struct App {
     /// silently drop) the whole queue. While set, [`App::take_next_queued`]
     /// yields nothing; the user resumes with a blank Enter (which clears it).
     pub queue_halted: bool,
-    /// Remaining frames of the click-triggered logo ripple (0 = at rest).
+    /// Live click ripples on the welcome wordmark (empty at rest).
     ///
-    /// The welcome wordmark is static at rest, so this is the only logo
-    /// animation state; the render loop ticks only while it is nonzero.
-    pub logo_pulse: u16,
-    /// Wordmark cell `(col, row)` a ripple expands from (the click point).
-    pub logo_origin: (u16, u16),
+    /// The wordmark is static at rest, so this is the only logo animation
+    /// state; the render loop ticks only while a ripple is playing. Each left
+    /// click spawns an independent ripple, so rapid clicks layer without
+    /// cancelling one another.
+    pub(crate) logo: crate::logo::Ripples,
     /// Screen rect of the welcome logo, recorded each render for click hit-tests.
     ///
     /// Set by the welcome renderer (which only borrows `&App`) and read by the
     /// event loop on a left click; honored only while [`Self::welcome_active`].
     pub logo_hit: Cell<Option<Rect>>,
+    /// Memoizes finalized-message markdown renders (cleared on palette change).
+    pub(crate) render_cache: crate::render_cache::MarkdownCache,
+    /// Active transcript text selection, if the user is selecting/has selected.
+    ///
+    /// Coordinates are content-relative (see [`Selection`]); `None` at rest. The
+    /// body renderer paints the highlight and the event loop drives drag updates.
+    pub(crate) selection: Option<Selection>,
+    /// Transcript geometry from the last frame, for mouse→line mapping.
+    pub(crate) sel_geom: Cell<SelGeom>,
+    /// Per-line body text (gutter stripped) from the last frame.
+    ///
+    /// Populated only while a [`Self::selection`] exists (there is always a
+    /// redraw between mouse-down and copy), so an idle TUI pays nothing.
+    pub(crate) sel_lines: RefCell<Vec<String>>,
 }
 
 impl App {
@@ -358,9 +540,12 @@ impl App {
             skills: Vec::new(),
             message_queue: std::collections::VecDeque::new(),
             queue_halted: false,
-            logo_pulse: 0,
-            logo_origin: (0, 0),
+            logo: crate::logo::Ripples::default(),
             logo_hit: Cell::new(None),
+            render_cache: crate::render_cache::MarkdownCache::default(),
+            selection: None,
+            sel_geom: Cell::new(SelGeom::default()),
+            sel_lines: RefCell::new(Vec::new()),
             config,
         }
     }
@@ -495,13 +680,15 @@ impl App {
 
     /// Advances animation clocks; called on each redraw tick.
     ///
-    /// A running logo ripple counts down, and the spinner only moves while a
+    /// Live logo ripples age (and prune), and the spinner only moves while a
     /// turn is in flight. At rest neither moves, so the loop parks the timer.
     pub fn tick(&mut self) {
-        self.logo_pulse = self.logo_pulse.saturating_sub(1);
+        self.logo.tick();
         if self.conversation.busy {
             self.spinner_tick = self.spinner_tick.wrapping_add(1);
         }
+        // Surface a slice more of the streamed buffer each tick (smooth reveal).
+        self.conversation.advance_reveal();
     }
 
     /// Returns `true` while the welcome screen is the active view.
@@ -525,10 +712,91 @@ impl App {
         self.conversation.is_empty() && self.overlay.is_none()
     }
 
-    /// Starts a click ripple from wordmark cell `(col, row)`.
-    pub fn trigger_logo_pulse(&mut self, col: u16, row: u16) {
-        self.logo_pulse = crate::logo::SWEEP_FRAMES;
-        self.logo_origin = (col, row);
+    /// Spawns a click ripple from wordmark cell `(col, row)`.
+    ///
+    /// Independent of any ripple already playing, so rapid clicks accumulate
+    /// into a continuous shimmer rather than cancelling one another.
+    pub fn spawn_logo_ripple(&mut self, col: u16, row: u16) {
+        self.logo.spawn(col, row);
+    }
+
+    /// Begins a transcript selection at a mouse cell, if it hit the body.
+    ///
+    /// Replaces any prior selection. A no-op when the click lands outside the
+    /// transcript (e.g. the composer), leaving an existing selection intact.
+    pub(crate) fn selection_start(&mut self, col: u16, row: u16) {
+        if let Some(hit) = hit_to_content(self.sel_geom.get(), col, row) {
+            self.selection = Some(Selection {
+                anchor: hit,
+                cursor: hit,
+                dragging: true,
+            });
+        }
+    }
+
+    /// Extends the in-progress selection to a mouse cell while dragging.
+    pub(crate) fn selection_update(&mut self, col: u16, row: u16) {
+        let geom = self.sel_geom.get();
+        let Some(sel) = self.selection.as_mut() else {
+            return;
+        };
+        if sel.dragging
+            && let Some(hit) = hit_to_content_clamped(geom, col, row)
+        {
+            sel.cursor = hit;
+        }
+    }
+
+    /// Ends the drag. A click with no movement selects nothing and is dropped.
+    pub(crate) fn selection_finish(&mut self) {
+        match self.selection {
+            // Zero-width: a plain click. Drop it so `Ctrl+C` still quits and no
+            // stray highlight lingers.
+            Some(sel) if sel.anchor == sel.cursor => self.selection = None,
+            Some(_) => {
+                if let Some(sel) = self.selection.as_mut() {
+                    sel.dragging = false;
+                }
+            }
+            None => {}
+        }
+    }
+
+    /// Whether a transcript selection is currently active.
+    pub(crate) fn has_selection(&self) -> bool {
+        self.selection.is_some()
+    }
+
+    /// Drops any active selection (called when the transcript layout shifts).
+    pub(crate) fn clear_selection(&mut self) {
+        self.selection = None;
+    }
+
+    /// Takes the selected text and clears the selection.
+    ///
+    /// Returns `None` when there is no selection or it is empty, so the caller
+    /// can fall through (e.g. `Ctrl+C` then quits).
+    pub(crate) fn take_selection_text(&mut self) -> Option<String> {
+        let sel = self.selection.take()?;
+        let text = extract_selection(sel, &self.sel_lines.borrow());
+        (!text.is_empty()).then_some(text)
+    }
+
+    /// Copies the most recent assistant message (opencode's `messages.copy`).
+    ///
+    /// Returns [`Action::Copy`] with the message text, or sets a flash and
+    /// returns [`Action::None`] when there is no assistant message yet.
+    fn copy_last_message(&mut self) -> Action {
+        match self.conversation.last_agent_text() {
+            Some(text) if !text.is_empty() => {
+                self.flash = Some("copied last message".to_owned());
+                Action::Copy(text)
+            }
+            _ => {
+                self.flash = Some("no assistant message to copy".to_owned());
+                Action::None
+            }
+        }
     }
 
     /// Re-binds the conversation to a fresh thread (after `/clear` or resume).
@@ -540,6 +808,8 @@ impl App {
         self.scrollback = 0;
         self.message_queue.clear();
         self.queue_halted = false;
+        // The line indices a selection referenced no longer exist.
+        self.selection = None;
     }
 
     /// Records that the engine connection was lost.
@@ -549,6 +819,9 @@ impl App {
     pub fn on_disconnected(&mut self) {
         self.disconnected = true;
         self.conversation.busy = false;
+        // Reset the partial stream + reveal cursor like every other busy->false
+        // transition, so a mid-stream disconnect cannot strand them.
+        self.conversation.clear_streaming();
         // Drop the queue so a reconnect cannot silently fire stale input. The
         // persistent footer banner supersedes any flash, so none is set here.
         self.message_queue.clear();
@@ -814,8 +1087,29 @@ impl App {
         let palette = self.palette_query().is_some();
 
         match key.code {
-            KeyCode::Char('c') if ctrl => Action::Quit,
+            // Ctrl+C copies an active transcript selection (opencode parity).
+            // With no selection it clears a non-empty composer, or does nothing
+            // on an empty one — it never quits. Quitting is Ctrl+D's job, on a
+            // blank composer, so an unfinished message is never lost to a stray
+            // Ctrl+C.
+            KeyCode::Char('c') if ctrl => {
+                if let Some(text) = self.take_selection_text() {
+                    self.flash = Some("copied selection".to_owned());
+                    Action::Copy(text)
+                } else if !self.input.is_blank() {
+                    self.input.clear();
+                    self.palette_index = 0;
+                    Action::None
+                } else {
+                    Action::None
+                }
+            }
             KeyCode::Char('d') if ctrl && self.input.is_blank() => Action::Quit,
+            // Esc clears an active selection first (before turn/queue handling).
+            KeyCode::Esc if self.has_selection() => {
+                self.clear_selection();
+                Action::None
+            }
             KeyCode::Esc => {
                 if self.conversation.busy {
                     // Interrupt the turn; an interrupt also discards the queue
@@ -891,6 +1185,9 @@ impl App {
             // Toggle expansion of every `/skill:<name>` invocation chip.
             KeyCode::Char('o') if ctrl => {
                 self.details_expanded = !self.details_expanded;
+                // Expanding/collapsing chips shifts every line below them, so a
+                // selection's absolute line indices would point at the wrong rows.
+                self.clear_selection();
                 Action::None
             }
             KeyCode::Char(c) if !ctrl => {
@@ -1073,6 +1370,7 @@ impl App {
             "quit" | "exit" | "q" => Action::Quit,
             "clear" | "new" => Action::Clear,
             "compact" => Action::Compact,
+            "copy" => self.copy_last_message(),
             // Open the picker in the default scope (All); Tab toggles to cwd.
             "session" | "resume" => Action::OpenSessionList {
                 filter: SessionFilter::default(),
@@ -1176,6 +1474,7 @@ impl App {
         };
         self.theme = theme;
         self.palette = Palette::resolve(self.theme, self.accent);
+        self.render_cache.clear();
         self.flash = Some(format!("theme: {name:?}"));
     }
 
@@ -1193,15 +1492,19 @@ impl App {
         };
         self.accent = accent;
         self.palette = Palette::resolve(self.theme, self.accent);
+        self.render_cache.clear();
         self.flash = Some(format!("accent: {name:?}"));
     }
 }
 
-/// Filters session entries by a case-insensitive substring of title or preview.
+/// Filters session entries by a case-insensitive substring of id, title, or
+/// preview.
 ///
-/// An empty query matches everything, preserving the newest-first order. Used
-/// by both the `/session` key handler and the overlay renderer so the
-/// highlighted index always lines up with what is drawn.
+/// An empty query matches everything, preserving the newest-first order. The
+/// thread id is matched too so the id printed on the exit farewell is a working
+/// search key (the user can paste it to find the session to resume). Used by
+/// both the `/session` key handler and the overlay renderer so the highlighted
+/// index always lines up with what is drawn.
 ///
 /// # Examples
 ///
@@ -1211,13 +1514,15 @@ impl App {
 /// use zhive_tui::rpc::SessionEntry;
 /// use zhive_proto::domain::ThreadId;
 /// let entries = vec![SessionEntry {
-///     id: ThreadId(Arc::from("thread:native/a")),
+///     id: ThreadId(Arc::from("thread:native/1749106321000-0")),
 ///     title: Some("Refactor".to_owned()),
 ///     preview: "parser cleanup".to_owned(),
 ///     updated_at: 0,
 ///     subagent_parent: None,
 /// }];
 /// assert_eq!(filter_sessions(&entries, "refac").len(), 1);
+/// // The exit-printed thread id is searchable verbatim.
+/// assert_eq!(filter_sessions(&entries, "native/1749106321000-0").len(), 1);
 /// assert_eq!(filter_sessions(&entries, "deploy").len(), 0);
 /// assert_eq!(filter_sessions(&entries, "").len(), 1);
 /// ```
@@ -1233,9 +1538,10 @@ pub fn filter_sessions<'a>(
     entries
         .iter()
         .filter(|e| {
-            e.title
-                .as_deref()
-                .is_some_and(|t| t.to_lowercase().contains(&needle))
+            e.id.0.to_lowercase().contains(&needle)
+                || e.title
+                    .as_deref()
+                    .is_some_and(|t| t.to_lowercase().contains(&needle))
                 || e.preview.to_lowercase().contains(&needle)
         })
         .collect()
@@ -1703,9 +2009,18 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_c_quits() {
+    fn ctrl_c_clears_input_but_never_quits() {
         let mut app = app();
-        assert_eq!(app.on_key(ctrl(KeyCode::Char('c'))), Action::Quit);
+        // Empty composer, no selection: Ctrl+C is a no-op (it must not quit).
+        assert_eq!(app.on_key(ctrl(KeyCode::Char('c'))), Action::None);
+        // With composer content: Ctrl+C clears it and stays on screen.
+        for c in "draft".chars() {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+        assert_eq!(app.on_key(ctrl(KeyCode::Char('c'))), Action::None);
+        assert!(app.input.is_blank(), "Ctrl+C cleared the composer");
+        // Quitting is Ctrl+D's job, on a blank composer.
+        assert_eq!(app.on_key(ctrl(KeyCode::Char('d'))), Action::Quit);
     }
 
     #[test]
@@ -2097,6 +2412,135 @@ mod tests {
         let hits = filter_sessions(&entries, "parser");
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].id.0.as_ref(), "thread:native/a");
+    }
+
+    // --- transcript selection helpers ---
+
+    fn sel(anchor: (usize, u16), cursor: (usize, u16)) -> Selection {
+        Selection {
+            anchor,
+            cursor,
+            dragging: false,
+        }
+    }
+
+    #[test]
+    fn slice_by_cells_ascii_range() {
+        assert_eq!(slice_by_cells("hello world", 0, 5), "hello");
+        assert_eq!(slice_by_cells("hello world", 6, 11), "world");
+        assert_eq!(slice_by_cells("hello", 2, 100), "llo");
+        assert_eq!(slice_by_cells("hello", 3, 3), ""); // empty range
+        assert_eq!(slice_by_cells("hello", 10, 12), ""); // starts past end
+    }
+
+    #[test]
+    fn slice_by_cells_is_width_aware() {
+        // CJK chars are width 2; a one-cell start inside one still takes it whole.
+        assert_eq!(slice_by_cells("你好", 0, 2), "你");
+        assert_eq!(slice_by_cells("你好", 2, 4), "好");
+        assert_eq!(slice_by_cells("你好", 0, 1), "你");
+    }
+
+    #[test]
+    fn extract_selection_single_and_multi_line() {
+        let lines = vec![
+            "hello world".to_owned(),
+            "second line".to_owned(),
+            "third".to_owned(),
+        ];
+        assert_eq!(extract_selection(sel((0, 0), (0, 5)), &lines), "hello");
+        assert_eq!(
+            extract_selection(sel((0, 6), (2, 3)), &lines),
+            "world\nsecond line\nthi"
+        );
+        // Reversed endpoints normalize to the same span.
+        assert_eq!(
+            extract_selection(sel((2, 3), (0, 6)), &lines),
+            "world\nsecond line\nthi"
+        );
+    }
+
+    #[test]
+    fn extract_selection_clamps_stale_indices() {
+        let lines = vec!["only".to_owned()];
+        assert_eq!(extract_selection(sel((5, 0), (9, 4)), &lines), "only");
+        assert_eq!(extract_selection(sel((0, 0), (0, 0)), &lines), ""); // zero-width
+    }
+
+    #[test]
+    fn cell_range_for_line_boundaries() {
+        let s = sel((1, 2), (3, 4));
+        assert_eq!(cell_range_for_line(s, 0, 10), None); // above the selection
+        assert_eq!(cell_range_for_line(s, 1, 10), Some((2, 10))); // first → to EOL
+        assert_eq!(cell_range_for_line(s, 2, 10), Some((0, 10))); // interior → whole
+        assert_eq!(cell_range_for_line(s, 3, 10), Some((0, 4))); // last → to cursor
+        assert_eq!(cell_range_for_line(s, 4, 10), None); // below the selection
+    }
+
+    #[test]
+    fn hit_to_content_inside_and_gutter() {
+        let geom = SelGeom::new(Rect::new(0, 0, 40, 10), 5);
+        // row 2 → line 7; col 5 → content cell 3 (col − gutter 2).
+        assert_eq!(hit_to_content(geom, 5, 2), Some((7, 3)));
+        // A click in the gutter clamps to content cell 0.
+        assert_eq!(hit_to_content(geom, 1, 0), Some((5, 0)));
+        // Outside the body → no hit.
+        assert_eq!(hit_to_content(geom, 50, 2), None);
+    }
+
+    #[test]
+    fn selection_drag_then_copy() {
+        let mut a = app();
+        a.sel_geom.set(SelGeom::new(Rect::new(0, 0, 40, 10), 0));
+        *a.sel_lines.borrow_mut() = vec!["hello world".to_owned(), "next".to_owned()];
+        a.selection_start(2, 0); // line 0, content cell 0
+        a.selection_update(6, 0); // drag to content cell 4
+        a.selection_finish();
+        assert!(a.has_selection());
+        assert_eq!(a.take_selection_text().as_deref(), Some("hell"));
+        assert!(!a.has_selection()); // taken
+    }
+
+    #[test]
+    fn plain_click_selects_nothing() {
+        let mut a = app();
+        a.sel_geom.set(SelGeom::new(Rect::new(0, 0, 40, 10), 0));
+        a.selection_start(5, 0);
+        a.selection_finish(); // no drag → dropped
+        assert!(!a.has_selection());
+    }
+
+    #[test]
+    fn ctrl_c_copies_selection_else_clears_input() {
+        let mut a = app();
+        // No selection, empty composer: Ctrl+C does nothing (never quits).
+        assert_eq!(a.on_key(ctrl(KeyCode::Char('c'))), Action::None);
+        // With a selection: Ctrl+C copies its text and consumes the selection.
+        a.sel_geom.set(SelGeom::new(Rect::new(0, 0, 40, 10), 0));
+        *a.sel_lines.borrow_mut() = vec!["copy me".to_owned()];
+        a.selection_start(2, 0);
+        a.selection_update(9, 0);
+        a.selection_finish();
+        assert_eq!(
+            a.on_key(ctrl(KeyCode::Char('c'))),
+            Action::Copy("copy me".to_owned())
+        );
+        assert!(!a.has_selection());
+    }
+
+    #[test]
+    fn copy_last_message_command() {
+        let mut a = app();
+        // No assistant message yet.
+        assert_eq!(a.run_slash("copy"), Action::None);
+        // After an agent message, /copy yields its text. Seed via the public
+        // history loader so the item lands in a turn keyed off its encoded id.
+        a.conversation
+            .load_history(vec![zhive_proto::domain::Item::AgentMessage {
+                id: zhive_proto::domain::ItemId(Arc::from("item:t/1/0")),
+                text: "the answer".to_owned(),
+            }]);
+        assert_eq!(a.run_slash("copy"), Action::Copy("the answer".to_owned()));
     }
 }
 

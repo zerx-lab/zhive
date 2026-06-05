@@ -39,6 +39,8 @@ pub struct Config {
     pub skills: SkillsSection,
     /// Per-turn engine limits (tool-call iteration cap).
     pub engine: EngineSection,
+    /// Built-in tool behavior (e.g. `.gitignore` handling for grep/glob).
+    pub tools: ToolsSection,
 }
 
 /// The `[provider]` table: a `default` name plus an open map of named entries.
@@ -404,6 +406,38 @@ pub struct EngineSection {
     pub max_turn_iterations: Option<u32>,
 }
 
+/// The `[tools]` section: behavior of the built-in coding tools.
+///
+/// Today this controls only how `grep` and `glob` traverse directories. The
+/// `.git` directory is *always* excluded; `respect_gitignore` toggles whether
+/// `.gitignore`, `.ignore`, global git excludes, and parent ignores are
+/// honored. Set it to `false` to search ignored files (e.g. build artifacts).
+///
+/// # Examples
+///
+/// ```
+/// # use zhive_cli::config::ToolsSection;
+/// let section = ToolsSection::default();
+/// assert!(section.respect_gitignore);
+///
+/// let parsed: ToolsSection = toml::from_str("respect_gitignore = false").unwrap();
+/// assert!(!parsed.respect_gitignore);
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ToolsSection {
+    /// When `true` (the default), `grep`/`glob` honor `.gitignore`-style files.
+    pub respect_gitignore: bool,
+}
+
+impl Default for ToolsSection {
+    fn default() -> Self {
+        Self {
+            respect_gitignore: true,
+        }
+    }
+}
+
 impl Config {
     /// Loads config from `explicit` or the standard search path.
     ///
@@ -572,6 +606,12 @@ enabled = true
 # default; 0 means unbounded (up to a hard safety ceiling); N caps at N.
 [engine]
 # max_turn_iterations = 80
+
+# Built-in tool behavior. respect_gitignore controls whether the grep/glob tools
+# honor .gitignore-style files (the .git directory is always excluded). Set it to
+# false to also search ignored files such as build artifacts.
+[tools]
+# respect_gitignore = true
 ";
 
 #[cfg(test)]
@@ -598,6 +638,27 @@ mod tests {
         let cfg: Config =
             toml::from_str("[engine]\nmax_turn_iterations = 0\n").expect("zero parses");
         assert_eq!(cfg.engine.max_turn_iterations, Some(0));
+    }
+
+    #[test]
+    fn tools_section_default_respects_gitignore() {
+        // Absent -> default true.
+        assert!(Config::default().tools.respect_gitignore);
+        // A full document omitting [tools] still defaults to true.
+        let cfg: Config = toml::from_str(SAMPLE_CONFIG).expect("sample must parse");
+        assert!(cfg.tools.respect_gitignore);
+    }
+
+    #[test]
+    fn tools_section_round_trips() {
+        // Explicit override parses.
+        let cfg: Config =
+            toml::from_str("[tools]\nrespect_gitignore = false\n").expect("tools section parses");
+        assert!(!cfg.tools.respect_gitignore);
+        // Round-trip through the serializer preserves the value.
+        let serialized = toml::to_string(&cfg).expect("serializes");
+        let reparsed: Config = toml::from_str(&serialized).expect("reparses");
+        assert!(!reparsed.tools.respect_gitignore);
     }
 
     #[test]
@@ -794,6 +855,9 @@ bogus = "nope"
             },
             engine: EngineSection {
                 max_turn_iterations: Some(80),
+            },
+            tools: ToolsSection {
+                respect_gitignore: true,
             },
         };
 

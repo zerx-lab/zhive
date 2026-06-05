@@ -22,7 +22,10 @@ struct Token {
 fn tokenize(line: &Line) -> Vec<Token> {
     let mut tokens = Vec::new();
     for span in &line.spans {
-        let style = span.style;
+        // Fold the line-level base style into each span: ratatui's Paragraph does
+        // not propagate Line::style to cells for a pre-wrapped line, so the span
+        // must carry the effective color (span style wins over the line base).
+        let style = line.style.patch(span.style);
         let mut current = String::new();
         let mut current_space: Option<bool> = None;
         for c in span.content.chars() {
@@ -95,6 +98,11 @@ pub fn wrap_line(line: &Line, max: u16) -> Vec<Line<'static>> {
         return vec![clone_line(line)];
     }
     let tokens = tokenize(line);
+    // Preserve the input line's base style on every wrapped row: ratatui renders
+    // line.style as the base under each span, so plain text keeps palette.fg,
+    // headings keep fg_bright+BOLD, and `Line::styled` dividers/headers keep
+    // their color after wrapping.
+    let line_style = line.style;
     let mut out: Vec<Line<'static>> = Vec::new();
     let mut cur: Vec<Span<'static>> = Vec::new();
     let mut cur_w = 0usize;
@@ -107,7 +115,9 @@ pub fn wrap_line(line: &Line, max: u16) -> Vec<Line<'static>> {
         {
             cur.pop();
         }
-        out.push(Line::from(std::mem::take(cur)));
+        let mut wrapped = Line::from(std::mem::take(cur));
+        wrapped.style = line_style;
+        out.push(wrapped);
         *cur_w = 0;
     };
 
@@ -150,24 +160,40 @@ pub fn wrap_line(line: &Line, max: u16) -> Vec<Line<'static>> {
         flush(&mut cur, &mut cur_w, &mut out);
     }
     if out.is_empty() {
-        out.push(Line::from(Vec::new()));
+        let mut empty = Line::from(Vec::new());
+        empty.style = line_style;
+        out.push(empty);
     }
     out
 }
 
 /// Clones a borrowed [`Line`] into an owned (`'static`) one.
 fn clone_line(line: &Line) -> Line<'static> {
-    Line::from(
+    let mut cloned = Line::from(
         line.spans
             .iter()
             .map(|s| Span::styled(s.content.clone().into_owned(), s.style))
             .collect::<Vec<_>>(),
-    )
+    );
+    cloned.style = line.style;
+    cloned
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preserves_line_level_style() {
+        use ratatui::style::{Color, Style};
+        let line = Line::from("some long text that wraps").style(Style::new().fg(Color::Red));
+        let wrapped = wrap_line(&line, 8);
+        assert!(wrapped.len() >= 2, "should wrap into multiple rows");
+        assert!(
+            wrapped.iter().all(|l| l.style.fg == Some(Color::Red)),
+            "every wrapped row must keep the input line's base style"
+        );
+    }
 
     #[test]
     fn wraps_on_word_boundaries() {

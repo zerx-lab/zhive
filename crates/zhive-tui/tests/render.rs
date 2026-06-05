@@ -357,7 +357,7 @@ fn renders_welcome_when_empty() {
     assert!(text.contains("demo"), "model label shown in top bar");
     assert!(
         text.contains('█'),
-        "welcome screen renders the zap wordmark; got: {text}"
+        "welcome screen renders the zhive wordmark; got: {text}"
     );
 }
 
@@ -381,4 +381,83 @@ fn renders_queued_messages_preview() {
         text.contains("queued message text"),
         "queued preview shown; got: {text}"
     );
+}
+
+/// [13] regression: `wrap_line` used to drop `line.style`, so plain body and
+/// headings reached the buffer with the terminal-default fg. Assert the palette
+/// colors actually land in the rendered cells (text-only tests can't catch it).
+#[test]
+fn markdown_body_carries_palette_colors() {
+    let mut app = App::new(TuiConfig::default(), thread());
+    app.on_engine(&EngineNotification::TurnStarted {
+        thread_id: thread(),
+        turn_id: turn(),
+    });
+    app.on_engine(&EngineNotification::ItemAppended {
+        thread_id: thread(),
+        turn_id: turn(),
+        item: Box::new(Item::AgentMessage {
+            id: ItemId(Arc::from("item:md")),
+            text: "# Bright Heading\n\nplain body words here\n\n```rust\nfn demo() {}\n```"
+                .to_owned(),
+        }),
+    });
+    app.on_engine(&EngineNotification::TurnCompleted {
+        thread_id: thread(),
+        turn_id: turn(),
+    });
+
+    let mut terminal = Terminal::new(TestBackend::new(70, 24)).expect("terminal");
+    terminal.draw(|frame| ui::draw(frame, &app)).expect("draw");
+
+    let cells = terminal.backend().buffer().content().to_vec();
+    let p = &app.palette;
+    let has_fg = |want| {
+        cells
+            .iter()
+            .any(|c| c.fg == want && !c.symbol().trim().is_empty())
+    };
+
+    assert!(
+        has_fg(p.fg_bright),
+        "heading must render with fg_bright (line.style survived wrap)"
+    );
+    assert!(
+        has_fg(p.fg),
+        "plain body must render with palette.fg, not terminal default"
+    );
+}
+
+/// Diff rows must carry the `diff_add_bg` / `diff_del_bg` backgrounds end-to-end.
+#[test]
+fn diff_rows_carry_diff_backgrounds() {
+    let mut app = App::new(TuiConfig::default(), thread());
+    app.on_engine(&EngineNotification::TurnStarted {
+        thread_id: thread(),
+        turn_id: turn(),
+    });
+    app.on_engine(&EngineNotification::ItemAppended {
+        thread_id: thread(),
+        turn_id: turn(),
+        item: Box::new(Item::Diff {
+            id: ItemId(Arc::from("item:diff")),
+            path: std::path::PathBuf::from("src/x.rs"),
+            old_text: Some("alpha\n".to_owned()),
+            new_text: "bravo\n".to_owned(),
+        }),
+    });
+    app.on_engine(&EngineNotification::TurnCompleted {
+        thread_id: thread(),
+        turn_id: turn(),
+    });
+
+    let mut terminal = Terminal::new(TestBackend::new(70, 24)).expect("terminal");
+    terminal.draw(|frame| ui::draw(frame, &app)).expect("draw");
+
+    let cells = terminal.backend().buffer().content().to_vec();
+    let p = &app.palette;
+    let has_bg = |want| cells.iter().any(|c| c.bg == want);
+
+    assert!(has_bg(p.diff_add_bg), "added line carries diff_add_bg");
+    assert!(has_bg(p.diff_del_bg), "deleted line carries diff_del_bg");
 }

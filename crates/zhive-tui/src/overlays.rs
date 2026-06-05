@@ -159,22 +159,25 @@ fn hint_row(key: &str, desc: &str, p: &Palette) -> Line<'static> {
 /// Renders the help overlay (keybindings and commands).
 fn render_help(frame: &mut Frame, app: &App, area: Rect) {
     let p = &app.palette;
-    let popup = area.centered(Constraint::Length(60), Constraint::Length(18));
+    let popup = area.centered(Constraint::Length(60), Constraint::Length(21));
     let inner = open_popup(frame, popup, "⌘ help", p);
     let lines = vec![
         hint_row("↵", "send · queue while busy · run command", p),
         hint_row("⌥↵ / ⌃J", "insert newline", p),
-        hint_row("esc", "interrupt the turn · clear the queue", p),
+        hint_row("esc", "clear selection · interrupt · clear queue", p),
         hint_row("⌃X", "pull last queued message back to edit", p),
         hint_row("↑↓ (single-line)", "browse input history", p),
         hint_row("PgUp PgDn · wheel", "scroll transcript", p),
         hint_row("⌃Home ⌃End", "jump to top / tail", p),
         hint_row("⌃← ⌃→", "word-left / word-right", p),
+        hint_row("drag", "select transcript text · ⌃C copies it", p),
+        hint_row("shift+drag", "native select (bypasses mouse capture)", p),
         hint_row("/ then ⌃N ⌃P", "navigate the command palette", p),
-        hint_row("/clear", "start a fresh thread", p),
-        hint_row("/compact", "summarize the conversation", p),
+        hint_row("/copy", "copy the last assistant message", p),
+        hint_row("/clear, /compact", "fresh thread · summarize", p),
         hint_row("/theme, /accent", "restyle the UI", p),
-        hint_row("⌃C", "quit", p),
+        hint_row("⌃C", "copy selection · else clear the composer", p),
+        hint_row("⌃D", "quit (on a blank composer)", p),
         Line::raw(""),
         Line::styled("press any key to close", Style::new().fg(p.fg_mute)),
     ];
@@ -191,7 +194,7 @@ fn render_model_info(frame: &mut Frame, app: &App, area: Rect) {
         hint_row("model", app.config.model_label.as_str(), p),
         Line::raw(""),
         Line::styled(
-            "the model is bound when zap launches; change it in",
+            "the model is bound when zhive launches; change it in",
             Style::new().fg(p.fg_dim),
         ),
         Line::styled(

@@ -125,8 +125,9 @@ pub struct Palette {
 
 /// Blends `top` over `bottom` with `alpha` in 256ths, channel-wise.
 ///
-/// Used to pre-compute the translucent selection tint as a solid color.
-fn blend(top: Color, bottom: Color, alpha: u16) -> Color {
+/// Used to pre-compute the translucent selection tint as a solid color, and by
+/// the diff renderer to brighten intra-line emphasis backgrounds.
+pub(crate) fn blend(top: Color, bottom: Color, alpha: u16) -> Color {
     let (Color::Rgb(tr, tg, tb), Color::Rgb(br, bg, bb)) = (top, bottom) else {
         return top;
     };

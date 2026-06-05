@@ -222,6 +222,10 @@ pub struct Conversation {
     /// cleared the moment the finalised `Item::AgentMessage` is appended, so
     /// the real item supersedes it without duplication.
     pub streaming: String,
+    /// Byte offset into `streaming` up to which text has been revealed to the
+    /// renderer (the smooth-reveal cursor). Always a char boundary; reset to 0
+    /// whenever the buffer is cleared via [`Conversation::clear_streaming`].
+    revealed: usize,
     /// Last transient error (rejected turn, transport hiccup) for the status bar.
     pub last_error: Option<String>,
     /// Subagents spawned within this conversation, in spawn order.
@@ -230,6 +234,11 @@ pub struct Conversation {
     /// render as nested summaries instead of leaking into the main transcript.
     pub subagents: Vec<SubagentView>,
 }
+
+/// Minimum chars revealed per tick (keeps slow streams visibly progressing).
+const REVEAL_FLOOR: usize = 3;
+/// Fraction of the remaining backlog revealed per tick (geometric drain).
+const REVEAL_RATIO: f64 = 0.20;
 
 impl Conversation {
     /// Creates an empty conversation bound to `thread_id`.
@@ -240,9 +249,73 @@ impl Conversation {
             turns: Vec::new(),
             busy: false,
             streaming: String::new(),
+            revealed: 0,
             last_error: None,
             subagents: Vec::new(),
         }
+    }
+
+    /// Clears the streaming buffer and resets the reveal cursor together.
+    ///
+    /// The single clear site keeps `revealed` from ever stranding past a now
+    /// shorter (or empty) buffer.
+    pub(crate) fn clear_streaming(&mut self) {
+        self.streaming = String::new();
+        self.revealed = 0;
+    }
+
+    /// Returns the already-revealed prefix of the live streaming buffer.
+    ///
+    /// Clamps defensively so an external mutation that left `revealed` past the
+    /// buffer end — or mid-multibyte — can never cause a slice panic.
+    pub(crate) fn revealed_streaming(&self) -> &str {
+        let mut end = self.revealed.min(self.streaming.len());
+        while end > 0 && !self.streaming.is_char_boundary(end) {
+            end -= 1;
+        }
+        &self.streaming[..end]
+    }
+
+    /// Advances the reveal cursor by an adaptive step (called once per tick).
+    ///
+    /// Reveals `max(REVEAL_FLOOR, ceil(backlog * REVEAL_RATIO))` chars so the
+    /// backlog drains geometrically — long replies finish fast, slow streams
+    /// still progress. A no-op once caught up.
+    pub(crate) fn advance_reveal(&mut self) {
+        // Defensive clamp first: a stale cursor (e.g. after an external reset)
+        // must never index past the end or land mid-multibyte.
+        self.revealed = self.revealed.min(self.streaming.len());
+        while self.revealed > 0 && !self.streaming.is_char_boundary(self.revealed) {
+            self.revealed -= 1;
+        }
+        if self.revealed >= self.streaming.len() {
+            return;
+        }
+        let tail = &self.streaming[self.revealed..];
+        let backlog_chars = tail.chars().count();
+        #[expect(
+            clippy::cast_precision_loss,
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "reveal step is a small count; f64 round-trip is exact at these sizes"
+        )]
+        let step = ((backlog_chars as f64) * REVEAL_RATIO).ceil() as usize;
+        let step = step.max(REVEAL_FLOOR).min(backlog_chars);
+        let advance_bytes = tail
+            .char_indices()
+            .nth(step)
+            .map_or(tail.len(), |(byte_off, _)| byte_off);
+        self.revealed += advance_bytes;
+    }
+
+    /// `true` when every received byte has been revealed (or the buffer empty).
+    pub(crate) fn reveal_caught_up(&self) -> bool {
+        self.revealed >= self.streaming.len()
+    }
+
+    /// `true` when buffered text remains to be revealed (keeps ticks firing).
+    pub(crate) fn is_revealing(&self) -> bool {
+        !self.reveal_caught_up()
     }
 
     /// `true` when no turn has produced any item yet (drives the welcome view).
@@ -255,6 +328,21 @@ impl Conversation {
     #[must_use]
     pub fn item_count(&self) -> usize {
         self.turns.iter().map(|t| t.items.len()).sum()
+    }
+
+    /// Text of the most recent finalized assistant message, if any.
+    ///
+    /// Scans turns and items newest-first; mirrors opencode's "copy last
+    /// assistant message" command. `None` when no agent message exists yet.
+    pub(crate) fn last_agent_text(&self) -> Option<String> {
+        self.turns
+            .iter()
+            .rev()
+            .flat_map(|turn| turn.items.iter().rev())
+            .find_map(|item| match item {
+                Item::AgentMessage { text, .. } => Some(text.clone()),
+                _ => None,
+            })
     }
 
     /// Replaces the transcript with `items` restored from a resumed thread.
@@ -355,12 +443,12 @@ impl Conversation {
             EngineNotification::TurnStarted { turn_id, .. } => {
                 self.turn_mut(turn_id).status = TurnLifecycle::InProgress;
                 self.busy = true;
-                self.streaming.clear();
+                self.clear_streaming();
                 self.last_error = None;
             }
             EngineNotification::ItemAppended { turn_id, item, .. } => {
                 // A finalised item supersedes any provisional streamed text.
-                self.streaming.clear();
+                self.clear_streaming();
                 self.turn_mut(turn_id).upsert((**item).clone());
             }
             EngineNotification::ItemDelta { delta, .. } => {
@@ -370,7 +458,7 @@ impl Conversation {
             EngineNotification::TurnCompleted { turn_id, .. } => {
                 self.turn_mut(turn_id).status = TurnLifecycle::Completed;
                 self.busy = false;
-                self.streaming.clear();
+                self.clear_streaming();
             }
             EngineNotification::TurnFailed { turn_id, error, .. } => {
                 let message = error.message.clone();
@@ -378,12 +466,12 @@ impl Conversation {
                     message: message.clone(),
                 };
                 self.busy = false;
-                self.streaming.clear();
+                self.clear_streaming();
                 self.last_error = Some(message);
             }
             EngineNotification::TurnRejected { reason } => {
                 self.busy = false;
-                self.streaming.clear();
+                self.clear_streaming();
                 self.last_error = Some(reason.clone());
             }
             EngineNotification::SessionAborted(_) => {
@@ -395,7 +483,7 @@ impl Conversation {
                     turn.status = TurnLifecycle::Interrupted;
                 }
                 self.busy = false;
-                self.streaming.clear();
+                self.clear_streaming();
             }
             // Subagent lifecycle (handled in `apply`) and non-transcript events
             // (phase / permission / usage / unhandled) need no main-thread fold.
@@ -460,6 +548,64 @@ mod tests {
             id: ItemId(Arc::from(id)),
             text: text.to_owned(),
         }
+    }
+
+    // ---- smooth-reveal cursor (Plan C) ----
+
+    #[test]
+    fn reveal_progresses_then_catches_up() {
+        let mut conv = Conversation::new(tid());
+        conv.streaming = "hello world, this is a longer streamed message".to_owned();
+        assert!(conv.is_revealing());
+        let before = conv.revealed_streaming().len();
+        conv.advance_reveal();
+        assert!(conv.revealed_streaming().len() > before, "cursor advanced");
+        for _ in 0..50 {
+            conv.advance_reveal();
+        }
+        assert!(conv.reveal_caught_up());
+        assert_eq!(conv.revealed_streaming(), conv.streaming);
+    }
+
+    #[test]
+    fn reveal_clamps_stale_cursor_without_panic() {
+        let mut conv = Conversation::new(tid());
+        conv.streaming = "hi".to_owned();
+        // Simulate a stale cursor left past a now-shorter buffer.
+        conv.revealed = 999;
+        assert_eq!(conv.revealed_streaming(), "hi");
+        conv.advance_reveal(); // must not panic, must self-heal
+        assert!(conv.reveal_caught_up());
+    }
+
+    #[test]
+    fn reveal_respects_multibyte_char_boundaries() {
+        let mut conv = Conversation::new(tid());
+        conv.streaming = "你好世界一二三四五六七八九十".to_owned();
+        // Stepping byte-agnostic must never slice mid-codepoint (would panic).
+        for _ in 0..40 {
+            conv.advance_reveal();
+            let _ = conv.revealed_streaming();
+        }
+        assert_eq!(conv.revealed_streaming(), conv.streaming);
+    }
+
+    #[test]
+    fn clear_streaming_resets_cursor() {
+        let mut conv = Conversation::new(tid());
+        conv.streaming = "abc".to_owned();
+        conv.advance_reveal();
+        conv.clear_streaming();
+        assert!(conv.streaming.is_empty());
+        assert_eq!(conv.revealed_streaming(), "");
+        assert!(conv.reveal_caught_up() && !conv.is_revealing());
+    }
+
+    #[test]
+    fn empty_buffer_is_caught_up() {
+        let conv = Conversation::new(tid());
+        assert!(conv.reveal_caught_up() && !conv.is_revealing());
+        assert_eq!(conv.revealed_streaming(), "");
     }
 
     #[test]

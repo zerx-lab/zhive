@@ -32,7 +32,7 @@ extensions = ["skills"]
 otel    = ["dep:tracing-opentelemetry", "dep:opentelemetry", "dep:opentelemetry_sdk"]
 sandbox = []
 skills  = ["dep:serde_norway"]
-tools   = ["dep:ignore", "dep:regex", "dep:glob"]
+tools   = ["dep:ignore", "dep:regex", "dep:glob", "dep:grep-searcher", "dep:grep-regex"]
 
 [dependencies]
 zhive-proto = { workspace = true }
@@ -72,6 +72,8 @@ serde_norway = { version = "0.9.42", optional = true }
 ignore = { workspace = true, optional = true }
 regex  = { workspace = true, optional = true }
 glob   = { workspace = true, optional = true }
+grep-searcher = { version = "0.1.16", optional = true }
+grep-regex = { version = "0.1.14", optional = true }
 
 # Safe syscall wrappers; only the UDS fallback path uses
 # `rustix::process::getuid` to compose `/tmp/zhive-<uid>.sock` without

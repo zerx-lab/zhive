@@ -208,6 +208,7 @@ pub fn apply_minimal_env(cmd: &mut tokio::process::Command) {
 /// use zhive_core::tools::builtin::BuiltinToolsConfig;
 /// let cfg = BuiltinToolsConfig::default();
 /// assert!(cfg.enable_bash);
+/// assert!(cfg.respect_gitignore);
 /// ```
 #[derive(Debug, Clone)]
 pub struct BuiltinToolsConfig {
@@ -216,6 +217,12 @@ pub struct BuiltinToolsConfig {
     pub enable_bash: bool,
     /// Sandbox applied to every [`BashTool`] invocation.
     pub sandbox: Arc<dyn Sandbox>,
+    /// When `true`, `grep` and `glob` honor `.gitignore`-style exclusions.
+    ///
+    /// The `.git` directory is always excluded regardless of this flag; this
+    /// only toggles `.gitignore`, `.ignore`, global git excludes, and parent
+    /// ignores. Forwarded to [`GrepTool::new`] and [`GlobTool::new`].
+    pub respect_gitignore: bool,
 }
 
 impl Default for BuiltinToolsConfig {
@@ -223,6 +230,7 @@ impl Default for BuiltinToolsConfig {
         Self {
             enable_bash: true,
             sandbox: Arc::new(DefaultSandbox),
+            respect_gitignore: true,
         }
     }
 }
@@ -259,8 +267,8 @@ pub fn register_builtins(registry: &mut ToolRegistry, config: &BuiltinToolsConfi
     registry.register(Arc::new(ReadFileTool));
     registry.register(Arc::new(WriteFileTool));
     registry.register(Arc::new(EditFileTool));
-    registry.register(Arc::new(GrepTool));
-    registry.register(Arc::new(GlobTool));
+    registry.register(Arc::new(GrepTool::new(config.respect_gitignore)));
+    registry.register(Arc::new(GlobTool::new(config.respect_gitignore)));
     registry.register(Arc::new(AgentTool));
     if config.enable_bash {
         registry.register(Arc::new(BashTool::with_sandbox(Arc::clone(

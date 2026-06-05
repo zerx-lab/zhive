@@ -159,7 +159,10 @@ pub async fn build_runtime(cfg: &Config) -> anyhow::Result<RuntimeTools> {
     // and on-disk skills are layered on afterwards and may override by name.
     zhive_core::tools::builtin::register_builtins(
         &mut registry,
-        &zhive_core::tools::builtin::BuiltinToolsConfig::default(),
+        &zhive_core::tools::builtin::BuiltinToolsConfig {
+            respect_gitignore: cfg.tools.respect_gitignore,
+            ..Default::default()
+        },
     );
 
     #[cfg(feature = "mcp")]
