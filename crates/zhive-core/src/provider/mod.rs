@@ -47,6 +47,9 @@ pub mod stream_fold;
 pub use scripted::ScriptedModel;
 pub use stream_fold::StreamFold;
 
+use std::collections::HashMap;
+use std::time::Duration;
+
 use thiserror::Error;
 
 use zhive_proto::domain::{Item, ItemId};
@@ -86,13 +89,14 @@ pub use llmsdk::provider::DynLanguageModel;
 pub enum ProviderError {
     /// HTTP 429 rate limit.
     ///
-    /// `retry_after` carries the server-advised delay when available.
-    /// Currently always `None` because `llmsdk::ProviderError` does not expose
-    /// a public response-headers accessor; a future llmsdk update may populate it.
+    /// `retry_after` carries the server-advised delay parsed from the
+    /// `Retry-After` response header (integer-seconds form) when the provider
+    /// sent one; otherwise `None`, and the engine falls back to its computed
+    /// exponential back-off.
     #[error("provider rate limited{}", .retry_after.map(|d| format!(" (retry after {d:?})")).unwrap_or_default())]
     RateLimit {
         /// Advised back-off delay from the `Retry-After` response header, if
-        /// the provider sent one and llmsdk surfaced it.
+        /// the provider sent one and it parsed as integer seconds.
         retry_after: Option<std::time::Duration>,
     },
     /// Transient HTTP failure (408 / 409 / 5xx) flagged retryable by llmsdk.
@@ -113,8 +117,10 @@ impl ProviderError {
     /// - `err.is_retryable()` true (408 / 409 / 5xx) → [`ProviderError::Transient`]
     /// - everything else → [`ProviderError::Other`]
     ///
-    /// `retry_after` is always `None` because `llmsdk::ProviderError` does not
-    /// currently expose a response-headers accessor.
+    /// On a 429, `retry_after` is populated from the `Retry-After` response
+    /// header (integer-seconds form) via
+    /// [`llmsdk::ProviderError::response_headers`] when present; absent or
+    /// non-integer (HTTP-date) values yield `None`.
     ///
     /// # Examples
     ///
@@ -128,9 +134,10 @@ impl ProviderError {
     #[must_use]
     pub fn from_llmsdk(err: &llmsdk::ProviderError) -> Self {
         if err.status_code() == Some(429) {
-            // Retry-After header is not accessible via llmsdk's public API today.
-            // TODO: populate retry_after once llmsdk exposes response-headers.
-            Self::RateLimit { retry_after: None }
+            // Honor the server-advised Retry-After when present; falls back to
+            // the engine's computed back-off when absent or non-integer.
+            let retry_after = err.response_headers().and_then(parse_retry_after);
+            Self::RateLimit { retry_after }
         } else if err.is_retryable() {
             // is_retryable() covers HTTP 408, 409, and 5xx per llmsdk defaults.
             Self::Transient(err.to_string())
@@ -161,6 +168,22 @@ impl From<llmsdk::ProviderError> for ProviderError {
     fn from(err: llmsdk::ProviderError) -> Self {
         Self::from_llmsdk(&err)
     }
+}
+
+/// Parses a `Retry-After` HTTP header value into a back-off [`Duration`].
+///
+/// The header lookup is case-insensitive because header maps preserve each
+/// transport's original key casing. Only the integer-seconds form is
+/// recognised — the form Anthropic and `OpenAI` send. The HTTP-date form is
+/// intentionally not parsed (it would require a date-parsing dependency this
+/// crate avoids), so such values yield `None` and the caller keeps its own
+/// computed back-off.
+fn parse_retry_after(headers: &HashMap<String, String>) -> Option<Duration> {
+    let raw = headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("retry-after"))
+        .map(|(_, value)| value.trim())?;
+    raw.parse::<u64>().ok().map(Duration::from_secs)
 }
 
 // ============================================================
@@ -270,6 +293,57 @@ mod tests {
             "expected RateLimit, got {err:?}"
         );
         assert!(err.is_retryable());
+    }
+
+    #[test]
+    fn provider_error_429_with_retry_after_header_parses_seconds() {
+        use std::collections::HashMap;
+        use std::time::Duration;
+
+        let mut headers = HashMap::new();
+        // Mixed casing exercises the case-insensitive header lookup.
+        headers.insert("Retry-After".to_string(), "30".to_string());
+        let sdk_err = llmsdk::ProviderError::api_call_builder("https://api.test", "rate limited")
+            .status_code(429)
+            .response_headers(headers)
+            .build();
+        match ProviderError::from(sdk_err) {
+            ProviderError::RateLimit { retry_after } => {
+                assert_eq!(retry_after, Some(Duration::from_secs(30)));
+            }
+            other => panic!("expected RateLimit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn provider_error_429_without_header_has_no_hint() {
+        let sdk_err = llmsdk::ProviderError::api_call_builder("https://api.test", "rate limited")
+            .status_code(429)
+            .build();
+        match ProviderError::from(sdk_err) {
+            ProviderError::RateLimit { retry_after } => assert!(retry_after.is_none()),
+            other => panic!("expected RateLimit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn provider_error_429_non_integer_retry_after_is_ignored() {
+        use std::collections::HashMap;
+
+        let mut headers = HashMap::new();
+        // The HTTP-date form is intentionally unsupported and must fall back to None.
+        headers.insert(
+            "retry-after".to_string(),
+            "Wed, 21 Oct 2026 07:28:00 GMT".to_string(),
+        );
+        let sdk_err = llmsdk::ProviderError::api_call_builder("https://api.test", "rate limited")
+            .status_code(429)
+            .response_headers(headers)
+            .build();
+        match ProviderError::from(sdk_err) {
+            ProviderError::RateLimit { retry_after } => assert!(retry_after.is_none()),
+            other => panic!("expected RateLimit, got {other:?}"),
+        }
     }
 
     #[test]
