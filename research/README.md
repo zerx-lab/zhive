@@ -80,4 +80,4 @@ $EDITOR research/NN-your-topic/README.md
 - 双形态分发：cargo install 的 TUI bin（ratatui） + 可嵌入的 Rust SDK
 - 未来支持：远程沙箱、云环境、Web UI、IDE 集成
 - 核心约束：编译速度优先、与 MCP/ACP/LSP 生态互操作
-- 当前代码：单 bin（`src/main.rs`），尚未拆分工作区
+- 当前代码：多 crate workspace（`crates/` 下含 zhive-proto / zhive-core / zhive-client-native / zhive-tui / zhive-cli / zhive-bridge-stdio / zhive-mcp / zhive-bridge-acp，外加 xtask），默认 bin 为 zhive-cli

@@ -1,33 +1,38 @@
 # proto/
 
-ConnectRPC schema for zhive. This directory is the single source of truth
-referenced by [research/99-decisions D-003](../research/99-decisions/README.md).
+JSON-RPC 2.0 wire schema for zhive. This directory is the single source of
+truth referenced by [research/99-decisions D-003](../research/99-decisions/README.md).
 
 ```
 proto/
+├── schema/                 # JSON Schema (one file per public wire type)
 └── zhive/
     └── v1/
-        └── zhive.proto      # session / thread / turn / approval services
+        └── zhive.proto      # legacy ConnectRPC artefact (superseded by D-003)
 ```
+
+The authoritative schema is defined in Rust inside `crates/zhive-proto` as
+`serde` types that derive `schemars::JsonSchema`; the `proto/schema/*.json`
+files are emitted from those types. The `.proto` file predates the
+JSON-RPC switch and is no longer the source of truth.
 
 ## Generation
 
-Rust bindings are produced inside two crates:
+Wire types live in one crate:
 
 | Crate | What it ships |
 |---|---|
-| `crates/zhive-proto`   | `prost`-generated message types |
-| `crates/zhive-service` | `connectrpc-build`-generated service traits and clients |
+| `crates/zhive-proto` | `serde`/`schemars` message types + LSP-style `Content-Length` framing |
 
-To regenerate (Phase 1 wiring lands later):
+To regenerate the JSON Schema files under `proto/schema/`:
 
 ```bash
-cargo xtask gen-proto
+cargo xtask schema
 ```
 
-The generated `.rs` files are committed to the source tree (per
+The generated `.json` files are committed to the source tree (per
 [M-OOBE](https://github.com/microsoft/rust-guidelines)) so that downstream
-consumers do not need `protoc` to build the workspace.
+consumers can read the schema without building the workspace.
 
 ## Versioning
 

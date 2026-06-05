@@ -17,13 +17,13 @@ supersedes: 99-decisions/README.md (D-001~D-010 第一版)
 | D-002 | TUI 不依赖 core | 保留 |
 | D-003 | Phase 1 RPC = JSON-RPC 2.0，ConnectRPC 推迟到 Phase 3 候选 | **推翻**上一版 ConnectRPC 选型 |
 | D-004 | Phase 1 同时含 stdio + UDS 两 transport | 实质改 |
-| D-005 | rmcp/ACP 精确锁版本，仅在 bridge crate 引用 | 实质改 |
+| D-005 | rmcp/ACP 仅在 bridge crate 引用 + adapter 隔离 | 实质改 |
 | D-006 | 三层原语 Thread/Turn/Item + serde+schemars 单 schema 源 | 修订（去 prost） |
 | D-007 | initialize + v1/v2 + capabilities 协商 | 保留 |
 | D-008 | 反向 RPC 走 JSON-RPC server-initiated request + steer/followUp + subagent permission inheritance | 实质改（去 ConnectRPC bidi） |
 | D-009 | 编译速度组合拳（无 hakari） | 保留 |
 | D-010 | 三阶段路径 + Phase 1 必含 bridge-stdio + ACP minimal harness | 实质改 |
-| D-011 | rusqlite **多库**（state / logs / memories / goals）+ JSONL+Leaf rollout + Storage trait 聚合 4 子接口 | **2026-05-28 修订**（用户决策推翻单库起步） |
+| D-011 | sqlx **多库**（state / logs / memories / goals）+ JSONL+Leaf rollout + Storage trait 聚合 4 子接口 | **2026-05-28 修订**（用户决策推翻单库起步） |
 | D-012 | Hooks JSON schema 至少 14 事件 + `#[non_exhaustive]` | 新增 |
 | D-013 | Extension manifest 统一发现，Skills/SlashCommand 是并列 namespace | 新增 |
 | D-014 | tracing 进核心，OTel exporter feature gated | 新增 |
@@ -120,23 +120,21 @@ crates/
 
 ---
 
-## D-005 MCP/ACP 仅在 bridge crate 内引用 + 精确锁版本
+## D-005 MCP/ACP 仅在 bridge crate 内引用
 
 **决策**：
 ```
-crates/zhive-bridge-stdio (Phase 1)
-  ├─ deps: agent-client-protocol = "=0.12.1"  (精确锁，不是 ^)
-  └─ deps: rmcp = "=1.7.0"                    (精确锁，不是 ^)
-
-crates/zhive-bridge-mcp (Phase 2)
-crates/zhive-bridge-acp (Phase 2)
+crates/zhive-bridge-acp
+  └─ deps: agent-client-protocol = "0.13"   (caret 跟版)
+crates/zhive-mcp
+  └─ deps: rmcp = "1.6"                       (caret 跟版)
 ```
 
 `AcpAdapter` / `McpAdapter` trait 自封一层，每次版本升级只动 adapter。
 
 **理由**：
-- ACP 0.12.0 已发生 breaking（McpAcpTransport 移除）+ 月度 minor，必须精确锁
-- rmcp 1.x 用 `#[non_exhaustive]` 防破坏，可放心 1.7.0 起步
+- ACP 月度 minor 易 breaking，靠 bridge 内 adapter 层隔离，core 不直接依赖
+- rmcp 1.x 用 `#[non_exhaustive]` 防破坏
 - bridge 是 codex 已验证的 hexagonal adapter 模式（Pi-acp 也是同模式）
 - 上层 zhive-core 不直接依赖 rmcp / acp-rust → 上游 breaking 时不污染 core
 
@@ -251,8 +249,8 @@ D-003 去 ConnectRPC 全家桶后，cold build 估算从 90-140s 降至 ~25-40s�
   - `session/cancel` 中断
 
 **Phase 2（生态接入）**
-- `zhive-bridge-mcp`：rmcp 1.7 runtime 落地
-- `zhive-bridge-acp`：agent-client-protocol 0.12.1 runtime 落地（read+write）
+- `zhive-mcp`：rmcp 1.6 runtime 落地
+- `zhive-bridge-acp`：agent-client-protocol 0.13 runtime 落地（read+write）
 - `zhive-exec`：headless 模式
 - Persistence 按 domain 拆库（Storage trait 已留口）
 
@@ -270,18 +268,18 @@ D-003 去 ConnectRPC 全家桶后，cold build 估算从 90-140s 降至 ~25-40s�
 
 ---
 
-## D-011 Session 持久化 = rusqlite 多库 + JSONL rollout
+## D-011 Session 持久化 = sqlx 多库 + JSONL rollout
 
 > **2026-05-28 修订**：上一版"Phase 1 单库起步，Storage trait 留口"已废。直接采用 codex 当前演进的多库结构，理由见 § 修订理由。
 
 **决策**：
-- `rusqlite =0.40 + bundled`（精确锁版本，不切 sqlx —— codex 用 sqlx 是其工程偏好，与 D-011 拒绝 sqlx-sqlite 的"破坏 cargo check -p 工作流"理由不冲突，结构借鉴 ≠ 实现照抄）
+- `sqlx 0.8 + sqlite`（`SqlitePool` 内建 async 连接池；仅用 `sqlx::migrate!` 嵌入迁移，避开 `query!` / `query_as!` 宏以免 `cargo check -p` 依赖 `DATABASE_URL`；结构借鉴 codex `state/`）
 - JSONL rollout 作 source-of-truth（独立 `zhive-rollout` 子 module 或同 core 内 module，参考 codex `rollout/` crate）
 - **SQLite 从 Phase 1 起就 4 库分离**，结构对齐 codex `codex-rs/state/`：
 
   | DB 文件 | 用途 | migrations 目录（zhive） | 对照 codex |
   |---|---|---|---|
-  | `state.db`    | threads / sessions / agent_jobs / 主索引 | `crates/zhive-core/migrations/state/` | `codex-rs/state/migrations/` |
+  | `state.db`    | threads / turns / items / 主索引 | `crates/zhive-core/migrations/state/` | `codex-rs/state/migrations/` |
   | `logs.db`     | 结构化日志（tool exec / error / event 流） | `crates/zhive-core/migrations/logs/` | `codex-rs/state/logs_migrations/` |
   | `memories.db` | 跨 session 长期记忆（per Pi+Claude Code 模式） | `crates/zhive-core/migrations/memories/` | `codex-rs/state/memory_migrations/` |
   | `goals.db`    | thread-level goals / TODO | `crates/zhive-core/migrations/goals/` | `codex-rs/state/goals_migrations/` |
@@ -295,8 +293,8 @@ D-003 去 ConnectRPC 全家桶后，cold build 估算从 90-140s 降至 ~25-40s�
       fn goals(&self) -> &GoalsDb;
   }
   ```
-- 每个 DB 独立 connection pool（rusqlite + `r2d2-sqlite` 或 `deadpool-sqlite`，本任务调研定）
-- **Leaf 指针**采纳 Pi 模型：JSONL 不只 append，最后一条可写 `leaf` entry 指向当前分支头，支持 fork（[B3 deliverable 落地](../../plans/phase1-core-native-research/phase1-core-native-research.md#b3--persistencerusqlite--jsonl-rollout)）
+- 每个 DB 一个 `sqlx::SqlitePool`（内建 async 池，无需额外 pool crate）
+- **Leaf 指针**采纳 Pi 模型：JSONL 不只 append，最后一条可写 `leaf` entry 指向当前分支头，支持 fork（[B3 deliverable 落地](../../plans/phase1-core-native-research/deliverables/B3-persistence.md)）
 
 **修订理由**（2026-05-28，用户决策）：
 
@@ -306,7 +304,7 @@ D-003 去 ConnectRPC 全家桶后，cold build 估算从 90-140s 降至 ~25-40s�
   - codex 自己的 PR #24591 ~3000 行 diff 就是这个学费
 - 上一版引用的"红线 8（不得因 codex 拆多 SQLite 就在 Phase 1 拆多库）"同步废除（见 § 红线）
 
-**拒绝的候选**（保留）：sled / diesel / sqlx-sqlite / sea-orm / redb / 纯 JSONL —— 理由同上一版
+**拒绝的候选**（保留）：sled / diesel / sea-orm / redb / 纯 JSONL —— 理由同上一版
 
 **与 91 § 二 Critic A-1 的关系**：A-1 反对"拆多 DB"，本次修订是用户基于工程总成本的反向决策；A-1 的论据未被否定（"codex 演进中段"是事实），但权衡换了一把尺。
 
@@ -343,8 +341,8 @@ D-003 去 ConnectRPC 全家桶后，cold build 估算从 90-140s 降至 ~25-40s�
 
 **决策**：
 ```
-.zhive/extensions/<name>/manifest.toml
-  kind: skill | slash_command | hook
+.zhive/extensions/<name>/manifest.json
+  kind: extension | prompt | skill
   ...
 ```
 
@@ -393,10 +391,10 @@ D-003 去 ConnectRPC 全家桶后，cold build 估算从 90-140s 降至 ~25-40s�
 
 ## 后续调研项（融入决策落地，不再单独建目录）
 
-- ACP 0.12 minimum compliance schema 子集（zhive 必须满足的最小 ACP 兼容性）
+- ACP 0.13 minimum compliance schema 子集（zhive 必须满足的最小 ACP 兼容性）
 - Hook schema 完整 14+ event JSON example
 - JSON-RPC 2.0 framing + UDS server 接入示例
-- Storage trait + 单库起步的迁移路径
+- Storage trait + 多库迁移路径
 - Sandbox 层抽象（Landlock / Seatbelt / Job Object / 远程容器）
 - LLM provider 抽象（统一 OpenAI / Anthropic / 本地模型）
 - 配置层（layered TOML 解析 + 校验）
@@ -409,11 +407,11 @@ D-003 去 ConnectRPC 全家桶后，cold build 估算从 90-140s 降至 ~25-40s�
 
 > 已修补的 3 处硬伤：D-001 server 归属 / ACP harness 归属 / framing 实现路径。下面是 R5 找出的剩余 7 处可放到 Phase 2 之前修的漏洞。
 
-1. ~~**D-008 `StreamingBehavior` 取消状态机**：仅声明 `Steer | FollowUp` 二元 mode 不够。落地前需补：`Steer` 时 in-flight tool_call 是否撤销 / 已发 reverse-request 是否回收 / Turn 边界如何重置。建议参考 Pi `pending extension UI requests` Map 设计。~~ —— **2026-06-05 主体已解决**：`Steer` 语义已在 `crates/zhive-core/src/engine/turn.rs:413-420` 定义并测试——`Steer` **不**撤销 in-flight tool_call（仅为下一次 LLM 调用 seed 注入），abort 走独立路径（`InjectionQueues::abort` / `CancellationTree`），故 `Steer` 域内无 reverse-request 需回收、Turn 边界由现有 turn 循环重置。**剩余开放项**仅"通用 `session/cancel` 路径下已发 reverse-request 的回收"，与 `Steer` 模式无关，单独跟踪。
-2. **D-013 Extension manifest 完整字段** + **与 D-012 Hooks 来源优先级**：当前 manifest 只写 `kind: skill | slash_command | hook`，未定义其余字段（`description / model_invocable / allowed_tools / disable_in_subagent / ...`）。也未规定"hook 通过 manifest 注册 vs settings 顶层注册"的优先级 / 覆盖规则。
+1. **通用 `session/cancel` 路径下已发 reverse-request 的回收**：`Steer` 模式本身不撤销 in-flight tool_call（语义见 `crates/zhive-core/src/engine/turn.rs`，abort 走独立的 `InjectionQueues::abort` / `CancellationTree` 路径），但通用 `session/cancel` 路径下已发出的 reverse-request 如何回收仍需定义。建议参考 Pi `pending extension UI requests` Map 设计。
+2. **D-013 跨 namespace 统一注册** + **与 D-012 Hooks 来源优先级**：manifest 字段已在 `zhive-proto::manifest` 定义齐全（extension / prompt / skill 三 kind + tools / hooks / slash_commands / shortcuts / flags 子表），但跨 extension/prompt/skill 的统一注册路径与"hook 通过 manifest 注册 vs settings 顶层注册"的优先级 / 覆盖规则仍在落地中（见 7c 扩展系统）。
 3. **验收标准缺失**：D-007 / D-008 / D-011 / D-014 只说"做"未说"如何证明做到"。每条决策应附 acceptance test 文件路径（如 `crates/zhive-core/tests/permission_reducer.rs`）。
 4. **Phase 1 占位决策缺失**：91 § 二待定项有 5 大块——LLM provider 抽象 / Sandbox 层 / 鉴权 / 配置层 / 远程 session 共享。当前 D-001~D-015 均未提供 Phase 1 占位决策。最少要：core 怎么对接 `llmsdk`、本地权限模型（UDS 文件权限够不够、token 何时需要）。
-5. **D-005 上游 patch 跟版流程**：精确锁 `=0.12.1 / =1.7.0 / =0.40` 后，上游出安全 patch 时谁负责追版？建议加"每月一次 `xtask check-upstream` 跑过一遍 diff"。
+5. **D-005 上游 patch 跟版流程**：agent-client-protocol 0.13 / rmcp 1.6 caret 跟版后，上游出安全 patch 时谁负责追版？建议加"每月一次 `xtask check-upstream` 跑过一遍 diff"。
 6. **91 § 二旧 ConnectRPC 结论需打 superseded 标**：91/README.md § 二 "结论：D-003 不全盘推翻，但加 feature gate" 与 § 八 终版 "推翻 ConnectRPC" 字面相反，已在 § 二行内补 `> ⚠️ 已被 § 八 取代` 提示。
 7. **Cargo.toml 阻塞项 owner / deadline**：D-001 / D-003 列了删 6 crate + 删 12 项依赖的清单，但未指定谁负责执行。建议本次提交后立刻跑一遍。
 

@@ -95,7 +95,7 @@ status: active
 
 | 参考点 | 类型 | 用途 |
 |---|---|---|
-| Pi CLI Extension manifest 公开 schema（地址待补） | 📋 | `kind: skill \| slash_command \| hook` 三 namespace；`source: extension \| prompt \| skill`；filesystem-discovered + model-invoked |
+| Pi CLI Extension manifest 公开 schema（地址待补） | 📋 | 顶层 namespace `extension \| prompt \| skill`；`slash_command` / `hook` 作为 extension manifest 下的子 section；filesystem-discovered + model-invoked |
 | [Gemini CLI extensions](https://github.com/google-gemini/gemini-cli/blob/main/docs/extensions/index.md) | 🧭 | declarative extensions manifest 含 prompts/MCP/commands/skills/hooks/sub-agents 的字段组织方式 |
 
 #### AgentCard schema（Phase 3 占位，D-015）
@@ -126,8 +126,8 @@ status: active
 |---|---|---|
 | `openai/codex` `codex-rs/.../rollout/` JSONL append-only | 🧭 | source-of-truth 文件结构；每行 JSON 时间戳排序；append-only 不可改 |
 | `openai/codex` `codex-rs/.../state/` SQLite 索引 | 🧭 | 索引表设计（按 ts / parent / thread 查询） |
-| [`rusqlite/rusqlite`](https://github.com/rusqlite/rusqlite) `=0.40 + bundled` | 📋 | 精确锁版本；bundled 避免运行时 SQLite 依赖 |
-| [codex PR #24591 拆 memories_1.sqlite](https://github.com/openai/codex/pull/24591) | ⚠️ | 这是 codex 演进的"中段"，**zhive 不照搬**。Phase 1 单库起步，Storage trait 留口 |
+| [`launchbadge/sqlx`](https://github.com/launchbadge/sqlx) `0.8`（SqlitePool + 内建异步连接池） | 📋 | 版本范围；`runtime-tokio + sqlite + migrate + macros + json` features，编译期 `sqlx::migrate!` 内嵌迁移 |
+| [codex PR #24591 拆 memories_1.sqlite](https://github.com/openai/codex/pull/24591) | ⚠️ | 这是 codex 演进的"中段"，**zhive 不照搬**。zhive Phase 1 直接按 domain 拆 4 库（state / logs / memories / goals），各自独立 migrations |
 
 #### Permission reducer（D-008）
 
@@ -188,7 +188,7 @@ status: active
 
 | 参考点 | 类型 | 用途 |
 |---|---|---|
-| [`agentclientprotocol/rust-sdk`](https://github.com/agentclientprotocol/rust-sdk) `=0.12.1` | 📋 | 精确锁 ACP runtime；仅在本 crate 引用 |
+| [`agentclientprotocol/rust-sdk`](https://github.com/agentclientprotocol/rust-sdk) `0.13`（caret） | 📋 | ACP runtime；仅在本 crate 引用 |
 | [ACP spec § session](https://agentclientprotocol.com/protocol/schema#session) | 📋 | 验收集：`initialize / session/new / session/prompt / session/update / session/cancel` |
 | ACP `SessionUpdate` 10 个 case 映射 | 📋 | `AcpAdapter` trait 自封；R2 实测 ~300-400 行 |
 | 验收 harness 位置：`crates/zhive-bridge-stdio/tests/acp_conformance.rs` | 📋 | D-010 硬约束（不放 xtask） |
@@ -197,7 +197,7 @@ status: active
 
 | 参考点 | 类型 | 用途 |
 |---|---|---|
-| [`modelcontextprotocol/rust-sdk`](https://github.com/modelcontextprotocol/rust-sdk) `rmcp =1.7.0` | 📋 | 精确锁版本；`#[non_exhaustive]` 已就位 |
+| [`modelcontextprotocol/rust-sdk`](https://github.com/modelcontextprotocol/rust-sdk) `rmcp 1.6`（caret） | 📋 | 版本范围；`#[non_exhaustive]` 已就位 |
 | rmcp → zhive Item ~150-250 行（R2 实测）；ContentBlock ↔ RawContent 1:1 同构 ~50 行 | 📋 | 工程量已量化 |
 | [`docs.rs/rmcp`](https://docs.rs/rmcp) | 🧭 | transport 选项 stdio / TokioChildProcess / StreamableHttpClient/Service / SSE |
 | [warpdotdev/Warp 1.6](https://github.com/warpdotdev/Warp) rmcp production 用法 | 🧭 | production 集成参考 |
@@ -244,7 +244,7 @@ status: active
 | 参考点 | 类型 | 用途 |
 |---|---|---|
 | matklad ["Large Rust Workspaces"](https://matklad.github.io/2021/08/22/large-rust-workspaces.html) | 🧭 | xtask 模式起源 |
-| `xtask check-upstream` 命令（R5 finding #5） | 📋 | 每月一次 diff `agent-client-protocol` / `rmcp` / `rusqlite` 上游 patch |
+| `xtask check-upstream` 命令（R5 finding #5） | 📋 | 每月一次 diff `agent-client-protocol` / `rmcp` / `sqlx` 上游 patch |
 
 ---
 
@@ -299,7 +299,7 @@ status: active
 
 | 参考点 | 类型 | 用途 |
 |---|---|---|
-| `openai/codex` PR #24591（memories_1.sqlite 拆分） | 🧭 | 当 Phase 1 单库性能不足时的演进路径（Storage trait 已留口） |
+| `openai/codex` PR #24591（memories_1.sqlite 拆分） | 🧭 | 进一步按子 domain 拆库的演进先例（zhive Phase 1 已按 state / logs / memories / goals 拆 4 库，Storage trait 留口） |
 | [`warpdotdev/Warp/tree/main/crates/persistence/migrations`](https://github.com/warpdotdev/Warp/tree/main/crates/persistence/migrations) | 🧭 | 时间戳迁移目录设计 |
 
 ### Repo 智能 / 长上下文压缩
@@ -332,9 +332,9 @@ status: active
 | `Aider-AI/aider` | coder × edit-format 类爆炸（10+ coder 子类） | 单一 prompt 接口 + 配置驱动 |
 | `anthropics/connect-rust` `=0.6.x` | 0.4→0.5→0.6 三连 breaking minor，pre-1.0 强制 buffa codegen | D-003 推翻 ConnectRPC，Phase 1 走 JSON-RPC 2.0 |
 | `a2aproject/a2a-rs` `0.2.0` | 单维护者 + pre-1.0 + 月更新可能停滞 | D-015 不引依赖，AgentCard 手写 |
-| `spacejam/sled` `0.34.7` | stuck since 2021-09，作者已转 komora | D-011 拒绝；用 rusqlite |
+| `spacejam/sled` `0.34.7` | stuck since 2021-09，作者已转 komora | D-011 拒绝；用 sqlx 0.8（SqlitePool） |
 | `sst/opencode` Go TUI 下线、TUI 跑 server 内 | 与 zhive "TUI 是一个客户端" 路线相反 | D-002 TUI 脱 core，独立进程 |
-| `openai/codex` PR #24591 多 SQLite 拆库 | 这是 codex 演进**中段**，不是起点 | D-011 Phase 1 单库；Storage trait 留口 |
+| `openai/codex` PR #24591 多 SQLite 拆库 | 这是 codex 演进**中段**，不是起点 | D-011 Phase 1 按 domain 拆 4 库（state / logs / memories / goals）；Storage trait 留口 |
 | `warpdotdev/Warp` ~60 crate 起步 | 起步过细 = import 折磨 | D-001 起步 7 crate |
 
 ---
@@ -349,10 +349,10 @@ mkdir -p ~/work/references && cd ~/work/references
 
 # === 一等参考（Phase 1 立刻要用） ===
 git clone https://github.com/openai/codex.git                              # codex-rs 在 codex-rs/ 子目录
-git clone https://github.com/agentclientprotocol/rust-sdk.git acp-rust-sdk # ACP 0.12.1
-git clone https://github.com/modelcontextprotocol/rust-sdk.git rmcp        # MCP rmcp 1.7
+git clone https://github.com/agentclientprotocol/rust-sdk.git acp-rust-sdk # ACP 0.13
+git clone https://github.com/modelcontextprotocol/rust-sdk.git rmcp        # MCP rmcp 1.6
 git clone https://github.com/ebkalderon/tower-lsp.git                      # stdio JSON-RPC 标杆
-git clone https://github.com/rusqlite/rusqlite.git                         # 0.40 + bundled
+git clone https://github.com/launchbadge/sqlx.git                          # sqlx 0.8（SqlitePool）
 
 # === 二等参考（schema 字段对齐、横向对照） ===
 git clone https://github.com/sst/opencode.git                              # ACP next + HttpApi + SSE

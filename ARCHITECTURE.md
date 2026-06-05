@@ -190,7 +190,7 @@ sequenceDiagram
         alt 有 ToolCall
             Note over T: PreToolUse hook → PermissionReducer<br/>(deny>defer>ask>allow)
             opt Ask
-                T-->>C: 反向RPC permission/request
+                T-->>C: 反向RPC session/request_permission
                 C-->>T: PermissionOutcome
             end
             Note over T: 执行工具 → PostToolUse hook
@@ -236,8 +236,8 @@ sequenceDiagram
 | 新 transport（远程/TLS） | `Transport` / `RpcTransport` trait | stdio+UDS 已实现 |
 | 新生态协议（MCP/ACP） | bridge crate + adapter trait，精确锁版本 | bridge-stdio 已实现 |
 | 新 LLM provider | `llmsdk::DynLanguageModel`（不自造 trait） | Anthropic/OpenAI/Scripted |
-| 新工具 | `Tool` trait + `ToolRegistry` | EchoTool 内置 |
-| 用户扩展（skill/cmd/hook） | manifest 统一发现（D-013），三层 settingSources | schema 已定 |
+| 新工具 | `Tool` trait + `ToolRegistry` | read/write/edit/grep/glob/agent/bash 内置 |
+| 用户扩展（extension/prompt/skill） | manifest 统一发现（D-013），三层 settingSources | schema 已定 |
 | Hooks | 14+ 事件，`#[non_exhaustive]`（D-012） | 已预留 5 个 Phase 2/3 事件 |
 | 协议演进 | initialize + v1/v2 + 独立 capability flag（D-007） | 已实现 |
 | 可观测性 | tracing spans 进核心，OTel exporter feature gate（D-014） | observability.rs |
@@ -245,5 +245,5 @@ sequenceDiagram
 ### 三阶段路径（D-010）
 
 - **Phase 1（当前）**：core 引擎 + proto + client-native + tui + cli + bridge-stdio + ACP minimal conformance harness。
-- **Phase 2（生态接入）**：`zhive-bridge-mcp`（rmcp =1.7.0）、`zhive-bridge-acp`（ACP =0.12.1 read+write）、`zhive-exec` headless、扩展系统落地。
+- **Phase 2（生态接入）**：`zhive-mcp`（rmcp 1.6）、`zhive-bridge-acp`（ACP 0.13 read+write）、`zhive-exec` headless、扩展系统落地。
 - **Phase 3（扩展）**：Web UI（复用 schema）、远程 TLS / 云沙箱、ConnectRPC 候选评估、A2A AgentCard schema 占位（手写 JSON，不引 a2a-rs）。
