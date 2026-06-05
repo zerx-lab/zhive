@@ -50,8 +50,10 @@ impl Tool for ReadFileTool {
 
     fn description(&self) -> Option<String> {
         Some(
-            "Read a file and return its contents with line numbers. \
-             Supports offset and limit for large files."
+            "Read a text file from disk and return its contents with 1-based line \
+             numbers. Use `offset`/`limit` to page through large files; output is \
+             line- and byte-capped. Text only — binary files such as images are \
+             rejected. To find files use `glob`; to search contents use `grep`."
                 .to_owned(),
         )
     }

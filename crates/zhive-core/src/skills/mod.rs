@@ -408,7 +408,6 @@ impl SkillSet {
 mod tests {
     use super::*;
     use std::fs;
-    use std::path::Path;
 
     fn write_skill_md(dir: &Path, name: &str, disable_model: bool) -> std::path::PathBuf {
         let skill_dir = dir.join(name);

@@ -44,7 +44,12 @@ impl Tool for WriteFileTool {
 
     fn description(&self) -> Option<String> {
         Some(
-            "Atomically write content to a file, creating parent directories as needed.".to_owned(),
+            "Atomically write content to a file, creating parent directories as \
+             needed. Overwrites the entire file when it exists — prefer `edit` for \
+             targeted changes so unrelated content is never lost. The write is \
+             staged to a temp file and renamed, so a failure never leaves a \
+             partially written target."
+                .to_owned(),
         )
     }
 
@@ -88,12 +93,7 @@ impl Tool for WriteFileTool {
 
         // Write atomically via a sibling temp file.
         let dir = dest.parent().unwrap_or_else(|| std::path::Path::new("."));
-        let tmp = dir.join(format!(
-            ".zhive-write-tmp-{}.tmp",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.subsec_nanos())
-        ));
+        let tmp = dir.join(tmp_file_name("write"));
 
         tokio::fs::write(&tmp, content.as_bytes())
             .await
@@ -172,7 +172,11 @@ impl Tool for EditFileTool {
 
     fn description(&self) -> Option<String> {
         Some(
-            "Replace a substring inside a file. Requires an exact (or nearly exact) unique match."
+            "Replace an exact substring inside an existing file, written back \
+             atomically. `old_string` must match a unique span — include \
+             surrounding context to disambiguate, or pass `replace_all` to change \
+             every occurrence. Use this for surgical edits; use `write` to create \
+             or fully replace a file."
                 .to_owned(),
         )
     }
@@ -346,6 +350,21 @@ fn find_unique_trim_match(content: &str, trimmed_old: &str) -> Result<(usize, us
     }
 }
 
+/// Monotonic counter making every temp-file name unique within this process.
+static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Builds a collision-resistant sibling temp-file name for an atomic write.
+///
+/// Combines the process id with a per-process monotonic counter so two writes
+/// to the same directory never share a path — even when issued in the same
+/// nanosecond from the same process, which a wall-clock-only name could not
+/// guarantee. The leading dot keeps the temp file hidden.
+#[must_use]
+fn tmp_file_name(tag: &str) -> String {
+    let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!(".zhive-{tag}-tmp-{}-{seq}.tmp", std::process::id())
+}
+
 /// Atomically writes `bytes` to `dest` via a sibling temp file + rename.
 ///
 /// # Errors
@@ -361,12 +380,7 @@ async fn atomic_write(dest: &std::path::Path, bytes: &[u8]) -> Result<(), ToolEr
         })?;
     }
     let dir = dest.parent().unwrap_or_else(|| std::path::Path::new("."));
-    let tmp = dir.join(format!(
-        ".zhive-edit-tmp-{}.tmp",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.subsec_nanos())
-    ));
+    let tmp = dir.join(tmp_file_name("edit"));
     tokio::fs::write(&tmp, bytes).await.map_err(|e| {
         ToolError::Execution(format!("cannot write temp file `{}`: {e}", tmp.display()))
     })?;
@@ -403,6 +417,16 @@ mod tests {
             cancel: CancellationToken::new(),
             spawner: None,
         }
+    }
+
+    // ---- temp-name helper ----
+
+    #[test]
+    fn tmp_file_name_is_unique_and_tagged() {
+        let names: std::collections::HashSet<String> =
+            (0..1000).map(|_| tmp_file_name("write")).collect();
+        assert_eq!(names.len(), 1000, "every temp name must be distinct");
+        assert!(tmp_file_name("edit").starts_with(".zhive-edit-tmp-"));
     }
 
     // ---- WriteFileTool tests ----

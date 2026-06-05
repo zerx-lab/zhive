@@ -207,27 +207,63 @@ impl Tool for SkillTool {
 // Resource pointer discovery
 // ============================================================
 
-/// Lists files in `root` other than `SKILL.md` as relative-path strings.
+/// Lists every bundled file under `root` (except the top-level `SKILL.md`) as a
+/// relative-path string, recursing into subdirectories.
 ///
-/// Returns an empty `Vec` when the directory cannot be read, so the
-/// absence of bundled resources is never a hard error.
+/// Nested resources (e.g. `scripts/helper.py`) are reported with their
+/// subdirectory prefix so the model can reference them directly instead of
+/// guessing the layout. Returns an empty `Vec` when the directory cannot be
+/// read, so the absence of bundled resources is never a hard error.
+///
+/// Symlinks are skipped (never followed) and recursion is depth-bounded, so a
+/// cyclic or adversarial tree cannot cause unbounded work.
 fn collect_resource_pointers(root: &std::path::Path) -> Vec<String> {
-    let Ok(entries) = std::fs::read_dir(root) else {
-        return Vec::new();
-    };
+    /// Maximum directory depth walked for bundled skill resources.
+    ///
+    /// Skill bundles are shallow by convention; this bounds work on a malformed
+    /// or adversarial tree without truncating any realistic layout.
+    const MAX_DEPTH: usize = 8;
+    /// Maximum number of resource pointers collected per skill.
+    ///
+    /// Caps the prompt budget a single skill can consume; bundles larger than
+    /// this are unusual and the overflow is silently dropped.
+    const MAX_POINTERS: usize = 500;
 
-    let mut pointers: Vec<String> = entries
-        .filter_map(|res| {
-            let entry = res.ok()?;
-            let name = entry.file_name().into_string().ok()?;
-            if name == "SKILL.md" {
-                return None;
+    let mut pointers: Vec<String> = Vec::new();
+    // Iterative DFS so a deep tree cannot blow the stack.
+    let mut stack = vec![(root.to_path_buf(), 0usize)];
+    while let Some((dir, depth)) = stack.pop() {
+        if pointers.len() >= MAX_POINTERS {
+            break;
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            // `file_type()` does not follow symlinks, so a symlinked directory
+            // reports neither `is_dir()` nor `is_file()` and is skipped — this
+            // is what prevents symlink cycles from causing unbounded recursion.
+            let Ok(ft) = entry.file_type() else { continue };
+            let path = entry.path();
+            if ft.is_dir() {
+                if depth + 1 < MAX_DEPTH {
+                    stack.push((path, depth + 1));
+                }
+            } else if ft.is_file() {
+                let Ok(rel) = path.strip_prefix(root) else {
+                    continue;
+                };
+                // Skip the skill's own manifest at the bundle root.
+                if depth == 0 && rel.as_os_str() == "SKILL.md" {
+                    continue;
+                }
+                pointers.push(rel.to_string_lossy().into_owned());
+                if pointers.len() >= MAX_POINTERS {
+                    break;
+                }
             }
-            // Only report regular files, not subdirectories.
-            let ft = entry.file_type().ok()?;
-            if ft.is_file() { Some(name) } else { None }
-        })
-        .collect();
+        }
+    }
 
     pointers.sort();
     pointers
@@ -298,6 +334,28 @@ mod tests {
             out.text
         );
         assert_eq!(tool.name(), "my-skill");
+    }
+
+    #[test]
+    fn collect_resource_pointers_recurses_subdirs_and_skips_manifest() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("SKILL.md"), "manifest").unwrap();
+        fs::write(root.join("notes.md"), "top-level resource").unwrap();
+        fs::create_dir_all(root.join("scripts")).unwrap();
+        fs::write(root.join("scripts").join("helper.py"), "print('hi')").unwrap();
+
+        let ptrs = collect_resource_pointers(root);
+
+        assert!(ptrs.contains(&"notes.md".to_owned()), "got {ptrs:?}");
+        assert!(
+            ptrs.contains(&format!("scripts{}helper.py", std::path::MAIN_SEPARATOR)),
+            "nested resource must keep its subdir prefix; got {ptrs:?}"
+        );
+        assert!(
+            !ptrs.iter().any(|p| p.ends_with("SKILL.md")),
+            "the manifest must be excluded; got {ptrs:?}"
+        );
     }
 
     #[test]

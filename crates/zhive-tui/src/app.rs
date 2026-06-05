@@ -258,6 +258,13 @@ pub struct App {
     pub spinner_tick: usize,
     /// Lines scrolled up from the bottom of the transcript (0 = follow tail).
     pub scrollback: u16,
+    /// Max scrollback of the last rendered frame, for jump-to-top.
+    ///
+    /// Set by the conversation renderer (which only borrows `&App`) and read by
+    /// the key handler so `ctrl+Home` can pin to the exact top rather than an
+    /// arbitrary large value (which would leave relative scrolling stuck). It
+    /// mirrors the [`Self::logo_hit`] render-to-handler hand-off pattern.
+    pub viewport_max_scroll: Cell<u16>,
     /// Whether collapsible detail blocks show their full content (ctrl+o).
     ///
     /// A single global toggle covering `/skill:<name>` chips, tool-call output,
@@ -341,6 +348,7 @@ impl App {
             flash: None,
             spinner_tick: 0,
             scrollback: 0,
+            viewport_max_scroll: Cell::new(0),
             details_expanded: false,
             palette_index: 0,
             should_quit: false,
@@ -915,6 +923,18 @@ impl App {
                 self.input.move_right();
                 Action::None
             }
+            // ctrl+Home / ctrl+End jump the transcript to the very top / tail.
+            // Placed before the bare Home/End cursor moves so the guard wins.
+            KeyCode::Home if ctrl => {
+                // The rendered max is the oldest scrollable line; pin to it so
+                // later relative scrolling resumes cleanly from the top.
+                self.scrollback = self.viewport_max_scroll.get();
+                Action::None
+            }
+            KeyCode::End if ctrl => {
+                self.scrollback = 0;
+                Action::None
+            }
             KeyCode::Home => {
                 self.input.move_home();
                 Action::None
@@ -1271,6 +1291,28 @@ mod tests {
 
     fn ctrl(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::CONTROL)
+    }
+
+    #[test]
+    fn ctrl_home_end_jump_transcript_to_top_and_tail() {
+        let mut a = app();
+        // Simulate a rendered frame whose oldest scrollable line is 42 rows up.
+        a.viewport_max_scroll.set(42);
+
+        // ctrl+End pins to the live tail.
+        a.scrollback = 17;
+        assert_eq!(a.on_key(ctrl(KeyCode::End)), Action::None);
+        assert_eq!(a.scrollback, 0);
+
+        // ctrl+Home pins to the rendered maximum (the very top).
+        assert_eq!(a.on_key(ctrl(KeyCode::Home)), Action::None);
+        assert_eq!(a.scrollback, 42);
+
+        // Bare Home/End move the input cursor and leave scrollback untouched.
+        assert_eq!(a.on_key(key(KeyCode::Home)), Action::None);
+        assert_eq!(a.scrollback, 42);
+        assert_eq!(a.on_key(key(KeyCode::End)), Action::None);
+        assert_eq!(a.scrollback, 42);
     }
 
     // ---- skill slash / picker ----

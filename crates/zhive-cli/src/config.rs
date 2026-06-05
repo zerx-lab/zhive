@@ -15,7 +15,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Top-level configuration document.
 ///
@@ -26,7 +26,7 @@ use serde::Deserialize;
 /// let cfg = Config::default();
 /// assert_eq!(cfg.provider.default, "anthropic");
 /// ```
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     /// Provider selection and per-provider settings.
@@ -50,7 +50,7 @@ pub struct Config {
 /// inner key sets before field rejection runs, causing every flattened key to
 /// be treated as unknown. `deny_unknown_fields` is therefore omitted here.
 /// Individual [`ProviderEntry`] deserialization still uses it.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ProviderSection {
     /// Name of the active provider entry (must be a key in `providers`).
@@ -138,7 +138,7 @@ impl Default for ProviderSection {
 /// ).unwrap();
 /// assert_eq!(entry.kind, "openai");
 /// ```
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ProviderEntry {
     /// Backend kind: `anthropic`, `openai`, `xai`, `mistral`, `azure`,
@@ -173,7 +173,7 @@ pub struct ProviderEntry {
 ///
 /// Stored as strings so this crate does not depend on `zhive-tui`; the `tui`
 /// command parses these into `zhive_tui` enums, ignoring unknown values.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct UiSection {
     /// Base theme: `dark`, `light`, or `mono`.
@@ -215,7 +215,7 @@ impl Default for UiSection {
 /// .unwrap();
 /// assert!(section.servers.contains_key("filesystem"));
 /// ```
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct McpSection {
     /// Named MCP servers, keyed by the server name (the tool prefix).
@@ -240,7 +240,7 @@ pub struct McpSection {
 /// .unwrap();
 /// assert!(matches!(def, McpServerDef::Http { .. }));
 /// ```
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "transport", rename_all = "lowercase", deny_unknown_fields)]
 pub enum McpServerDef {
     /// Spawn a child process and speak JSON-RPC over its stdio.
@@ -360,7 +360,7 @@ impl McpSection {
 /// assert!(section.enabled);
 /// assert!(section.extra_roots.is_empty());
 /// ```
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SkillsSection {
     /// Whether on-disk skill discovery runs at boot.
@@ -395,7 +395,7 @@ impl Default for SkillsSection {
 /// let section = EngineSection::default();
 /// assert!(section.max_turn_iterations.is_none());
 /// ```
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct EngineSection {
     /// Maximum provider-call iterations per turn. `None` keeps the engine
@@ -510,6 +510,29 @@ api_key_env = \"OPENAI_API_KEY\"
 # model = \"llama-3.3-70b-instruct\"
 # base_url = \"http://localhost:1234/v1\"
 # api_key = \"lm-studio\"
+
+# Cloud providers take extra fields. Azure OpenAI:
+# [provider.azure]
+# kind = \"azure\"
+# model = \"gpt-4o\"
+# resource_name = \"my-resource\"  # <resource>.openai.azure.com
+# api_version = \"v1\"             # Azure API version query parameter
+# deployment = \"my-deployment\"   # legacy deployment-based URLs only
+
+# Google Vertex AI (project + location; region is shared with AWS backends):
+# [provider.vertex]
+# kind = \"google-vertex\"
+# model = \"gemini-2.5-pro\"
+# project = \"my-gcp-project\"
+# location = \"us-central1\"
+# region = \"us-central1\"
+
+# Anthropic on AWS Bedrock (region + workspace_id):
+# [provider.bedrock]
+# kind = \"anthropic-aws\"
+# model = \"claude-sonnet-4-6\"
+# region = \"us-east-1\"
+# workspace_id = \"my-workspace\"  # anthropic-workspace-id header
 
 [ui]
 theme = \"dark\"      # dark | light | mono
@@ -688,6 +711,132 @@ bogus = "nope"
 "#;
         let result: Result<McpServerDef, _> = toml::from_str(toml);
         assert!(result.is_err(), "unknown field must be rejected");
+    }
+
+    /// Drift guard: every key reachable from a fully-populated [`Config`] must
+    /// be documented in [`SAMPLE_CONFIG`].
+    ///
+    /// `zhive config init` emits the hand-written, comment-rich `SAMPLE_CONFIG`
+    /// (not a serializer dump), so it silently drifts out of sync whenever a new
+    /// field is added to a config struct. This test serializes a maximal config
+    /// (every optional field `Some`, both `McpServerDef` variants present) and
+    /// asserts each emitted scalar key appears in `SAMPLE_CONFIG` as a documented
+    /// key — commented (`# key = ...`) or live (`key = ...`). A new struct field
+    /// nobody added to the sample fails this test, never the user's config file.
+    ///
+    /// The maximal config is built from full struct literals (no `..default()`),
+    /// so a new field on any config struct also fails to *compile* here until the
+    /// author handles it — the runtime substring check then forces it into the
+    /// sample. Limitation: map-valued fields (`env`, `headers`) serialize as TOML
+    /// sub-tables rather than `key = value` lines, so their field *names* are not
+    /// individually guarded (both are already documented and structurally
+    /// stable); their scalar siblings still are. A brand-new enum *variant* is
+    /// only covered if it is added to the maximal config below.
+    #[test]
+    fn sample_config_documents_every_field() {
+        // Every struct is built with a full field literal (no `..default()`), so
+        // adding a field to ANY config struct fails to compile here until the
+        // author handles it — extending the guard's reach to the optional fields
+        // a `default()`-plus-mutation setup would silently omit. env/headers are
+        // left empty on purpose: a map serializes as a TOML sub-table, and
+        // keeping values before tables keeps the serialized output valid.
+        let cfg = Config {
+            provider: ProviderSection {
+                default: "anthropic".to_owned(),
+                providers: BTreeMap::from([(
+                    "anthropic".to_owned(),
+                    ProviderEntry {
+                        kind: "azure".to_owned(),
+                        model: "gpt-4o".to_owned(),
+                        api_key: Some("inline".to_owned()),
+                        api_key_env: Some("OPENAI_API_KEY".to_owned()),
+                        base_url: Some("https://example.invalid".to_owned()),
+                        region: Some("us-east-1".to_owned()),
+                        project: Some("proj".to_owned()),
+                        location: Some("us-central1".to_owned()),
+                        resource_name: Some("res".to_owned()),
+                        api_version: Some("v1".to_owned()),
+                        deployment: Some("dep".to_owned()),
+                        workspace_id: Some("ws".to_owned()),
+                    },
+                )]),
+            },
+            ui: UiSection {
+                theme: "dark".to_owned(),
+                accent: "cyan".to_owned(),
+                density: "default".to_owned(),
+            },
+            mcp: McpSection {
+                servers: BTreeMap::from([
+                    (
+                        "filesystem".to_owned(),
+                        McpServerDef::Stdio {
+                            command: "npx".to_owned(),
+                            args: vec!["-y".to_owned()],
+                            env: BTreeMap::new(),
+                            cwd: Some("/tmp".to_owned()),
+                        },
+                    ),
+                    (
+                        "remote".to_owned(),
+                        McpServerDef::Http {
+                            url: "http://localhost:8000/mcp".to_owned(),
+                            headers: BTreeMap::new(),
+                            auth_token: Some("tok".to_owned()),
+                            auth_token_env: Some("MCP_TOKEN".to_owned()),
+                        },
+                    ),
+                ]),
+            },
+            skills: SkillsSection {
+                enabled: true,
+                extra_roots: vec![PathBuf::from("/opt/zhive/skills")],
+            },
+            engine: EngineSection {
+                max_turn_iterations: Some(80),
+            },
+        };
+
+        let serialized = toml::to_string(&cfg).expect("maximal config serializes");
+
+        let mut missing = Vec::new();
+        for line in serialized.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('[') {
+                continue;
+            }
+            let Some((key, _)) = line.split_once('=') else {
+                continue;
+            };
+            let key = key.trim();
+            if !key.is_empty() && !sample_documents_key(key) {
+                missing.push(key.to_owned());
+            }
+        }
+        missing.sort();
+        missing.dedup();
+
+        assert!(
+            missing.is_empty(),
+            "SAMPLE_CONFIG is missing documentation for config key(s): {missing:?}. \
+             Add each (a commented `# key = ...` example is enough) so `zhive config init` \
+             stays in sync with the config schema.",
+        );
+    }
+
+    /// True when `key` appears in [`SAMPLE_CONFIG`] as a documented TOML key,
+    /// either live (`key = ...`) or commented (`# key = ...`).
+    ///
+    /// Anchored on the `key =` token rather than a bare substring so a short key
+    /// such as `env` is not spuriously matched by prose like "environment".
+    fn sample_documents_key(key: &str) -> bool {
+        SAMPLE_CONFIG.lines().any(|line| {
+            // Strip any nesting of comment markers and whitespace (`# `, `# # `)
+            // so commented-out examples count as documentation.
+            let line = line.trim_start_matches(|c: char| c == '#' || c.is_whitespace());
+            line.strip_prefix(key)
+                .is_some_and(|rest| rest.trim_start().starts_with('='))
+        })
     }
 
     #[cfg(feature = "mcp")]

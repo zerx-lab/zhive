@@ -128,7 +128,14 @@ impl Tool for BashTool {
     }
 
     fn description(&self) -> Option<String> {
-        Some("Run a shell command and return its combined stdout/stderr output.".to_owned())
+        Some(
+            "Run a shell command via `sh -c` and return its combined output \
+             (stderr appended after stdout, not interleaved). Runs with a cleared \
+             environment — only PATH, HOME, and TERM are kept — under a timeout. \
+             Prefer the dedicated `read`/`grep`/`glob`/`edit` tools for file work; \
+             use bash for builds, tests, git, and other commands."
+                .to_owned(),
+        )
     }
 
     fn input_schema(&self) -> Value {

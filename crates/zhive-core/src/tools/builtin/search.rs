@@ -52,7 +52,13 @@ impl Tool for GrepTool {
     }
 
     fn description(&self) -> Option<String> {
-        Some("Search file contents using a regex pattern across a directory tree.".to_owned())
+        Some(
+            "Search file contents with a regular expression across a directory \
+             tree. Honors .gitignore and skips binary files; results are \
+             `path:line:text`, capped by `max_results`. Use `glob` to match by \
+             file name or path instead, and `read` to view a specific file."
+                .to_owned(),
+        )
     }
 
     fn input_schema(&self) -> Value {
@@ -61,7 +67,7 @@ impl Tool for GrepTool {
             "properties": {
                 "pattern":     { "type": "string",  "description": "Regular expression to search for." },
                 "path":        { "type": "string",  "description": "Root directory (default: cwd)." },
-                "glob":        { "type": "string",  "description": "Filename glob filter (e.g. '*.rs')." },
+                "glob":        { "type": "string",  "description": "Glob filter on the file name or path relative to the search root (e.g. '*.rs' or 'src/**/*.rs')." },
                 "ignore_case": { "type": "boolean", "description": "Case-insensitive matching." },
                 "max_results": { "type": "integer", "minimum": 1, "description": "Result cap." }
             },
@@ -143,10 +149,16 @@ fn grep_walk(
         }
         let path = entry.path();
 
-        // Apply glob filter on file name only.
+        // Apply the glob filter against the basename OR the path relative to
+        // the search root, so both `*.rs` (basename) and `src/**/*.rs` (path)
+        // patterns match. `*` never crosses `/`, so a path pattern would
+        // otherwise silently never match a basename-only test.
         if let Some(pattern) = glob_filter {
-            let file_name = path.file_name().map(|n| n.to_string_lossy());
-            if !file_name.is_some_and(|n| pattern.matches(&n)) {
+            let rel = path.strip_prefix(base).unwrap_or(path);
+            let name_match = path
+                .file_name()
+                .is_some_and(|n| pattern.matches(&n.to_string_lossy()));
+            if !name_match && !pattern.matches_path(rel) {
                 continue;
             }
         }
@@ -216,7 +228,13 @@ impl Tool for GlobTool {
     }
 
     fn description(&self) -> Option<String> {
-        Some("Expand a glob pattern and return sorted matching file paths.".to_owned())
+        Some(
+            "Find files by a glob pattern (e.g. `src/**/*.rs`) and return sorted \
+             paths. Use this to locate files by name or layout; use `grep` to \
+             search inside file contents. Results are capped to a bounded number \
+             of paths."
+                .to_owned(),
+        )
     }
 
     fn input_schema(&self) -> Value {
@@ -371,6 +389,50 @@ mod tests {
         let out = GrepTool.execute(args, &ctx()).await.unwrap();
         assert!(out.text.contains("a.rs"));
         assert!(!out.text.contains("b.txt"));
+    }
+
+    #[tokio::test]
+    async fn grep_glob_filter_matches_path_pattern() {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("src").join("deep")).unwrap();
+        std::fs::create_dir_all(dir.path().join("other")).unwrap();
+        std::fs::write(
+            dir.path().join("src").join("deep").join("x.rs"),
+            "fn target() {}\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("other").join("y.rs"), "fn target() {}\n").unwrap();
+
+        // A path-scoped glob matches only the file beneath src/.
+        let args = serde_json::json!({
+            "pattern": "fn target",
+            "path": dir.path().to_str().unwrap(),
+            "glob": "src/**/*.rs"
+        });
+        let out = GrepTool.execute(args, &ctx()).await.unwrap();
+        assert!(
+            out.text.contains("x.rs"),
+            "src match expected: {}",
+            out.text
+        );
+        assert!(
+            !out.text.contains("y.rs"),
+            "other/ must be excluded: {}",
+            out.text
+        );
+
+        // A basename glob still matches nested files (basename OR path).
+        let args = serde_json::json!({
+            "pattern": "fn target",
+            "path": dir.path().to_str().unwrap(),
+            "glob": "*.rs"
+        });
+        let out = GrepTool.execute(args, &ctx()).await.unwrap();
+        assert!(
+            out.text.contains("x.rs") && out.text.contains("y.rs"),
+            "basename glob matches both nested files: {}",
+            out.text
+        );
     }
 
     // ---- GlobTool tests ----

@@ -168,6 +168,7 @@ fn render_help(frame: &mut Frame, app: &App, area: Rect) {
         hint_row("⌃X", "pull last queued message back to edit", p),
         hint_row("↑↓ (single-line)", "browse input history", p),
         hint_row("PgUp PgDn · wheel", "scroll transcript", p),
+        hint_row("⌃Home ⌃End", "jump to top / tail", p),
         hint_row("⌃← ⌃→", "word-left / word-right", p),
         hint_row("/ then ⌃N ⌃P", "navigate the command palette", p),
         hint_row("/clear", "start a fresh thread", p),

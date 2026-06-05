@@ -188,6 +188,9 @@ fn render_body(frame: &mut Frame, app: &App, area: Rect) {
     let total = u16::try_from(lines.len()).unwrap_or(u16::MAX);
     let visible = inner.height;
     let max_scroll = total.saturating_sub(visible);
+    // Record the rendered max so the key handler's ctrl+Home can pin to the
+    // exact top (see `App::viewport_max_scroll`).
+    app.viewport_max_scroll.set(max_scroll);
     // Clamp scrollback to [0, max_scroll] so we never scroll past the top or
     // get stuck above it when the transcript shrinks (e.g. after /clear).
     let scrollback = app.scrollback.min(max_scroll);
