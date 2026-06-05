@@ -409,7 +409,7 @@ D-003 去 ConnectRPC 全家桶后，cold build 估算从 90-140s 降至 ~25-40s�
 
 > 已修补的 3 处硬伤：D-001 server 归属 / ACP harness 归属 / framing 实现路径。下面是 R5 找出的剩余 7 处可放到 Phase 2 之前修的漏洞。
 
-1. **D-008 `StreamingBehavior` 取消状态机**：仅声明 `Steer | FollowUp` 二元 mode 不够。落地前需补：`Steer` 时 in-flight tool_call 是否撤销 / 已发 reverse-request 是否回收 / Turn 边界如何重置。建议参考 Pi `pending extension UI requests` Map 设计。
+1. ~~**D-008 `StreamingBehavior` 取消状态机**：仅声明 `Steer | FollowUp` 二元 mode 不够。落地前需补：`Steer` 时 in-flight tool_call 是否撤销 / 已发 reverse-request 是否回收 / Turn 边界如何重置。建议参考 Pi `pending extension UI requests` Map 设计。~~ —— **2026-06-05 主体已解决**：`Steer` 语义已在 `crates/zhive-core/src/engine/turn.rs:413-420` 定义并测试——`Steer` **不**撤销 in-flight tool_call（仅为下一次 LLM 调用 seed 注入），abort 走独立路径（`InjectionQueues::abort` / `CancellationTree`），故 `Steer` 域内无 reverse-request 需回收、Turn 边界由现有 turn 循环重置。**剩余开放项**仅"通用 `session/cancel` 路径下已发 reverse-request 的回收"，与 `Steer` 模式无关，单独跟踪。
 2. **D-013 Extension manifest 完整字段** + **与 D-012 Hooks 来源优先级**：当前 manifest 只写 `kind: skill | slash_command | hook`，未定义其余字段（`description / model_invocable / allowed_tools / disable_in_subagent / ...`）。也未规定"hook 通过 manifest 注册 vs settings 顶层注册"的优先级 / 覆盖规则。
 3. **验收标准缺失**：D-007 / D-008 / D-011 / D-014 只说"做"未说"如何证明做到"。每条决策应附 acceptance test 文件路径（如 `crates/zhive-core/tests/permission_reducer.rs`）。
 4. **Phase 1 占位决策缺失**：91 § 二待定项有 5 大块——LLM provider 抽象 / Sandbox 层 / 鉴权 / 配置层 / 远程 session 共享。当前 D-001~D-015 均未提供 Phase 1 占位决策。最少要：core 怎么对接 `llmsdk`、本地权限模型（UDS 文件权限够不够、token 何时需要）。
