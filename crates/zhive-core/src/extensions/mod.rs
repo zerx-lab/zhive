@@ -22,10 +22,12 @@
 mod discovery;
 mod error;
 mod loader;
+mod registry;
 
 pub use discovery::{DiscoveredManifest, ExtensionDiscoveryConfig, MANIFEST_FILE, discover};
 pub use error::ExtensionError;
 pub use loader::{load_manifest_file, parse_manifest};
+pub use registry::{ContributionDigest, ExtensionRegistry, ExtensionSummary};
 
 use std::path::PathBuf;
 
