@@ -399,6 +399,56 @@ pub const EVENT_ITEM_DELTA: &str = "events/item_delta";
 /// ```
 pub const EVENT_PHASE_CHANGED: &str = "events/phase_changed";
 
+/// Server notification: context compaction entered the summarization phase.
+///
+/// Body: [`crate::events::CompactionStartedPayload`]. Anchors the
+/// `compaction_delta` / `compaction_completed` / `compaction_failed` bracket.
+///
+/// # Examples
+///
+/// ```
+/// use zhive_proto::methods::EVENT_COMPACTION_STARTED;
+/// assert_eq!(EVENT_COMPACTION_STARTED, "events/compaction_started");
+/// ```
+pub const EVENT_COMPACTION_STARTED: &str = "events/compaction_started";
+
+/// Server notification: a streamed fragment of the compaction summary.
+///
+/// Body: [`crate::events::CompactionDeltaPayload`].
+///
+/// # Examples
+///
+/// ```
+/// use zhive_proto::methods::EVENT_COMPACTION_DELTA;
+/// assert_eq!(EVENT_COMPACTION_DELTA, "events/compaction_delta");
+/// ```
+pub const EVENT_COMPACTION_DELTA: &str = "events/compaction_delta";
+
+/// Server notification: context compaction finished successfully.
+///
+/// Body: [`crate::events::CompactionCompletedPayload`].
+///
+/// # Examples
+///
+/// ```
+/// use zhive_proto::methods::EVENT_COMPACTION_COMPLETED;
+/// assert_eq!(EVENT_COMPACTION_COMPLETED, "events/compaction_completed");
+/// ```
+pub const EVENT_COMPACTION_COMPLETED: &str = "events/compaction_completed";
+
+/// Server notification: context compaction failed after it began.
+///
+/// Body: [`crate::events::CompactionFailedPayload`]. Carries the reason
+/// because the `engine/compact` reply already returned `Started`.
+///
+/// # Examples
+///
+/// ```
+/// use zhive_proto::methods::EVENT_COMPACTION_FAILED;
+/// assert_eq!(EVENT_COMPACTION_FAILED, "events/compaction_failed");
+/// ```
+pub const EVENT_COMPACTION_FAILED: &str = "events/compaction_failed";
+
 /// Server notification: a session was aborted and injection queues drained.
 ///
 /// Body: [`crate::permission::SessionAbortedNotification`].

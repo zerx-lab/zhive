@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use zhive_proto::domain::{Item, ItemId, ThreadId, TurnError, TurnId};
-use zhive_proto::hook::EnginePhase;
+use zhive_proto::hook::{CompactTrigger, EnginePhase};
 use zhive_proto::permission::{RequestPermissionRequest, SessionAbortedNotification};
 
 use super::submission::PermissionRequestId;
@@ -236,6 +236,56 @@ pub enum EngineEvent {
         new_thread_id: ThreadId,
         /// Inclusive item the fork was taken at, or `None` for full history.
         forked_from_item: Option<ItemId>,
+    },
+
+    /// Context compaction entered the summarization phase.
+    ///
+    /// Anchors the [`EngineEvent::CompactionDelta`] /
+    /// [`EngineEvent::CompactionCompleted`] / [`EngineEvent::CompactionFailed`]
+    /// bracket. Emitted right after the `Idle → Compaction`
+    /// [`EngineEvent::PhaseChanged`], before any summary delta. Both manual
+    /// (`/compact`) and automatic (threshold) compaction emit this.
+    CompactionStarted {
+        /// Thread being compacted.
+        thread_id: ThreadId,
+        /// Why compaction fired (`Manual` for `/compact`, `Auto` for the threshold).
+        trigger: CompactTrigger,
+        /// Transcript items that will be folded into the summary.
+        entries: u32,
+    },
+
+    /// A streamed fragment of the compaction summary.
+    ///
+    /// Emitted once per provider `TextDelta` so clients can render the handoff
+    /// summary as it is generated. The complete summary still finalises as an
+    /// [`EngineEvent::ItemAppended`], so a client that ignores deltas loses nothing.
+    CompactionDelta {
+        /// Thread being compacted.
+        thread_id: ThreadId,
+        /// Incremental summary fragment.
+        delta: String,
+    },
+
+    /// Context compaction finished successfully.
+    ///
+    /// Closes the delta bracket; the summary item is also delivered via
+    /// [`EngineEvent::ItemAppended`].
+    CompactionCompleted {
+        /// Thread that was compacted.
+        thread_id: ThreadId,
+        /// Transcript items folded into the summary.
+        entries_compacted: u32,
+    },
+
+    /// Context compaction failed after it began.
+    ///
+    /// Carries the reason because the `engine/compact` reply already returned
+    /// `Started` and the failure can no longer travel back through it.
+    CompactionFailed {
+        /// Thread whose compaction failed.
+        thread_id: ThreadId,
+        /// Human-readable failure reason.
+        reason: String,
     },
 }
 

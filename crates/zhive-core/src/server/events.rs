@@ -26,6 +26,10 @@
 //! | `ThreadForked`             | `events/thread_forked`         |
 //! | `SubagentStarted`          | `events/subagent_started`      |
 //! | `SubagentCompleted`        | `events/subagent_completed`    |
+//! | `CompactionStarted`        | `events/compaction_started`    |
+//! | `CompactionDelta`          | `events/compaction_delta`      |
+//! | `CompactionCompleted`      | `events/compaction_completed`  |
+//! | `CompactionFailed`         | `events/compaction_failed`     |
 //!
 //! ## Per-connection filtering
 //!
@@ -44,9 +48,11 @@ use tokio_util::sync::CancellationToken;
 use zhive_proto::Message;
 use zhive_proto::Notification;
 use zhive_proto::events::{
-    ItemAppendedPayload, ItemDeltaPayload, PermissionRequestedPayload, PhaseChangedPayload,
-    SubagentCompletedPayload, SubagentStartedPayload, ThreadForkedPayload, TurnCompletedPayload,
-    TurnFailedPayload, TurnRejectedPayload, TurnRejectedReason, TurnStartedPayload, UsagePayload,
+    CompactionCompletedPayload, CompactionDeltaPayload, CompactionFailedPayload,
+    CompactionStartedPayload, ItemAppendedPayload, ItemDeltaPayload, PermissionRequestedPayload,
+    PhaseChangedPayload, SubagentCompletedPayload, SubagentStartedPayload, ThreadForkedPayload,
+    TurnCompletedPayload, TurnFailedPayload, TurnRejectedPayload, TurnRejectedReason,
+    TurnStartedPayload, UsagePayload,
 };
 use zhive_proto::methods;
 use zhive_proto::permission::{
@@ -366,6 +372,46 @@ pub fn engine_event_to_notification(event: &EngineEvent) -> Option<Notification>
             ))
             .ok()?,
         ),
+        EngineEvent::CompactionStarted {
+            thread_id,
+            trigger,
+            entries,
+        } => (
+            methods::EVENT_COMPACTION_STARTED,
+            serde_json::to_value(CompactionStartedPayload::new(
+                thread_id.clone(),
+                *trigger,
+                *entries,
+            ))
+            .ok()?,
+        ),
+        EngineEvent::CompactionDelta { thread_id, delta } => (
+            methods::EVENT_COMPACTION_DELTA,
+            serde_json::to_value(CompactionDeltaPayload::new(
+                thread_id.clone(),
+                delta.clone(),
+            ))
+            .ok()?,
+        ),
+        EngineEvent::CompactionCompleted {
+            thread_id,
+            entries_compacted,
+        } => (
+            methods::EVENT_COMPACTION_COMPLETED,
+            serde_json::to_value(CompactionCompletedPayload::new(
+                thread_id.clone(),
+                *entries_compacted,
+            ))
+            .ok()?,
+        ),
+        EngineEvent::CompactionFailed { thread_id, reason } => (
+            methods::EVENT_COMPACTION_FAILED,
+            serde_json::to_value(CompactionFailedPayload::new(
+                thread_id.clone(),
+                reason.clone(),
+            ))
+            .ok()?,
+        ),
         // Internal engine event suppressed from the wire stream in Phase 1.
         //
         // SavePoint is a persistence marker (deferred session writes flushed);
@@ -533,6 +579,58 @@ mod tests {
         let p = n.params.as_ref().unwrap();
         assert_eq!(p["itemId"], "item:0");
         assert!(p["item"].is_object());
+    }
+
+    #[test]
+    fn compaction_started_maps_to_events_compaction_started() {
+        use zhive_proto::hook::CompactTrigger;
+        let ev = EngineEvent::CompactionStarted {
+            thread_id: tid("thread:native/c"),
+            trigger: CompactTrigger::Manual,
+            entries: 9,
+        };
+        let n = engine_event_to_notification(&ev).unwrap();
+        assert_eq!(n.method, "events/compaction_started");
+        let p = n.params.as_ref().unwrap();
+        assert_eq!(p["threadId"], "thread:native/c");
+        assert_eq!(p["trigger"], "manual");
+        assert_eq!(p["entries"], 9u32);
+    }
+
+    #[test]
+    fn compaction_delta_carries_text() {
+        let ev = EngineEvent::CompactionDelta {
+            thread_id: tid("t"),
+            delta: "frag".into(),
+        };
+        let n = engine_event_to_notification(&ev).unwrap();
+        assert_eq!(n.method, "events/compaction_delta");
+        let p = n.params.as_ref().unwrap();
+        assert_eq!(p["delta"], "frag");
+    }
+
+    #[test]
+    fn compaction_completed_carries_entry_count() {
+        let ev = EngineEvent::CompactionCompleted {
+            thread_id: tid("t"),
+            entries_compacted: 12,
+        };
+        let n = engine_event_to_notification(&ev).unwrap();
+        assert_eq!(n.method, "events/compaction_completed");
+        let p = n.params.as_ref().unwrap();
+        assert_eq!(p["entriesCompacted"], 12u32);
+    }
+
+    #[test]
+    fn compaction_failed_carries_reason() {
+        let ev = EngineEvent::CompactionFailed {
+            thread_id: tid("t"),
+            reason: "provider exploded".into(),
+        };
+        let n = engine_event_to_notification(&ev).unwrap();
+        assert_eq!(n.method, "events/compaction_failed");
+        let p = n.params.as_ref().unwrap();
+        assert_eq!(p["reason"], "provider exploded");
     }
 
     #[test]

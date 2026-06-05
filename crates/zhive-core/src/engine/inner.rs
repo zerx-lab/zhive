@@ -456,8 +456,11 @@ impl EngineInner {
                 thread_id,
                 user_input,
                 scope,
+                reasoning,
             } => {
-                let outcome = self.start_turn(thread_id, user_input, scope).await;
+                let outcome = self
+                    .start_turn(thread_id, user_input, scope, reasoning)
+                    .await;
                 if let Some(tx) = reply {
                     let _ = tx.send(SubmissionReply::StartTurn(outcome));
                 }
@@ -503,7 +506,7 @@ impl EngineInner {
                 }
             }
             Submission::Compact { thread_id, trigger } => {
-                let outcome = self.compact(thread_id, trigger).await;
+                let outcome = self.compact_dispatch(thread_id, trigger).await;
                 if let Some(tx) = reply {
                     let _ = tx.send(SubmissionReply::Compact(outcome));
                 }

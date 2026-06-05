@@ -342,11 +342,14 @@ async fn run_turn_inner(
     // `start_child_turn` stored via `ActiveTurn::new_with_cancel_and_scope`.
     // In either case the authoritative value is in `handle.active_turn.scope`,
     // so we always read it from there to honour the narrowing guarantee.
-    let scope: PermissionScope = {
+    // Read both the turn scope and the requested reasoning depth from the
+    // active-turn record in a single lock acquisition.
+    let (scope, reasoning): (PermissionScope, Option<zhive_proto::domain::ThinkingEffort>) = {
         let guard = handle.active_turn.lock().await;
-        guard
-            .as_ref()
-            .map_or_else(PermissionScope::default_turn_scope, |a| a.scope.clone())
+        match guard.as_ref() {
+            Some(a) => (a.scope.clone(), a.reasoning),
+            None => (PermissionScope::default_turn_scope(), None),
+        }
     };
 
     // Per-turn item sequence counter for persistence.  Monotonically
@@ -450,8 +453,17 @@ async fn run_turn_inner(
 
         // 1. Build the prompt by reconstructing it from the thread's item tail
         //    (the single source of truth; see `build_call_options`).
-        let call_options =
+        let mut call_options =
             build_call_options(&handle, inner.tools(), inner.system_prompt(), &scope).await;
+        // Layer the turn's requested reasoning depth onto the request (no-op
+        // when `reasoning` is `None`). Maps onto Anthropic `effort` + adaptive
+        // thinking, or the portable `reasoning` enum for other providers.
+        crate::engine::reasoning::apply_reasoning(
+            &mut call_options,
+            reasoning,
+            inner.provider().provider(),
+            inner.provider().model_id(),
+        );
 
         // 2. Call the provider with retry/backoff for transient outer errors.
         //
@@ -1192,6 +1204,7 @@ mod tests {
                 thread_id.clone(),
                 vec![user_message("item:user/0", "hello world")],
                 None,
+                None,
             )
             .await
             .expect("start_turn must accept the submission");
@@ -1362,6 +1375,7 @@ mod tests {
                 thread_id.clone(),
                 vec![user_message("item:user/0", "hello")],
                 None,
+                None,
             )
             .await
             .expect("start_turn");
@@ -1409,6 +1423,7 @@ mod tests {
                 thread_id.clone(),
                 vec![user_message("item:user/0", "hello")],
                 None,
+                None,
             )
             .await
             .expect("start_turn");
@@ -1442,6 +1457,7 @@ mod tests {
             .start_turn(
                 thread_id.clone(),
                 vec![user_message("item:user/0", "hello")],
+                None,
                 None,
             )
             .await

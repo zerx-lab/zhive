@@ -439,6 +439,11 @@ pub struct App {
     /// and command output: ctrl+o expands/collapses all of them at once (the
     /// transcript has no per-message focus).
     pub details_expanded: bool,
+    /// Current reasoning depth, cycled with Ctrl+T and sent with every turn.
+    ///
+    /// Defaults to [`zhive_proto::domain::ThinkingEffort::Off`]; the top bar
+    /// shows the active level whenever it is above `Off`.
+    pub thinking_effort: zhive_proto::domain::ThinkingEffort,
     /// Highlighted entry in the slash-command palette.
     pub palette_index: usize,
     /// Set once the user asks to quit.
@@ -500,6 +505,29 @@ pub struct App {
     /// Populated only while a [`Self::selection`] exists (there is always a
     /// redraw between mouse-down and copy), so an idle TUI pays nothing.
     pub(crate) sel_lines: RefCell<Vec<String>>,
+    /// Live context-compaction progress, shown as a streaming panel.
+    ///
+    /// `Some` from `CompactionStarted` until `CompactionCompleted`; on failure
+    /// it stays `Some` with `error` set so the reason persists until the next
+    /// turn or compaction. `None` at rest.
+    pub compaction: Option<CompactionView>,
+}
+
+/// Live state of an in-progress (or just-failed) context compaction.
+///
+/// Drives the streaming summary panel: the summary text grows as
+/// `CompactionDelta` events arrive, and `error` flips the panel to a failure
+/// notice that persists in the transcript.
+#[derive(Debug, Clone)]
+pub struct CompactionView {
+    /// Why compaction fired (manual `/compact` vs automatic threshold).
+    pub trigger: zhive_proto::hook::CompactTrigger,
+    /// Transcript items being folded into the summary.
+    pub entries: u32,
+    /// Summary text streamed so far.
+    pub summary: String,
+    /// Failure reason if compaction failed; `None` while in progress/succeeded.
+    pub error: Option<String>,
 }
 
 impl App {
@@ -532,6 +560,7 @@ impl App {
             scrollback: 0,
             viewport_max_scroll: Cell::new(0),
             details_expanded: false,
+            thinking_effort: zhive_proto::domain::ThinkingEffort::default(),
             palette_index: 0,
             should_quit: false,
             last_usage: None,
@@ -546,6 +575,7 @@ impl App {
             selection: None,
             sel_geom: Cell::new(SelGeom::default()),
             sel_lines: RefCell::new(Vec::new()),
+            compaction: None,
             config,
         }
     }
@@ -568,6 +598,44 @@ impl App {
     /// ```
     pub fn set_extra_commands(&mut self, commands: Vec<SlashCommand>) {
         self.extra_commands = commands;
+    }
+
+    /// Advances the reasoning depth one step through the active model's levels.
+    ///
+    /// Bound to Ctrl+T. The cycle is model-specific
+    /// ([`zhive_proto::domain::ThinkingEffort::cycle_for`]) so the displayed
+    /// level is always one the model actually supports — what you see is exactly
+    /// what is sent. Sets a transient [`Self::flash`] announcing the new level,
+    /// or a "not supported" notice for models without depth control.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use zhive_tui::app::App;
+    /// use zhive_tui::TuiConfig;
+    /// use zhive_proto::domain::{ThinkingEffort, ThreadId};
+    /// // The default config's provider is non-Anthropic, which offers the
+    /// // portable low/medium/high tiers.
+    /// let mut app = App::new(TuiConfig::default(), ThreadId(Arc::from("thread:native/t")));
+    /// assert_eq!(app.thinking_effort, ThinkingEffort::Off);
+    /// app.cycle_thinking_effort();
+    /// assert_eq!(app.thinking_effort, ThinkingEffort::Low);
+    /// ```
+    pub fn cycle_thinking_effort(&mut self) {
+        use zhive_proto::domain::ThinkingEffort;
+        let levels =
+            ThinkingEffort::cycle_for(&self.config.provider_label, &self.config.model_label);
+        // A single-entry cycle is `[Off]`: the model has no depth control.
+        if levels.len() <= 1 {
+            self.flash = Some(format!(
+                "thinking not supported by {}",
+                self.config.model_label
+            ));
+            return;
+        }
+        self.thinking_effort = self.thinking_effort.cycle_next(levels);
+        self.flash = Some(format!("thinking: {}", self.thinking_effort.label()));
     }
 
     /// Registers the discovered skills for `/skill:<name>` and the `/skills`
@@ -847,6 +915,56 @@ impl App {
         } = event
         {
             self.last_usage = Some((*input_tokens, *output_tokens));
+        }
+        // Track in-progress / failed compaction for the streaming progress
+        // panel. Auto and manual compaction both surface here.
+        match event {
+            EngineNotification::CompactionStarted {
+                trigger, entries, ..
+            } => {
+                self.compaction = Some(CompactionView {
+                    trigger: *trigger,
+                    entries: *entries,
+                    summary: String::new(),
+                    error: None,
+                });
+                self.scrollback = 0;
+            }
+            EngineNotification::CompactionDelta { delta, .. } => {
+                if let Some(view) = self.compaction.as_mut() {
+                    view.summary.push_str(delta);
+                }
+                self.scrollback = 0;
+            }
+            EngineNotification::CompactionCompleted {
+                entries_compacted, ..
+            } => {
+                // The marker + summary items arrive via ItemAppended; the live
+                // panel has done its job, so drop it.
+                self.compaction = None;
+                self.flash = Some(format!("compacted {entries_compacted} entries"));
+            }
+            EngineNotification::CompactionFailed { reason, .. } => {
+                // Keep a panel carrying the reason so the failure is visible in
+                // the transcript, not just a transient flash.
+                match self.compaction.as_mut() {
+                    Some(view) => view.error = Some(reason.clone()),
+                    None => {
+                        self.compaction = Some(CompactionView {
+                            trigger: zhive_proto::hook::CompactTrigger::Manual,
+                            entries: 0,
+                            summary: String::new(),
+                            error: Some(reason.clone()),
+                        });
+                    }
+                }
+                self.flash = Some(format!("compact failed: {reason}"));
+            }
+            // A new turn supersedes any lingering compaction panel.
+            EngineNotification::TurnStarted { .. } => {
+                self.compaction = None;
+            }
+            _ => {}
         }
         self.conversation.apply(event);
         // Snap to the tail when new output lands so the user sees it.
@@ -1188,6 +1306,11 @@ impl App {
                 // Expanding/collapsing chips shifts every line below them, so a
                 // selection's absolute line indices would point at the wrong rows.
                 self.clear_selection();
+                Action::None
+            }
+            // Cycle reasoning depth: Off → Low → Medium → High → Xhigh → Off.
+            KeyCode::Char('t') if ctrl => {
+                self.cycle_thinking_effort();
                 Action::None
             }
             KeyCode::Char(c) if !ctrl => {
@@ -1825,6 +1948,72 @@ mod tests {
         for c in text.chars() {
             app.on_key(key(KeyCode::Char(c)));
         }
+    }
+
+    #[test]
+    fn on_engine_drives_compaction_panel_lifecycle() {
+        use zhive_proto::hook::CompactTrigger;
+        let mut app = app();
+        let tid = app.conversation.thread_id.clone();
+
+        app.on_engine(&EngineNotification::CompactionStarted {
+            thread_id: tid.clone(),
+            trigger: CompactTrigger::Manual,
+            entries: 5,
+        });
+        let view = app.compaction.as_ref().expect("panel opens on start");
+        assert_eq!(view.entries, 5);
+        assert!(view.error.is_none());
+        assert!(view.summary.is_empty());
+
+        app.on_engine(&EngineNotification::CompactionDelta {
+            thread_id: tid.clone(),
+            delta: "Hello ".to_owned(),
+        });
+        app.on_engine(&EngineNotification::CompactionDelta {
+            thread_id: tid.clone(),
+            delta: "world".to_owned(),
+        });
+        assert_eq!(app.compaction.as_ref().unwrap().summary, "Hello world");
+
+        // Completed clears the live panel; the persisted summary arrives as an
+        // ItemAppended item the conversation reducer renders normally.
+        app.on_engine(&EngineNotification::CompactionCompleted {
+            thread_id: tid,
+            entries_compacted: 5,
+        });
+        assert!(app.compaction.is_none());
+        assert_eq!(app.flash.as_deref(), Some("compacted 5 entries"));
+    }
+
+    #[test]
+    fn on_engine_compaction_failure_persists_reason() {
+        use zhive_proto::hook::CompactTrigger;
+        let mut app = app();
+        let tid = app.conversation.thread_id.clone();
+        app.on_engine(&EngineNotification::CompactionStarted {
+            thread_id: tid.clone(),
+            trigger: CompactTrigger::Auto,
+            entries: 3,
+        });
+        app.on_engine(&EngineNotification::CompactionFailed {
+            thread_id: tid.clone(),
+            reason: "provider exploded".to_owned(),
+        });
+        // Failure keeps the panel with the reason so it stays visible.
+        let view = app.compaction.as_ref().expect("panel persists on failure");
+        assert_eq!(view.error.as_deref(), Some("provider exploded"));
+        assert_eq!(
+            app.flash.as_deref(),
+            Some("compact failed: provider exploded")
+        );
+
+        // A new turn supersedes the lingering failure panel.
+        app.on_engine(&EngineNotification::TurnStarted {
+            thread_id: tid,
+            turn_id: turn_id("turn:native/t/0"),
+        });
+        assert!(app.compaction.is_none());
     }
 
     #[test]

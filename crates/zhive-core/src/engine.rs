@@ -37,6 +37,7 @@ mod inner;
 mod lifecycle;
 pub mod phase;
 mod prompt;
+mod reasoning;
 mod resume;
 mod subagent_spawn;
 pub mod submission;
@@ -612,11 +613,37 @@ impl Engine {
         user_input: Vec<Item>,
         scope: Option<PermissionScope>,
     ) -> Result<TurnId, EngineError> {
+        self.start_turn_with_reasoning(thread_id, user_input, scope, None)
+            .await
+    }
+
+    /// Starts a turn, additionally requesting a reasoning depth.
+    ///
+    /// Identical to [`start_turn`](Self::start_turn) but carries a
+    /// [`zhive_proto::domain::ThinkingEffort`] that `run_turn_inner` applies to
+    /// the provider request. `None` leaves the provider default; `Some(level)`
+    /// requests that depth ([`ThinkingEffort::Off`] explicitly disables it).
+    ///
+    /// # Errors
+    ///
+    /// Same as [`start_turn`](Self::start_turn): channel-level
+    /// [`EngineError`] variants, or [`EngineError::EngineBusy`] when a turn is
+    /// already in flight.
+    ///
+    /// [`ThinkingEffort::Off`]: zhive_proto::domain::ThinkingEffort::Off
+    pub async fn start_turn_with_reasoning(
+        &self,
+        thread_id: ThreadId,
+        user_input: Vec<Item>,
+        scope: Option<PermissionScope>,
+        reasoning: Option<zhive_proto::domain::ThinkingEffort>,
+    ) -> Result<TurnId, EngineError> {
         let reply = self
             .submit_with_reply(Submission::StartTurn {
                 thread_id,
                 user_input,
                 scope,
+                reasoning,
             })
             .await?;
         match reply {
@@ -682,17 +709,23 @@ impl Engine {
 
     /// Compacts a thread's transcript history into an LLM-generated summary.
     ///
+    /// Returns once compaction has *started*, not finished: the synchronous
+    /// prelude (snapshot, phase claim, `PreCompact` hook) runs inline and, on
+    /// success, the slow provider summarization is spawned in the background
+    /// while this returns [`submission::CompactReply::Started`]. The eventual
+    /// success or failure is delivered via the `compaction_completed` /
+    /// `compaction_failed` events, not this reply.
+    ///
     /// Requires the engine to be `Idle`; if a turn is in flight the dispatch
     /// fails with [`submission::CompactError::EngineBusy`] rather than
-    /// blocking. Compaction is in-memory only in Phase 1 (it is not persisted
-    /// to the rollout).
+    /// blocking. The compacted transcript is persisted as a rollout checkpoint.
     ///
     /// # Errors
     ///
-    /// Channel-level [`EngineError`] variants on actor failure; the
-    /// compaction's own failures (unknown thread, busy engine, provider
-    /// error) are folded into the `Ok` value as
-    /// [`submission::CompactError`].
+    /// Channel-level [`EngineError`] variants on actor failure; the fast
+    /// terminal failures (unknown thread, busy engine, `PreCompact` block) are
+    /// folded into the `Ok` value as [`submission::CompactError`]. A
+    /// summarization failure surfaces later as a `compaction_failed` event.
     ///
     /// ```no_run
     /// use zhive_core::engine::Engine;

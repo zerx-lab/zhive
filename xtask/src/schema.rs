@@ -150,6 +150,10 @@ pub fn run() -> anyhow::Result<()> {
     emit!(zhive_proto::events::SubagentStartedPayload);
     emit!(zhive_proto::events::SubagentCompletedPayload);
     emit!(zhive_proto::events::ThreadForkedPayload);
+    emit!(zhive_proto::events::CompactionStartedPayload);
+    emit!(zhive_proto::events::CompactionDeltaPayload);
+    emit!(zhive_proto::events::CompactionCompletedPayload);
+    emit!(zhive_proto::events::CompactionFailedPayload);
 
     eprintln!("cargo xtask schema: done.");
     Ok(())

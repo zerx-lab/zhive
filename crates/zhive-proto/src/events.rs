@@ -36,7 +36,7 @@ use serde::{Deserialize, Serialize};
 use schemars::JsonSchema;
 
 use crate::domain::{Item, ItemId, ThreadId, TurnError, TurnId};
-use crate::hook::EnginePhase;
+use crate::hook::{CompactTrigger, EnginePhase};
 use crate::permission::RequestPermissionRequest;
 
 // ============================================================
@@ -585,6 +585,225 @@ impl PhaseChangedPayload {
             from,
             to,
         }
+    }
+}
+
+// ============================================================
+// events/compaction_started
+// ============================================================
+
+/// Payload of the `events/compaction_started` notification.
+///
+/// Emitted when context compaction enters the summarization phase. Anchors
+/// the `compaction_delta` / `compaction_completed` / `compaction_failed`
+/// bracket that follows for the same thread.
+///
+/// # Examples
+///
+/// ```
+/// use std::sync::Arc;
+/// use zhive_proto::domain::ThreadId;
+/// use zhive_proto::hook::CompactTrigger;
+/// use zhive_proto::events::CompactionStartedPayload;
+/// let p = CompactionStartedPayload::new(
+///     ThreadId(Arc::from("thread:native/t")),
+///     CompactTrigger::Manual,
+///     12,
+/// );
+/// let v = serde_json::to_value(&p).unwrap();
+/// assert_eq!(v["threadId"], "thread:native/t");
+/// assert_eq!(v["trigger"], "manual");
+/// assert_eq!(v["entries"], 12u32);
+/// let back: CompactionStartedPayload = serde_json::from_value(v).unwrap();
+/// assert_eq!(back, p);
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct CompactionStartedPayload {
+    /// Thread being compacted.
+    pub thread_id: ThreadId,
+    /// Why compaction fired (`manual` for `/compact`, `auto` for the threshold).
+    pub trigger: CompactTrigger,
+    /// Transcript items that will be folded into the summary.
+    pub entries: u32,
+}
+
+impl CompactionStartedPayload {
+    /// Constructs a compaction-started payload.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use zhive_proto::domain::ThreadId;
+    /// use zhive_proto::hook::CompactTrigger;
+    /// use zhive_proto::events::CompactionStartedPayload;
+    /// let p = CompactionStartedPayload::new(
+    ///     ThreadId(Arc::from("t")), CompactTrigger::Auto, 3,
+    /// );
+    /// assert_eq!(p.entries, 3);
+    /// ```
+    #[must_use]
+    pub fn new(thread_id: ThreadId, trigger: CompactTrigger, entries: u32) -> Self {
+        Self {
+            thread_id,
+            trigger,
+            entries,
+        }
+    }
+}
+
+// ============================================================
+// events/compaction_delta
+// ============================================================
+
+/// Payload of the `events/compaction_delta` notification.
+///
+/// One streamed fragment of the compaction summary as the model produces it.
+///
+/// # Examples
+///
+/// ```
+/// use std::sync::Arc;
+/// use zhive_proto::domain::ThreadId;
+/// use zhive_proto::events::CompactionDeltaPayload;
+/// let p = CompactionDeltaPayload::new(ThreadId(Arc::from("t")), "Hello".into());
+/// let v = serde_json::to_value(&p).unwrap();
+/// assert_eq!(v["delta"], "Hello");
+/// let back: CompactionDeltaPayload = serde_json::from_value(v).unwrap();
+/// assert_eq!(back, p);
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct CompactionDeltaPayload {
+    /// Thread being compacted.
+    pub thread_id: ThreadId,
+    /// Streaming summary fragment.
+    pub delta: String,
+}
+
+impl CompactionDeltaPayload {
+    /// Constructs a compaction-delta payload.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use zhive_proto::domain::ThreadId;
+    /// use zhive_proto::events::CompactionDeltaPayload;
+    /// let p = CompactionDeltaPayload::new(ThreadId(Arc::from("t")), "x".into());
+    /// assert_eq!(p.delta, "x");
+    /// ```
+    #[must_use]
+    pub fn new(thread_id: ThreadId, delta: String) -> Self {
+        Self { thread_id, delta }
+    }
+}
+
+// ============================================================
+// events/compaction_completed
+// ============================================================
+
+/// Payload of the `events/compaction_completed` notification.
+///
+/// Closes the delta bracket; the persisted summary item also arrives via
+/// `events/item_appended`.
+///
+/// # Examples
+///
+/// ```
+/// use std::sync::Arc;
+/// use zhive_proto::domain::ThreadId;
+/// use zhive_proto::events::CompactionCompletedPayload;
+/// let p = CompactionCompletedPayload::new(ThreadId(Arc::from("t")), 42);
+/// let v = serde_json::to_value(&p).unwrap();
+/// assert_eq!(v["entriesCompacted"], 42u32);
+/// let back: CompactionCompletedPayload = serde_json::from_value(v).unwrap();
+/// assert_eq!(back, p);
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct CompactionCompletedPayload {
+    /// Thread that was compacted.
+    pub thread_id: ThreadId,
+    /// Transcript items folded into the summary.
+    pub entries_compacted: u32,
+}
+
+impl CompactionCompletedPayload {
+    /// Constructs a compaction-completed payload.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use zhive_proto::domain::ThreadId;
+    /// use zhive_proto::events::CompactionCompletedPayload;
+    /// let p = CompactionCompletedPayload::new(ThreadId(Arc::from("t")), 7);
+    /// assert_eq!(p.entries_compacted, 7);
+    /// ```
+    #[must_use]
+    pub fn new(thread_id: ThreadId, entries_compacted: u32) -> Self {
+        Self {
+            thread_id,
+            entries_compacted,
+        }
+    }
+}
+
+// ============================================================
+// events/compaction_failed
+// ============================================================
+
+/// Payload of the `events/compaction_failed` notification.
+///
+/// Carries the failure reason because the `engine/compact` reply already
+/// returned `Started` and the error can no longer travel back through it.
+///
+/// # Examples
+///
+/// ```
+/// use std::sync::Arc;
+/// use zhive_proto::domain::ThreadId;
+/// use zhive_proto::events::CompactionFailedPayload;
+/// let p = CompactionFailedPayload::new(ThreadId(Arc::from("t")), "boom".into());
+/// let v = serde_json::to_value(&p).unwrap();
+/// assert_eq!(v["reason"], "boom");
+/// let back: CompactionFailedPayload = serde_json::from_value(v).unwrap();
+/// assert_eq!(back, p);
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct CompactionFailedPayload {
+    /// Thread whose compaction failed.
+    pub thread_id: ThreadId,
+    /// Human-readable failure reason.
+    pub reason: String,
+}
+
+impl CompactionFailedPayload {
+    /// Constructs a compaction-failed payload.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use zhive_proto::domain::ThreadId;
+    /// use zhive_proto::events::CompactionFailedPayload;
+    /// let p = CompactionFailedPayload::new(ThreadId(Arc::from("t")), "x".into());
+    /// assert_eq!(p.reason, "x");
+    /// ```
+    #[must_use]
+    pub fn new(thread_id: ThreadId, reason: String) -> Self {
+        Self { thread_id, reason }
     }
 }
 

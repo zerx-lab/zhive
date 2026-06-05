@@ -394,6 +394,13 @@ pub struct ActiveTurn {
     /// Stored here so that a subagent spawn request can access the
     /// parent turn's live scope without acquiring extra locks.
     pub scope: PermissionScope,
+    /// Requested reasoning depth for this turn, threaded from
+    /// [`crate::engine::submission::Submission::StartTurn`].
+    ///
+    /// `None` leaves the provider default in place; `Some(level)` is read by
+    /// `run_turn_inner` and applied to the provider request. Subagent turns
+    /// leave this `None` (they do not inherit the parent's depth).
+    pub reasoning: Option<zhive_proto::domain::ThinkingEffort>,
 }
 
 impl ActiveTurn {
@@ -421,6 +428,7 @@ impl ActiveTurn {
             next_item_seq: 0,
             cancel: CancellationToken::new(),
             scope: PermissionScope::default_turn_scope(),
+            reasoning: None,
         }
     }
 
@@ -458,6 +466,7 @@ impl ActiveTurn {
             next_item_seq: 0,
             cancel,
             scope: PermissionScope::default_turn_scope(),
+            reasoning: None,
         }
     }
 
@@ -496,6 +505,7 @@ impl ActiveTurn {
             next_item_seq: 0,
             cancel,
             scope,
+            reasoning: None,
         }
     }
 }

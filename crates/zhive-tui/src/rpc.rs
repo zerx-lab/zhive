@@ -84,9 +84,21 @@ fn user_message(thread: &ThreadId, text: &str) -> Item {
 ///
 /// Returns [`crate::error::TuiError::Client`] if the engine rejects the turn
 /// (e.g. busy) or the transport fails.
-pub async fn start_turn(client: &Client, thread: &ThreadId, text: &str) -> Result<()> {
+pub async fn start_turn(
+    client: &Client,
+    thread: &ThreadId,
+    text: &str,
+    reasoning: zhive_proto::domain::ThinkingEffort,
+) -> Result<()> {
     let item = user_message(thread, text);
-    let params = json!({ "threadId": thread, "userInput": [item], "scope": null });
+    // `reasoning` is always sent explicitly (including `Off`) so the turn's
+    // depth is exactly what the UI shows rather than an engine default.
+    let params = json!({
+        "threadId": thread,
+        "userInput": [item],
+        "scope": null,
+        "reasoning": reasoning,
+    });
     client.call("engine/start_turn", Some(params)).await?;
     Ok(())
 }

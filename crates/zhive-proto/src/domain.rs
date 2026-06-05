@@ -291,6 +291,192 @@ pub struct TurnError {
     pub additional_details: Option<String>,
 }
 
+/// Requested reasoning depth for a turn (the "thinking" effort knob).
+///
+/// A portable, provider-agnostic depth that the engine maps onto each
+/// provider's native control — Anthropic's `output_config.effort`, `OpenAI`'s
+/// `reasoning_effort`, Google's thinking budget. [`Off`](Self::Off) disables
+/// the thinking phase entirely; the remaining levels request progressively
+/// deeper reasoning. Defaults to [`Off`](Self::Off).
+///
+/// # Examples
+///
+/// ```
+/// use zhive_proto::domain::ThinkingEffort;
+/// assert_eq!(ThinkingEffort::default(), ThinkingEffort::Off);
+/// let v = serde_json::to_value(ThinkingEffort::High).unwrap();
+/// assert_eq!(v, "high");
+/// let back: ThinkingEffort = serde_json::from_value(v).unwrap();
+/// assert_eq!(back, ThinkingEffort::High);
+/// ```
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub enum ThinkingEffort {
+    /// Reasoning disabled; the model answers without a thinking phase.
+    #[default]
+    Off,
+    /// Minimal reasoning — fastest reasoning tier (OpenAI base GPT-5 only).
+    Minimal,
+    /// Shallow reasoning — fastest, lowest token cost.
+    Low,
+    /// Balanced reasoning depth.
+    Medium,
+    /// Deep reasoning for harder, intelligence-sensitive work.
+    High,
+    /// Extra-deep reasoning (Anthropic Opus 4.7+ only).
+    Xhigh,
+    /// Maximum reasoning (Anthropic Opus 4.6+ only).
+    Max,
+}
+
+impl ThinkingEffort {
+    /// Returns `true` when a thinking phase is requested (any level but `Off`).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use zhive_proto::domain::ThinkingEffort;
+    /// assert!(!ThinkingEffort::Off.is_enabled());
+    /// assert!(ThinkingEffort::Low.is_enabled());
+    /// ```
+    #[must_use]
+    pub const fn is_enabled(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+
+    /// Returns the short lowercase label used in the UI and config files.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use zhive_proto::domain::ThinkingEffort;
+    /// assert_eq!(ThinkingEffort::Off.label(), "off");
+    /// assert_eq!(ThinkingEffort::Xhigh.label(), "xhigh");
+    /// ```
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Xhigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
+
+    /// Returns the depth levels a model supports, in cycle order (always Off-first).
+    ///
+    /// The single source of truth for which depths the UI offers and the engine
+    /// accepts, so the displayed level always matches what is sent — no silent
+    /// downgrade. Mirrors the official per-provider effort matrices (and
+    /// opencode's per-model variant sets):
+    ///
+    /// - **Anthropic**: Opus 4.7+ get `xhigh`/`max`, Opus 4.6 gets `max` (no
+    ///   `xhigh`), Opus 4.5 and Sonnet 4.6 cap at `high`; others only `Off`.
+    /// - **OpenAI**: o-series get `low`/`medium`/`high`; base GPT-5 adds
+    ///   `minimal`; GPT-5.1+ drop `minimal`; GPT-5.2+ / codex-max add `xhigh`;
+    ///   `*-chat` is fixed `medium`; non-reasoning models (`gpt-4o`, …) only
+    ///   `Off`. (OpenAI has no `max`; Anthropic has no `minimal`.)
+    /// - **Other providers**: the portable `low`/`medium`/`high` tiers.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use zhive_proto::domain::ThinkingEffort::{self, High, Low, Max, Medium, Minimal, Off, Xhigh};
+    /// assert_eq!(
+    ///     ThinkingEffort::cycle_for("anthropic", "claude-opus-4-8"),
+    ///     &[Off, Low, Medium, High, Xhigh, Max],
+    /// );
+    /// assert_eq!(ThinkingEffort::cycle_for("anthropic", "claude-sonnet-4-6"), &[Off, Low, Medium, High]);
+    /// assert_eq!(ThinkingEffort::cycle_for("anthropic", "claude-haiku-4-5"), &[Off]);
+    /// assert_eq!(
+    ///     ThinkingEffort::cycle_for("openai", "gpt-5"),
+    ///     &[Off, Minimal, Low, Medium, High],
+    /// );
+    /// assert_eq!(ThinkingEffort::cycle_for("openai", "o3"), &[Off, Low, Medium, High]);
+    /// assert_eq!(ThinkingEffort::cycle_for("openai", "gpt-4o"), &[Off]);
+    /// ```
+    #[must_use]
+    pub fn cycle_for(provider: &str, model_id: &str) -> &'static [ThinkingEffort] {
+        use ThinkingEffort::{High, Low, Max, Medium, Minimal, Off, Xhigh};
+        match provider {
+            "anthropic" => {
+                if model_id.contains("claude-opus-4-7") || model_id.contains("claude-opus-4-8") {
+                    &[Off, Low, Medium, High, Xhigh, Max]
+                } else if model_id.contains("claude-opus-4-6") {
+                    &[Off, Low, Medium, High, Max]
+                } else if model_id.contains("claude-opus-4-5")
+                    || model_id.contains("claude-sonnet-4-6")
+                {
+                    &[Off, Low, Medium, High]
+                } else {
+                    // Sonnet 4.5, Haiku 4.5, older: no effort support.
+                    &[Off]
+                }
+            }
+            // OpenAI — match most-specific id substrings first (the family names
+            // nest: `gpt-5.1-codex-max` contains `gpt-5`, `codex`, `gpt-5.1`).
+            "openai" => {
+                if model_id.contains("-chat") {
+                    &[Off, Medium] // reasoning-less chat tier; fixed medium
+                } else if model_id.contains("-pro") {
+                    &[Off, High] // pro: `high` only (Responses-only model)
+                } else if model_id.contains("codex-max") {
+                    &[Off, Low, Medium, High, Xhigh]
+                } else if model_id.contains("codex") {
+                    &[Off, Low, Medium, High]
+                } else if model_id.contains("gpt-5.1") {
+                    &[Off, Low, Medium, High] // 5.1 dropped `minimal`
+                } else if model_id.contains("gpt-5.2")
+                    || model_id.contains("gpt-5.3")
+                    || model_id.contains("gpt-5.4")
+                    || model_id.contains("gpt-5.5")
+                {
+                    &[Off, Low, Medium, High, Xhigh] // 5.2+ added `xhigh`
+                } else if model_id.contains("gpt-5") {
+                    &[Off, Minimal, Low, Medium, High] // base GPT-5 / mini / nano
+                } else if model_id.starts_with("o1")
+                    || model_id.starts_with("o3")
+                    || model_id.starts_with("o4")
+                {
+                    &[Off, Low, Medium, High] // o-series
+                } else {
+                    // gpt-4o, gpt-4.1, unknown: not a reasoning model.
+                    &[Off]
+                }
+            }
+            // xAI, Google, etc.: portable tiers until per-provider tables exist.
+            _ => &[Off, Low, Medium, High],
+        }
+    }
+
+    /// Returns the next level after `self` within `levels`, wrapping to the start.
+    ///
+    /// Used to cycle the depth with one keypress. If `self` is not in `levels`
+    /// (e.g. the model changed), returns the first entry so the result is always
+    /// a level the current model supports.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use zhive_proto::domain::ThinkingEffort::{self, High, Low, Medium, Off};
+    /// let levels = [Off, Low, Medium, High];
+    /// assert_eq!(Off.cycle_next(&levels), Low);
+    /// assert_eq!(High.cycle_next(&levels), Off);
+    /// ```
+    #[must_use]
+    pub fn cycle_next(self, levels: &[ThinkingEffort]) -> ThinkingEffort {
+        match levels.iter().position(|&l| l == self) {
+            Some(i) => levels[(i + 1) % levels.len()],
+            None => levels.first().copied().unwrap_or(ThinkingEffort::Off),
+        }
+    }
+}
+
 // ============================================================
 // Item (14 cases; discriminator = "kind"; snake_case)
 // ============================================================

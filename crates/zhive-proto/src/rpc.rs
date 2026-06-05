@@ -34,7 +34,7 @@ use serde_json::Value;
 #[cfg(feature = "schema")]
 use schemars::JsonSchema;
 
-use crate::domain::{Item, ItemId, Thread, ThreadId, ToolKind, TurnId};
+use crate::domain::{Item, ItemId, ThinkingEffort, Thread, ThreadId, ToolKind, TurnId};
 use crate::hook::CompactTrigger;
 use crate::permission::PermissionScope;
 
@@ -84,6 +84,10 @@ pub struct StartTurnParams {
     /// Optional permission scope override; `None` inherits the parent scope.
     #[serde(default)]
     pub scope: Option<PermissionScope>,
+    /// Requested reasoning depth for this turn; `None` inherits the engine
+    /// default (no override), `Some(Off)` explicitly disables thinking.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<ThinkingEffort>,
 }
 
 impl StartTurnParams {
@@ -109,7 +113,29 @@ impl StartTurnParams {
             thread_id,
             user_input,
             scope,
+            reasoning: None,
         }
+    }
+
+    /// Sets the requested reasoning depth, returning the updated params.
+    ///
+    /// `None` leaves the engine default in place; `Some(level)` requests that
+    /// depth for the turn ([`ThinkingEffort::Off`] explicitly disables it).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use zhive_proto::domain::{ThinkingEffort, ThreadId};
+    /// use zhive_proto::rpc::StartTurnParams;
+    /// let p = StartTurnParams::new(ThreadId(Arc::from("thread:native/x")), vec![], None)
+    ///     .with_reasoning(Some(ThinkingEffort::High));
+    /// assert_eq!(p.reasoning, Some(ThinkingEffort::High));
+    /// ```
+    #[must_use]
+    pub fn with_reasoning(mut self, reasoning: Option<ThinkingEffort>) -> Self {
+        self.reasoning = reasoning;
+        self
     }
 }
 
@@ -352,6 +378,9 @@ pub enum CompactStatus {
     Compacted,
     /// The transcript was already compact; nothing to do.
     NothingToCompact,
+    /// Compaction began asynchronously; progress arrives via the
+    /// `events/compaction_*` notifications and `entriesCompacted` is 0.
+    Started,
 }
 
 /// Result of the `engine/compact` RPC.

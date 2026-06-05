@@ -138,16 +138,21 @@ needed to continue. Respond with the summary only.\n\n\
 --- TRANSCRIPT ---\n";
 
 impl EngineInner {
-    /// Compacts the transcript of `thread_id` into a summary.
+    /// Compacts `thread_id`, returning once async summarization has *started*.
     ///
-    /// Looks the thread up in the store, then runs [`Self::run_compaction`].
+    /// Used by the manual `engine/compact` path. The synchronous prelude
+    /// (snapshot, phase claim, `PreCompact` hook) runs inline on the actor
+    /// loop; on success the slow provider summarization is spawned as a
+    /// detached task and this returns [`CompactReply::Started`]. The eventual
+    /// outcome is delivered via [`EngineEvent::CompactionCompleted`] /
+    /// [`EngineEvent::CompactionFailed`], not this reply.
     ///
     /// # Errors
     ///
     /// * [`CompactError::ThreadNotFound`] — no such thread.
     /// * [`CompactError::EngineBusy`] — engine phase was not `Idle`.
-    /// * [`CompactError::SummarizationFailed`] — the provider call failed.
-    pub(in crate::engine) async fn compact(
+    /// * [`CompactError::BlockedByHook`] — a `PreCompact` hook blocked it.
+    pub(in crate::engine) async fn compact_dispatch(
         self: &Arc<Self>,
         thread_id: ThreadId,
         trigger: CompactTrigger,
@@ -157,33 +162,46 @@ impl EngineInner {
             .get(&thread_id)
             .await
             .ok_or(CompactError::ThreadNotFound)?;
-        self.run_compaction(&handle, thread_id, trigger).await
+        match self.compact_prelude(&handle, &thread_id, trigger).await {
+            CompactStart::Done(result) => result,
+            CompactStart::Started { snapshot, entries } => {
+                let inner = Arc::clone(self);
+                tokio::spawn(async move {
+                    inner
+                        .compact_tail(handle, thread_id, trigger, snapshot, entries)
+                        .await;
+                });
+                Ok(CompactReply::Started)
+            }
+        }
     }
 
-    /// Core compaction routine shared by the manual entry point and the
-    /// inline auto-trigger at the end of a turn.
+    /// Synchronous compaction prelude: snapshot, phase claim, `PreCompact`.
     ///
-    /// Requires the engine to be `Idle`; the `Idle → Compaction` CAS fails
-    /// cleanly (returning [`CompactError::EngineBusy`]) if a turn is in
-    /// flight, so compaction never races a live turn mutating the transcript.
-    pub(in crate::engine) async fn run_compaction(
+    /// Runs on the actor loop (the only await is the hook dispatch, which
+    /// compaction already paid before summarizing). Returns
+    /// [`CompactStart::Done`] for a fast terminal outcome — with the phase
+    /// already rolled back where it was claimed — or [`CompactStart::Started`]
+    /// once the `Idle → Compaction` phase is held, the `PreCompact` hook has
+    /// passed, and [`EngineEvent::CompactionStarted`] has been broadcast.
+    async fn compact_prelude(
         self: &Arc<Self>,
         handle: &Arc<ThreadHandle>,
-        thread_id: ThreadId,
+        thread_id: &ThreadId,
         trigger: CompactTrigger,
-    ) -> Result<CompactReply, CompactError> {
+    ) -> CompactStart {
         // 1. Snapshot the transcript. Nothing to do on an empty thread.
         let snapshot: Vec<Item> = handle.items_snapshot().await;
         if snapshot.is_empty() {
-            return Ok(CompactReply::NothingToCompact);
+            return CompactStart::Done(Ok(CompactReply::NothingToCompact));
         }
         let entries = u32::try_from(snapshot.len()).unwrap_or(u32::MAX);
 
         // 2. Claim the engine phase. Compaction requires Idle.
         if let Err(err) = self.try_set_phase_atomic(EnginePhase::Idle, EnginePhase::Compaction) {
-            return Err(CompactError::EngineBusy {
+            return CompactStart::Done(Err(CompactError::EngineBusy {
                 current: err.actual(),
-            });
+            }));
         }
         let _ = self.events_tx().send(EngineEvent::PhaseChanged {
             thread_id: Some(thread_id.clone()),
@@ -195,27 +213,98 @@ impl EngineInner {
         //    A hook that returns a blocking decision (continue_loop=false or
         //    Deny) aborts the compaction cleanly; the phase is rolled back.
         if let Err(blocked) = self
-            .dispatch_compact_hook(true, &thread_id, trigger, entries)
+            .dispatch_compact_hook(true, thread_id, trigger, entries)
             .await
         {
-            self.leave_compaction(&thread_id);
-            return Err(blocked);
+            self.leave_compaction(thread_id);
+            return CompactStart::Done(Err(blocked));
         }
 
-        // 4. Summarise via the provider, inside the `zhive.compaction` span.
-        //    Use `.instrument()` (not `.enter()`) so the span is correctly
-        //    attached across the await on a multi-thread runtime.
-        let summary = summarize(self.provider(), &snapshot, self.compaction_instruction())
-            .instrument(tracing::info_span!("zhive.compaction", "session.id" = %thread_id.0))
-            .await;
+        // Announce the start (anchors the delta bracket) before the tail runs.
+        let _ = self.events_tx().send(EngineEvent::CompactionStarted {
+            thread_id: thread_id.clone(),
+            trigger,
+            entries,
+        });
+
+        CompactStart::Started { snapshot, entries }
+    }
+
+    /// Core compaction routine shared by the post-turn auto-trigger and tests.
+    ///
+    /// Runs the prelude then the tail inline (no spawn), so callers that want
+    /// to await the full compaction — the auto-trigger in [`super::turn`] and
+    /// unit tests — get a synchronous result. The manual RPC path uses
+    /// [`Self::compact_dispatch`] instead, which spawns the tail.
+    ///
+    /// Requires the engine to be `Idle`; the `Idle → Compaction` CAS fails
+    /// cleanly (returning [`CompactError::EngineBusy`]) if a turn is in flight.
+    ///
+    /// # Errors
+    ///
+    /// * [`CompactError::EngineBusy`] — engine phase was not `Idle`. A
+    ///   summarization failure is reported via [`EngineEvent::CompactionFailed`],
+    ///   not the return value.
+    pub(in crate::engine) async fn run_compaction(
+        self: &Arc<Self>,
+        handle: &Arc<ThreadHandle>,
+        thread_id: ThreadId,
+        trigger: CompactTrigger,
+    ) -> Result<CompactReply, CompactError> {
+        match self.compact_prelude(handle, &thread_id, trigger).await {
+            CompactStart::Done(result) => result,
+            CompactStart::Started { snapshot, entries } => {
+                Arc::clone(self)
+                    .compact_tail(Arc::clone(handle), thread_id, trigger, snapshot, entries)
+                    .await;
+                Ok(CompactReply::Compacted {
+                    entries_compacted: entries,
+                })
+            }
+        }
+    }
+
+    /// Async compaction tail: summarize (streaming), replace history, persist,
+    /// broadcast, `PostCompact`, leave the phase.
+    ///
+    /// Runs spawned (manual path) or inline (auto path / tests). A
+    /// [`CompactionPhaseGuard`] is the backstop: if this returns early or
+    /// panics while still holding `Compaction`, the guard restores `Idle` and
+    /// broadcasts [`EngineEvent::CompactionFailed`] so a subscriber is never
+    /// left waiting. Compaction is **not** cancellable in this pass — the
+    /// transcript swap is a single atomic replace applied only after a
+    /// successful summary, so a partial stream is harmless.
+    async fn compact_tail(
+        self: Arc<Self>,
+        handle: Arc<ThreadHandle>,
+        thread_id: ThreadId,
+        trigger: CompactTrigger,
+        snapshot: Vec<Item>,
+        entries: u32,
+    ) {
+        let mut guard = CompactionPhaseGuard::new(Arc::clone(&self), thread_id.clone());
+
+        // 4. Summarise via the provider, streaming each delta to subscribers,
+        //    inside the `zhive.compaction` span. Use `.instrument()` (not
+        //    `.enter()`) so the span survives the await on a multi-thread runtime.
+        let summary = summarize_streaming(
+            self.provider(),
+            &snapshot,
+            self.compaction_instruction(),
+            |delta| {
+                let _ = self.events_tx().send(EngineEvent::CompactionDelta {
+                    thread_id: thread_id.clone(),
+                    delta: delta.to_owned(),
+                });
+            },
+        )
+        .instrument(tracing::info_span!("zhive.compaction", "session.id" = %thread_id.0))
+        .await;
         let summary = match summary {
             Ok(s) => s,
             Err(e) => {
-                // Roll the phase back before surfacing the error.
-                self.leave_compaction(&thread_id);
-                return Err(CompactError::SummarizationFailed {
-                    message: e.to_string(),
-                });
+                self.finish_failed(&mut guard, &thread_id, e.to_string());
+                return;
             }
         };
 
@@ -273,12 +362,31 @@ impl EngineInner {
             .dispatch_compact_hook(false, &thread_id, trigger, entries)
             .await;
 
-        // 7. Compaction → Idle.
+        // 7. Compaction → Idle, then announce successful completion.
         self.leave_compaction(&thread_id);
-
-        Ok(CompactReply::Compacted {
+        let _ = self.events_tx().send(EngineEvent::CompactionCompleted {
+            thread_id: thread_id.clone(),
             entries_compacted: entries,
-        })
+        });
+        guard.disarm();
+    }
+
+    /// Rolls the phase back to `Idle` and broadcasts a failure event.
+    ///
+    /// Disarms `guard` so its `Drop` backstop does not double-report the
+    /// failure just surfaced here.
+    fn finish_failed(
+        &self,
+        guard: &mut CompactionPhaseGuard,
+        thread_id: &ThreadId,
+        reason: String,
+    ) {
+        self.leave_compaction(thread_id);
+        let _ = self.events_tx().send(EngineEvent::CompactionFailed {
+            thread_id: thread_id.clone(),
+            reason,
+        });
+        guard.disarm();
     }
 
     /// Restores `Idle` from `Compaction` and broadcasts the `PhaseChanged`.
@@ -414,6 +522,64 @@ impl EngineInner {
     }
 }
 
+/// Outcome of [`EngineInner::compact_prelude`].
+enum CompactStart {
+    /// A fast terminal outcome; the caller replies immediately. The phase is
+    /// already rolled back where it was claimed, or was never claimed.
+    Done(Result<CompactReply, CompactError>),
+    /// The `Compaction` phase is held and `PreCompact` passed; the caller must
+    /// drive [`EngineInner::compact_tail`] with this snapshot.
+    Started {
+        /// Transcript snapshot to summarize.
+        snapshot: Vec<Item>,
+        /// Item count being folded into the summary.
+        entries: u32,
+    },
+}
+
+/// RAII backstop restoring `Idle` if a compaction tail exits while still
+/// holding the `Compaction` phase.
+///
+/// The normal success and failure paths leave the phase explicitly and then
+/// call [`Self::disarm`]. If the tail returns early or panics while armed,
+/// `Drop` runs the conditional `Compaction → Idle` CAS (a logged no-op when
+/// the phase already moved) and broadcasts [`EngineEvent::CompactionFailed`],
+/// so a subscriber is never left waiting on a started-but-silent compaction.
+struct CompactionPhaseGuard {
+    inner: Arc<EngineInner>,
+    thread_id: ThreadId,
+    armed: bool,
+}
+
+impl CompactionPhaseGuard {
+    /// Arms a guard for `thread_id`'s in-flight compaction.
+    fn new(inner: Arc<EngineInner>, thread_id: ThreadId) -> Self {
+        Self {
+            inner,
+            thread_id,
+            armed: true,
+        }
+    }
+
+    /// Disarms the guard after the tail has left the phase normally.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CompactionPhaseGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.inner.leave_compaction(&self.thread_id);
+        let _ = self.inner.events_tx().send(EngineEvent::CompactionFailed {
+            thread_id: self.thread_id.clone(),
+            reason: "compaction task terminated unexpectedly".to_owned(),
+        });
+    }
+}
+
 /// Deterministic item id for a compaction-generated item.
 ///
 /// Incorporates the monotonic `seq` counter so repeated compactions on the
@@ -430,27 +596,28 @@ fn compaction_item_id(thread_id: &ThreadId, seq: u64, suffix: &str) -> ItemId {
     )))
 }
 
-/// Renders `items` to plain text and asks `provider` for a handoff summary.
+/// Asks `provider` for a handoff summary, streaming each fragment to `on_delta`.
 ///
 /// `instruction` is the summarization request prepended to the rendered
 /// transcript; callers pass [`super::inner::EngineInner::compaction_instruction`],
 /// which is the host-configured prompt or the built-in [`SUMMARY_INSTRUCTION`].
-/// Collects every `TextDelta` from the streamed response into a single
-/// string. Returns the trimmed summary text.
-///
-/// Shared with [`super::fork`], which reuses the same provider summarisation
-/// path for the optional branch-summary step rather than building a parallel
-/// one.
+/// `on_delta` is invoked once per provider `TextDelta` with the raw fragment,
+/// letting the caller surface the summary as it is generated. The complete,
+/// trimmed summary is also returned.
 ///
 /// # Errors
 ///
 /// Returns a [`ProviderError`] if the provider call fails or the stream
 /// yields an error part.
-pub(in crate::engine) async fn summarize(
+pub(in crate::engine) async fn summarize_streaming<F>(
     provider: &DynLanguageModel,
     items: &[Item],
     instruction: &str,
-) -> Result<String, ProviderError> {
+    mut on_delta: F,
+) -> Result<String, ProviderError>
+where
+    F: FnMut(&str),
+{
     let mut transcript = String::new();
     for item in items {
         match item {
@@ -494,10 +661,31 @@ pub(in crate::engine) async fn summarize(
     let mut summary = String::new();
     while let Some(part) = result.stream.next().await {
         if let StreamPart::TextDelta { delta, .. } = part.map_err(ProviderError::from)? {
+            on_delta(&delta);
             summary.push_str(&delta);
         }
     }
     Ok(summary.trim().to_owned())
+}
+
+/// Renders `items` to plain text and asks `provider` for a handoff summary.
+///
+/// Non-streaming wrapper over [`summarize_streaming`]; collects every
+/// `TextDelta` into the returned string without surfacing intermediate
+/// fragments. Shared with [`super::fork`], which reuses the same provider
+/// summarisation path for the optional branch-summary step rather than
+/// building a parallel one.
+///
+/// # Errors
+///
+/// Returns a [`ProviderError`] if the provider call fails or the stream
+/// yields an error part.
+pub(in crate::engine) async fn summarize(
+    provider: &DynLanguageModel,
+    items: &[Item],
+    instruction: &str,
+) -> Result<String, ProviderError> {
+    summarize_streaming(provider, items, instruction, |_| {}).await
 }
 
 #[cfg(test)]
@@ -530,6 +718,43 @@ mod tests {
         )
         .into_dyn();
         Arc::new(EngineInner::new(tx, model))
+    }
+
+    fn inner_with_model(model: DynLanguageModel) -> Arc<EngineInner> {
+        let (tx, _rx) = broadcast::channel::<EngineEvent>(64);
+        Arc::new(EngineInner::new(tx, model))
+    }
+
+    /// Provider whose calls always fail, to exercise the compaction failure path.
+    #[derive(Debug)]
+    struct FailingModel;
+
+    #[async_trait::async_trait]
+    impl llmsdk::LanguageModel for FailingModel {
+        fn provider(&self) -> &'static str {
+            "fail"
+        }
+        fn model_id(&self) -> &'static str {
+            "fail"
+        }
+        async fn do_generate(
+            &self,
+            _opts: CallOptions,
+        ) -> llmsdk::error::Result<llmsdk::language_model::GenerateResult> {
+            Err(llmsdk::ProviderError::no_such_model(
+                "fail",
+                "languageModel",
+            ))
+        }
+        async fn do_stream(
+            &self,
+            _opts: CallOptions,
+        ) -> llmsdk::error::Result<llmsdk::language_model::StreamResult> {
+            Err(llmsdk::ProviderError::no_such_model(
+                "fail",
+                "languageModel",
+            ))
+        }
     }
 
     fn user(id: &str, t: &str) -> Item {
@@ -694,6 +919,149 @@ mod tests {
         assert!(
             marker_id.contains("compaction-2-marker"),
             "second compaction marker must carry seq=2 in its id, got {marker_id}"
+        );
+    }
+
+    #[tokio::test]
+    async fn summarize_streaming_invokes_on_delta_per_fragment() {
+        let model = ScriptedModel::new(
+            "t",
+            "m",
+            vec![
+                StreamPart::TextStart {
+                    id: "b".into(),
+                    provider_metadata: None,
+                },
+                StreamPart::TextDelta {
+                    id: "b".into(),
+                    delta: "Hel".into(),
+                    provider_metadata: None,
+                },
+                StreamPart::TextDelta {
+                    id: "b".into(),
+                    delta: "lo".into(),
+                    provider_metadata: None,
+                },
+                StreamPart::TextEnd {
+                    id: "b".into(),
+                    provider_metadata: None,
+                },
+            ],
+        )
+        .into_dyn();
+        let items = vec![user("u0", "hi")];
+        let mut fragments: Vec<String> = Vec::new();
+        let summary = summarize_streaming(&model, &items, SUMMARY_INSTRUCTION, |d| {
+            fragments.push(d.to_owned());
+        })
+        .await
+        .expect("summarize must succeed");
+        assert_eq!(fragments, vec!["Hel".to_owned(), "lo".to_owned()]);
+        assert_eq!(summary, "Hello");
+    }
+
+    #[tokio::test]
+    async fn compact_dispatch_returns_started_then_completes_in_background() {
+        use std::time::Duration;
+
+        let inner = inner_with_summary("SUMMARY");
+        let tid = ThreadId(Arc::from("thread:native/cd"));
+        let handle = inner.threads().get_or_init(&tid).await;
+        handle
+            .start_turn_buffer(TurnId(Arc::from("turn:cd/0")), 0)
+            .await;
+        handle.push_item(user("u0", "hello")).await;
+
+        let mut rx = inner.events_tx().subscribe();
+        let reply = inner
+            .compact_dispatch(tid.clone(), CompactTrigger::Manual)
+            .await
+            .expect("dispatch reachable");
+        assert!(
+            matches!(reply, CompactReply::Started),
+            "manual dispatch must return Started immediately"
+        );
+
+        let mut saw_started = false;
+        let mut saw_delta = false;
+        let mut saw_completed = false;
+        for _ in 0..64 {
+            match tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("event timeout")
+                .expect("broadcast recv")
+            {
+                EngineEvent::CompactionStarted {
+                    entries, trigger, ..
+                } => {
+                    assert_eq!(entries, 1);
+                    assert_eq!(trigger, CompactTrigger::Manual);
+                    saw_started = true;
+                }
+                EngineEvent::CompactionDelta { delta, .. } => {
+                    assert!(!delta.is_empty());
+                    saw_delta = true;
+                }
+                EngineEvent::CompactionCompleted {
+                    entries_compacted, ..
+                } => {
+                    assert_eq!(entries_compacted, 1);
+                    saw_completed = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_started, "must broadcast CompactionStarted");
+        assert!(saw_delta, "must stream at least one CompactionDelta");
+        assert!(saw_completed, "must broadcast CompactionCompleted");
+
+        // History was replaced with [marker, summary].
+        let tail: Vec<Item> = handle.items_snapshot().await;
+        assert_eq!(tail.len(), 2);
+        assert_eq!(*inner.phase_lock(), EnginePhase::Idle);
+    }
+
+    #[tokio::test]
+    async fn compaction_failure_broadcasts_failed_and_restores_idle() {
+        use std::time::Duration;
+
+        let inner = inner_with_model(DynLanguageModel::new(FailingModel));
+        let tid = ThreadId(Arc::from("thread:native/cf"));
+        let handle = inner.threads().get_or_init(&tid).await;
+        handle
+            .start_turn_buffer(TurnId(Arc::from("turn:cf/0")), 0)
+            .await;
+        handle.push_item(user("u0", "hi")).await;
+
+        let mut rx = inner.events_tx().subscribe();
+        // Inline so the tail completes before we inspect; a provider failure is
+        // surfaced via CompactionFailed, not the return value.
+        let _ = inner
+            .run_compaction(&handle, tid.clone(), CompactTrigger::Manual)
+            .await;
+
+        let mut saw_failed = false;
+        for _ in 0..64 {
+            if let EngineEvent::CompactionFailed { reason, .. } =
+                tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                    .await
+                    .expect("event timeout")
+                    .expect("broadcast recv")
+            {
+                assert!(!reason.is_empty(), "failure must carry a reason");
+                saw_failed = true;
+                break;
+            }
+        }
+        assert!(
+            saw_failed,
+            "summary failure must broadcast CompactionFailed"
+        );
+        assert_eq!(
+            *inner.phase_lock(),
+            EnginePhase::Idle,
+            "phase must be restored to Idle after a failed compaction"
         );
     }
 }

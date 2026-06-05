@@ -211,7 +211,12 @@ impl Handler for StartTurnHandler {
         let params: StartTurnParams = decode_params(params)?;
         match self
             .engine
-            .start_turn(params.thread_id, params.user_input, params.scope)
+            .start_turn_with_reasoning(
+                params.thread_id,
+                params.user_input,
+                params.scope,
+                params.reasoning,
+            )
             .await
         {
             Ok(turn_id) => {
@@ -297,6 +302,7 @@ impl Handler for CompactHandler {
                     CompactReply::NothingToCompact => {
                         CompactResult::new(CompactStatus::NothingToCompact, 0)
                     }
+                    CompactReply::Started => CompactResult::new(CompactStatus::Started, 0),
                 };
                 // A fully-typed struct cannot fail to serialise; fall back to
                 // Null rather than `.expect()` (CLAUDE.md no-expect rule).

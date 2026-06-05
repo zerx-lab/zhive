@@ -475,18 +475,30 @@ mod span_emission_tests {
         let _ = engine.start_turn(tid.clone(), vec![user], None).await;
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
+        let mut events = engine.subscribe();
         let outcome = engine
             .compact(tid, CompactTrigger::Manual)
             .await
             .expect("actor reachable")
-            .expect("compaction must succeed");
+            .expect("compaction must dispatch");
         assert!(
-            matches!(
-                outcome,
-                crate::engine::submission::CompactReply::Compacted { .. }
-            ),
-            "expected Compacted, got {outcome:?}"
+            matches!(outcome, crate::engine::submission::CompactReply::Started),
+            "expected Started, got {outcome:?}"
         );
+
+        // Compaction now runs in a background task; wait for it to finish so the
+        // `zhive.compaction` span (opened inside the tail) has been emitted.
+        for _ in 0..64 {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
+                .await
+                .expect("compaction event timeout")
+                .expect("broadcast recv")
+            {
+                crate::engine::EngineEvent::CompactionCompleted { .. }
+                | crate::engine::EngineEvent::CompactionFailed { .. } => break,
+                _ => {}
+            }
+        }
 
         let names = capture.recorded();
         assert!(

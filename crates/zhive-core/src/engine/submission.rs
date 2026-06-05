@@ -92,6 +92,10 @@ pub enum CompactReply {
     },
     /// The target thread had no items to compact; nothing was done.
     NothingToCompact,
+    /// Compaction entered the async summarize phase; the outcome arrives via
+    /// the `compaction_completed` / `compaction_failed` events rather than
+    /// this reply.
+    Started,
 }
 
 /// Reasons a `Compact` submission failed inside the actor.
@@ -395,6 +399,8 @@ pub enum Submission {
         user_input: Vec<Item>,
         /// Optional explicit scope; `None` inherits the thread scope.
         scope: Option<PermissionScope>,
+        /// Requested reasoning depth; `None` leaves the provider default.
+        reasoning: Option<zhive_proto::domain::ThinkingEffort>,
     },
     /// Cancel the active turn on the given thread.
     CancelTurn {

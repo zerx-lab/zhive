@@ -154,6 +154,14 @@ fn render_top_bar(frame: &mut Frame, app: &App, area: Rect) {
             Style::new().fg(p.fg_dim),
         ));
     }
+    // Active reasoning depth, shown only above `Off` and accent-colored so it
+    // stands out next to the muted model pill (mirrors opencode's variant tag).
+    if app.thinking_effort.is_enabled() {
+        right_spans.push(Span::styled(
+            format!("think:{}  ", app.thinking_effort.label()),
+            Style::new().fg(p.accent),
+        ));
+    }
     // Muted model label — a single brand accent (the `⚡ zhive` mark) is enough;
     // a highlighted pill here reads as loud next to it.
     right_spans.push(Span::styled(
@@ -375,6 +383,60 @@ fn transcript_lines(app: &App, inner_width: u16) -> Vec<Line<'static>> {
         };
         push_message(&mut out, "", p.role_zap, body);
     }
+
+    // Live compaction progress / failure panel at the transcript tail.
+    if let Some(view) = &app.compaction {
+        out.extend(compaction_panel_lines(
+            view,
+            app.spinner_tick,
+            content_width,
+            p,
+        ));
+    }
+    out
+}
+
+/// Builds the live compaction panel: a streaming summary, or a failure notice.
+///
+/// In progress: a spinner divider plus the summary streamed so far. On failure:
+/// a persistent `✗` divider plus the wrapped reason, so it stays visible in the
+/// transcript rather than vanishing with a transient flash.
+fn compaction_panel_lines(
+    view: &crate::app::CompactionView,
+    spinner_tick: usize,
+    width: u16,
+    p: &Palette,
+) -> Vec<Line<'static>> {
+    let mut out = vec![Line::raw("")];
+    if let Some(reason) = &view.error {
+        out.push(Line::styled(
+            "─── ✗ compaction failed ───",
+            Style::new().fg(p.error),
+        ));
+        out.extend(wrap_plain(reason, Style::new().fg(p.error), width));
+        return out;
+    }
+    let label = if view.entries > 0 {
+        format!(
+            "─── {} compacting… ({} entries) ───",
+            widgets::spinner(spinner_tick),
+            view.entries
+        )
+    } else {
+        format!("─── {} compacting… ───", widgets::spinner(spinner_tick))
+    };
+    out.push(Line::styled(label, Style::new().fg(p.warn)));
+    let body = view.summary.trim();
+    if body.is_empty() {
+        out.push(Line::styled(
+            "preparing summary…",
+            Style::new().fg(p.fg_dim),
+        ));
+    } else {
+        for line in markdown::render(body, p) {
+            out.extend(wrap::wrap_line(&line, width));
+        }
+    }
     out
 }
 
@@ -491,8 +553,12 @@ fn item_body(
     match item {
         Item::UserMessage { content, .. } => user_message_lines(content, expanded, p, width),
         Item::AgentMessage { text, .. } => {
+            // A compaction handoff summary carries the "[context summary]"
+            // prefix; strip that marker line so the body reads as a clean
+            // summary (the `─── Compaction ───` divider above already labels it).
+            let body = text.strip_prefix("[context summary]\n").unwrap_or(text);
             let mut out = Vec::new();
-            for line in cache.render(text, p) {
+            for line in cache.render(body, p) {
                 out.extend(wrap::wrap_line(&line, width));
             }
             out
@@ -584,10 +650,7 @@ fn item_body(
             wrap_plain(message, Style::new().fg(color), width)
         }
         Item::ContextCompaction { .. } => {
-            vec![Line::styled(
-                "─── context compacted ───",
-                Style::new().fg(p.fg_mute),
-            )]
+            vec![Line::styled("─── Compaction ───", Style::new().fg(p.info))]
         }
         other => vec![Line::styled(
             format!("[{}]", item_kind_name(other)),
@@ -1010,6 +1073,11 @@ fn render_composer(frame: &mut Frame, app: &App, area: Rect) -> Rect {
     // bottom key-hint bar was removed, so this is where those signals surface.
     let (status, dot) = if app.disconnected {
         ("⚠ disconnected".to_owned(), p.error)
+    } else if app.compaction.as_ref().is_some_and(|v| v.error.is_none()) {
+        (
+            format!("{} compacting…", widgets::spinner(app.spinner_tick)),
+            p.warn,
+        )
     } else if let Some(flash) = &app.flash {
         (flash.clone(), p.warn)
     } else if busy {

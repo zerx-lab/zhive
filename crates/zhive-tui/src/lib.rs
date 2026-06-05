@@ -338,7 +338,8 @@ async fn event_loop(
             _ = ticker.tick(),
                 if app.conversation.busy
                     || app.logo.is_active()
-                    || app.conversation.is_revealing() =>
+                    || app.conversation.is_revealing()
+                    || app.compaction.is_some() =>
             {
                 app.tick();
                 dirty = true;
@@ -428,9 +429,12 @@ fn perform(
             // Optimistically mark busy so the queue drainer won't re-fire on the
             // next tick before `TurnStarted` arrives; reset by `SubmitFailed`.
             app.conversation.busy = true;
+            // Capture the current depth (Copy) so the moved closure sends the
+            // level the UI shows at submit time.
+            let reasoning = app.thinking_effort;
             spawn_rpc(client, cmd_tx, move |client, _tx| async move {
                 let failed = text.clone();
-                rpc::start_turn(&client, &thread, &text)
+                rpc::start_turn(&client, &thread, &text, reasoning)
                     .await
                     .err()
                     .map(|e| LoopMsg::SubmitFailed {
@@ -447,10 +451,18 @@ fn perform(
         }),
         Action::Compact => spawn_rpc(client, cmd_tx, move |client, _tx| async move {
             match rpc::compact(&client, &thread).await {
+                // Compaction started; live progress and the final summary /
+                // failure surface via `events/compaction_*`, so nothing to flash.
+                Ok(outcome) if outcome.status == "started" => None,
+                Ok(outcome) if outcome.status == "nothing_to_compact" => {
+                    Some(LoopMsg::Flash("nothing to compact".to_owned()))
+                }
+                // Defensive: a synchronous compaction (legacy path) still reports.
                 Ok(outcome) => Some(LoopMsg::Flash(format!(
                     "compact: {} ({} entries)",
                     outcome.status, outcome.entries_compacted
                 ))),
+                // Fast terminal failures (engine busy, unknown thread) arrive here.
                 Err(e) => Some(LoopMsg::Flash(format!("compact failed: {e}"))),
             }
         }),

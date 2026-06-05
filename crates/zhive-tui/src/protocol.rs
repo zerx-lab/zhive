@@ -14,11 +14,12 @@
 use serde_json::Value;
 use zhive_proto::domain::{Item, ThreadId, TurnError, TurnId};
 use zhive_proto::events::{
-    ItemAppendedPayload, ItemDeltaPayload, PermissionRequestedPayload, PhaseChangedPayload,
-    SubagentCompletedPayload, SubagentStartedPayload, TurnCompletedPayload, TurnFailedPayload,
-    TurnStartedPayload, UsagePayload,
+    CompactionCompletedPayload, CompactionDeltaPayload, CompactionFailedPayload,
+    CompactionStartedPayload, ItemAppendedPayload, ItemDeltaPayload, PermissionRequestedPayload,
+    PhaseChangedPayload, SubagentCompletedPayload, SubagentStartedPayload, TurnCompletedPayload,
+    TurnFailedPayload, TurnStartedPayload, UsagePayload,
 };
-use zhive_proto::hook::EnginePhase;
+use zhive_proto::hook::{CompactTrigger, EnginePhase};
 use zhive_proto::methods as m;
 use zhive_proto::permission::SessionAbortedNotification;
 
@@ -120,6 +121,36 @@ pub enum EngineNotification {
         child_thread_id: ThreadId,
         /// Whether the subagent produced a final message.
         has_final: bool,
+    },
+    /// Context compaction entered the summarization phase (manual or auto).
+    CompactionStarted {
+        /// Thread being compacted.
+        thread_id: ThreadId,
+        /// Why compaction fired (manual `/compact` vs automatic threshold).
+        trigger: CompactTrigger,
+        /// Transcript items being folded into the summary.
+        entries: u32,
+    },
+    /// A streamed fragment of the compaction summary.
+    CompactionDelta {
+        /// Thread being compacted.
+        thread_id: ThreadId,
+        /// Incremental summary fragment.
+        delta: String,
+    },
+    /// Context compaction finished successfully.
+    CompactionCompleted {
+        /// Thread that was compacted.
+        thread_id: ThreadId,
+        /// Transcript items folded into the summary.
+        entries_compacted: u32,
+    },
+    /// Context compaction failed; carries the reason to display.
+    CompactionFailed {
+        /// Thread whose compaction failed.
+        thread_id: ThreadId,
+        /// Human-readable failure reason.
+        reason: String,
     },
     /// A recognized-but-unmodeled or unknown notification method.
     Unhandled {
@@ -233,6 +264,66 @@ pub fn decode(method: &str, params: Option<Value>) -> EngineNotification {
 
     if method == m::EVENT_SUBAGENT_STARTED || method == m::EVENT_SUBAGENT_COMPLETED {
         return decode_subagent(method, params);
+    }
+
+    if matches!(
+        method,
+        m::EVENT_COMPACTION_STARTED
+            | m::EVENT_COMPACTION_DELTA
+            | m::EVENT_COMPACTION_COMPLETED
+            | m::EVENT_COMPACTION_FAILED
+    ) {
+        return decode_compaction(method, params);
+    }
+
+    unhandled()
+}
+
+/// Decodes the four `events/compaction_*` notifications.
+fn decode_compaction(method: &str, params: Value) -> EngineNotification {
+    let unhandled = || EngineNotification::Unhandled {
+        method: method.to_owned(),
+    };
+
+    if method == m::EVENT_COMPACTION_STARTED {
+        return match serde_json::from_value::<CompactionStartedPayload>(params) {
+            Ok(p) => EngineNotification::CompactionStarted {
+                thread_id: p.thread_id,
+                trigger: p.trigger,
+                entries: p.entries,
+            },
+            Err(_) => unhandled(),
+        };
+    }
+
+    if method == m::EVENT_COMPACTION_DELTA {
+        return match serde_json::from_value::<CompactionDeltaPayload>(params) {
+            Ok(p) => EngineNotification::CompactionDelta {
+                thread_id: p.thread_id,
+                delta: p.delta,
+            },
+            Err(_) => unhandled(),
+        };
+    }
+
+    if method == m::EVENT_COMPACTION_COMPLETED {
+        return match serde_json::from_value::<CompactionCompletedPayload>(params) {
+            Ok(p) => EngineNotification::CompactionCompleted {
+                thread_id: p.thread_id,
+                entries_compacted: p.entries_compacted,
+            },
+            Err(_) => unhandled(),
+        };
+    }
+
+    if method == m::EVENT_COMPACTION_FAILED {
+        return match serde_json::from_value::<CompactionFailedPayload>(params) {
+            Ok(p) => EngineNotification::CompactionFailed {
+                thread_id: p.thread_id,
+                reason: p.reason,
+            },
+            Err(_) => unhandled(),
+        };
     }
 
     unhandled()
