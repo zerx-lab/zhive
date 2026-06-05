@@ -3,7 +3,7 @@ task: C4
 title: 反向 RPC handler 注册接口（zhive-client-native）
 plan: phase1-core-native-research
 date: 2026-05-28
-status: draft
+status: implemented
 crate: zhive-client-native（仅依赖 zhive-proto）
 depends_on:
   - deliverables/C1-client-api.md          (ReverseHandler trait + builder 注册 + 未声明 method 自动 MethodNotFound + ClientEvent::ServerRequest 旁路)

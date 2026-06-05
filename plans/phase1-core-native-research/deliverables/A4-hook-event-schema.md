@@ -2,7 +2,7 @@
 task: A4 — Hook event schema（14 + 5 reserved）
 plan: phase1-core-native-research
 date: 2026-05-28
-status: draft
+status: implemented
 owner: A4 subagent
 depends:
   - D-012（Hooks JSON schema 至少 14 事件 + `#[non_exhaustive]`）
@@ -26,7 +26,7 @@ consumes_by:
 
 - **14 个 case 的 `HookEvent` enum**（D-012 锁定）+ `#[non_exhaustive]` + 一个显式 `Unknown { name, payload }` case 处理未来 SDK 升级。
 - **统一 `HookEventBase` wrapper**（不让各 event 自带 base 字段）—— wire 形如 `{ ...base..., hook_event_name: "...", ...event_specific... }`，反序列化用 `#[serde(flatten)]` 复用。
-- **`registered_by: ExtensionRef` 进 base**，wire 字段名 `registered_by`，结构 `{ id, version, source: "user" | "project" | "local" | "builtin" }`，对齐 Pi `${PI}/packages/coding-agent/src/core/extensions/types.ts:551-557` 的 source 概念。
+- **`registered_by: ExtensionRef` 进 base**，wire 字段名 `registeredBy`（base struct 走 `#[serde(rename_all = "camelCase")]`），结构 `{ id, version, source: "user" | "project" | "local" | "builtin" }`，对齐 Pi `${PI}/packages/coding-agent/src/core/extensions/types.ts:551-557` 的 source 概念。
 - **Subagent 上下文**（`agent_id / agent_type / parent_tool_use_id`）放 `HookEventBase` 而非各 event，**Option 化**（top-level agent 时为 None）。对齐 Claude Code TypeScript SDK "fields on the base hook input"。
 - **不分 harness-level / extension-level** 两层 category。理由：zhive 的 JSON-RPC 反向请求模型不区分 harness 与 extension 调用者；权限/源追溯靠 `registered_by` 字段即可。Pi 分层是 TS in-process callback 注册 API 的副产物（harness 自己监听 vs extension 注册），不构成 wire schema 需求。
 - **Pi 24 + 17 = 41 个 event** 与 zhive 14 的对照：14/41 ✅ 直接覆盖，5/41 通过 reserved 占位，13/41 ⚠️ 暂缺（compaction / branch_summary / leaf / model_select / tree 等），9/41 ❌ 拒收（in-process render / TypeBox schema / TS 专属机制等）。
@@ -141,22 +141,23 @@ impl<'de> Deserialize<'de> for HookEvent { /* TODO(开放项 A4-Q1): 在 B5 实�
 ```json
 {
   "hook_event_name": "PreToolUse",
-  "session_id": "thread_abc",
+  "sessionId": "thread_abc",
   "cwd": "/home/user/proj",
-  "registered_by": { "id": "builtin:filesystem", "version": "1.0", "source": "builtin" },
-  "agent_id": null,
-  "agent_type": null,
-  "parent_tool_use_id": null,
-  "tool_name": "bash",
-  "tool_input": { "command": "ls" },
-  "tool_use_id": "tool_xyz"
+  "registeredBy": { "id": "builtin:filesystem", "version": "1.0", "source": "builtin" },
+  "agentId": null,
+  "agentType": null,
+  "parentToolUseId": null,
+  "toolName": "bash",
+  "toolInput": { "command": "ls" },
+  "toolUseId": "tool_xyz"
 }
 ```
 
-Rust 表征用 `#[serde(flatten)]`：
+Rust 表征用 `#[serde(flatten)]` + `#[serde(rename_all = "camelCase")]`（flatten 出来的 base 字段与本 struct 字段都按 camelCase 上线）：
 
 ```rust
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct PreToolUseInput {
     #[serde(flatten)]
     pub base: HookEventBase,
@@ -179,7 +180,7 @@ pub struct PreToolUseInput {
 
 **答**：
 
-- wire 字段名：`registered_by`（snake_case，对齐 hook 其它 base 字段如 `session_id`）
+- wire 字段名：`registeredBy`（camelCase，对齐 hook 其它 base 字段如 `sessionId`；base struct 走 `#[serde(rename_all = "camelCase")]`，Rust 字段名仍是 `registered_by`）
 - 类型：
 
   ```rust
@@ -205,7 +206,7 @@ pub struct PreToolUseInput {
   ```
 
 - 强制性：`HookEventBase.registered_by` 不是 Option。B5 host 在 hook 注册路径（`register_hook(extension: ExtensionRef, ...)`）强制要求传入；hostbuiltin hook 自己填 `Builtin`。
-- JSON 编码示例：`"registered_by": { "id": "user:my-skill", "version": "0.2.1", "source": "user" }`
+- JSON 编码示例：`"registeredBy": { "id": "user:my-skill", "version": "0.2.1", "source": "user" }`
 
 > 锚点：Pi `${PI}/packages/coding-agent/src/core/extensions/types.ts:551-557` 用 `source: "quit" | "reload" | ...`，那是 reason；真正的 extension provenance 在 manifest 层（A5 处理）。zhive 把 provenance 升到 wire 是红线 10 的硬要求。
 
@@ -253,6 +254,7 @@ use schemars::JsonSchema;
 /// wire 上通过 `#[serde(flatten)]` 内嵌到每个 event 的 JSON object，
 /// 不构成独立 nested object。
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
 pub struct HookEventBase {
     /// Thread / session 标识。对齐 D-006 Thread.id。
     pub session_id: String,
@@ -288,6 +290,7 @@ pub struct HookEventBase {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
 pub struct ExtensionRef {
     pub id: String,
     pub version: String,
@@ -351,6 +354,7 @@ pub enum HookEvent {
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct PreToolUseInput {
     #[serde(flatten)]
     pub base: HookEventBase,
@@ -360,6 +364,7 @@ pub struct PreToolUseInput {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct PostToolUseInput {
     #[serde(flatten)]
     pub base: HookEventBase,
@@ -370,6 +375,7 @@ pub struct PostToolUseInput {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct PostToolUseFailureInput {
     #[serde(flatten)]
     pub base: HookEventBase,
@@ -394,6 +400,7 @@ pub enum ToolErrorKind {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct UserPromptSubmitInput {
     #[serde(flatten)]
     pub base: HookEventBase,
@@ -402,6 +409,7 @@ pub struct UserPromptSubmitInput {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct SessionStartInput {
     #[serde(flatten)]
     pub base: HookEventBase,
@@ -423,6 +431,7 @@ pub enum SessionStartSource {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct SessionEndInput {
     #[serde(flatten)]
     pub base: HookEventBase,
@@ -441,6 +450,7 @@ pub enum SessionEndReason {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct SubagentStartInput {
     #[serde(flatten)]
     pub base: HookEventBase,  // base 内 agent_id / agent_type / parent_tool_use_id 必填
@@ -449,6 +459,7 @@ pub struct SubagentStartInput {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct SubagentStopInput {
     #[serde(flatten)]
     pub base: HookEventBase,
@@ -460,6 +471,7 @@ pub struct SubagentStopInput {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct PreCompactInput {
     #[serde(flatten)]
     pub base: HookEventBase,
@@ -479,6 +491,7 @@ pub enum CompactTrigger {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct PermissionRequestInput {
     #[serde(flatten)]
     pub base: HookEventBase,
@@ -490,6 +503,7 @@ pub struct PermissionRequestInput {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct StopInput {
     #[serde(flatten)]
     pub base: HookEventBase,
@@ -499,6 +513,7 @@ pub struct StopInput {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct NotificationInput {
     #[serde(flatten)]
     pub base: HookEventBase,
@@ -520,6 +535,7 @@ pub enum NotificationCategory {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct SetupInput {
     #[serde(flatten)]
     pub base: HookEventBase,
@@ -534,6 +550,7 @@ pub enum SetupTrigger {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct ToolApprovalChangeInput {
     #[serde(flatten)]
     pub base: HookEventBase,
@@ -572,21 +589,21 @@ pub enum ToolApprovalOrigin {
 
 ## 4. Hook input JSON 示例 × 14
 
-> 所有 fixture 共享一个虚拟 base，重点突出 event-specific 字段。`session_id` 都用 `"thread_abc"`，registered_by 都填一个 builtin 示例。
+> 所有 fixture 共享一个虚拟 base，重点突出 event-specific 字段。`sessionId` 都用 `"thread_abc"`，registeredBy 都填一个 builtin 示例。对象 key 走 camelCase，仅 `hook_event_name` discriminator 与各 enum 字符串值保持 snake_case。
 
 ### 4.1 PreToolUse
 
 ```json
 {
   "hook_event_name": "PreToolUse",
-  "session_id": "thread_abc",
+  "sessionId": "thread_abc",
   "cwd": "/home/user/proj",
-  "registered_by": { "id": "builtin:filesystem-guard", "version": "0.1.0", "source": "builtin" },
-  "permission_mode": "default",
-  "transcript_path": "/home/user/.zhive/rollouts/thread_abc.jsonl",
-  "tool_name": "bash",
-  "tool_input": { "command": "rm -rf /" },
-  "tool_use_id": "tooluse_01"
+  "registeredBy": { "id": "builtin:filesystem-guard", "version": "0.1.0", "source": "builtin" },
+  "permissionMode": "default",
+  "transcriptPath": "/home/user/.local/share/zhive/rollouts/thread_abc.jsonl",
+  "toolName": "bash",
+  "toolInput": { "command": "rm -rf /" },
+  "toolUseId": "tooluse_01"
 }
 ```
 
@@ -595,13 +612,13 @@ pub enum ToolApprovalOrigin {
 ```json
 {
   "hook_event_name": "PostToolUse",
-  "session_id": "thread_abc",
+  "sessionId": "thread_abc",
   "cwd": "/home/user/proj",
-  "registered_by": { "id": "user:audit-log", "version": "0.2.1", "source": "user" },
-  "tool_name": "bash",
-  "tool_input": { "command": "ls -la" },
-  "tool_response": { "stdout": "total 0\n", "stderr": "", "exit_code": 0 },
-  "tool_use_id": "tooluse_02"
+  "registeredBy": { "id": "user:audit-log", "version": "0.2.1", "source": "user" },
+  "toolName": "bash",
+  "toolInput": { "command": "ls -la" },
+  "toolResponse": { "stdout": "total 0\n", "stderr": "", "exit_code": 0 },
+  "toolUseId": "tooluse_02"
 }
 ```
 
@@ -610,14 +627,14 @@ pub enum ToolApprovalOrigin {
 ```json
 {
   "hook_event_name": "PostToolUseFailure",
-  "session_id": "thread_abc",
+  "sessionId": "thread_abc",
   "cwd": "/home/user/proj",
-  "registered_by": { "id": "builtin:error-reporter", "version": "0.1.0", "source": "builtin" },
-  "tool_name": "bash",
-  "tool_input": { "command": "false" },
-  "tool_use_id": "tooluse_03",
+  "registeredBy": { "id": "builtin:error-reporter", "version": "0.1.0", "source": "builtin" },
+  "toolName": "bash",
+  "toolInput": { "command": "false" },
+  "toolUseId": "tooluse_03",
   "error": "command exited with code 1",
-  "error_kind": "execution_error"
+  "errorKind": "execution_error"
 }
 ```
 
@@ -626,10 +643,10 @@ pub enum ToolApprovalOrigin {
 ```json
 {
   "hook_event_name": "UserPromptSubmit",
-  "session_id": "thread_abc",
+  "sessionId": "thread_abc",
   "cwd": "/home/user/proj",
-  "registered_by": { "id": "project:prompt-redactor", "version": "0.0.3", "source": "project" },
-  "permission_mode": "default",
+  "registeredBy": { "id": "project:prompt-redactor", "version": "0.0.3", "source": "project" },
+  "permissionMode": "default",
   "prompt": "summarize the diff"
 }
 ```
@@ -639,9 +656,9 @@ pub enum ToolApprovalOrigin {
 ```json
 {
   "hook_event_name": "SessionStart",
-  "session_id": "thread_abc",
+  "sessionId": "thread_abc",
   "cwd": "/home/user/proj",
-  "registered_by": { "id": "builtin:session-init", "version": "0.1.0", "source": "builtin" },
+  "registeredBy": { "id": "builtin:session-init", "version": "0.1.0", "source": "builtin" },
   "source": "startup",
   "model": "anthropic/claude-opus-4-7"
 }
@@ -652,9 +669,9 @@ pub enum ToolApprovalOrigin {
 ```json
 {
   "hook_event_name": "SessionEnd",
-  "session_id": "thread_abc",
+  "sessionId": "thread_abc",
   "cwd": "/home/user/proj",
-  "registered_by": { "id": "user:cleanup", "version": "1.0.0", "source": "user" },
+  "registeredBy": { "id": "user:cleanup", "version": "1.0.0", "source": "user" },
   "reason": "prompt_input_exit"
 }
 ```
@@ -664,13 +681,13 @@ pub enum ToolApprovalOrigin {
 ```json
 {
   "hook_event_name": "SubagentStart",
-  "session_id": "thread_abc",
+  "sessionId": "thread_abc",
   "cwd": "/home/user/proj",
-  "registered_by": { "id": "builtin:subagent-tracer", "version": "0.1.0", "source": "builtin" },
-  "agent_id": "sub_01",
-  "agent_type": "explore",
-  "parent_tool_use_id": "tooluse_04",
-  "inherited_scope": { "fs_read": ["/home/user/proj/**"], "fs_write": [], "exec": [] }
+  "registeredBy": { "id": "builtin:subagent-tracer", "version": "0.1.0", "source": "builtin" },
+  "agentId": "sub_01",
+  "agentType": "explore",
+  "parentToolUseId": "tooluse_04",
+  "inheritedScope": { "fs_read": ["/home/user/proj/**"], "fs_write": [], "exec": [] }
 }
 ```
 
@@ -679,14 +696,14 @@ pub enum ToolApprovalOrigin {
 ```json
 {
   "hook_event_name": "SubagentStop",
-  "session_id": "thread_abc",
+  "sessionId": "thread_abc",
   "cwd": "/home/user/proj",
-  "registered_by": { "id": "builtin:subagent-tracer", "version": "0.1.0", "source": "builtin" },
-  "agent_id": "sub_01",
-  "agent_type": "explore",
-  "parent_tool_use_id": "tooluse_04",
-  "agent_transcript_path": "/home/user/.zhive/rollouts/thread_abc.sub_01.jsonl",
-  "stop_hook_active": false
+  "registeredBy": { "id": "builtin:subagent-tracer", "version": "0.1.0", "source": "builtin" },
+  "agentId": "sub_01",
+  "agentType": "explore",
+  "parentToolUseId": "tooluse_04",
+  "agentTranscriptPath": "/home/user/.local/share/zhive/rollouts/thread_abc.sub_01.jsonl",
+  "stopHookActive": false
 }
 ```
 
@@ -695,12 +712,12 @@ pub enum ToolApprovalOrigin {
 ```json
 {
   "hook_event_name": "PreCompact",
-  "session_id": "thread_abc",
+  "sessionId": "thread_abc",
   "cwd": "/home/user/proj",
-  "registered_by": { "id": "user:archive-before-compact", "version": "0.3.0", "source": "user" },
+  "registeredBy": { "id": "user:archive-before-compact", "version": "0.3.0", "source": "user" },
   "trigger": "auto",
-  "entries_count": 142,
-  "custom_instructions": "keep all file edits verbatim"
+  "entriesCount": 142,
+  "customInstructions": "keep all file edits verbatim"
 }
 ```
 
@@ -709,13 +726,13 @@ pub enum ToolApprovalOrigin {
 ```json
 {
   "hook_event_name": "PermissionRequest",
-  "session_id": "thread_abc",
+  "sessionId": "thread_abc",
   "cwd": "/home/user/proj",
-  "registered_by": { "id": "builtin:permission-prompter", "version": "0.1.0", "source": "builtin" },
-  "tool_name": "bash",
-  "tool_input": { "command": "git push" },
-  "tool_use_id": "tooluse_05",
-  "requested_scope": { "exec": ["git push"] }
+  "registeredBy": { "id": "builtin:permission-prompter", "version": "0.1.0", "source": "builtin" },
+  "toolName": "bash",
+  "toolInput": { "command": "git push" },
+  "toolUseId": "tooluse_05",
+  "requestedScope": { "exec": ["git push"] }
 }
 ```
 
@@ -724,10 +741,10 @@ pub enum ToolApprovalOrigin {
 ```json
 {
   "hook_event_name": "Stop",
-  "session_id": "thread_abc",
+  "sessionId": "thread_abc",
   "cwd": "/home/user/proj",
-  "registered_by": { "id": "builtin:turn-finalizer", "version": "0.1.0", "source": "builtin" },
-  "stop_hook_active": false
+  "registeredBy": { "id": "builtin:turn-finalizer", "version": "0.1.0", "source": "builtin" },
+  "stopHookActive": false
 }
 ```
 
@@ -736,9 +753,9 @@ pub enum ToolApprovalOrigin {
 ```json
 {
   "hook_event_name": "Notification",
-  "session_id": "thread_abc",
+  "sessionId": "thread_abc",
   "cwd": "/home/user/proj",
-  "registered_by": { "id": "user:slack-forward", "version": "0.4.2", "source": "user" },
+  "registeredBy": { "id": "user:slack-forward", "version": "0.4.2", "source": "user" },
   "category": "permission_prompt",
   "title": "Approve bash command",
   "message": "Agent wants to run: git push"
@@ -750,9 +767,9 @@ pub enum ToolApprovalOrigin {
 ```json
 {
   "hook_event_name": "Setup",
-  "session_id": "thread_abc",
+  "sessionId": "thread_abc",
   "cwd": "/home/user/proj",
-  "registered_by": { "id": "builtin:bootstrap", "version": "0.1.0", "source": "builtin" },
+  "registeredBy": { "id": "builtin:bootstrap", "version": "0.1.0", "source": "builtin" },
   "trigger": "init"
 }
 ```
@@ -762,10 +779,10 @@ pub enum ToolApprovalOrigin {
 ```json
 {
   "hook_event_name": "ToolApprovalChange",
-  "session_id": "thread_abc",
+  "sessionId": "thread_abc",
   "cwd": "/home/user/proj",
-  "registered_by": { "id": "builtin:approval-tracker", "version": "0.1.0", "source": "builtin" },
-  "tool_name": "bash",
+  "registeredBy": { "id": "builtin:approval-tracker", "version": "0.1.0", "source": "builtin" },
+  "toolName": "bash",
   "previous": "ask",
   "current": "allow",
   "origin": "user_decision"

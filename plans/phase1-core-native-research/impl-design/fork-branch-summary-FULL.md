@@ -1,25 +1,13 @@
 # 【全量·档B】跨 thread fork + branch + branch_summary —— 真正的「新 thread + forked_from + SessionHeader.parent_session + JSONL 重放」
 
 ## currentState
-基线（档C）已设计但未接线；本全量目标在其上叠加 codex 式跨 thread fork。精确现状（文件:行号）：
+本全量在基线（档C）之上叠加 codex 式跨 thread fork，复用引擎已有的几处骨架与范本：
 
-(1) **EnginePhase::BranchSummary 转换已就位、无触发者**：`crates/zhive-proto/src/hook.rs:113` 定义变体；`crates/zhive-core/src/engine/phase.rs:31-38` 的 `allows_transition` 已含 `(Idle, Turn|Compaction|BranchSummary)` 与 `(Compaction|BranchSummary, Idle)`。全工程无 `try_set_phase_atomic(Idle, BranchSummary)` 调用；`Submission`（submission.rs:143-199）无 Fork/BranchSummary 变体；dispatch（inner.rs:350-418）无对应分支，落到 408 `other => debug!(...unhandled)`。
+(1) **Compaction 是全量可大量复用的骨架**：compaction.rs:74-191 的 compact/run_compaction（Idle→Compaction CAS、PhaseChanged 广播、`.instrument(info_span!("zhive.compaction"))`、summarize 复用、错误回滚 leave_compaction:177-191）；summarize（compaction.rs:263-311）渲染 Item→文本→provider.do_stream→收集 TextDelta。
 
-(2) **Leaf.target_id 永远写 None**：`RolloutEntry::Leaf { target_id: Option<String> }` 定义 rollout.rs:54-59；唯一写入点 writer.rs:384 `RolloutEntry::Leaf { target_id: None }`（turn 结束标记）；无 `set_leaf_id`。read_all（rollout.rs:145-164）能读回 Leaf；rebuild_state_from_rollout 对 Leaf 走 writer.rs:558-560 `_ => {}` 忽略。
+(2) **subagent_spawn 是「新 child thread + 注册 + 起 turn + 持久化」的现成范本**：subagent_spawn.rs:96-224 分配 child id、`ThreadHandle::new_child`（thread.rs:136-159，已存 parent_thread_id）、`threads().write_guard().insert`、start_child_turn 入 ThreadUpserted+TurnStarted。subagent 仍走 new_child（空历史），不带 forked_from——本阶段不动它（见 crossModuleDeps 的 phase2 TODO）。
 
-(3) **forked_from 全链路接通 state_db、但所有构造点硬编码 None**：`Thread.forked_from: Option<ThreadId>`（domain.rs:132，serde camelCase `forkedFrom`，skip_if None）；state_db 写 121/131/144、读 452/469、列名 `forked_from`（list_threads:343、get_thread:380）。构造点全部 `forked_from: None`：lifecycle.rs:155/320/416、subagent_spawn.rs:299、writer.rs:523。
-
-(4) **SessionHeader.parent_session 字段在但永远 None**：`RolloutEntry::Session { parent_session: Option<String> }` rollout.rs:39-41（serde 默认 + skip_if None）；唯一写入点 writer.rs:283 `parent_session: None`（apply_thread_upserted）；rebuild 读 Session 时丢弃（writer.rs:509-510 `..` 忽略 parent_session）。
-
-(5) **branch_summary span 未插桩**：`spans::BRANCH_SUMMARY = "zhive.branch_summary"`（observability.rs:44）仅常量；`span_literals_match_constants`（observability.rs:144-149）显式注释 "deferred with the fork feature"，仅 `let _ = spans::BRANCH_SUMMARY;`。
-
-(6) **EngineInner 不持有 Arc<Storage>（全量阻塞点）**：EngineConfig.storage（engine.rs:187）在 spawn_with_config（engine.rs:409-419）被消费——仅 `PersistenceWriter::spawn(Arc::clone(s))` 取出 writer tx+handle，原 `Arc<Storage>` 在 416-419 后被 drop。EngineInner（inner.rs:81-148）只有 `storage_writer: Mutex<StorageWriterState>`（写通道），**没有读路径**。跨 thread fork 需读源 thread 的 rollout JSONL（`Storage::rollout_path` + `read_all`），故必须把 `Arc<Storage>` 留存进 EngineInner。
-
-(7) **Compaction 是全量可大量复用的骨架**：compaction.rs:74-191 的 compact/run_compaction（Idle→Compaction CAS、PhaseChanged 广播、`.instrument(info_span!("zhive.compaction"))`、summarize 复用、错误回滚 leave_compaction:177-191）；summarize（compaction.rs:263-311）渲染 Item→文本→provider.do_stream→收集 TextDelta。
-
-(8) **subagent_spawn 是「新 child thread + 注册 + 起 turn + 持久化」的现成范本**：subagent_spawn.rs:96-224 分配 child id、`ThreadHandle::new_child`（thread.rs:136-159，已存 parent_thread_id）、`threads().write_guard().insert`、start_child_turn 入 ThreadUpserted+TurnStarted（subagent_spawn.rs:293-315，但 forked_from:None）。
-
-(9) **B2 lazy-load 仍是占位**：thread.rs:339-341 注释「B2 attaches lazy_load_from_jsonl」；ThreadStore（thread.rs:343-384）纯内存 HashMap，无从 JSONL 载入路径。B2 deliverable 占位 trait `load_items_page(thread_id,turn_id,offset,limit)`（B2:226）按 turn 分页，**不**直接满足 fork 需要的「整源 thread 历史→items」重放。
+(3) **B2 lazy-load 仍是占位**：thread.rs 注释「B2 attaches lazy_load_from_jsonl」；ThreadStore 纯内存 HashMap，无从 JSONL 载入路径。B2 deliverable 占位 trait `load_items_page(thread_id,turn_id,offset,limit)`（B2:226）按 turn 分页，**不**直接满足 fork 需要的「整源 thread 历史→items」重放——故本全量另落地 `replay_thread_items`（见 crossModuleDeps）。
 
 ## harnessRef
 **全量真正参考的是 codex 的「新 thread 模型」（不是 pi 的同 thread leaf 移动）。** 两份 harness 的精确映射：
@@ -38,7 +26,7 @@
 **B. pi 同 thread leaf-pointer（基线 C 模型，仅保留作为「branch_summary 文本生成」+「leaf 切叶」机制的二级参考，~/Desktop/code/github/pi/packages/agent/）**：
 - `harness/session/jsonl-storage.ts:226-244` `setLeafId(leafId)`：显式 append `{type:"leaf", id, parentId:currentLeafId, targetId:leafId}` 行 + 维护 currentLeafId。`leafIdAfterEntry`（同文件 `entry.type==="leaf" ? targetId : entry.id`）。**映射**：zhive `RolloutWriter::set_leaf_id`。
 - `harness/agent-harness.ts:737-833` `navigateTree(targetId, {summarize})`：`phase="branch_summary"`（742）→ `collectEntriesForBranchSummary(oldLeafId,targetId)`（748）→ 可选 `generateBranchSummary(entries, {model,...})`（770）→ `session.moveTo(newLeafId, {summary})`（812）→ `phase="idle"`（finally 833）。**这是同 thread 模型**；zhive 全量把它降级为 codex 跨 thread fork 路径里「可选的 branch summary 文本生成」一步（复用 zhive compaction.rs:263 summarize 而非 pi generateBranchSummary）。
-- `harness/session/jsonl-storage.ts:200-219` `static create({cwd, sessionId, parentSessionPath})`：写 `SessionHeader { parentSession: parentSessionPath }`。**映射**：zhive 新 thread 的首行 `RolloutEntry::Session { parent_session: Some(source) }`（当前 writer.rs:283 写死 None 需改）。
+- `harness/session/jsonl-storage.ts:200-219` `static create({cwd, sessionId, parentSessionPath})`：写 `SessionHeader { parentSession: parentSessionPath }`。**映射**：zhive 新 thread 的首行 `RolloutEntry::Session { parent_session: Some(source) }`。
 
 ## approach
 **全量方案 = codex「新 thread 跨 thread fork」为主干 + 基线 C 的 leaf/branch_summary/span 机制为辅。** 为什么：用户拍板档 B「真正的跨 thread fork（新 thread + forked_from + parent_session + JSONL 重放）」，基线 C 明确否决了这条（理由是踩 B2 lazy-load 硬边界）；全量做法是**同时落地 B2 fork 所需的最小重放接口**（见 crossModuleDeps），从而合法地实现 codex 模型。基线 C 已设计的 `set_leaf_id` / branch_summary span / Submission 骨架全部保留并扩展。
@@ -109,7 +97,7 @@
 
 ## crossModuleDeps
 - **与 state-lazy-load（强耦合，本特性的硬前置）**：跨 thread fork 的「从 S.jsonl 重放历史→items」**不是** B2 占位 trait 的 `load_items_page(thread_id,turn_id,offset,limit)`（那是按 turn 分页、给 UI lazy load 用）。fork 需要的是**整源 thread 一次性重放到 ItemId 边界**。请 state-lazy-load topic 扩大实现范围，至少提供以下精确接口之一（按优先级）：(A) 最小够用：`Storage::replay_thread_items(&self, source: &ThreadId, up_to: Option<&ItemId>) -> StorageResult<Vec<Item>>`（实现 = read_all(rollout_path(source)) 过滤 Item + 截断到 up_to）——本设计 files 已把它放在 persistence/mod.rs，可由 state-lazy-load topic 落地实现体；fork.rs 仅消费。(B) 若 state-lazy-load 要做通用 lazy load，则 fork 复用其 `rebuild_thread_from_jsonl(source) -> (Thread, Vec<Turn>/Vec<Item>)` 返回完整历史，fork 再自行按 up_to 截断。**关键约定**：该接口必须能读 items_tail 256 窗口之外的历史（直接读 JSONL，不依赖内存窗口）——这正是 fork 相对 compaction（只操作 items_tail）的能力升级，也是基线 C 否决跨 thread fork 的那条硬边界，现由此接口闭合。
-- **与 B3 persistence**：依赖 `RolloutEntry::Leaf.target_id`（rollout.rs:54）+ `RolloutEntry::Session.parent_session`（rollout.rs:39，当前 writer.rs:283 写死 None 需改）。新增 StorageWriteOp::SetLeaf + ForkHeader 须与 writer 现有「Leaf=turn 完成标记(target_id=None)」语义并存：约定 target_id=None 仍 turn save point，Some=fork/切叶；ForkHeader 写的 Session 行须更新 writer 的 header_written 集合（writer.rs:166,276-296）避免后续 ThreadUpserted 重写 header。rebuild（writer.rs:479-571）须把 Session.parent_session 接回 Thread.forked_from（当前 509-532 丢弃）。
+- **与 B3 persistence**：依赖 `RolloutEntry::Leaf.target_id`（rollout.rs:54）+ `RolloutEntry::Session.parent_session`（rollout.rs:39，由 ForkHeader 写入 `Some(source)`）。新增 StorageWriteOp::SetLeaf + ForkHeader 与 writer 现有「Leaf=turn 完成标记(target_id=None)」语义并存：约定 target_id=None 仍 turn save point，Some=fork/切叶；ForkHeader 写的 Session 行更新 writer 的 header_written 集合（writer.rs:166,276-296）避免后续 ThreadUpserted 重写 header。rebuild（writer.rs:479-571）把 Session.parent_session 接回 Thread.forked_from。
 - **与 B9 tracing**：本方案落地 `zhive.branch_summary` 真插桩（fork.rs 的 info_span），消除 observability.rs:144-149 deferred 注释——是 B9 缺口『branch_summary span 无插桩』的直接闭合点；必须同 PR 改 observability 测试（span_literals_match_constants + span_emission_tests），否则常量断言与真插桩不同步。span 字段建议 `session.id`=新 thread C + `zhive.parent.session.id`=source（复用 fields::PARENT_THREAD_ID observability.rs:68，与 subagent span 一致）。
 - **与 #8『client-native + fork』任务（task #8）**：本设计就是 #8 fork 部分的全量实现。client-native（server 层）需暴露 fork 的 JSON-RPC method（如 thread/fork），其参数映射 Engine::fork_thread(source, up_to_item, summarize)，返回 new_thread_id。server topic 须在 Submission/SubmissionReply round-trip 中加 Fork case。
 - **与 A4 hook**：PreBranchSummary/PostBranchSummary 若加，须与 HookHost::dispatch 的 14+ 事件注册表对齐（decision-diffs §1.7 已 reserved）；hook 失败按 compaction.rs:dispatch_compact_hook（196-241）的『log-and-proceed 内部维护』语义，不能让 hook 否决 fork。本阶段仅加类型+serde 测试，dispatch 接线推后。

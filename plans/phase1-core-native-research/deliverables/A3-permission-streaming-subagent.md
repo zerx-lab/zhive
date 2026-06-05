@@ -2,7 +2,7 @@
 task: A3
 plan: phase1-core-native-research
 date: 2026-05-28
-status: draft
+status: implemented
 depends:
   - research/99-decisions/README.md#d-008
   - research/99-decisions/README.md (R5 finding #1)
@@ -14,14 +14,11 @@ non-goals:
 
 # A3 · Permission schema + StreamingBehavior + Subagent 继承
 
-> **决策冲突警告：D-008 / R5 finding #1**
+> **三队列模型（取代二元 mode，对齐 Pi `agent-harness.ts:183-187` 的 `steerQueue` / `followUpQueue` / `nextTurnQueue`）：**
 >
-> D-008 当前声明 `StreamingBehavior: steer | followUp` **二元 mode**。本 deliverable 在通读 Pi 一手代码后建议 **修订为三队列模型** —— 与 Pi `agent-harness.ts:183-187` (`steerQueue` / `followUpQueue` / `nextTurnQueue`) 对齐：
 > - 队列与 wire `streamingBehavior` 取值**不是 1:1**。Pi `streamingBehavior?: "steer" | "followUp"`（[rpc-types.ts:21](../../../../github/pi/packages/coding-agent/src/modes/rpc/rpc-types.ts)）只覆盖前两个；第三队列 `nextTurnQueue` 由独立的 `nextTurn` 命令驱动（[agent-harness.ts:664-667](../../../../github/pi/packages/agent/src/harness/agent-harness.ts)），**不进 `streamingBehavior` 枚举**
-> - `abort()` 清前两队列、保留 nextTurn —— D-008 未规定 abort 与队列的交互
-> - 每队列各自有 `QueueMode { All, OneAtATime }`（[types.ts:44](../../../../github/pi/packages/agent/src/harness/types.ts)），D-008 未提
->
-> 建议词条修订草案见本文件末 `> 建议 D-008 词条修订`。本调研不直接改 99-decisions/，按 plan §10 走 `decision-diffs.md`。
+> - `abort()` 清前两队列、保留 nextTurn
+> - 每队列各自有 `QueueMode { All, OneAtATime }`（[types.ts:44](../../../../github/pi/packages/agent/src/harness/types.ts)）
 
 ---
 
@@ -77,7 +74,7 @@ pub enum PermissionDecision {
     /// 推迟。挂起 turn，等 client `session.resume(turn_id)` 续命；
     /// `updatedInput` 字段在此态下**会被忽略**（Claude Code 行为）。
     Defer,
-    /// 询问用户。触发 reverse-RPC `permission/request` → 等待响应。
+    /// 询问用户。触发 reverse-RPC `session/request_permission` → 等待响应。
     Ask,
     /// 允许。最低优先级。
     Allow,
@@ -125,13 +122,12 @@ pub enum PermissionMode {
     Plan,
 }
 
-/// 三队列注入语义。**这是 in-process 状态机枚举，不是 wire-only enum**。
+/// 两个 mid-turn 注入队列的 **wire tag**。
 ///
-/// Wire 上仅 `Steer / FollowUp` 通过 `streamingBehavior?: "steer" | "followUp"`
-/// 暴露（对齐 Pi `rpc-types.ts:21`）；`NextTurn` 由独立的 `session/next_turn`
-/// RPC method 驱动，**不进 `streamingBehavior` 枚举**（避免与 Pi wire 字面冲突）。
-///
-/// > 决策冲突警告：D-008 写"二元 mode"，本枚举三态。详见本文件顶 警告块。
+/// `Steer / FollowUp` 通过 `streamingBehavior?: "steer" | "followUp"`
+/// 暴露（对齐 Pi `rpc-types.ts:21`）。第三队列 `NextTurn` 由独立的
+/// `session/enqueue_next_turn` RPC method 驱动，**不进此枚举**（避免与 Pi wire
+/// 字面冲突）；in-process 三向目标见 §4 的 `QueueTarget`。
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq,
     Serialize, Deserialize, JsonSchema,
@@ -144,9 +140,6 @@ pub enum StreamingBehavior {
     Steer,
     /// Agent 即将 stop 时注入。drain → 续 loop 而不退出。
     FollowUp,
-    /// 仅 idle 时入队、下一个 turn 启动时 splice 到 user_message 前。
-    /// abort 不清此队列（**恢复 / 重发关键**）。
-    NextTurn,
 }
 ```
 
@@ -394,11 +387,12 @@ pub enum HookSpecificOutput {
 t0  client → server : prompt("doStuff")                            (turn_start)
 t1  engine          : drain steer (空) → spawn LLM stream req      ─┐
 t2  LLM streams     : reasoning chunks → tool_call("run_tests")    │
-t3  engine          : reverse-RPC permission/request → client      │  in-flight
-                      pendingReverse[req_id] = (resolver, deadline)│  tool_call
-t4  client          : enqueue_steer("also run lint") [phase=Turn] │  线
+t3  engine          : reverse-RPC session/request_permission       │  in-flight
+                      → client                                     │  tool_call
+                      pendingReverse[req_id] = (resolver, deadline)│  线
+t4  client          : enqueue_steer("also run lint") [phase=Turn] │
                       → steerQueue.push                            │
-t5  client          : response permission/request → Allow          │
+t5  client          : response session/request_permission → Allow │
 t6  engine          : tool exec begins (real syscall fired)        │
                                                                     │
     ===  here client sends `abort()` request  ============================
@@ -428,7 +422,7 @@ t11 client          : prompt("continue") → executeTurn() 入口
 | 维度 | Pi 行为 | zhive 决策 | 理由 |
 |---|---|---|---|
 | `Steer` 触发时 in-flight tool_call | **不撤销**，继续跑完；steer 消息在 LLM **下一轮**请求前才注入（agent-loop.ts:253） | 同 Pi | (a) 撤销 in-flight syscall 本来就脆（fs/network 已落副作用）；(b) 撤销 ≠ undo —— 留给 user via abort+rollback；(c) 与 Pi 对齐保留 wire-level 互操作潜力 |
-| 已发的 reverse-request（permission/request）回收 | `pendingExtensionRequests` Map，AbortSignal 触发 `cleanup()` + **resolve(default)** 而非 reject（rpc-mode.ts:107-127） | 走 ACP `Cancelled` outcome（`RequestPermissionOutcome::Cancelled`），不 resolve(default) | ACP 0.12 硬约束（schema doc 行 728-735 verbatim）："client MUST respond to all pending session/request_permission requests with this Cancelled outcome"；Pi 是单进程内 default 兜底，zhive 是跨进程必须走 wire |
+| 已发的 reverse-request（session/request_permission）回收 | `pendingExtensionRequests` Map，AbortSignal 触发 `cleanup()` + **resolve(default)** 而非 reject（rpc-mode.ts:107-127） | 走 ACP `Cancelled` outcome（`RequestPermissionOutcome::Cancelled`），不 resolve(default) | ACP 硬约束（schema doc 行 728-735 verbatim）："client MUST respond to all pending session/request_permission requests with this Cancelled outcome"；Pi 是单进程内 default 兜底，zhive 是跨进程必须走 wire |
 | Turn 边界是否重置 | `Steer` 不重置 turn；`FollowUp` 在 turn-end 后续 loop（伪 turn 复用）；`abort()` 强制 turn 边界关闭 | 同 Pi | turn = 一次 user input + 全 agent 响应（D-006）；steer 是 turn 内补丁，不破坏边界；abort 关闭边界并允许 nextTurn 续命 |
 | `nextTurn` 在 abort 时是否清空 | **不清空**（agent-harness.ts:937-940 只清 steer/followUp） | 同 Pi | 这是 Pi 唯一保证"abort 后用户可重发未投递的消息"的机制，**核心语义**；D-008 未规定，本 deliverable 补完 |
 
@@ -437,7 +431,8 @@ t11 client          : prompt("continue") → executeTurn() 入口
 ```
 client                     server (zhive-core)
   │                              │
-  │ <── permission/request id=A  │  pendingReverse[A] = (resolver, scope)
+  │ <── session/request_permission id=A
+  │                              │  pendingReverse[A] = (resolver, scope)
   │                              │
   │ ── session/cancel ──────────→│  abort_token.cancel()
   │                              │  for (id, r) in pendingReverse:
@@ -581,7 +576,7 @@ tool_call inside child subagent
 
 ```rust
 // notification: server → client
-// method: "session/aborted"
+// method: "events/session_aborted"
 //
 // 对齐 Pi: `{ type: "abort", clearedSteer: AgentMessage[], clearedFollowUp: AgentMessage[] }`
 // 但 nextTurn 不出现在 abort 通知中（保留）。
@@ -612,7 +607,7 @@ pub struct SessionAbortedNotification {
 | 清 nextTurn | **不清** | **不清** | ✅ |
 | 取消 in-flight | `runAbortController?.abort()` | `cancel_token.cancel()` | ✅ |
 | 等 idle | `await this.waitForIdle()` | 同（`runPromise.await`） | ✅ |
-| 发送 abort 事件 | `emitOwn({ type: "abort", clearedSteer, clearedFollowUp })` | `session/aborted` notification | ✅（增加 `next_turn_retained_count` 提示） |
+| 发送 abort 事件 | `emitOwn({ type: "abort", clearedSteer, clearedFollowUp })` | `events/session_aborted` notification | ✅（增加 `next_turn_retained_count` 提示） |
 | 错误聚合 | `AggregateError([...])` | `thiserror` `#[from]` + `Vec<Cause>` | ✅ |
 | 返回值 | `Promise<AbortResult>`（同 clearedSteer/clearedFollowUp） | `Result<AbortResult, AbortError>` | ✅ |
 
@@ -620,9 +615,9 @@ pub struct SessionAbortedNotification {
 
 > 当 client 调用 `session/cancel` 时：
 > 1. 当前 turn 立即取消；in-flight tool_call 的 cancellation 取决于工具实现（zhive 不强制撤销已发的系统调用 / 网络请求）
-> 2. `steer` 与 `followUp` 队列被清空，内容随 `session/aborted` notification 返回给 client
+> 2. `steer` 与 `followUp` 队列被清空，内容随 `events/session_aborted` notification 返回给 client
 > 3. **`nextTurn` 队列保留**。client 可在 cancel 后立即 `enqueue_next_turn(...)` 追加消息，下一次 `session/prompt` 触发时这些消息会被 splice 到新 user message 之前
-> 4. 所有 pending `permission/request` reverse-RPC 立即用 `Cancelled` outcome 响应（ACP 0.12 硬约束）
+> 4. 所有 pending `session/request_permission` reverse-RPC 立即用 `Cancelled` outcome 响应（ACP 硬约束）
 
 ---
 
@@ -635,7 +630,7 @@ pub struct SessionAbortedNotification {
 | 3.A | 三队列分工 | Steer (turn 内)/FollowUp (turn 后)/NextTurn (跨 abort 保留) | Pi 一手代码 agent-harness.ts:183-187 + agent-loop.ts 时序闭合验证 |
 | 3.B | 每队列独立 QueueMode | `Steer / FollowUp` 各自独立；`NextTurn` 无 mode（永远 All） | Pi: `steeringQueueMode + followUpQueueMode` 两个字段，`nextTurn` 直接 `splice(0)` 见 agent-harness.ts:534 |
 | 4.A | Steer 触发时撤销 in-flight tool_call？ | **不撤** | Pi 模式 + 撤销已发 syscall 不可逆；steer 是"下一轮 LLM 视角"补丁 |
-| 4.B | 已发的 reverse-request 回收？ | 用 ACP `Cancelled` outcome 显式响应所有 pending | ACP 0.12 schema 行 728-735 verbatim 硬约束 |
+| 4.B | 已发的 reverse-request 回收？ | 用 ACP `Cancelled` outcome 显式响应所有 pending | ACP schema 行 728-735 verbatim 硬约束 |
 | 4.C | Steer 是否重置 turn 边界？ | **不重置** | turn 是 D-006 的逻辑单位；steer 是 inner-loop 内的注入；只有 abort/agent_end 关闭 turn |
 | 5 | `Subagent.inherited_permissions` wire 字段？ | **不存在该字段** | 继承靠 `SubagentDefinition` 内 `Option` 字段缺省语义；与 Claude Code wire 对齐（无 explicit `inherited_permissions`） |
 | 6 | 字段命名是否完全对齐 Claude Code？ | **完全对齐** | `hookSpecificOutput.permissionDecision / permissionDecisionReason / updatedInput / additionalContext / updatedToolOutput` 全部 `rename_all = "camelCase"` 直出；`hookEventName` 作 `#[serde(tag)]` |
@@ -649,7 +644,7 @@ pub struct SessionAbortedNotification {
 
 > TODO(开放项 A3-O2)：`enqueue_next_turn` 在 `Idle` 入队后是否要主动通知 client。Pi 静默；zhive 是否发 `next_turn_queued` 事件？需要 B7 决定（影响 client 端 UI 提示策略）。
 
-> TODO(开放项 A3-O3)：reverse-RPC `permission/request` 是否有 server 侧 timeout 默认。Pi 有 `setTimeout(...) → resolve(default)`；zhive 倾向加默认 30s `Deny` timeout（保护 server 资源），由 B6 落定。
+> TODO(开放项 A3-O3)：reverse-RPC `session/request_permission` 是否有 server 侧 timeout 默认。Pi 有 `setTimeout(...) → resolve(default)`；zhive 倾向加默认 30s `Deny` timeout（保护 server 资源），由 B6 落定。
 
 > TODO(开放项 A3-O4)：subagent 自身 `permission_mode = BypassPermissions` 时 child reducer 是否完全短路。倾向"hooks 全返回 Allow，但 parent 仍能 deny"，由 B6 落地。
 
@@ -657,26 +652,23 @@ pub struct SessionAbortedNotification {
 
 > TODO(开放项 A3-O6)：`PermissionMode` 是否要加 `Plan` 之外的 `Inherit` 显式占位？目前 `Option<PermissionMode>` 的 `None` 即继承，无需 enum case；但若未来 wire 要"显式继承"可识别（比如 IDE 反查父 mode 时），可补 `PermissionMode::Inherit`。B6 决。
 
-> TODO(开放项 A3-O7)：`session/aborted` 是 notification 还是 reverse-request？倾向 notification（client 无需回 ack），但 ACP 的 `session/cancel` 已是 client → server notification 单向；abort 是其响应，可能需要 result —— 待 B4（server transport）决定 wire 形态。
+> TODO(开放项 A3-O7)：`events/session_aborted` 是 notification 还是 reverse-request？倾向 notification（client 无需回 ack），但 ACP 的 `session/cancel` 已是 client → server notification 单向；abort 是其响应，可能需要 result —— 待 B4（server transport）决定 wire 形态。
 
 ---
 
-## 11. 建议 D-008 词条修订（送 `decision-diffs.md`）
+## 11. StreamingBehavior 三队列模型小结
 
-```diff
-- Schema 含 `StreamingBehavior: steer | followUp` 二元 mode（Pi 模型）
-+ Schema 含 **三队列模型**（取代二元 mode，对齐 Pi agent-harness.ts:183-187）：
-+   - `Steer`：turn 执行期间注入，对下一个 LLM 请求立即可见
-+   - `FollowUp`：agent 无更多 action 时注入
-+   - `NextTurn`：abort **不清空**，跨 turn 保留（恢复 / 重发关键）
-+   每队列独立 `QueueMode { All | OneAtATime }`，NextTurn 无 mode（永远 All）。
-+   Wire 上 `streamingBehavior?: "steer" | "followUp"` 二元仅覆盖前两个；
-+   `NextTurn` 由独立 `session/next_turn` RPC method 驱动。
-+ `abort()` 清 steer + followUp，**保留 nextTurn**；发
-+   `session/aborted { clearedSteer, clearedFollowUp, nextTurnRetainedCount }` notification。
-+ Pending `permission/request` 在 abort 时必须用 `Cancelled` outcome 响应
-+   （ACP 0.12 硬约束，schema 行 728-735）。
-```
+- Schema 含 **三队列模型**（取代二元 mode，对齐 Pi agent-harness.ts:183-187）：
+  - `Steer`：turn 执行期间注入，对下一个 LLM 请求立即可见
+  - `FollowUp`：agent 无更多 action 时注入
+  - `NextTurn`：abort **不清空**，跨 turn 保留（恢复 / 重发关键）
+  - 每队列独立 `QueueMode { All | OneAtATime }`，NextTurn 无 mode（永远 All）。
+  - Wire 上 `streamingBehavior?: "steer" | "followUp"` 二元仅覆盖前两个；
+    `NextTurn` 由独立 `session/enqueue_next_turn` RPC method 驱动。
+- `abort()` 清 steer + followUp，**保留 nextTurn**；发
+  `events/session_aborted { clearedSteer, clearedFollowUp, nextTurnRetainedCount }` notification。
+- Pending `session/request_permission` 在 abort 时必须用 `Cancelled` outcome 响应
+  （ACP 硬约束，schema 行 728-735）。
 
 ---
 

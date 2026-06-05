@@ -2,7 +2,7 @@
 task: B5 — Hook host（D-012 host 侧 + 红线 10/11）
 plan: phase1-core-native-research
 date: 2026-05-28
-status: draft
+status: implemented
 owner: B5 subagent
 depends_on:
   - A4 deliverable（HookEvent 14 case + HookEventBase + ExtensionRef + Unknown 兜底）
@@ -27,7 +27,7 @@ consumed_by:
 
 ## 0. 摘要
 
-- **执行模型**：**进程内 trait + JSON 反序列化**（in-process），**不**走子进程；子进程模型推到 Phase 2（manifest 字段 `entrypoint: cmd:...` 时落地）。理由：A5 决定 Phase 1 仅承认 builtin hook（manifest §2 字段 `execute` 拒收，`entrypoint` 仅留占位），无第三方 extension code 运行需求；in-process 走 `dyn HookFn` 调用零序列化代价。**双轨**保留扩展位：`HookExecutor` enum 内部有 `InProcess(BoxedHookFn)` + `Subprocess(...)` 两 variant，Phase 1 只实装前者。
+- **执行模型**：双轨——**进程内**（in-process `dyn HookFn`，零序列化代价）+ **子进程**（外部程序走 stdin JSON / stdout JSON 协议）。理由：builtin hook 是 Rust 函数，进程内 trait 调用零 IPC 开销；子进程轨服务 manifest 字段 `entrypoint: cmd:...` 形态的外部 hook。`HookExecutor` enum 有 `InProcess(Arc<dyn HookFn>)` + `Subprocess(Arc<SubprocessSpec>)` 两 variant，均已落地（`run_subprocess_hook` + `register_subprocess_hook`）。
 - **注册时机**：**startup 一次性扫盘**（manifest 扫盘走 A5 §4 流程），**配合手动 `/reload`**（A5 §7.2 决定 A）；不做 fs-watch。
 - **顺序策略**：`(extension_source_rank, manifest_priority, registration_order)` 三键 lex order。settingSources rank 与 A5 §3 三层（user > project > local）+ builtin > mcp 对齐；priority 是 manifest `[[hooks]] priority = N` 整数字段（默认 0）。
 - **错误隔离**：每个 hook 一个 `tokio::time::timeout` + `tokio::spawn_blocking`（如 InProcess sync fn）/ `catch_unwind`-shim；单 hook 失败 / panic / timeout 不抛出 turn pipeline，写入 `HookExecutionError` 上报 D-014 tracing，dispatch 继续下一个 hook。
@@ -193,12 +193,11 @@ struct RegisteredHook {
     executor: HookExecutor,
 }
 
-/// 双轨：Phase 1 只实装 InProcess；Subprocess 留扩展位。
+/// 双轨：InProcess（Rust 闭包）+ Subprocess（外部程序，stdin/stdout JSON 协议），均已落地。
 enum HookExecutor {
-    InProcess(BoxedHookFn),
-    /// Phase 2 才落地。manifest 写 `entrypoint = "cmd:./main.sh"` 时走这条。
-    #[allow(dead_code)]
-    Subprocess { /* command, args, schema, timeout */ },
+    InProcess(Arc<dyn HookFn>),
+    /// manifest 写 `entrypoint = "cmd:./main.sh"` 时走这条。
+    Subprocess(Arc<SubprocessSpec>),
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -283,7 +282,7 @@ struct HookHostInner {
 
 > TODO(B5-1)：`BoxedHookFn` 是否需要支持 `&mut state` capture？Phase 1 builtin hook 多为无状态，先用 `Fn`；如果出现需要可变状态的内置 hook（如 turn-counter），改为内部 `Arc<Mutex<State>>` 闭包捕获，不动签名。
 
-> TODO(B5-2)：`jsonschema` crate 是否已在 workspace dep？若否，A5 已用 `schemars` 出 schema，校验侧需要 `jsonschema = "0.18"` —— 走 cargo add 流程并写一条 `decision-diffs.md`。
+> TODO(B5-2)：A5 已用 `schemars` 出 schema，校验侧用 workspace dep `jsonschema = "0.46"`（已落地）。
 
 ---
 
@@ -346,15 +345,15 @@ async fn dispatch(&self, event: HookEvent, cancel: CancellationToken)
 
     for h in handles {  // handles 已按 sort_key 升序
         let hook = &table.table[h];
-        let fn_ref = match &hook.executor {
-            HookExecutor::InProcess(f) => f.as_ref(),
-            HookExecutor::Subprocess { .. } => return Err(HookHostError::Execution(
-                HookFnError::Panic("subprocess executor not in Phase 1".into()),
-            )),
+        // 两轨统一成一个 future：进程内直接调闭包，子进程走 run_subprocess_hook
+        let fut = match &hook.executor {
+            HookExecutor::InProcess(f) => f.call(current_event.clone()),
+            HookExecutor::Subprocess(spec) => {
+                run_subprocess_hook_boxed(spec.clone(), current_event.clone())
+            }
         };
 
         // 错误隔离 + timeout + cancel race
-        let fut = (fn_ref)(current_event.clone());
         let res = tokio::select! {
             _ = cancel.cancelled() => return Ok(DispatchOutcome::Aborted {
                 reason: "cancelled by turn-level cancel".into(),
@@ -835,7 +834,7 @@ impl HookHost for DefaultHookHost {
 
 ### Q2 · Hook 执行模型：进程内 trait + JSON vs spawn 子进程？怎么共存？
 
-**Phase 1 仅实装进程内**（`HookExecutor::InProcess(BoxedHookFn)`）。理由：A5 §2 决定 Phase 1 不承认第三方 extension code（`execute` 字段拒收，`entrypoint` 仅占位）；builtin hook 是 Rust 函数，进程内 trait 调用零 IPC 开销。**双轨保留**：`HookExecutor` enum 内已留 `Subprocess { command, args, schema, timeout }` variant 占位，Phase 2 manifest 出现 `entrypoint = "cmd:./hook.sh"` 时落地（走 stdin JSON / stdout JSON 协议，对齐 Claude Code 文档 command-type hook，timeout 默认 600s）。
+**双轨并存**：进程内（`HookExecutor::InProcess(Arc<dyn HookFn>)`）+ 子进程（`HookExecutor::Subprocess(Arc<SubprocessSpec>)`）。理由：builtin hook 是 Rust 函数，进程内 trait 调用零 IPC 开销；子进程轨服务 manifest 出现 `entrypoint = "cmd:./hook.sh"` 形态的外部 hook（走 stdin JSON / stdout JSON 协议，对齐 Claude Code 文档 command-type hook，timeout 默认 600s）。两轨由 `register_hook` / `register_subprocess_hook` 分别注册，dispatch 时统一调度。
 
 ### Q3 · 多个 hook 对同一 event 的执行顺序：注册顺序 / namespace / priority？
 
@@ -843,7 +842,7 @@ impl HookHost for DefaultHookHost {
 
 ### Q4 · Hook timeout / panic 隔离：一个挂了怎么不连累 turn？
 
-`tokio::time::timeout(hook.timeout, fut)` 包外层；`FutureExt::catch_unwind` 拦 panic 转 `HookFnError::Panic`；失败时 `tracing::warn!` 记录 + **跳过此 hook，继续下一个**（错误隔离，对齐 Pi `runner.ts:698-706` 但 Rust 化避免裸 unwind）。timeout 默认值按 manifest `[[hooks]] timeout` 字段读取，缺省 30s（对齐 Claude Code UserPromptSubmit 默认；其余 event 也用 30s——更激进的 600s 留给 Phase 2 subprocess）。turn-level cancel token 是**唯一**会打断 dispatch 的信号（select! 优先 race）。
+`tokio::time::timeout(hook.timeout, fut)` 包外层；`FutureExt::catch_unwind` 拦 panic 转 `HookFnError::Panic`；失败时 `tracing::warn!` 记录 + **跳过此 hook，继续下一个**（错误隔离，对齐 Pi `runner.ts:698-706` 但 Rust 化避免裸 unwind）。timeout 默认值按 manifest `[[hooks]] timeout` 字段读取，缺省 30s（对齐 Claude Code UserPromptSubmit 默认；其余 event 也用 30s——更激进的 600s 用于 subprocess hook，见 `DEFAULT_SUBPROCESS_TIMEOUT`）。turn-level cancel token 是**唯一**会打断 dispatch 的信号（select! 优先 race）。
 
 ### Q5 · 与 permission reducer（B6）的协作点
 
@@ -891,7 +890,7 @@ A5 §7.2 已定 client 侧（extension）持 `ExtensionScope` + `HookHandle`；�
 
 > TODO(B5-1)：`BoxedHookFn` 是否需支持 `&mut state` capture？Phase 1 builtin hook 多为无状态，先用 `Fn`；若出现需要可变状态的内置 hook，改 `Arc<Mutex<State>>` 闭包捕获，不动签名。
 
-> TODO(B5-2)：`jsonschema` crate 是否已在 workspace dep？A5 用 `schemars` 出 schema，校验侧需要 `jsonschema = "0.18"`——走 cargo add 流程并写 `decision-diffs.md`。
+> TODO(B5-2)：A5 用 `schemars` 出 schema，校验侧用 workspace dep `jsonschema = "0.46"`（已落地）。
 
 > TODO(B5-3)：`catch_unwind` 对 async closure 的支持需要 `futures::FutureExt::catch_unwind`（`futures` crate 是否在 workspace？）或手写 `AssertUnwindSafe` wrap——决定推到实装期。
 
@@ -904,5 +903,3 @@ A5 §7.2 已定 client 侧（extension）持 `ExtensionScope` + `HookHandle`；�
 > TODO(B5-7)：与 Claude Code 文档 "all matching hooks run in parallel" 的串行 vs 并行分歧需在 `decision-diffs.md` 记一条来源，避免 D-012 修订时被误以为漏看 Claude Code 文档。
 
 > TODO(B5-8)：B1 提议的 `PhaseTransition` hook（B1 §6.7）是否进 D-012 第 15 个 event？本 deliverable §8 对照表标 ⚠️ 待 A4 / D-012 修订时决定。
-
-> TODO(B5-9)：subprocess executor 落地的 protocol（stdin JSON / stdout JSON / exit-code 语义）—— Phase 2 任务，需要再开一个 deliverable 抄 Claude Code command-type hook 协议。

@@ -2,12 +2,12 @@
 task: B2
 title: State 内存模型（活跃 Thread / Turn / Item 表征 + 读 / 写 / 订阅路径）
 date: 2026-05-28
-status: draft
+status: implemented
 depends_on:
   - A1 deliverable (Thread / Turn / Item 类型 + TurnStartedNotification / TurnCompletedNotification 形态)
   - B1 deliverable (Engine actor + Arc<EngineInner> + channel 拓扑 + ThreadHandle / ActiveTurn / TurnState)
   - D-006 (Thread/Turn/Item + serde + schemars 单 schema 源)
-  - D-011 (rusqlite 4 库 + JSONL+Leaf rollout —— B3 落地，本调研只对齐 sync 点)
+  - D-011 (sqlx 4 库 + JSONL+Leaf rollout —— B3 落地，本调研只对齐 sync 点)
   - D-012 (Hook 14 事件 + `#[non_exhaustive]` —— 内存 mutate 触发 hook 的位点)
   - D-014 (tracing 强制覆盖 Turn / ToolCall / Permission —— 与 item appender 同 span)
 references:
@@ -41,7 +41,7 @@ references:
 | codex `ThreadStore::load_history(params) -> StoredThreadHistory` —— resume / fork / rollback / memory jobs 共用入口 | `${CODEX}/thread-store/src/store.rs` | 61-65 |
 | codex `ThreadStore::list_items` 分页接口 —— lazy load 必经入口 | `${CODEX}/thread-store/src/store.rs` | 98-103 |
 | A1 `TurnItemsView = NotLoaded \| Summary \| Full` 三态视图 —— **lazy load 状态机已在 wire 层就位** | plans/.../A1-thread-turn-item.md | §6 (草图 434-442) |
-| A1 `Item` 14 case `#[serde(tag = "kind", rename_all = "snake_case")]` `#[non_exhaustive]` | plans/.../A1-thread-turn-item.md | §6 (草图 467-552) |
+| A1 `Item` 14 case `#[serde(tag = "itemKind", rename_all = "snake_case")]` `#[non_exhaustive]` | plans/.../A1-thread-turn-item.md | §6 (草图 467-552) |
 | B1 `EngineInner.threads: Arc<RwLock<HashMap<ThreadId, Arc<ThreadHandle>>>>` —— **已锁形态** | plans/.../B1-engine-loop.md | §4 (草图 252-274) |
 | B1 `ThreadHandle.active_turn: Mutex<Option<ActiveTurn>>` + `thread: Arc<RwLock<Thread>>` + `sub_tx: mpsc::Sender<Submission>` —— **已锁形态** | plans/.../B1-engine-loop.md | §4 (草图 276-290) |
 | B1 `ActiveTurn.item_tx: mpsc::Sender<Item>` bounded(256) —— turn 内 item 流唯一 producer/consumer | plans/.../B1-engine-loop.md | §6.2 channel 表 |
@@ -365,7 +365,7 @@ while let Some(item) = item_rx.recv().await {
 
 1. **`engine.shutdown()`**（B1 §4.5 公开方法）—— 必发 `FlushBarrier` + 等 ack；codex `ThreadStore::shutdown_thread`（`store.rs:51-52`）等价
 2. **`engine.compact()` 进入 Compaction phase 前**（D-012 PreCompact hook 前）—— 内存压缩前必须落盘旧 item，否则压缩丢数据
-3. **`spawn_subagent` 派生瞬间**（B1 SubagentSpawn phase）—— 父 thread 的最新状态必须 durable，子 thread 才能可信地 inherit
+3. **`spawn_subagent` 派生瞬间**（在 Turn 内由 `agent` 工具触发）—— 父 thread 的最新状态必须 durable，子 thread 才能可信地 inherit
 4. **`reverse_rpc` permission 应答 / elicitation 应答返回前**（D-008）—— 客户端可能在 reply 后立刻断线，未持久化 → 重连看不到原请求
 5. **turn `Completed / Interrupted / Failed`**（每次 `TurnCompleted` op 入队后）—— 客户端 `thread/read` 或 reconnect 时看到的 turn 视图必须包含已结束 turn 的完整 items
 6. **空闲 timeout 1s** —— 默认 fallback；EngineConfig 可调
@@ -477,9 +477,9 @@ while let Some(item) = item_rx.recv().await {
 
 > TODO(开放项 B2-6)：`TurnHistoryBuffer.active` 与 `ThreadHandle.active_turn`（B1）是两份相关数据（前者是 Turn schema 投影，后者是 ActiveTurn 运行时状态），靠 `turn_id` 同步。需要在 B6 hook 入口处验证二者一致（debug_assert），避免分裂。或考虑把 `active: Option<Turn>` 字段移到 `ActiveTurn` 内嵌（合并），但会破坏「ActiveTurn 是运行时态 / Turn 是 schema 态」的分层。
 
-> TODO(开放项 B2-7)：D-011 多库 `state.db`（threads/logs/memories/agent_jobs）与 JSONL rollout 的 sync 一致性窗口：write_queue → JSONL fsync（fast）vs state.db `INSERT`（可能慢）。当前 §4.2 fsync barrier 列表只保证 JSONL；state.db 异步 catch-up。崩溃时 state.db 可能落后 JSONL 几条记录 —— **可接受**因 state.db 内容（preview/索引）可从 JSONL 重建（参 codex `state_db_bridge.rs`）。需 B3 deliverable 明确写"state.db 是衍生索引，JSONL 是 source of truth"。
+> TODO(开放项 B2-7)：D-011 多库 `state.db`（threads/logs/memories/goals）与 JSONL rollout 的 sync 一致性窗口：write_queue → JSONL fsync（fast）vs state.db `INSERT`（可能慢）。当前 §4.2 fsync barrier 列表只保证 JSONL；state.db 异步 catch-up。崩溃时 state.db 可能落后 JSONL 几条记录 —— **可接受**因 state.db 内容（preview/索引）可从 JSONL 重建（参 codex `state_db_bridge.rs`）。需 B3 deliverable 明确写"state.db 是衍生索引，JSONL 是 source of truth"。
 
-> TODO(开放项 B2-8)：subagent thread 的 `ThreadHandle` 是父 engine 的 registry 里挂另一项，还是子 engine 实例？倾向**同 engine 内**（不为每个 subagent spawn 新 Engine actor），父子用 `forked_from: Option<ThreadId>` 关联（A1 已就位）。但 B1 §2.4 SubagentSpawn phase 描述的是"父 engine 派生"——意指父子共 engine。本调研沿用此路线，但 hook permission inheritance 的具体路径推到 A3 + B7 deliverable。
+> TODO(开放项 B2-8)：subagent thread 的 `ThreadHandle` 是父 engine 的 registry 里挂另一项，还是子 engine 实例？倾向**同 engine 内**（不为每个 subagent spawn 新 Engine actor），父子用 `forked_from: Option<ThreadId>` 关联（A1 已就位）。subagent 派生由 Turn 内的 `agent` 工具触发，父子共 engine。本调研沿用此路线，但 hook permission inheritance 的具体路径推到 A3 + B7 deliverable。
 
 ---
 

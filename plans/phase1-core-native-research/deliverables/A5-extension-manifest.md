@@ -2,7 +2,7 @@
 task: A5
 title: Extension manifest schema（D-013 落地）
 date: 2026-05-28
-status: draft
+status: implemented
 depends_on:
   - research/99-decisions D-012 (Hooks schema)
   - research/99-decisions D-013 (Extension manifest)
@@ -17,7 +17,7 @@ references:
   - ${PI}/packages/coding-agent/src/modes/rpc/rpc-types.ts
 ---
 
-> 决策冲突警告：D-013 当前只规定了 `kind: skill | slash_command | hook` 三 namespace 与 `settingSources` 三层；Pi 一手代码采用的 namespace 名是 `extension | prompt | skill`（见 `rpc-types.ts:82`），且 **extension 本身就是 hook + tool + command + shortcut + flag + renderer 的聚合容器**，把 hook 与 slash_command 拍平成 namespace 与 Pi 模型不一致。本 deliverable 给出 **修订建议 R-D013**：把 D-013 三 namespace 改为 `extension | prompt | skill`，hook/slash_command 收纳到 `extension` 的 sub-section。理由见 §3。
+> namespace 取 `kind: extension | prompt | skill`（与 D-013 第一版 `skill | slash_command | hook` 不同）。Pi 一手代码采用的 namespace 名就是 `extension | prompt | skill`（见 `rpc-types.ts:82`），且 **extension 本身就是 hook + tool + command + shortcut + flag + renderer 的聚合容器**，把 hook 与 slash_command 拍平成 namespace 会与 Pi 模型不一致。因此 hook/slash_command 收纳到 `extension` 的 sub-section。理由见 §3。
 
 # A5 · Extension Manifest Schema
 
@@ -44,27 +44,27 @@ references:
 
 ## 2. Pi `ToolDefinition` 12 字段处理表（R5 finding #2 字段全集回答）
 
-> 列：Pi 字段 → zhive 决定 → 备注。zhive 字段名遵循 snake_case（manifest 是 TOML），Rust 内部类型用 PascalCase。
+> 列：Pi 字段 → zhive 决定 → 备注。extension `manifest.json` 的 wire key 用 camelCase，Rust 内部类型用 PascalCase。
 
 | # | Pi 字段（`types.ts:426-472`） | TS 类型 | zhive 决定 | manifest 字段名 | 备注 |
 |---|---|---|---|---|---|
-| 1 | `name` | `string` | **保留** | `name` | LLM tool name；manifest 顶层 `[[tools]]` table key |
+| 1 | `name` | `string` | **保留** | `name` | LLM tool name；manifest `tools[]` 元素 key |
 | 2 | `label` | `string` | **保留** | `label` | UI 显示名；TUI render 用 |
 | 3 | `description` | `string` | **保留** | `description` | 给 LLM；强制 ≤ 1024 字符（避免 prompt 灌水）|
-| 4 | `promptSnippet` | `string?` | **保留** | `prompt_snippet` | snake_case 改名；与 Pi 行为一致（不填则不进 Available tools 段）|
-| 5 | `promptGuidelines` | `string[]?` | **保留** | `prompt_guidelines` | snake_case 改名；TOML 数组 |
-| 6 | `parameters` | `TSchema` (TypeBox) | **保留 + 改名** | `parameters_schema` | 存 **JSON Schema**（zhive 用 `schemars` 出，跟 D-006 单 schema 源对齐）；不抄 TypeBox |
-| 7 | `renderShell` | `"default" \| "self"` | **保留** | `render_shell` | 见 §6 ratatui 描述符；只在 ratatui 客户端有意义 |
-| 8 | `prepareArguments` | `(args) => Static<TParams>` | **拒收** | — | Pi 用闭包做兼容 shim，**强制函数指针不能进 manifest**；zhive 改走 `parameters_schema` + `allow_loose_inputs: bool` flag，由 host 在反序列化前做 best-effort 修正 |
-| 9 | `executionMode` | `"sequential" \| "parallel"` | **保留** | `execution_mode` | 默认 `sequential`；snake_case |
-| 10 | `execute` | async fn | **拒收（manifest 层）** | — | manifest 只声明，**执行体由 extension code 提供**（D-013 说 manifest 是 filesystem-discovered + model-invoked，code 路径 = manifest 同目录 `main.{rs.wasm,py,sh}` 之类，超 Phase 1 范围）。Phase 1 仅留 `entrypoint: string` 占位字段，host 端 `todo!()` |
-| 11 | `renderCall` | `(args, theme, ctx) => Component` | **改名 + 重定义** | `render_call` | Pi 是 React 组件函数，zhive 改成 **JSON 描述符（见 §6）**。manifest 只能存 declarative 字段；live 渲染靠 TUI client |
-| 12 | `renderResult` | `(result, opts, theme, ctx) => Component` | **改名 + 重定义** | `render_result` | 同上 |
+| 4 | `promptSnippet` | `string?` | **保留** | `promptSnippet` | 与 Pi 行为一致（不填则不进 Available tools 段）|
+| 5 | `promptGuidelines` | `string[]?` | **保留** | `promptGuidelines` | JSON 数组 |
+| 6 | `parameters` | `TSchema` (TypeBox) | **保留 + 改名** | `parametersSchema` | 存 **JSON Schema**（zhive 用 `schemars` 出，跟 D-006 单 schema 源对齐）；不抄 TypeBox |
+| 7 | `renderShell` | `"default" \| "self"` | **保留** | `renderShell` | 见 §6 ratatui 描述符；只在 ratatui 客户端有意义 |
+| 8 | `prepareArguments` | `(args) => Static<TParams>` | **拒收** | — | Pi 用闭包做兼容 shim，**强制函数指针不能进 manifest**；zhive 改走 `parametersSchema` + `allowLooseInputs: bool` flag，由 host 在反序列化前做 best-effort 修正 |
+| 9 | `executionMode` | `"sequential" \| "parallel"` | **保留** | `executionMode` | 默认 `sequential` |
+| 10 | `execute` | async fn | **拒收（manifest 层）** | — | manifest 只声明，**执行体由 extension code 提供**（D-013 说 manifest 是 filesystem-discovered + model-invoked，code 路径 = manifest 同目录 `main.{rs.wasm,py,sh}` 之类，超 Phase 1 范围）。Phase 1 仅留 `entrypoint: string` 占位字段，只接 `"builtin"` |
+| 11 | `renderCall` | `(args, theme, ctx) => Component` | **改名 + 重定义** | `renderCall` | Pi 是 React 组件函数，zhive 改成 **JSON 描述符（见 §6）**。manifest 只能存 declarative 字段；live 渲染靠 TUI client |
+| 12 | `renderResult` | `(result, opts, theme, ctx) => Component` | **改名 + 重定义** | `renderResult` | 同上 |
 
-**统计**：12 字段 → **保留 9**（含 1 改名：`parameters → parameters_schema`）+ **拒收 2**（`prepareArguments / execute`）+ **重定义 2**（`renderCall / renderResult` 由函数变 JSON 描述符；它们 _字段名_ 仍保留但 _语义_ 改了，故同时计 "保留 ∩ 重定义"，**实际有效保留 = 11**）。
+**统计**：12 字段 → **保留 9**（含 1 改名：`parameters → parametersSchema`）+ **拒收 2**（`prepareArguments / execute`）+ **重定义 2**（`renderCall / renderResult` 由函数变 JSON 描述符；它们 _字段名_ 仍保留但 _语义_ 改了，故同时计 "保留 ∩ 重定义"，**实际有效保留 = 11**）。
 
 按提交格式拍扁：
-- 保留：9（其中 1 改名 `parameters → parameters_schema`，2 改 snake_case 不算实质改名）
+- 保留：9（其中 1 改名 `parameters → parametersSchema`）
 - 改名 + 重定义：2（`renderCall / renderResult`）
 - 拒收：2（`prepareArguments / execute`）
 
@@ -74,12 +74,10 @@ references:
 
 ## 3. 三 namespace 字段定义（kind = extension | prompt | skill）
 
-> **不沿用 D-013 原文 `kind: skill | slash_command | hook`**。修订理由（R-D013）：
+> `kind` 取值 = `extension | prompt | skill`（区别于 D-013 第一版 `skill | slash_command | hook`）。hook / slash_command / tool / shortcut / flag / message_renderer 全部作为 `kind = extension` 的 **sub-section**。理由：
 > 1. Pi 的 namespace 实际是 **资源 / 发现单位**（`source: extension | prompt | skill` per `rpc-types.ts:82`），不是注册原语。
 > 2. 把 hook、tool、command、shortcut、flag 全部塞进同一个 extension package 是 Pi 的工程现实（`ExtensionAPI` 接口 `loader.ts:183-326`），把 hook / slash_command 拍平成顶层 namespace 会拆散 manifest 的物理边界。
-> 3. SlashCommand 在 Pi 是 extension 内的 `registerCommand`（`types.ts:1061-1067`）；强行拍成 top-level namespace 会导致同一目录下 `extension.toml` 与 `commands/*.toml` 并存，发现器要爬两层。
->
-> **修订建议**：`kind` 取值 = `extension | prompt | skill`。hook / slash_command / tool / shortcut / flag / message_renderer 全部作为 `kind = extension` 的 **sub-section**。
+> 3. SlashCommand 在 Pi 是 extension 内的 `registerCommand`（`types.ts:1061-1067`）；强行拍成 top-level namespace 会导致同一目录下 extension manifest 与 `commands/*` 并存，发现器要爬两层。
 
 ### 3.1 目录布局（filesystem-discovered）
 
@@ -87,7 +85,7 @@ references:
 <settingSource>/                       # ~/.zhive/ | <project>/.zhive/ | <project>/.zhive.local/
 ├── extensions/
 │   └── <name>/
-│       ├── manifest.toml              # kind = "extension"
+│       ├── manifest.json              # kind = "extension"
 │       ├── entrypoint.{wasm,..}       # Phase 1 builtin-only；第三方推 Phase 2
 │       └── README.md
 ├── prompts/
@@ -99,78 +97,90 @@ references:
 ```
 
 发现器扫盘规则照 Pi `package-manager.ts:190-195` 的 `FILE_PATTERNS`：
-- `extensions/*/manifest.toml`
+- `extensions/*/manifest.json`
 - `prompts/*.md`（front-matter 注入）
 - `skills/*/SKILL.md`
 
 ### 3.2 `kind = extension` manifest
 
-```toml
-# extensions/<name>/manifest.toml
-[manifest]
-kind = "extension"
-schema_version = "1"
-name = "git-helper"
-display_name = "Git Helper"
-description = "Git workflow helpers"
-version = "0.1.0"
-authors = ["..."]
-license = "..."
-entrypoint = "builtin"      # Phase 1：只接 "builtin"；Phase 2 接 "wasm:./main.wasm" 等
+```json
+// extensions/<name>/manifest.json
+{
+  "kind": "extension",
+  "schemaVersion": "1",
+  "name": "git-helper",
+  "displayName": "Git Helper",
+  "description": "Git workflow helpers",
+  "version": "0.1.0",
+  "authors": ["..."],
+  "license": "...",
+  "entrypoint": "builtin",
 
-[capabilities]
-hooks = true
-tools = true
-slash_commands = true
-shortcuts = false
-flags = false
+  "capabilities": {
+    "hooks": true,
+    "tools": true,
+    "slashCommands": true,
+    "shortcuts": false,
+    "flags": false
+  },
 
-# --- sub-sections（聚合 Pi ExtensionAPI 全表面） ---
+  "tools": [
+    {
+      "name": "git_blame_at",
+      "label": "Git Blame",
+      "description": "...",
+      "parametersSchema": "{ \"type\": \"object\", \"properties\": { } }",
+      "executionMode": "sequential",
+      "renderShell": "default",
+      "renderCall": { "kind": "preset", "preset": "command_line" },
+      "renderResult": { "kind": "preset", "preset": "diff" }
+    }
+  ],
 
-[[tools]]                   # 见 §2，12 字段（去 prepareArguments/execute）
-name = "git_blame_at"
-label = "Git Blame"
-description = "..."
-parameters_schema = """ { "type": "object", "properties": { ... } } """
-execution_mode = "sequential"
-render_shell = "default"
-render_call = { kind = "preset", preset = "command_line" }     # 见 §6
-render_result = { kind = "preset", preset = "diff" }
+  "hooks": [
+    {
+      "event": "PreToolUse",
+      "toolFilter": ["bash", "edit"],
+      "priority": 0
+    }
+  ],
 
-[[hooks]]                   # 与 A4 HookEvent enum 对齐
-event = "PreToolUse"        # snake/PascalCase 在 A4 定；此处先沿用 D-012 命名
-tool_filter = ["bash", "edit"]   # 可选
-priority = 0
-# registered_by 由 host 在加载时自动注入（红线 10），不在 manifest 写
+  "slashCommands": [
+    {
+      "name": "blame",
+      "description": "...",
+      "target": "tool:git_blame_at"
+    }
+  ],
 
-[[slash_commands]]
-name = "blame"
-description = "..."
-# command body: 与 prompt namespace 互通；可指 entry 函数
-target = "tool:git_blame_at"     # 或 "prompt:templates/blame.md"
+  "shortcuts": [
+    { "key": "ctrl+g b", "command": "blame" }
+  ],
 
-[[shortcuts]]
-key = "ctrl+g b"
-command = "blame"
-
-[[flags]]
-name = "auto-blame"
-type = "boolean"
-default = false
-description = "..."
+  "flags": [
+    {
+      "name": "auto-blame",
+      "type": "boolean",
+      "default": false,
+      "description": "..."
+    }
+  ]
+}
 ```
+
+`entrypoint` Phase 1 只接 `"builtin"`，Phase 2 接 `"wasm:./main.wasm"` 等。`tools[]` 见 §2 字段表（去 `prepareArguments` / `execute`）。`renderCall` / `renderResult` 见 §6。`hooks[].event` 命名与 A4 HookEvent enum 对齐；`registeredBy` 由 host 在加载时自动注入（红线 10），不在 manifest 写。`slashCommands[].target` 与 prompt namespace 互通（可指 `prompt:templates/blame.md`）。
 
 ### 3.3 `kind = prompt` manifest（front-matter in `.md`）
 
 ```markdown
 ---
 kind: prompt
-schema_version: "1"
+schemaVersion: "1"
 name: code-review
 description: "Code review checklist"
-model_invocable: true       # 可以被 LLM 直接 invoke 还是只能 slash 调
-allowed_tools: ["read", "grep", "edit"]
-disable_in_subagent: false
+modelInvocable: true        # 可以被 LLM 直接 invoke 还是只能 slash 调
+allowedTools: ["read", "grep", "edit"]
+disableInSubagent: false
 ---
 
 You are reviewing code...
@@ -181,24 +191,24 @@ You are reviewing code...
 | 字段 | 类型 | 来源 / 决定 | 说明 |
 |---|---|---|---|
 | `kind` | `"prompt"` | zhive | 必填 |
-| `schema_version` | `"1"` | zhive | manifest schema 自身的版本，未来 breaking 用 |
+| `schemaVersion` | `"1"` | zhive | manifest schema 自身的版本，未来 breaking 用 |
 | `name` | `string` | Pi `RpcSlashCommand.name` (`rpc-types.ts:78`) | 必填，全名空间内唯一 |
 | `description` | `string?` | Pi `RpcSlashCommand.description` (`rpc-types.ts:80`) | |
-| `model_invocable` | `bool` | R5 finding #2 列表 | 默认 `false`，只能 slash 调；`true` 才会进 system prompt |
-| `allowed_tools` | `string[]?` | R5 finding #2 列表 | scope down；与 PermissionScope 合流 |
-| `disable_in_subagent` | `bool` | R5 finding #2 列表 | subagent 不可见，对应 D-008 父子继承的子缩窄 |
+| `modelInvocable` | `bool` | R5 finding #2 列表 | 默认 `false`，只能 slash 调；`true` 才会进 system prompt |
+| `allowedTools` | `string[]?` | R5 finding #2 列表 | scope down；与 PermissionScope 合流 |
+| `disableInSubagent` | `bool` | R5 finding #2 列表 | subagent 不可见，对应 D-008 父子继承的子缩窄 |
 
 ### 3.4 `kind = skill` manifest（front-matter in `SKILL.md`）
 
 ```markdown
 ---
 kind: skill
-schema_version: "1"
+schemaVersion: "1"
 name: provider-contract-test
 description: "Test provider compatibility"
-model_invocable: true
-allowed_tools: ["bash", "read", "edit"]
-auto_invoke_keywords: ["provider", "contract"]
+modelInvocable: true
+allowedTools: ["bash", "read", "edit"]
+autoInvokeKeywords: ["provider", "contract"]
 ---
 
 # Provider Contract Test
@@ -210,12 +220,12 @@ auto_invoke_keywords: ["provider", "contract"]
 | 字段 | 类型 | 来源 / 决定 | 说明 |
 |---|---|---|---|
 | `kind` | `"skill"` | zhive | 必填 |
-| `schema_version` | `"1"` | zhive | |
+| `schemaVersion` | `"1"` | zhive | |
 | `name` | `string` | Pi `RpcSlashCommand` | |
 | `description` | `string?` | Pi 同 | |
-| `model_invocable` | `bool` | Pi resources_discover skill 模型 | 默认 `true`（与 prompt 默认相反）|
-| `allowed_tools` | `string[]?` | 同 prompt | |
-| `auto_invoke_keywords` | `string[]?` | zhive 新增 | Skill 触发关键词（Claude Code Skills 模型），LLM 自决是否进入 |
+| `modelInvocable` | `bool` | Pi resources_discover skill 模型 | 默认 `true`（与 prompt 默认相反）|
+| `allowedTools` | `string[]?` | 同 prompt | |
+| `autoInvokeKeywords` | `string[]?` | zhive 新增 | Skill 触发关键词（Claude Code Skills 模型），LLM 自决是否进入 |
 
 ---
 
@@ -248,14 +258,14 @@ auto_invoke_keywords: ["provider", "contract"]
 
 ### 4.3 hook 通过 manifest 注册 vs settings 顶层注册的优先级（R5 finding #2 第二问回答）
 
-**决定**：**禁止 settings 顶层裸注册 hook**。所有 hook 必须挂在某个 `kind = extension` manifest 下，由 host 在加载时自动注入 `registered_by` 元数据（红线 10）。
+**决定**：**禁止 settings 顶层裸注册 hook**。所有 hook 必须挂在某个 `kind = extension` manifest 下，由 host 在加载时自动注入 `registeredBy` 元数据（红线 10）。
 
 理由：
-- 红线 10 要求 hook event base 必带 `registered_by: ExtensionRef`；若允许 settings 顶层注册，`registered_by` 字段无法取值（不属于任何 extension），会出现 `registered_by = "<settings>"` 这种特例，违反"每个 hook 必有明确 owner"。
+- 红线 10 要求 hook event base 必带 `registeredBy: ExtensionRef`；若允许 settings 顶层注册，`registeredBy` 字段无法取值（不属于任何 extension），会出现 `registeredBy = "<settings>"` 这种特例，违反"每个 hook 必有明确 owner"。
 - Pi 没有 settings 顶层 hook 这一模式（所有 hook 通过 `pi.on(event, handler)` 在 extension factory 里注册，见 `loader.ts:185-190`），无前例可循。
-- 若用户要"全局 hook"，可建一个 `~/.zhive/extensions/global-hooks/manifest.toml`，效果等价但 `registered_by` 落地。
+- 若用户要"全局 hook"，可建一个 `~/.zhive/extensions/global-hooks/manifest.json`，效果等价但 `registeredBy` 落地。
 
-**覆盖规则**：同 event + 同 `tool_filter` 的多个 hook 按 §4.2 rank 合并；rank 较高的 hook **不覆盖** rank 较低的，而是 **依次执行**（hook chain）。`priority` 字段控制同 rank 内顺序。
+**覆盖规则**：同 event + 同 `toolFilter` 的多个 hook 按 §4.2 rank 合并；rank 较高的 hook **不覆盖** rank 较低的，而是 **依次执行**（hook chain）。`priority` 字段控制同 rank 内顺序。
 
 > TODO(开放项)：A4 deliverable 必须定义 `HookChain` 的执行语义（fold reducer vs 短路）。当前预设：reducer 由 B6 实现，A5 不再展开。
 
@@ -278,19 +288,19 @@ auto_invoke_keywords: ["provider", "contract"]
 
 如果 Phase 1 内部就要让 extension 贡献额外资源路径，走 **manifest 静态声明**：
 
-```toml
-[manifest]
-kind = "extension"
-# ...
-
-[[resource_contributions]]    # zhive 新增；纯声明
-kind = "skill"
-paths = ["./bundled_skills/"]   # 相对 extension 根
+```json
+{
+  "kind": "extension",
+  "...": "...",
+  "resourceContributions": [
+    { "kind": "skill", "paths": ["./bundled_skills/"] }
+  ]
+}
 ```
 
 发现器在加载 extension 时一次性把这些路径并入扫盘队列。无 lifecycle，无回调，无 zombie listener 风险。
 
-> TODO(开放项)：`resource_contributions` 是否要标 precedence？建议默认与 owning extension 同 rank，但用户可加 `priority_offset` 微调。Phase 1 先不实现，预留字段名。
+> TODO(开放项)：`resourceContributions` 是否要标 precedence？建议默认与 owning extension 同 rank，但用户可加 `priorityOffset` 微调。Phase 1 schema 预留字段名但不读。
 
 ---
 
@@ -298,7 +308,7 @@ paths = ["./bundled_skills/"]   # 相对 extension 根
 
 ### 6.1 问题
 
-Pi 的 `renderCall / renderResult` 是 React 组件函数（`types.ts:464-472`），输入 `(args, theme, context) => Component`，无法直接进 manifest（manifest 是 TOML，不是 JS）。Pi 的 `ToolRenderContext`（`types.ts:396-421`）还含 `invalidate` 闭包、`lastComponent` 引用、`state` 可变状态等 React 专属概念，**zhive TUI 是 ratatui，必须降级到 declarative JSON 描述符**。
+Pi 的 `renderCall / renderResult` 是 React 组件函数（`types.ts:464-472`），输入 `(args, theme, context) => Component`，无法直接进 manifest（manifest 是 JSON，不是 JS）。Pi 的 `ToolRenderContext`（`types.ts:396-421`）还含 `invalidate` 闭包、`lastComponent` 引用、`state` 可变状态等 React 专属概念，**zhive TUI 是 ratatui，必须降级到 declarative JSON 描述符**。
 
 ### 6.2 zhive 模型：**declarative descriptor + preset 集**
 
@@ -306,9 +316,9 @@ manifest 里只能存 **JSON 描述符**，host 在 TUI 渲染时解析描述符
 
 #### Level 1：preset（强烈推荐，覆盖 80% 工具）
 
-```toml
-render_call = { kind = "preset", preset = "command_line" }
-render_result = { kind = "preset", preset = "diff" }
+```json
+"renderCall": { "kind": "preset", "preset": "command_line" },
+"renderResult": { "kind": "preset", "preset": "diff" }
 ```
 
 zhive 内置 preset 集（Phase 1 起码 5 个，后续追加）：
@@ -323,16 +333,14 @@ zhive 内置 preset 集（Phase 1 起码 5 个，后续追加）：
 
 #### Level 2：composite（罕用，复杂 widget 才走）
 
-```toml
-[tools.render_call]
-kind = "composite"
-[[tools.render_call.rows]]
-type = "title"
-text = "Edit ${args.path}"          # 字段插值
-[[tools.render_call.rows]]
-type = "diff"
-old_field = "args.old_content"
-new_field = "args.new_content"
+```json
+"renderCall": {
+  "kind": "composite",
+  "rows": [
+    { "type": "title", "text": "Edit ${args.path}" },
+    { "type": "diff", "oldField": "args.old_content", "newField": "args.new_content" }
+  ]
+}
 ```
 
 支持的 row.type：`title | text | diff | key_value | file_path | spinner`。`spinner` 仅当 `context.argsComplete == false` 时显示。
@@ -458,13 +466,13 @@ zombie listener 在 step 2 已被清空，step 1 的 cleanup hook 是 best-effor
 
 ### Q2 · Hook 通过 manifest 注册 vs settings 顶层注册的优先级
 
-**不允许 settings 顶层裸注册 hook**。所有 hook 必须挂 manifest 下，host 自动注入 `registered_by`（红线 10）。同事件多 hook 走 hook chain，rank（settingSources precedence）+ priority（manifest 字段）双键排序。详 §4.3。
+**不允许 settings 顶层裸注册 hook**。所有 hook 必须挂 manifest 下，host 自动注入 `registeredBy`（红线 10）。同事件多 hook 走 hook chain，rank（settingSources precedence）+ priority（manifest 字段）双键排序。详 §4.3。
 
 **选 A 不选 B 的理由**：选项 B（允许 settings 顶层）违反红线 10；选项 A（manifest-only）零特例。
 
 ### Q3 · `ResourcesDiscoverEvent` 进 Phase 1？
 
-**不进**。Phase 1 = 纯静态扫盘 + manifest 静态 `resource_contributions`（声明式，无 callback）。详 §5。
+**不进**。Phase 1 = 纯静态扫盘 + manifest 静态 `resourceContributions`（声明式，无 callback）。详 §5。
 
 **选 A 不选 B 的理由**：B（进 Phase 1）会拖出 lifecycle、去重、zombie listener、persistence 落库四个子问题，Phase 1 schema 锁不死。A（不进）零回归代价（reserve 事件名，Phase 2 直接补）。
 
@@ -488,28 +496,25 @@ zombie listener 在 step 2 已被清空，step 1 的 cleanup hook 是 best-effor
 
 > TODO(开放项-2)：A4 deliverable 必须定义 `HookChain` 的执行语义（fold reducer vs 短路）。当前预设由 B6 实现，A5 不再展开。
 
-> TODO(开放项-3)：`resource_contributions` 的 `priority_offset` 字段 Phase 1 是否实现？建议预留字段名但不读，避免 manifest schema 后续不兼容。
+> TODO(开放项-3)：`resourceContributions` 的 `priorityOffset` 字段 Phase 1 是否实现？建议预留字段名但不读，避免 manifest schema 后续不兼容。
 
 > TODO(开放项-4)：`preset` 列表是否在 zhive-proto schema 里枚举（即 client 必须支持的最小集），还是只在 TUI crate 内？倾向放 proto enum（schemars 出 schema 让所有 client 知道）。
 
-> TODO(开放项-5)：`tool_call` hook mutate `event.input` 后强制重验证（红线 11）由 B5 host 实现；A5 manifest 层不需要新字段，但 manifest 的 `parameters_schema` 是重验证的 source-of-truth —— 强校验时 host 必须能加载该 schema，意味着 schema **必须在 manifest 静态可读**（不能 dynamic compute）。
+> TODO(开放项-5)：`tool_call` hook mutate `event.input` 后强制重验证（红线 11）由 B5 host 实现；A5 manifest 层不需要新字段，但 manifest 的 `parametersSchema` 是重验证的 source-of-truth —— 强校验时 host 必须能加载该 schema，意味着 schema **必须在 manifest 静态可读**（不能 dynamic compute）。
 
-> TODO(开放项-6)：`disable_in_subagent` 字段在 prompt / skill 都列了，是否要在 extension 顶层 / `[[tools]]` / `[[hooks]]` 也加？建议加，与 D-008 subagent 父子继承贯通。
+> `disableInSubagent` 字段在 prompt / skill 以及 `tools[]` / `hooks[]` 元素上均提供，与 D-008 subagent 父子继承贯通。
 
-> TODO(开放项-7)：schema_version 演进策略。建议 zhive 自己写一个 `xtask check-manifest-compat` 验证。
+> TODO(开放项-7)：schemaVersion 演进策略。建议 zhive 自己写一个 `xtask check-manifest-compat` 验证。
 
 ---
 
-## 10. 决策修订建议
+## 10. 决策落地记录
 
-> **R-D013（建议提交至 `decision-diffs.md`）**：D-013 当前文本：
-> > `kind: skill | slash_command | hook`
->
-> 修订为：
-> > `kind: extension | prompt | skill`，其中 `extension` 内含子表 `[[tools]] [[hooks]] [[slash_commands]] [[shortcuts]] [[flags]]`。
+> **D-013 namespace**（记于 `decision-diffs.md` §1.11）：从第一版 `kind: skill | slash_command | hook` 改为
+> > `kind: extension | prompt | skill`，其中 `extension` 内含子表 `tools[] / hooks[] / slashCommands[] / shortcuts[] / flags[]`。
 >
 > 理由：见 §3 开头三条（Pi 一手 namespace 名、聚合 vs 拍平、目录边界 = 物理边界）。
 
-> **R-D013-2**：D-013 应明确 "hook 必须挂 extension manifest，不允许 settings 顶层裸注册"。这与红线 10 直接联动，应同期落地。
+> **hook 注册边界**："hook 必须挂 extension manifest，不允许 settings 顶层裸注册"，与红线 10 直接联动（host 拒绝 settings 级注册）。
 
-> **R-D013-3**：D-013 `settingSources` 三层目前只有名字（user/project/local）；本 deliverable §4.1-4.2 给出 **目录路径 + precedence rank 表**，建议把表搬进 D-013 正文。
+> **settingSources**：三层（user/project/local）的 **目录路径 + precedence rank 表** 见本 deliverable §4.1-4.2。

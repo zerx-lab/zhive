@@ -1,10 +1,10 @@
 ---
 task: B3
-title: Persistence layer — rusqlite 4 库 + JSONL+Leaf rollout（D-011 修订版落地）
+title: Persistence layer — sqlx 4 库 + JSONL+Leaf rollout（D-011 修订版落地）
 date: 2026-05-28
-status: draft
+status: implemented
 depends_on:
-  - research/99-decisions D-011（rusqlite 多库 + JSONL+Leaf rollout，2026-05-28 修订）
+  - research/99-decisions D-011（sqlx 多库 + JSONL+Leaf rollout，2026-05-28 修订）
   - A1 deliverable（Thread/Turn/Item schema + turn lifecycle notification 形态）
   - B1 deliverable（Engine actor pattern：`Codex.tx_sub / rx_event` + `ActiveTurn` 边界）
 references:
@@ -29,7 +29,7 @@ references:
   - research/99-decisions/README.md:420-438                                (红线 1 / 红线 8 废除 / 红线 10-11)
 ---
 
-> **R-2 触发**：rusqlite =0.40 + `bundled` cold release build **实测 78-80s**，超过 60s 阈值。详见 §8。**建议向用户确认是否接受**，缓解措施在 §11 列。R-7（pool 选型）三方案对照见 §6，**未自行决策**，**等用户拍**。R-8（跨库一致性）按 D-011 "JSONL source of truth" 给出 fail-strategy + 崩溃恢复伪码（§7）。
+> **持久化层用 sqlx 0.8**（`SqlitePool`，内建 async 连接池）。这绕开了 rusqlite 路线的两个痛点：R-2（rusqlite `bundled` cold release build 实测 78-80s，超 60s 阈值，详见 §8 研究记录）与 R-7（rusqlite `Connection` 非 Send/Sync 导致的 pool 选型，详见 §6 研究记录）。R-8（跨库一致性）按 D-011 "JSONL source of truth" 给出 fail-strategy + 崩溃恢复伪码（§7）。
 
 ---
 
@@ -69,40 +69,39 @@ references:
 ### 2.1 运行时数据目录
 
 ```
-$XDG_DATA_HOME/zhive/                    # Linux 默认 = ~/.local/share/zhive/
-   db/
-      state.db                           # threads / sessions / 主索引
-      state.db-wal / state.db-shm        # WAL 模式产物（运行时存在）
-      logs.db
-      logs.db-wal / logs.db-shm
-      memories.db
-      memories.db-wal / memories.db-shm
-      goals.db
-      goals.db-wal / goals.db-shm
-   rollouts/                              # JSONL source-of-truth（D-011）
-      rollout-2026-05-28T14-37-21-<uuid>.jsonl
-      rollout-...jsonl
-      session_index.jsonl                # thread_id ↔ name 映射（抄 codex/state_db.rs:1615-1625）
-   archived_rollouts/                     # 软删除归档（codex `ARCHIVED_SESSIONS_SUBDIR` 同名）
+<base>/                                  # 见下方解析顺序，Linux 默认 = ~/.local/share/zhive/
+   state.db                              # threads / sessions / 主索引
+   state.db-wal / state.db-shm           # WAL 模式产物（运行时存在）
+   logs.db
+   logs.db-wal / logs.db-shm
+   memories.db
+   memories.db-wal / memories.db-shm
+   goals.db
+   goals.db-wal / goals.db-shm
+   rollouts/                             # JSONL source-of-truth（D-011）
+      <thread_id>.jsonl                  # 每 thread 一个文件，thread_id 经路径安全化
+      session_index.jsonl               # thread_id ↔ name 映射（抄 codex/state_db.rs:1615-1625）
+   archived_rollouts/                    # 软删除归档（codex `ARCHIVED_SESSIONS_SUBDIR` 同名）
 ```
 
-> 路径 override：环境变量 `ZHIVE_DATA_HOME`，类比 codex `CODEX_SQLITE_HOME`（`state/src/lib.rs:79`）。
+> `<base>` 解析顺序：环境变量 `$ZHIVE_DATA_DIR` → `$XDG_DATA_HOME/zhive` → `$HOME/.local/share/zhive`。`$ZHIVE_DATA_DIR` override 类比 codex `CODEX_SQLITE_HOME`（`state/src/lib.rs:79`）。
 
 ### 2.2 Migration 源代码布局
 
 ```
 crates/zhive-core/migrations/
    state/
-      0001_threads.sql
+      0001_init.sql
+      0002_threads_subagent_cwd.sql
    logs/
-      0001_logs.sql
+      0001_init.sql
    memories/
-      0001_memories.sql
+      0001_init.sql
    goals/
-      0001_goals.sql
+      0001_init.sql
 ```
 
-每个子目录 1 个文件起步（**对照 codex `goals_migrations/`（1 文件）+ `memory_migrations/`（1 文件）+ `logs_migrations/`（2 文件）+ `migrations/`（35 文件含 backfill）**）。codex `migrations/` 35 文件几乎全是历史演进留痕（`0008_backfill_state.sql / 0009_stage1_outputs_rollout_slug.sql / 0023_drop_logs.sql / 0035_drop_memory_tables.sql` 全是迁移痕迹），zhive **直接落最终态**，4 个 0001 文件即可启动。
+每个子目录从 1 个 `0001_init.sql` 起步（**对照 codex `goals_migrations/`（1 文件）+ `memory_migrations/`（1 文件）+ `logs_migrations/`（2 文件）+ `migrations/`（35 文件含 backfill）**）。codex `migrations/` 35 文件几乎全是历史演进留痕（`0008_backfill_state.sql / 0009_stage1_outputs_rollout_slug.sql / 0023_drop_logs.sql / 0035_drop_memory_tables.sql` 全是迁移痕迹），zhive **直接落最终态**，每库一个初始迁移即可启动（state 后续追加了 `0002_threads_subagent_cwd.sql` 一条演进）。
 
 > Phase 1 zhive 不复制 codex `agent_jobs / agent_job_items`（`migrations/0014_agent_jobs.sql`），那是 codex 的 CSV 批跑任务专用，与 zhive Phase 1 范围无关。Phase 2 是否引入交 D-010 phase planning。
 
@@ -112,7 +111,7 @@ crates/zhive-core/migrations/
 
 下面 4 段 SQL 全部按 D-006（Thread/Turn/Item）+ A1（Item 14 case enum）合并设计；逐条标注「抄 codex 哪一行」「砍掉哪一列 + 理由」「zhive 新增哪一列」。
 
-### 3.1 `migrations/state/0001_threads.sql`
+### 3.1 `migrations/state/0001_init.sql`
 
 ```sql
 -- 对照：${CODEX}/codex-rs/state/migrations/0001_threads.sql:1-25
@@ -165,7 +164,7 @@ CREATE INDEX idx_turn_index_thread_started ON turn_index(thread_id, started_at_m
 
 > **关键差异**：codex `threads.rollout_path` 是显式列；zhive **不存** —— 用 `rollouts/{thread_id}.jsonl` 推导。这是 D-011 修订条款 "JSONL 是 source of truth，DB 是索引" 的具体落地。
 
-### 3.2 `migrations/logs/0001_logs.sql`
+### 3.2 `migrations/logs/0001_init.sql`
 
 ```sql
 -- 对照：${CODEX}/codex-rs/state/logs_migrations/0001_logs.sql:1-22
@@ -195,9 +194,9 @@ CREATE INDEX idx_logs_process_uuid_threadless_ts      ON logs(process_uuid, ts_m
     WHERE thread_id IS NULL;
 ```
 
-> **跨库 FK 限制**：`logs.thread_id` **不能** SQL 层 FK 引用 `state.threads.id`（rusqlite 不支持跨 database file 的 FK，sqlite ATTACH 也仅能软引用）。zhive 在 ORM/repo 层做软校验；删除 thread 时调用层负责级联到 logs（应用代码而非 DB）。详见 §7。
+> **跨库 FK 限制**：`logs.thread_id` **不能** SQL 层 FK 引用 `state.threads.id`（sqlite 不支持跨 database file 的 FK，ATTACH 也仅能软引用）。zhive 在 repo 层做软校验；删除 thread 时调用层负责级联到 logs（应用代码而非 DB）。详见 §7。
 
-### 3.3 `migrations/memories/0001_memories.sql`
+### 3.3 `migrations/memories/0001_init.sql`
 
 ```sql
 -- 对照：${CODEX}/codex-rs/state/memory_migrations/0001_memories.sql:1-36
@@ -226,7 +225,7 @@ CREATE INDEX idx_memories_thread     ON memories(thread_id) WHERE thread_id IS N
 CREATE INDEX idx_memories_kind       ON memories(kind);
 CREATE INDEX idx_memories_updated_at ON memories(updated_at_ms DESC, id DESC);
 
--- 全文检索（rusqlite 0.40 bundled 自带 FTS5）
+-- 全文检索（sqlx sqlite 驱动捆绑的 libsqlite3 自带 FTS5）
 CREATE VIRTUAL TABLE memories_fts USING fts5(
     body,
     tags,
@@ -247,11 +246,11 @@ CREATE TRIGGER memories_au AFTER UPDATE ON memories BEGIN
 END;
 ```
 
-> FTS5 是 sqlite 标准 extension，rusqlite 0.40 + `bundled` feature 自带（编译进 amalgamation），无需额外 feature flag。
+> FTS5 是 sqlite 标准 extension，sqlx sqlite 驱动捆绑的 libsqlite3 自带（编译进 amalgamation），无需额外 feature flag。
 
 > TODO(开放项 B3-3)：Pi `MemoryRepo` 是否分 thread-local / 全局两类？当前 schema 用 `thread_id NULL` 表示全局已能 cover，但 Pi 实际拆了两张表 — 待 A5 / B2 调研补足。
 
-### 3.4 `migrations/goals/0001_goals.sql`
+### 3.4 `migrations/goals/0001_init.sql`
 
 ```sql
 -- 对照：${CODEX}/codex-rs/state/goals_migrations/0001_thread_goals.sql:1-19
@@ -305,11 +304,13 @@ $XDG_DATA_HOME/zhive/rollouts/
 ```jsonc
 {
   "type": "session",
-  "version": 1,                         // zhive 起 v1（Pi 是 v3，因 Pi 已经经历 2 次 schema break）
-  "id": "01HXYZ...",                    // thread_id（uuid v7 建议）
-  "timestamp": "2026-05-28T14:37:21Z",  // RFC3339 UTC
+  "version": 4,                         // 当前 schema 版本（Wave4 起 v4）
+  "id": "thread:native/0190...",        // thread_id
+  "timestamp": 1748443041,              // Unix 秒
   "cwd": "/home/user/project",
-  "parentSession": "01HX..."            // optional，fork 来源 thread_id
+  "parentSession": "thread:native/...", // optional，fork 来源 thread_id
+  "subagentParent": "thread:native/...",// optional，作为 subagent 被 spawn 时的父 thread
+  "source": "user"                      // optional，thread 来源：user / subagent / memory_consolidation
 }
 ```
 
@@ -317,29 +318,30 @@ $XDG_DATA_HOME/zhive/rollouts/
 
 照 Pi `types.ts:334-414` 的 `SessionTreeEntryBase` 模式，但 entry 内容用 **A1 deliverable §2.1 的 14-case `Item` enum**（参考 `A1-thread-turn-item.md:83-98`）。
 
-公共 envelope：
+每行用 `type` 作判别符（snake_case 值），其余字段随 case 而定：
 
 ```jsonc
 {
   "type": "<entry_type>",        // 见下面 case 列表
-  "id": "01HX...",                // 该 entry 自己的 id（rolloutLine id，非 turn_id / item_id）
-  "parentId": "01HX..." | null,   // 父 entry id（链表形式构造 tree —— fork 时 parentId 跨分支跳跃）
-  "timestamp": "2026-05-28T14:37:22Z",
+  "threadId": "thread:native/...",// 多数 case 带（leaf 例外）
+  "turnId": "...",                // item / compaction / pending_permission 带
+  "timestamp": 1748443042,        // Unix 秒
   ...case-specific...
 }
 ```
 
-**zhive 实测必需的 entry types**：
+**zhive rollout 的 entry types**（`RolloutEntry`）：
 
-| entry.type | 携带数据 | 触发时机 |
+| type | 携带数据 | 触发时机 |
 |---|---|---|
-| `item` | A1 `Item`（14 case 之一）；`turnId: string`；`itemId: string` | Engine 每次 emit item 时（B1 `tx_event`） |
-| `turn_start` | `turnId / input: Vec<UserInput>` | Turn 开始（A1 `TurnStartedNotification`） |
-| `turn_end` | `turnId / status: TurnStatus / error?` | Turn 完成（A1 `TurnCompletedNotification`） |
-| `compaction` | `summary: string / firstKeptEntryId: string / tokensBefore: number` | Pi `CompactionEntry` 同名（types.ts:357-363） |
-| `branch_summary` | `fromId: string / summary: string` | Pi `BranchSummaryEntry`（types.ts:366-372），fork 时旁注 |
-| `model_change` | `provider / modelId` | Pi `ModelChangeEntry`（types.ts:351-355） |
+| `session` | `version / id / timestamp / cwd / parentSession? / subagentParent? / source?` | 文件第 1 行（§4.2） |
+| `item` | `threadId / turnId / timestamp`；A1 `Item`（含 `itemKind` 判别符） | Engine 每次 emit item 时（B1 `tx_event`） |
+| `compaction` | `threadId / turnId / timestamp / summary / replacement: [Item] / entriesCompacted` | 上下文压缩 checkpoint（Pi `CompactionEntry` 同源，types.ts:357-363） |
+| `pending_permission` | `threadId / turnId / timestamp / requestId / request` | turn 因 `Defer` 权限决策挂起（B6），resume 时重新 surface |
+| `permission_resolved` | `threadId / requestId / timestamp` | 挂起的权限请求被应答 / turn 取消（B6），supersede 对应 `pending_permission` |
 | `leaf` | `targetId: string \| null` | **仅 fork / 回放选支时写**；普通 append 不写（Pi 规则，§4.4 解释） |
+
+> turn 生命周期（start / end / status）不进 rollout，而是落在 state.db 的 `turns` 表（§3）；rollout 只承载上面这些内容流 + 控制行。
 
 ### 4.4 Leaf 指针写入策略
 
@@ -375,21 +377,18 @@ storage.set_leaf_id(Some(entry_x_id))?;
 
 ## 5. `Storage` trait + 4 子 trait 草图
 
-> 仅定义 trait + 方法签名；**不写 impl**。具体 impl 落地在 B3 完成后由实现工程师写 `crates/zhive-core/src/persistence/`。
+> 本节是 trait + 方法签名草图。落地后 `crates/zhive-core/src/persistence/` 用聚合 struct `Storage`（持 4 个具体 `StateDb / LogsDb / MemoriesDb / GoalsDb`）+ 一个 `ThreadStorage`（RPITIT，可 mock）承载下面这些操作。
 
 ```rust
-//! crates/zhive-core/src/persistence/mod.rs（待补）
-
-use std::sync::Arc;
+//! crates/zhive-core/src/persistence/mod.rs
 
 /// 4 库聚合接口（D-011 §决策）。
 ///
-/// 实现层握有 4 个 [`ConnectionPool`]（或 4 个 `Arc<Mutex<Connection>>`，
-/// 选型见 §6），按需借 connection。
+/// 实现层握有 4 个 [`sqlx::SqlitePool`]（每库一文件一池），按需借 connection。
 ///
-/// **跨库一致性**：本 trait **不提供** 跨库事务原语（rusqlite 不支持
-/// ATTACH-level 多 DB 写事务有限）。调用者必须遵循 §7 的 "JSONL source of truth"
-/// fail-strategy。
+/// **跨库一致性**：本 trait **不提供** 跨库事务原语（sqlite `BEGIN` 是单 DB
+/// 文件作用域，ATTACH 上来的库在 WAL 下默认 read-only，见 §7）。调用者必须遵循
+/// §7 的 "JSONL source of truth" fail-strategy。
 pub trait Storage: Send + Sync {
     fn state(&self) -> &dyn StateDb;
     fn logs(&self) -> &dyn LogsDb;
@@ -413,14 +412,14 @@ pub struct StorageDbPaths {
 #[async_trait::async_trait]
 pub trait StateDb: Send + Sync {
     /// 创建新 thread。返回该 thread 的稳定 id。
-    async fn create_thread(&self, args: CreateThreadArgs) -> Result<ThreadId, PersistenceError>;
+    async fn create_thread(&self, args: CreateThreadArgs) -> Result<ThreadId, StorageError>;
 
     /// 列出 thread（分页 + status 过滤）。**JSONL 是 source of truth**：
     /// 这里只返回索引视图（标题、created_at 等），不还原全部 item。
-    async fn list_threads(&self, q: ThreadQuery) -> Result<ThreadPage, PersistenceError>;
+    async fn list_threads(&self, q: ThreadQuery) -> Result<ThreadPage, StorageError>;
 
     /// 取单 thread 元信息（不含 item / turn 历史）。
-    async fn get_thread(&self, id: &ThreadId) -> Result<Option<ThreadMeta>, PersistenceError>;
+    async fn get_thread(&self, id: &ThreadId) -> Result<Option<ThreadMeta>, StorageError>;
 
     /// 新 turn 入索引（不存 turn 内 item；item 流落 JSONL）。
     async fn record_turn_start(
@@ -428,7 +427,7 @@ pub trait StateDb: Send + Sync {
         thread_id: &ThreadId,
         turn_id: &TurnId,
         started_at_ms: i64,
-    ) -> Result<(), PersistenceError>;
+    ) -> Result<(), StorageError>;
 
     /// turn 结束时更新索引。
     async fn record_turn_end(
@@ -437,10 +436,10 @@ pub trait StateDb: Send + Sync {
         turn_id: &TurnId,
         status: TurnStatus,
         completed_at_ms: i64,
-    ) -> Result<(), PersistenceError>;
+    ) -> Result<(), StorageError>;
 
     /// 软删除 thread（status -> 'archived'）。**不级联** logs / memories / goals。
-    async fn archive_thread(&self, id: &ThreadId) -> Result<(), PersistenceError>;
+    async fn archive_thread(&self, id: &ThreadId) -> Result<(), StorageError>;
 }
 
 // ---- LogsDb（logs.db） ----
@@ -448,16 +447,16 @@ pub trait StateDb: Send + Sync {
 #[async_trait::async_trait]
 pub trait LogsDb: Send + Sync {
     /// 单条 log 落盘。`thread_id == None` 表示 process-level log（如 startup）。
-    async fn record_log(&self, log: LogEntry) -> Result<(), PersistenceError>;
+    async fn record_log(&self, log: LogEntry) -> Result<(), StorageError>;
 
     /// 批量 log（高频路径走批写）。
-    async fn record_logs(&self, logs: Vec<LogEntry>) -> Result<(), PersistenceError>;
+    async fn record_logs(&self, logs: Vec<LogEntry>) -> Result<(), StorageError>;
 
     /// 查询 log（按 thread / level / 时间范围）。
-    async fn query_logs(&self, q: LogQuery) -> Result<Vec<LogRow>, PersistenceError>;
+    async fn query_logs(&self, q: LogQuery) -> Result<Vec<LogRow>, StorageError>;
 
     /// 清理：删除 ts_ms < cutoff 的 log（运维用）。
-    async fn purge_logs_before(&self, cutoff_ms: i64) -> Result<u64, PersistenceError>;
+    async fn purge_logs_before(&self, cutoff_ms: i64) -> Result<u64, StorageError>;
 }
 
 // ---- MemoriesDb（memories.db） ----
@@ -465,30 +464,30 @@ pub trait LogsDb: Send + Sync {
 #[async_trait::async_trait]
 pub trait MemoriesDb: Send + Sync {
     /// upsert：若 id 已存在则更新 body / tags / updated_at_ms。
-    async fn upsert_memory(&self, mem: Memory) -> Result<(), PersistenceError>;
+    async fn upsert_memory(&self, mem: Memory) -> Result<(), StorageError>;
 
     /// 按 id 取单条。
-    async fn get_memory(&self, id: &MemoryId) -> Result<Option<Memory>, PersistenceError>;
+    async fn get_memory(&self, id: &MemoryId) -> Result<Option<Memory>, StorageError>;
 
     /// FTS5 search：`query` 走 sqlite MATCH 语法。
-    async fn search_memories(&self, q: MemoryQuery) -> Result<Vec<Memory>, PersistenceError>;
+    async fn search_memories(&self, q: MemoryQuery) -> Result<Vec<Memory>, StorageError>;
 
     /// 删除单条。
-    async fn delete_memory(&self, id: &MemoryId) -> Result<(), PersistenceError>;
+    async fn delete_memory(&self, id: &MemoryId) -> Result<(), StorageError>;
 }
 
 // ---- GoalsDb（goals.db） ----
 
 #[async_trait::async_trait]
 pub trait GoalsDb: Send + Sync {
-    /// 新增 goal。复合主键 (thread_id, goal_id) 冲突时返回 `PersistenceError::Conflict`。
-    async fn add_goal(&self, goal: Goal) -> Result<(), PersistenceError>;
+    /// 新增 goal。复合主键 (thread_id, goal_id) 冲突时由底层 sqlx 抛 `StorageError::Sqlx`。
+    async fn add_goal(&self, goal: Goal) -> Result<(), StorageError>;
 
     /// 标记 goal 完成（status -> 'complete'）+ 更新 updated_at_ms。
-    async fn mark_done(&self, thread_id: &ThreadId, goal_id: &GoalId) -> Result<(), PersistenceError>;
+    async fn mark_done(&self, thread_id: &ThreadId, goal_id: &GoalId) -> Result<(), StorageError>;
 
     /// 列 goal（按 thread / status）。
-    async fn list_goals(&self, q: GoalQuery) -> Result<Vec<Goal>, PersistenceError>;
+    async fn list_goals(&self, q: GoalQuery) -> Result<Vec<Goal>, StorageError>;
 
     /// 累加 tokens_used（每 turn 结束时调用）。
     async fn add_tokens_used(
@@ -496,19 +495,20 @@ pub trait GoalsDb: Send + Sync {
         thread_id: &ThreadId,
         goal_id: &GoalId,
         delta: u64,
-    ) -> Result<(), PersistenceError>;
+    ) -> Result<(), StorageError>;
 }
 
 // ---- 共享类型（占位；具体字段沿 A1 / D-011） ----
 
 #[derive(thiserror::Error, Debug)]
-pub enum PersistenceError {
-    #[error("sqlite error: {0}")] Sqlite(#[from] rusqlite::Error),
-    #[error("connection pool exhausted")] PoolExhausted,
-    #[error("not found")] NotFound,
-    #[error("conflict (already exists)")] Conflict,
-    #[error("schema migration failed: {0}")] Migration(String),
-    #[error("io: {0}")] Io(#[from] std::io::Error),
+#[non_exhaustive]
+pub enum StorageError {
+    #[error("sqlx error: {0}")] Sqlx(#[from] sqlx::Error),
+    #[error("migration error: {0}")] Migrate(#[from] sqlx::migrate::MigrateError),
+    #[error("io error: {0}")] Io(#[from] std::io::Error),
+    #[error("json error: {0}")] Json(#[from] serde_json::Error),
+    #[error("rollout corrupted at line {line}: {reason}")]
+    RolloutCorrupted { line: usize, reason: String },
 }
 
 pub type ThreadId = String;          // 占位；真正定义在 A1
@@ -525,8 +525,8 @@ pub type MemoryId = String;
 
 | zhive | codex | 取舍 |
 |---|---|---|
-| `Storage` 4-method aggregate trait | codex `StateRuntime` （`lib.rs:21,46`）—— 单一 struct 不是 trait | zhive 选 trait 是为测试 mock；codex 直接 struct 是因为 codex 不做 in-memory mock |
-| `StateDb / LogsDb / MemoriesDb / GoalsDb` 4 trait | codex `MemoryStore / GoalStore`（`lib.rs:55-58`）+ `log_db` module —— **2 trait + 1 module，未对齐** | zhive 4 trait 对齐 4 库，工程感更整齐 |
+| `Storage` 聚合 struct（持 4 个具体 DB） | codex `StateRuntime` （`lib.rs:21,46`）—— 同为聚合 struct | 形态一致；zhive 额外抽 `ThreadStorage`（RPITIT trait）供 in-memory mock 注入 |
+| `StateDb / LogsDb / MemoriesDb / GoalsDb` 4 个具体 struct | codex `MemoryStore / GoalStore`（`lib.rs:55-58`）+ `log_db` module —— **2 trait + 1 module，未对齐** | zhive 4 struct 对齐 4 库，工程感更整齐 |
 | `record_log` / `query_logs` | codex `log_db::*`（`state/src/log_db.rs`） | 同语义 |
 | `upsert_memory / search_memories` | codex `MemoryStore` | 同语义 |
 | `add_goal / mark_done` | codex `GoalStore / GoalUpdate / GoalAccountingMode`（`lib.rs:54-57`） | zhive 砍 `GoalAccountingMode`（codex 用于 token 限额，Phase 1 不引入） |
@@ -536,56 +536,32 @@ pub type MemoryId = String;
 
 ---
 
-## 6. Connection pool 选型（R-7 三方案对照 + 用户决策建议）
+## 6. Connection pool（sqlx `SqlitePool`，每库一池）
 
-### 6.1 背景：rusqlite 0.40 `Connection` 不是 Send/Sync
+### 6.1 sqlx 0.8 自带 async 连接池
 
-参考 `${SQL}/src/lib.rs:437-548`，`Connection` 是 `!Send + !Sync`（内部用 `RefCell` 包裹原始指针）。多线程访问必须：
+持久化层用 sqlx 0.8 的 `SqlitePool`（内建 async 连接池，tokio-native）。每库一个文件、一个 pool：`StateDb / LogsDb / MemoriesDb / GoalsDb` 各自握有一个 `SqlitePool`，通过 `SqlitePool::connect_with(SqliteConnectOptions)` 打开。
 
-- **方案 a**：每线程 / 每 task 自己 `Connection::open(path)` —— 简单但每次 open 都重做 PRAGMA。
-- **方案 b**：用 connection pool（r2d2-sqlite / deadpool-sqlite）—— 共享 idle connection 复用。
-- **方案 c**：自写 `Arc<Mutex<Connection>>`（无 pool）—— 全局序列化所有 DB 操作，简单到 ~50 行。
+> **R-7 研究记录**：rusqlite 路线下 `Connection` 是 `!Send + !Sync`（内部用 `RefCell` 包裹原始指针，见 `${SQL}/src/lib.rs:437-548`），多线程访问需要自选 pool 策略（r2d2-sqlite / deadpool-sqlite 触发禁新依赖红线，或自写 `Arc<Mutex<Connection>>` mini pool），这正是促成改用 sqlx 的原因之一 —— sqlx `SqlitePool` 提供原生 async 池，无需引入额外 pool crate，也不触发 CLAUDE.md 红线 1。
 
-下表三方案对照：
+### 6.2 连接选项（WAL + NORMAL + foreign_keys）
 
-| 方案 | 新依赖? | 实现量 | 优点 | 缺点 | 适用场景 |
-|---|---|---|---|---|---|
-| **a. r2d2-sqlite** | ✅ 触发红线 1（`r2d2` + `r2d2-sqlite` 2 个新 crate） | ~30 行 setup | 同步 API（与 rusqlite 0.40 同步语义匹配）；社区主流；与 rusqlite 同 maintainer | 不与 tokio 异步亲和（要 `spawn_blocking`）；2 个新依赖 | 多线程同步代码 |
-| **b. deadpool-sqlite** | ✅ 触发红线 1（`deadpool` + `deadpool-sqlite` + `tokio-rusqlite` 3 个新 crate） | ~40 行 setup | tokio-native；async API；推荐用于 tokio 项目 | 3 个新依赖；其中 `tokio-rusqlite` 封装层会包裹 `Connection` 进 spawn_blocking 后台线程 | tokio app（zhive ✓） |
-| **c. 自写 mini pool** | ❌ 不触发红线 | ~80-150 行 | 0 新依赖；可控；可精确按 4 库各持 N 个 connection | 维护负担；要写池子的 acquire / release / 死链回收；测试覆盖工作量 | 强约束新依赖时 |
-| **d. 无 pool（`Arc<Mutex<Connection>>`）** | ❌ 不触发红线 | ~20 行 | 0 新依赖；最简；DB 串行写避免 SQLITE_BUSY | 写并发 = 0；高频写会变瓶颈；读也被锁死（除非每 DB 一个 reader connection） | 单库少并发；MVP |
+每库 `SqliteConnectOptions` 设置一致，由 sqlx 在建立 connection 时应用：
 
-### 6.2 推荐方向（**仅建议，等用户决策**）
+```rust
+let opts = SqliteConnectOptions::new()
+    .filename(path)
+    .create_if_missing(true)
+    .journal_mode(SqliteJournalMode::Wal)
+    .synchronous(SqliteSynchronous::Normal)   // WAL 配 NORMAL 即可，FULL 太慢
+    .foreign_keys(true);                       // state.db 跨表 FK 级联需要
+let pool = SqlitePool::connect_with(opts).await?;
+```
 
-> 本任务**不擅自决策**，因为方案 a / b 触发 CLAUDE.md 红线 1（禁新依赖）。
-
-**短期方向（Phase 1 起步）**：**方案 d**「`Arc<Mutex<Connection>>` × 4 库」。
-- 每库 1 个 `Arc<Mutex<Connection>>`（**不是 4 个共享**，每库独立锁 → §6.3 WAL 行为）
-- 0 新依赖
-- 阻塞写时间 < 10ms（rusqlite + WAL 单写者吞吐），Phase 1 可接受
-- 读路径未来需要并发时，每库加一个 readonly `Connection`（`OpenFlags::SQLITE_OPEN_READ_ONLY`），用 `RwLock<...>` 升级方案
-
-**中期演进路径**：**方案 c**「自写 mini pool」，**或** 方案 b（deadpool-sqlite），等 Phase 2 实测出热点再选。
-
-**触发"禁新依赖"红线的处理建议**：
-- 若用户希望直接上 deadpool-sqlite，请在 PR 描述里走 CLAUDE.md 红线 1 流程：列依赖 + 理由 + 等批准
-- 若用户优先「现在能跑」，选方案 d 起步，留 `// TODO: pool` 注释
-
-### 6.3 多 connection 下 WAL 行为（Q3 直接回答）
-
-rusqlite 同进程多 `Connection` 打开**同一个** DB 文件 + `journal_mode=WAL`：
-
-- **支持**：sqlite WAL 模式允许多 reader + 1 writer 并行（这是 WAL 比 rollback journal 的核心优势）
-- **同进程多 `Connection`**：每个 `Connection` 是独立的 sqlite session，互不共享 prepared cache / transaction state，但共享同一份 `*.db-wal` 文件
-- **PRAGMA journal_mode 持久化**：journal_mode 是 DB 级别（写在 sqlite header），**任一 connection 改了即对所有 connection 生效**。但**每个 connection 启动后仍要单独执行 `PRAGMA journal_mode = WAL;` 以确认**（rusqlite docs / sqlite spec），否则 `BEGIN` 会用默认 rollback 路径 fallback。
-- **zhive 起步建议**：每库**独立** `Arc<Mutex<Connection>>`，每个 `Connection::open` 后第一条 SQL 永远是：
-  ```rust
-  conn.pragma_update(None, "journal_mode", "WAL")?;
-  conn.pragma_update(None, "synchronous", "NORMAL")?;  // WAL 配 NORMAL 即可，FULL 太慢
-  conn.pragma_update(None, "foreign_keys", "ON")?;
-  conn.pragma_update(None, "busy_timeout", 5000)?;     // 5s 超时，配 multi-reader 场景
-  ```
-- **每库独立 pool 还是共享 pool？**：**独立**。4 库是 4 个文件，sqlite WAL 锁是文件级；用共享 pool 是无意义的（共享池里的 connection 各自指向不同文件，不能复用）。
+- **WAL 模式**：sqlite WAL 允许多 reader + 1 writer 并行（这是 WAL 比 rollback journal 的核心优势）；pool 内的连接共享同一份 `*.db-wal` 文件。
+- **`synchronous=NORMAL`**：配 WAL 的安全/吞吐折中点；FULL 在每次提交都 fsync，太慢。
+- **`foreign_keys=ON`**：sqlite 默认关闭 FK 强制；state.db 的 `turn_index → threads` 级联删除依赖它，故每个 connection 都需开启。
+- **每库独立 pool，不共享**：4 库是 4 个文件，sqlite WAL 锁是文件级；跨文件共享一个 pool 无意义（池里的连接各指不同文件，不能复用）。
 
 ---
 
@@ -593,7 +569,7 @@ rusqlite 同进程多 `Connection` 打开**同一个** DB 文件 + `journal_mode
 
 ### 7.1 跨库事务原子性：**不保证**
 
-rusqlite 0.40（以及 sqlite 本身）的 `BEGIN TRANSACTION` 是单 DB 文件作用域。多 DB 想原子写有三个理论方案：
+sqlite 的 `BEGIN TRANSACTION` 是单 DB 文件作用域（sqlx 与任何 sqlite 驱动同此）。多 DB 想原子写有三个理论方案：
 
 1. **sqlite ATTACH DATABASE**：把 4 个文件 ATTACH 到同一 main DB，写事务跨 ATTACH。
    - 限制：WAL 模式 + ATTACH 的写事务**仅 main DB 可写**，ATTACH 上来的库默认 read-only（[sqlite WAL doc](https://www.sqlite.org/wal.html) §10）。
@@ -607,7 +583,7 @@ rusqlite 0.40（以及 sqlite 本身）的 `BEGIN TRANSACTION` 是单 DB 文件�
 
 ```text
 顺序     操作                                        失败处理
-1.     append JSONL（fsync 完成后才算 OK）         失败 → 整体 fail，向上抛 PersistenceError
+1.     append JSONL（fsync 完成后才算 OK）         失败 → 整体 fail，向上抛 StorageError
 2.     state.record_turn_start（索引）              失败 → log warn + 标记 thread "needs_rebuild"
 3.     logs.record_log（如果 turn 写 log）          失败 → log warn + 跳过（log 是可丢的）
 4.     memories.upsert_memory（如果有）             失败 → log warn + 标记 memory_id "pending_retry"
@@ -624,7 +600,7 @@ rusqlite 0.40（以及 sqlite 本身）的 `BEGIN TRANSACTION` 是单 DB 文件�
 async fn rebuild_indexes_from_jsonl(
     rollouts_dir: &Path,
     storage: &dyn Storage,
-) -> Result<RebuildStats, PersistenceError> {
+) -> Result<RebuildStats, StorageError> {
     let mut stats = RebuildStats::default();
     for entry in std::fs::read_dir(rollouts_dir)? {
         let path = entry?.path();
@@ -635,32 +611,33 @@ async fn rebuild_indexes_from_jsonl(
             continue;  // 索引文件，跳过
         }
 
-        // 1. 解析 header（第一行）
+        // 1. 解析 header（第一行 = RolloutEntry::Session）
         let mut reader = BufReader::new(File::open(&path)?);
         let mut header_line = String::new();
         reader.read_line(&mut header_line)?;
-        let header: SessionHeader = serde_json::from_str(&header_line)?;
+        let header: RolloutEntry = serde_json::from_str(&header_line)?;
 
         // 2. upsert thread metadata（state.db）
         storage.state().upsert_thread_from_header(&header).await?;
 
-        // 3. 逐行重放 entry，按 entry.type 分派到 4 库
+        // 3. 逐行重放 entry，按 RolloutEntry 变体分派
         for line in reader.lines() {
-            let entry: SessionTreeEntry = serde_json::from_str(&line?)?;
-            match entry.kind() {
-                EntryKind::TurnStart { thread_id, turn_id, ts } =>
-                    storage.state().record_turn_start(&thread_id, &turn_id, ts).await?,
-                EntryKind::TurnEnd { thread_id, turn_id, status, ts } =>
-                    storage.state().record_turn_end(&thread_id, &turn_id, status, ts).await?,
-                EntryKind::Item { .. } => {
-                    // item 本身落在 JSONL；这里不重建 item 表（zhive 无）
-                    // 但如果 item 是 PreCompact / MemoryWrite，触发 memory upsert
+            let entry: RolloutEntry = serde_json::from_str(&line?)?;
+            match entry {
+                RolloutEntry::Item { thread_id, turn_id, ref item, .. } => {
+                    // 重建 state.db 的 turns / items 索引（item 全文留在 JSONL）
+                    storage.state().index_item(&thread_id, &turn_id, item).await?;
                 }
-                EntryKind::Compaction { .. } |
-                EntryKind::BranchSummary { .. } |
-                EntryKind::ModelChange { .. } |
-                EntryKind::Leaf { .. } => {
-                    // 这些 entry 仅 JSONL 用，DB 无对应表
+                RolloutEntry::Compaction { thread_id, turn_id, .. } => {
+                    // 压缩 checkpoint：重放 turn 元信息并安装 replacement
+                    storage.state().index_compaction(&thread_id, &turn_id, &entry).await?;
+                }
+                RolloutEntry::Leaf { .. }
+                | RolloutEntry::PendingPermission { .. }
+                | RolloutEntry::PermissionResolved { .. }
+                | RolloutEntry::Session { .. } => {
+                    // 控制行 / header：不重建额外 DB 表（leaf 指针与权限恢复
+                    // 由 resume 路径单独处理）
                 }
             }
             stats.entries_replayed += 1;
@@ -683,9 +660,9 @@ async fn rebuild_indexes_from_jsonl(
 
 ---
 
-## 8. R-2 实测：rusqlite 0.40 + bundled + 4 DB 编译与启动数据
+## 8. R-2 研究记录：rusqlite 0.40 + bundled 编译成本
 
-> **本节是 R-2 直接证据**。实测于 **2026-05-28**，使用临时 probe crate `crates/zhive-persistence-probe/`（已删除）。
+> **本节是 R-2 研究证据**，记录 rusqlite `bundled` 路线的编译成本测量；这条成本是 D-011 锁定 sqlx 的依据之一。实测于 **2026-05-28**，使用临时 probe crate `crates/zhive-persistence-probe/`（已删除）。
 
 ### 8.1 测试方法
 
@@ -709,24 +686,19 @@ probe crate 设计（已 cleanup）：
 
 ### 8.3 R-2 判定
 
-> **R-2 触发**：cold release build **78-80s > 60s 阈值**（plan §9 R-2 阈值）。**未达 >2min 极端值**，但显著超过 60s。
+> **R-2 触发**：rusqlite `bundled` 路线 cold release build **78-80s > 60s 阈值**（plan §9 R-2 阈值）。**未达 >2min 极端值**，但显著超过 60s。
 
-**Phase 1 实际影响估算**：
-- zhive-core 引入 rusqlite + bundled 后，**zhive-core 单 crate cold release** 估算 += 60-65s（probe crate 是空 main，zhive-core 已有 tokio / serde / schemars 等大依赖，故 zhive-core cold release **预估 90-150s**）
-- dev profile（开发主路径）影响 += ~8-10s，可接受
-- 二进制体积 **+2.5 MiB**：zhive-core 静态库会承担 ~2.5MB 的 libsqlite3 C 编译产物，最终 `zhive-cli` binary 体积估算 += 2.5MB
+probe 的空 main 已要 78-80s，叠加 zhive-core 既有的 tokio / serde / schemars 等大依赖后，rusqlite+bundled 下的 zhive-core 单 crate cold release 预估会进一步抬到 90-150s，外加二进制 +2.5 MiB（libsqlite3 C 编译产物）。**这条编译/体积成本是 D-011 锁定 sqlx 的关键依据** —— sqlx 用预编译的 sqlite 驱动，cold build 不背 C amalgamation 编译。
 
-**未提前缓解的迹象**：
-- workspace 的 `[profile.dev.package."*"] opt-level = 1` 设置会让 sqlite C 也走 opt-1，dev cold build 可能比 probe（dev=0）更慢，需进一步验证 → §10 未决项
-- workspace 的 `[profile.release] strip = "symbols"` 可减少 ~7% 体积（参考 §8.2 stripped 2.5 vs unstripped 2.7）
+### 8.4 rusqlite 路线本需要的缓解清单
 
-### 8.4 缓解建议
+下列缓解专属于 rusqlite+bundled 路线（背 C amalgamation 编译时才相关）：
 
-1. **CI 配 sccache**（已部署，per memory `feedback-sccache-incremental.md`）—— sqlite C 编译产物可 cache，**第二次 CI 跑及之后约 < 5s**
-2. **本机开发用 dev profile**（cold = 11s OK）+ release 仅在打包 / dist 时触发
-3. **不切 `bundled-sqlcipher`**（会拉 OpenSSL，体积 +5MB / cold +30s）
-4. **关闭 rusqlite 默认不需要的 feature**：当前只用 `bundled`；不开 `vtab / array / functions / hooks / chrono` 等
-5. 长期：考虑 `libsqlite3-sys` 改用系统 sqlite3 `.so` 链接 —— 砍编译时间，但 Phase 1 不做（Windows / macOS 用户体验劣化）
+1. **CI 配 sccache**（已部署，per memory `feedback-sccache-incremental.md`）—— sqlite C 编译产物可 cache。
+2. **本机开发用 dev profile**（cold = 11s OK）+ release 仅在打包 / dist 时触发。
+3. **不切 `bundled-sqlcipher`**（会拉 OpenSSL，体积 +5MB / cold +30s）。
+4. **关闭 rusqlite 默认不需要的 feature**：只用 `bundled`，不开 `vtab / array / functions / hooks / chrono` 等。
+5. 长期可考虑 `libsqlite3-sys` 改链系统 sqlite3 `.so` —— 砍编译时间，但牺牲 Windows / macOS 用户体验。
 
 ---
 
@@ -734,8 +706,8 @@ probe crate 设计（已 cleanup）：
 
 | 项 | codex（当前主线） | zhive Phase 1 | 取舍 |
 |---|---|---|---|
-| ORM | `sqlx` (`state/Cargo.toml`) | `rusqlite =0.40 bundled` | D-011 锁定 rusqlite，理由：cargo check -p 工作流 + 同步 API 更可控 |
-| 库分离 | 4 个文件，35+2+1+1 migrations | 4 个文件，1+1+1+1 migration（终态直落） | zhive 直接抄结构但跳过 codex 演进留痕 |
+| ORM | `sqlx` (`state/Cargo.toml`) | `sqlx 0.8`（`SqlitePool`，内建 async 池） | D-011 修订锁定 sqlx，理由：`sqlx::migrate!` 可嵌入 SQL 文件 + 原生 async 池免引 pool crate |
+| 库分离 | 4 个文件，35+2+1+1 migrations | 4 个文件，2+1+1+1 migration（终态直落） | zhive 直接抄结构但跳过 codex 演进留痕 |
 | DB 文件名 | `state_5.sqlite / logs_2.sqlite / memories_1.sqlite / goals_1.sqlite`（带版本号） | `state.db / logs.db / memories.db / goals.db`（无版本号） | zhive schema version 由 migration table 自管，文件名不带版本（便于 backup tooling） |
 | rollout 文件 | `rollout-<rfc3339>-<thread_id>.jsonl` | `<thread_id>.jsonl` | 文件名简化（理由 §4.1） |
 | session_index | `session_index.jsonl` append-only | 同 | 抄 |
@@ -747,8 +719,8 @@ probe crate 设计（已 cleanup）：
 | `goals.PRIMARY KEY` | `(thread_id)` 单字段 → 限制 1 thread 1 goal | `(thread_id, goal_id)` 复合 → 多 goal 并行 | zhive 放宽 |
 | `goals.status` 枚举 | 6 态（含 `usage_limited / budget_limited`） | 5 态（去 quota，加 `cancelled`） | Phase 1 无 quota |
 | Leaf 指针 | 无（codex fork = 新 jsonl 文件） | 有（D-011 修订条款，Pi 模型） | zhive 选 Pi |
-| FTS5 memory 搜索 | 无（codex 用关键字 LIKE） | 有 | zhive 加 FTS5（rusqlite bundled 自带） |
-| Connection 抽象 | sqlx Pool | trait + impl 待定（§6 三方案对照） | 等用户决策 |
+| FTS5 memory 搜索 | 无（codex 用关键字 LIKE） | 有 | zhive 加 FTS5（sqlx sqlite 驱动捆绑的 libsqlite3 自带） |
+| Connection 抽象 | sqlx Pool | sqlx `SqlitePool`（每库一池） | 同选 sqlx 内建池 |
 
 ---
 
@@ -756,8 +728,8 @@ probe crate 设计（已 cleanup）：
 
 | 风险 | 触发 | 本 deliverable 给出的缓解 |
 |---|---|---|
-| **R-2**（rusqlite bundled cold build） | ✅ 触发（78-80s release，超 60s 阈值） | §8.4 缓解清单：sccache（已部署）+ dev profile 日常 + 关闭多余 feature；建议向用户确认是否接受 release 慢路径 |
-| **R-7**（pool 新依赖红线） | 部分触发（方案 a/b 引新 dep） | §6 三方案对照；推荐 d 起步 + c 中期演进；**未自决，等用户拍** |
+| **R-2**（rusqlite bundled cold build） | 已规避 | 改用 sqlx 后不再背 C amalgamation 编译；§8 保留 rusqlite 路线的测量作为决策依据 |
+| **R-7**（pool 新依赖红线） | 已规避 | sqlx `SqlitePool` 提供原生 async 池，无需 r2d2/deadpool 等 pool crate，不触发红线 1（§6） |
 | **R-8**（跨库一致性） | ✅ 触发（4 库无原子事务） | §7 fail-strategy：JSONL source of truth + 异步重建索引；崩溃恢复伪码已落地 §7.3 |
 
 ---
@@ -767,16 +739,12 @@ probe crate 设计（已 cleanup）：
 > 全部按 plan §10 回流原则待补到 D-011 / B3 实施任务。
 
 - **TODO(开放项 B3-1)**：用户手写 memory（`kind="note" / "fact"`）是否也走 JSONL 落盘 → 当前方案接受 memories.db 损坏 = 手写丢失。**待用户决策**：是否新增 `memories.jsonl` source of truth？
-- **TODO(开放项 B3-2)**：connection pool 选型 —— §6 推荐方案 d（`Arc<Mutex<Connection>>`）起步，但需用户确认（避免后续返工换 deadpool-sqlite）。
 - **TODO(开放项 B3-3)**：Pi `MemoryRepo` 是否分 thread-local / 全局两类？zhive 目前 schema 用 `thread_id NULL` 表示全局，等 A5 / B2 调研最终拍。
-- **TODO(开放项 B3-4)**：rusqlite **release** cold build 78-80s 超阈值；用户是否接受这个 trade-off？若要砍，需切「系统 sqlite3 链接」方案（Windows/macOS 用户体验劣化）或切「runtime download libsqlite3」（运行时依赖）。
-- **TODO(开放项 B3-5)**：`zhive-core` 把 SQLite + 4 库 + rollout 全揉一起，**单 crate 编译时间** 实测可能 > 150s。是否拆 `zhive-persistence` 子 crate（违反 D-001 "7 crate 起步" 约束）？或继续单 crate 等 sccache + 增量缓解？
+- **TODO(开放项 B3-5)**：`zhive-core` 把 4 库 + rollout 全揉一起，是否拆 `zhive-persistence` 子 crate（违反 D-001 "7 crate 起步" 约束）？或继续单 crate？
 - **TODO(开放项 B3-6)**：cross-DB ID 跨域映射工具：`logs.thread_id ↔ state.threads.id` 软关系，建议落「ID newtype + 跨 trait 校验函数」防止 lint 漏过。
-- **TODO(开放项 B3-7)**：测试矩阵。当前 trait 草图已设计，但 `MockStorage`（in-memory 测试替身）的实现策略未定：用 `:memory:` SQLite 还是用纯 `HashMap` impl？
-- **TODO(开放项 B3-8)**：`workspace [profile.dev.package."*"] opt-level = 1` 对 sqlite C 编译时间影响未单测 —— §8.3 提到可能让 dev cold build 比 probe（dev=0）更慢，需 zhive-core 真接入 rusqlite 后再测一次。
 
 ---
 
 ## 12. 一句话总结（plan §10 回流摘要）
 
-zhive Phase 1 直接落 4 库（state / logs / memories / goals）+ JSONL Leaf rollout；4 个 `0001_*.sql` 已对照 codex 同名 migration 写好；`Storage` trait + 4 子 trait + cross-DB fail-strategy（JSONL source of truth + 异步 DB 重建）已就位；R-2 实测**触发**（release cold 78-80s，>60s 阈值），二进制 +2.5MB，启动 1.5ms；R-7 不自决，**等用户在「`Arc<Mutex<Connection>>` 起步」与「上 deadpool-sqlite 引 3 个新 dep」之间拍板**。
+zhive Phase 1 直接落 4 库（state / logs / memories / goals）+ JSONL Leaf rollout，用 sqlx 0.8 + 每库一个 `SqlitePool`（内建 async 池）；每库 `0001_init.sql` 已对照 codex 同名 migration 写好（state 后续加了 `0002_threads_subagent_cwd.sql`）；`Storage` 聚合 struct + `ThreadStorage`（RPITIT，可 mock）+ cross-DB fail-strategy（JSONL source of truth + 异步 DB 重建）已就位；选 sqlx 同时规避了 R-2（rusqlite bundled cold build）与 R-7（rusqlite `Connection` 非 Send/Sync 的 pool 选型）两条研究风险。

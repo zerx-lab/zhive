@@ -3,10 +3,10 @@ task: C3
 title: 取消处理（zhive-client-native cancel API + 与 B7 server 侧 对接点）
 plan: phase1-core-native-research
 date: 2026-05-28
-status: draft
+status: implemented
 crate: zhive-client-native（仅依赖 zhive-proto）
 depends_on:
-  - deliverables/B7-cancel-streaming.md   (三层 CancellationToken / Steer 不撤 in-flight tool_call / pending permission/request abort 时 ACP Cancelled outcome 显式回 / NextTurn 跨 abort 保留)
+  - deliverables/B7-cancel-streaming.md   (三层 CancellationToken / Steer 不撤 in-flight tool_call / pending session/request_permission abort 时 ACP Cancelled outcome 显式回 / NextTurn 跨 abort 保留)
   - deliverables/C1-client-api.md         (Client / ClientBuilder / ClientEvent 四 case / request_typed oneshot / ReverseHandler)
   - deliverables/C2-reconnect.md          (Disconnected 终态、不自动重连)
   - deliverables/A3-permission-streaming-subagent.md  (session/cancel reverse-RPC 形状 + Cancelled outcome)
@@ -25,7 +25,7 @@ references_internal:
   - plans/phase1-core-native-research/deliverables/B7-cancel-streaming.md §3.3               (NextTurn 跨 abort 保留 + Steer 不撤 in-flight tool_call 时序)
   - plans/phase1-core-native-research/deliverables/C1-client-api.md §2.2                     (Client / RequestHandle / ReverseHandler 公开 API surface + Disconnected case)
   - plans/phase1-core-native-research/deliverables/C2-reconnect.md §3-§4                     (Disconnected 终态、in-flight oneshot 一律 `Err(Disconnected)`)
-  - plans/phase1-core-native-research/deliverables/A3-permission-streaming-subagent.md §6.3  (pending permission/request 必须用 ACP `Cancelled` outcome 显式回 client)
+  - plans/phase1-core-native-research/deliverables/A3-permission-streaming-subagent.md §6.3  (pending session/request_permission 必须用 ACP `Cancelled` outcome 显式回 client)
 non-goals:
   - 不写 zhive crate 源码（本 deliverable 所有 Rust 代码块为草图，`todo!()` 占位）
   - 不改 research/99-decisions/
@@ -35,7 +35,7 @@ non-goals:
 
 > 范围声明：C3 调研产出。client 侧取消 API 形状 + 与 B7 server 侧对接。
 > ${ACP} = `~/Desktop/code/github/acp-rust-sdk/`；${ACP_REG} = `~/.cargo/registry/src/index.crates.io-*/`；${LSP} = `~/Desktop/code/github/tower-lsp/`；${CODEX} = `~/Desktop/code/github/codex/codex-rs/`。
-> **关键先验**：ACP `session/cancel` 是 **client→agent notification**（无 response；按 session_id 而非 request_id 取消），与 LSP `$/cancelRequest`（按 request_id 取消）维度不同。B7 已固化此语义并要求 server 侧 abort 时 drain pending `permission/request` 用 `Cancelled` outcome 显式回 client。
+> **关键先验**：ACP `session/cancel` 是 **client→agent notification**（无 response；按 session_id 而非 request_id 取消），与 LSP `$/cancelRequest`（按 request_id 取消）维度不同。B7 已固化此语义并要求 server 侧 abort 时 drain pending `session/request_permission` 用 `Cancelled` outcome 显式回 client。
 
 ---
 
@@ -52,7 +52,7 @@ non-goals:
 | LSP server `Cancellable` middleware：`$/cancelRequest` notification → `pending.cancel(id)` | `${LSP}/src/service/layers.rs` | 200-210, 265-300 |
 | codex `app-server-client` **无** generic cancel API（侧证：取消是协议级 method） | `${CODEX}/app-server-client/src/lib.rs` | grep `cancel` 0 命中 |
 | B7：`session/cancel` 触发 → `ActiveTurn.cancel.cancel()` + drain `pending_approvals` 送 `Cancelled` outcome + 清 steer/follow_up、保留 next_turn | `deliverables/B7-cancel-streaming.md` §3.3, §4.2 | — |
-| B7：pending `permission/request` abort 时**必须**用 ACP `Cancelled` outcome 显式回 client（不能让请求悬挂） | `deliverables/B7-cancel-streaming.md` §3.3, §4.3 | — |
+| B7：pending `session/request_permission` abort 时**必须**用 ACP `Cancelled` outcome 显式回 client（不能让请求悬挂） | `deliverables/B7-cancel-streaming.md` §3.3, §4.3 | — |
 | C1：`Client::request_typed::<_, T>(...)` 走 oneshot；`next_event()` 走单 mpsc 融合 Notification + ServerRequest + Lagged + Disconnected | `deliverables/C1-client-api.md` §2.2, §4 | — |
 | C1：`Client::notify(method, params)` 用于 wire-level notification（无 response） | `deliverables/C1-client-api.md` §2.2 | — |
 | C1：`ReverseHandler::handle` 在 worker 收到 cancel 时**先**自动应答所有 in-flight 用 `Cancelled` outcome | `deliverables/C1-client-api.md` §2.2, §6.3 | — |
@@ -65,13 +65,13 @@ non-goals:
 
 ### 2.1 设计 invariant
 
-1. **取消粒度对齐 ACP `session/cancel` = per-session（turn）**，**不是** per-request。`session_id` 在 zhive 语境 ≈ thread_id 上的当前 turn 的 root（B7 §2.1 ThreadHandle.cancel）。这是 ACP 的**强约束**：调一次 `session/cancel` 撤的是「这个 session 当前 in-flight 的整个 turn + 所有 pending reverse-RPC」，不是单个 `request_typed` 的句柄。
+1. **取消粒度对齐 ACP `session/cancel` = per-session（turn）**，**不是** per-request。zhive wire 上携带的是 `thread_id`，撤的是该 thread 当前 turn 的 root（B7 §2.1 ThreadHandle.cancel）。这是 ACP 的**强约束**：调一次 `session/cancel` 撤的是「这个 thread 当前 in-flight 的整个 turn + 所有 pending reverse-RPC」，不是单个 `request_typed` 的句柄。
 2. **不在 `request_typed` 返回值上挂 `CancellationToken`**：因为 zhive 的 cancel 是 session 维度（撤的是 turn 不是单 request），把 token 挂到单 request 的句柄上会**误导 caller** 以为 `token.cancel()` 只撤这一条 request。
 3. **提供两个层级的 API**：
    - **底层**：`client.notify("session/cancel", params).await` —— 走 C1 通用 notify，caller 自己组 params。**这一条已被 C1 §2.2 覆盖**，本 deliverable 不重复定义。
-   - **顶层 helper**：`client.cancel_session(session_id).await` —— 包薄一层 typed param + method 字符串常量，避免 caller 拼错 method 名。
+   - **顶层 helper**：`client.cancel_session(thread_id).await` —— 包薄一层 typed param + method 字符串常量，避免 caller 拼错 method 名。
 4. **`Drop` in-flight `request_typed` future 不自动发 cancel**：原因 §4 详述。要 cancel turn，caller **必须显式**调 `cancel_session` 或 `notify("session/cancel", ...)`。
-5. **`session/aborted` notification 回收**：cancel 后 server 会发 `session/aborted { cleared_steer, cleared_follow_up, next_turn_retained_count }`（B7 §3.3）—— caller 通过 `next_event() → ClientEvent::Notification` 接收。**不**提供 sync `cancel().await -> AbortedNotification` API（避免双通道：notification 走 event 流，应答走 oneshot 会让 caller 两种取数路径都得写）。
+5. **`events/session_aborted` notification 回收**：cancel 后 server 会发 `events/session_aborted { cleared_steer, cleared_follow_up, next_turn_retained_count }`（B7 §3.3）—— caller 通过 `next_event() → ClientEvent::Notification` 接收。**不**提供 sync `cancel().await -> AbortedNotification` API（避免双通道：notification 走 event 流，应答走 oneshot 会让 caller 两种取数路径都得写）。
 
 ### 2.2 Rust 草图（zhive-client-native 公开 API surface 增量）
 
@@ -79,18 +79,18 @@ non-goals:
 //! C3 增量草图：append 到 C1 §2.2 的 `impl Client { ... }`。
 //! 不引入新 type，仅一个 helper method。
 
-use zhive_proto::{SessionId, Notification};  // zhive-proto 既有类型（A1 / A3）
+use zhive_proto::{domain::ThreadId, rpc::SessionCancelParams, Notification};  // zhive-proto 既有类型
 
 impl Client {
     /// 发 ACP `session/cancel` notification，请求 server 取消此 session 当前 turn。
     ///
     /// **语义**（B7 §3.3）：
     /// - 触发 server 侧 `ActiveTurn.cancel.cancel()` —— provider stream / tool 执行 / hook 全部 cancel
-    /// - **清空** steer / follow_up 队列（内容通过 `session/aborted.cleared_*` 字段返回 client）
+    /// - **清空** steer / follow_up 队列（内容通过 `events/session_aborted.cleared_*` 字段返回 client）
     /// - **保留** next_turn 队列（用于下次 `session/prompt` 注入）
-    /// - **drain pending `permission/request`** —— 每个 in-flight reverse-RPC 收到
+    /// - **drain pending `session/request_permission`** —— 每个 in-flight reverse-RPC 收到
     ///   `RequestPermissionResponse { outcome: Cancelled }` 应答（ACP 0.12 硬约束，B7 §4）
-    /// - server 在 abort 完成后发 `session/aborted` notification（caller 通过 `next_event()` 接收）
+    /// - server 在 abort 完成后发 `events/session_aborted` notification（caller 通过 `next_event()` 接收）
     ///
     /// **本调用立即返回**（notification 无 response）。caller 想等 abort 完成 ⇒
     /// 自己 loop `next_event()` 直到看到 `ClientEvent::Notification(SessionAborted { .. })`。
@@ -103,18 +103,18 @@ impl Client {
     /// - `ClientError::Transport` —— transport 写失败
     /// - `ClientError::Disconnected` —— 已断连（worker 已退）
     /// - **不**返回 `ClientError::Server`：notification 无 response，server 错误只能从
-    ///   后续 `session/aborted` 或别的事件里推断
-    pub async fn cancel_session(&self, session_id: &SessionId) -> Result<(), ClientError> {
+    ///   后续 `events/session_aborted` 或别的事件里推断
+    pub async fn cancel_session(&self, thread_id: &ThreadId) -> Result<(), ClientError> {
         // 内部：
-        //   self.notify("session/cancel", &CancelParams { session_id: session_id.clone(), meta: None }).await
-        // CancelParams 由 zhive-proto 提供（A3 衍生 + ACP 0.12 schema 对齐）
+        //   self.notify("session/cancel", &SessionCancelParams { thread_id: thread_id.clone() }).await
+        // SessionCancelParams 由 zhive-proto::rpc 提供（按 ACP 0.12 schema 对齐，承载 thread_id）
         todo!()
     }
 }
 
 impl RequestHandle {
     /// 同 `Client::cancel_session`，可在 clone 的 handle 上调（用于「另一个 task 触发 cancel」场景）。
-    pub async fn cancel_session(&self, session_id: &SessionId) -> Result<(), ClientError> {
+    pub async fn cancel_session(&self, thread_id: &ThreadId) -> Result<(), ClientError> {
         todo!()
     }
 }
@@ -127,7 +127,7 @@ impl RequestHandle {
 | `request_typed::<...>(...).await -> (Result<T>, CancellationToken)` | **不提供** | cancel 是 session 维度，单 request 句柄上挂 token 会误导（详 §4） |
 | `client.cancel(request_id)` 按 request id 取消单 request | **不提供** | ACP `session/cancel` 不接受 request id 维度（schema 字段仅 `session_id`）。要按 request id 走只能自造 method，偏离协议 |
 | `client.cancel_all_sessions()` 取消所有 session | **不提供** | ACP 无此 method；caller 想全撤 ⇒ 自己遍历 thread_id 列表分别调 `cancel_session` |
-| `cancel_session(session_id).await -> SessionAbortedNotification` 等 abort 完成 | **不提供** | abort notification 走 event 流（C1 §4 单一事件通道）；helper 等结果会引双通道、复杂化 backpressure；caller 想等就在 event loop 里 match |
+| `cancel_session(thread_id).await -> SessionAbortedNotification` 等 abort 完成 | **不提供** | abort notification 走 event 流（C1 §4 单一事件通道）；helper 等结果会引双通道、复杂化 backpressure；caller 想等就在 event loop 里 match |
 | `Drop` impl on `RequestFuture` auto-cancel | **不提供** | drop 单 request future 不应触发 server-side abort —— **N×M 副作用陷阱**（详 §4） |
 
 ---
@@ -139,17 +139,16 @@ impl RequestHandle {
 | 字段 | 类型 | 来源 | 必填？ |
 |---|---|---|---|
 | `method` | `"session/cancel"` 字符串 | ACP `enum_impls.rs:62` verbatim | 是（JSON-RPC notification） |
-| `params.session_id` | `SessionId`（zhive-proto；ACP 0.12 schema 对齐） | ACP `CancelNotification.session_id` | 是 |
-| `params._meta` | `Option<Meta>`（key-value bag） | ACP `CancelNotification.meta` | 否（默认 None） |
+| `params.threadId` | `ThreadId`（zhive-proto；ACP 0.12 schema 对齐） | ACP `CancelNotification.session_id` | 是 |
 | **JSON-RPC `id`** | — | — | **省略**（notification 不带 id） |
 
 **wire 形态**（JSON）：
 
 ```json
-{ "jsonrpc": "2.0", "method": "session/cancel", "params": { "sessionId": "thread-abc-turn-xyz" } }
+{ "jsonrpc": "2.0", "method": "session/cancel", "params": { "threadId": "thread:native/abc" } }
 ```
 
-> ACP `SessionId` 在 zhive 语境的映射由 A1 / B4 决定。当前共识（B1 §2.1 + A1 §6）：`SessionId = ThreadId` ⇒ 取消"thread 的当前活动 turn"；若一个 thread 同时只能有 ≤1 active turn，则 session_id 唯一映射当前 turn。
+> zhive 把 ACP `session_id` 维度落为 `thread_id`（`SessionCancelParams.thread_id: ThreadId`）⇒ 取消"thread 的当前活动 turn"；一个 thread 同时只能有 ≤1 active turn，故 `thread_id` 唯一映射当前 turn。
 
 ### 3.2 server 侧响应路径（client 视角）
 
@@ -177,10 +176,10 @@ client                                  server (B7)
   │  ◄────────────────────────────────────│ {jsonrpc:"2.0", id:<req_A>, result:{outcome:"cancelled"}}
   │  ◄────────────────────────────────────│ {jsonrpc:"2.0", id:<req_B>, result:{outcome:"cancelled"}}
   │  ...                                  │
-  │                                       │ 6. emit session/aborted notification
-  │  ◄────────────────────────────────────│ {jsonrpc:"2.0", method:"session/aborted",
-  │                                       │  params: { cleared_steer, cleared_follow_up,
-  │                                       │            next_turn_retained_count }}
+  │                                       │ 6. emit events/session_aborted notification
+  │  ◄────────────────────────────────────│ {jsonrpc:"2.0", method:"events/session_aborted",
+  │                                       │  params: { threadId, clearedSteer, clearedFollowUp,
+  │                                       │            nextTurnRetainedCount }}
   │                                       │
   │  (此后所有原 turn 内的 streaming      │
   │   notification 停止；新 turn 可起)     │
@@ -188,28 +187,28 @@ client                                  server (B7)
 
 ### 3.3 client 侧 worker 处理路径
 
-worker 收到反向 RPC 应答 + `session/aborted` notification 时的动作（C1 §4 + 本文件）：
+worker 收到反向 RPC 应答 + `events/session_aborted` notification 时的动作（C1 §4 + 本文件）：
 
 | 入站消息 | worker 动作 | 出站到 caller |
 |---|---|---|
-| `result: {outcome:"cancelled"}` for in-flight `permission/request` reverse-RPC | **不**调 `ReverseHandler::handle` 后处理；该 reverse-RPC 在 worker 内的 pending_reverse Map 上 `take + drop`（handle future 自然被 drop） | 若 `ReverseHandler::handle` 已 spawn 但未 await 完成 ⇒ tokio cooperative cancel 会让 future drop（**前提**：handle 内部用 `tokio::select!` + 自己的 cancel 信号，否则跑完） |
-| `session/aborted` notification | 走 C1 §2.2 通用 notification 路径 | `ClientEvent::Notification(SessionAbortedNotification { ... })` 投递到 event 流 |
-| 原 turn 的 `turn/completed` / `item/completed` 等 streaming notification | 已在 cancel 前可能 in-flight；worker 不特殊处理（按到达顺序 emit） | caller 在 event 流中可能看到 cancel **之后**还有少量 streaming 事件（race 窗口），按 `session/aborted` 为终止边界处理 |
+| `result: {outcome:"cancelled"}` for in-flight `session/request_permission` reverse-RPC | **不**调 `ReverseHandler::handle` 后处理；该 reverse-RPC 在 worker 内的 pending_reverse Map 上 `take + drop`（handle future 自然被 drop） | 若 `ReverseHandler::handle` 已 spawn 但未 await 完成 ⇒ tokio cooperative cancel 会让 future drop（**前提**：handle 内部用 `tokio::select!` + 自己的 cancel 信号，否则跑完） |
+| `events/session_aborted` notification | 走 C1 §2.2 通用 notification 路径 | `ClientEvent::Notification(SessionAbortedNotification { ... })` 投递到 event 流 |
+| 原 turn 的 `events/turn_completed` / `events/item_appended` 等 streaming notification | 已在 cancel 前可能 in-flight；worker 不特殊处理（按到达顺序 emit） | caller 在 event 流中可能看到 cancel **之后**还有少量 streaming 事件（race 窗口），按 `events/session_aborted` 为终止边界处理 |
 
 ### 3.4 caller 端典型代码模式（取消 + 等 abort 完成）
 
 ```rust
 // 草图：caller 在 TUI / bridge 里 cancel 一个 session 并等 server abort 完成
 let cancel_handle = client.request_handle();  // Clone 一份给 cancel task
-let session_id = current_session_id.clone();
+let thread_id = current_thread_id.clone();
 
 // 触发 cancel（一行）
-cancel_handle.cancel_session(&session_id).await?;
+cancel_handle.cancel_session(&thread_id).await?;
 
 // 同时 event loop 里 match SessionAborted
 while let Some(event) = client.next_event().await {
     match event {
-        ClientEvent::Notification(n) if n.method() == "session/aborted" => {
+        ClientEvent::Notification(n) if n.method() == "events/session_aborted" => {
             let aborted: SessionAbortedNotification = n.deserialize()?;
             println!("aborted; cleared_steer={}, cleared_follow_up={}, next_turn_retained={}",
                 aborted.cleared_steer.len(),
@@ -229,8 +228,8 @@ while let Some(event) = client.next_event().await {
 | in-flight 状态 | cancel 发出后命运 | 锚点 |
 |---|---|---|
 | client→server `request_typed("turn/start", ...)` 还在等 response | **不受 `cancel_session` 影响**：cancel 是 turn 维度，turn/start 本身是握手；若 server 在收到 cancel 后才回响应，caller 拿到的可能是 `Ok(turn)` 也可能是 server 主动发的某种错误（schema 待 B7-3 决） | B7 §3.3, 本文 §3.2 |
-| server→client `permission/request` 反向请求；client 端 `ReverseHandler::handle` 跑中 | server 主动用 `Cancelled outcome` 应答这条反向 RPC（B7 §4）；worker 收到应答后把 future drop；handle 内部如果用 cooperative cancel 模式（`select!{ cancel.cancelled() => ... }`）会立即退出，否则跑完丢弃返回值 | B7 §4, C1 §6.3 |
-| 原 turn 的 streaming notification（`turn/event`, `item/streamed`） | 在 abort 处理过程中可能继续 emit 几条 ⇒ caller 在 event 流里看到 race；按 `session/aborted` 为终止边界丢弃后续 | B7 §3.3 |
+| server→client `session/request_permission` 反向请求；client 端 `ReverseHandler::handle` 跑中 | server 主动用 `Cancelled outcome` 应答这条反向 RPC（B7 §4）；worker 收到应答后把 future drop；handle 内部如果用 cooperative cancel 模式（`select!{ cancel.cancelled() => ... }`）会立即退出，否则跑完丢弃返回值 | B7 §4, C1 §6.3 |
+| 原 turn 的 streaming notification（`events/turn_completed`, `events/item_delta`） | 在 abort 处理过程中可能继续 emit 几条 ⇒ caller 在 event 流里看到 race；按 `events/session_aborted` 为终止边界丢弃后续 | B7 §3.3 |
 | `cancel_session` 自身 | notification 无 response，单向 fire-and-forget；**永远不会** stuck 在 await 上 | 本文 §3.1 |
 
 ---
@@ -289,7 +288,7 @@ worker 内的 `pending_requests: HashMap<RequestId, oneshot::Sender<...>>`（C1 
 
 ### Q2：`client.cancel(turn_id)` 是单独 request 还是 notification？
 
-**Notification。** zhive `cancel_session(session_id)` 内部走 `client.notify("session/cancel", ...)`，**无 response**。锚点：(a) ACP `CancelNotification` 由 `impl_jsonrpc_notification!` 而非 `impl_jsonrpc_request!`（${ACP}/...notifications.rs:1-3）；(b) ACP 把 cancel 放在 `client_to_agent/notifications.rs` 而非 `requests.rs`；(c) LSP `$/cancelRequest` 同样是 notification（${LSP}/src/service.rs:48-50）。两个参考协议一致：cancel 都是 **fire-and-forget notification**，server 处理后通过**独立**的 `session/aborted` notification 反馈结果。zhive 直接采纳。
+**Notification。** zhive `cancel_session(thread_id)` 内部走 `client.notify("session/cancel", ...)`，**无 response**。锚点：(a) ACP `CancelNotification` 由 `impl_jsonrpc_notification!` 而非 `impl_jsonrpc_request!`（${ACP}/...notifications.rs:1-3）；(b) ACP 把 cancel 放在 `client_to_agent/notifications.rs` 而非 `requests.rs`；(c) LSP `$/cancelRequest` 同样是 notification（${LSP}/src/service.rs:48-50）。两个参考协议一致：cancel 都是 **fire-and-forget notification**，server 处理后通过**独立**的 `events/session_aborted` notification 反馈结果。zhive 直接采纳。
 
 ### Q3：Drop in-flight `Future` 时是否自动发 cancel？
 
@@ -303,15 +302,15 @@ worker 内的 `pending_requests: HashMap<RequestId, oneshot::Sender<...>>`（C1 
 |---|---|---|
 | `Client::notify(method, params)` 通用 notification 入口 | C1 §2.2 | `cancel_session` 内部调用此 method |
 | `ClientError::{Transport, Disconnected}` 两态 | C1 §3.5 | `cancel_session` 的 Err 仅这两种（无 Server 态：notification 无 response） |
-| `ClientEvent::Notification(...)` 单一事件通道 | C1 §2.2, §4 | `session/aborted` 经此投递 |
+| `ClientEvent::Notification(...)` 单一事件通道 | C1 §2.2, §4 | `events/session_aborted` 经此投递 |
 | `ClientEvent::Disconnected { message }` 终态 | C1 §2.2 | 断连后 `cancel_session` 立即 `Err(Disconnected)` |
-| Disconnected = 终态，不自动重连 | C2 §4 | cancel 期间 / 之后断连 ⇒ caller drop + rebuild Client；旧 `session_id` 在新 Client 上无效 |
+| Disconnected = 终态，不自动重连 | C2 §4 | cancel 期间 / 之后断连 ⇒ caller drop + rebuild Client；旧 `thread_id` 在新 Client 上无效 |
 | `RequestHandle` 多 task clone | C1 §2.2, §3.4 | 提供 `RequestHandle::cancel_session` 对偶，多 task 都能触发 cancel |
-| ACP `Cancelled` outcome 必须显式回 | A3 §6.3, B7 §3.3 | client 端 worker 在收到 `result:{outcome:"cancelled"}` for in-flight `permission/request` 时 **不调** `ReverseHandler::handle` 后处理（B7 §3.3 server 主动发应答给 client） |
+| ACP `Cancelled` outcome 必须显式回 | A3 §6.3, B7 §3.3 | client 端 worker 在收到 `result:{outcome:"cancelled"}` for in-flight `session/request_permission` 时 **不调** `ReverseHandler::handle` 后处理（B7 §3.3 server 主动发应答给 client） |
 | Steer 不撤当前 tool_call | B7 §3.1 | client 调用 `cancel_session` 时**整个 turn 都被撤**；steer 是另一条路径（不引发 cancel） |
 | NextTurn 跨 abort 保留 | B7 §3.3 | client 在 cancel 后下次 `session/prompt` 时 server 自动 splice nextTurn 到 user message 前；client 无需特殊处理 |
-| pending `permission/request` 必发 Cancelled outcome | B7 §4.2 | client worker 把 in-flight reverse-RPC 的 future 自然 drop；caller 注册的 `ReverseHandler` 若用 cooperative cancel 可立即退出，否则跑完丢弃 |
-| `SessionId` 类型 | A1（待落） / ACP schema 0.12 verbatim | 由 zhive-proto 暴露；C3 在 `cancel_session(sid: &SessionId)` 直接消费 |
+| pending `session/request_permission` 必发 Cancelled outcome | B7 §4.2 | client worker 把 in-flight reverse-RPC 的 future 自然 drop；caller 注册的 `ReverseHandler` 若用 cooperative cancel 可立即退出，否则跑完丢弃 |
+| `ThreadId` 类型 | A1 / ACP schema 0.12 verbatim | 由 zhive-proto 暴露；C3 在 `cancel_session(thread_id: &ThreadId)` 直接消费 |
 
 ---
 
@@ -323,7 +322,7 @@ worker 内的 `pending_requests: HashMap<RequestId, oneshot::Sender<...>>`（C1 
 
 > TODO(开放项 C3-N3)：`Client::shutdown()`（C1 §2.2 graceful path）调用时是否要先发 `session/cancel` 给所有已知 in-flight session？目前草图：shutdown 仅 drop transport（C2 §3 表）；server 端通过 transport EOF 推断 client 走人，**不收**任何 wire cancel。这与"cancel 时 server 必须 drain pending_approvals 发 Cancelled outcome"语义有别（B7 §4.2 表"shutdown"行：RAII drop，不发 wire 回包）—— 一致。但 IDE UX 上若 server 没收到 cancel notification 就走 EOF，可能 log 一堆"client died unexpectedly" —— B5 / B6 决定。
 
-> TODO(开放项 C3-N4)：`cancel_session` 是否接受批量 session_id（`cancel_sessions(sids: &[SessionId])`）？ACP schema 单条 `session_id`；zhive 想加批量必须循环。Phase 1 不做，保持 ACP wire 1:1。caller 想批量 ⇒ 自己 `for sid in ... { client.cancel_session(sid).await?; }`。
+> TODO(开放项 C3-N4)：`cancel_session` 是否接受批量 thread_id（`cancel_sessions(thread_ids: &[ThreadId])`）？ACP schema 单条 `session_id`；zhive 想加批量必须循环。Phase 1 不做，保持 ACP wire 1:1。caller 想批量 ⇒ 自己 `for tid in ... { client.cancel_session(tid).await?; }`。
 
 > TODO(开放项 C3-N5)：client 视角下"已发出的 `request_typed` 在 cancel 期间到底有没有响应"无 wire 保证。例如 caller 同时发 `turn/start` + `cancel_session` 在 server 收到顺序未知。建议 server 侧（B7）补"cancel notification 到达时 currently-handling request 的处理策略"决策：(a) 让正在跑的 handler 跑完正常回响应；(b) 让 handler 也走 cancel 路径回 -32099 cancelled。当前 B7 倾向 (a)（cancel 仅撤 turn-level concept，request handler 本身是 RPC 层不受影响）。
 

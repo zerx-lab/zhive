@@ -3,10 +3,10 @@ task: B7
 title: 取消传播树 + StreamingBehavior 三队列状态机 + pendingSessionWrites 智能刷新
 plan: phase1-core-native-research
 date: 2026-05-28
-status: draft
+status: implemented
 depends_on:
   - A3 deliverable (三队列 + QueueMode + Steer 不撤当前 tool_call + ACP Cancelled outcome)
-  - B1 deliverable (Engine actor + EnginePhase 6 态 + watch::Sender<EnginePhase> + CancellationToken 选型 + broadcast(1024) / mpsc / oneshot 拓扑)
+  - B1 deliverable (Engine actor + EnginePhase 5 态 + watch::Sender<EnginePhase> + CancellationToken 选型 + broadcast(1024) / mpsc / oneshot 拓扑)
   - research/99-decisions/README.md#d-008 (StreamingBehavior 二元 mode —— 本任务沿 A3 推进三队列修订)
 references_external:
   - ${ACP}/src/agent-client-protocol/src/schema/client_to_agent/notifications.rs:1-3       (`CancelNotification` impl with method `"session/cancel"`)
@@ -55,7 +55,7 @@ non-goals:
 | Pi `emitHook` / `emit` 内部把 signal 透传 observers / handlers | `${PI}/packages/agent/docs/hooks.md` | 124-149 |
 | B1 决定：`ActiveTurn.cancel: CancellationToken` + `ThreadHandle.cancel: CancellationToken` + `shutdown: CancellationToken`（tokio_util） | `plans/phase1-core-native-research/deliverables/B1-engine-loop.md` | 695-705, 725 |
 | B1 决定：event broadcast 容量 1024 / submission mpsc(512) / per-thread mpsc(64) / item mpsc(256) | `plans/phase1-core-native-research/deliverables/B1-engine-loop.md` | 716-723 |
-| A3 决定：abort 清 steer/followUp、保留 nextTurn；pending permission/request 用 ACP `Cancelled` outcome 显式回 | `plans/phase1-core-native-research/deliverables/A3-permission-streaming-subagent.md` | §6.2-§6.3, §8 |
+| A3 决定：abort 清 steer/followUp、保留 nextTurn；pending session/request_permission 用 ACP `Cancelled` outcome 显式回 | `plans/phase1-core-native-research/deliverables/A3-permission-streaming-subagent.md` | §6.2-§6.3, §8 |
 | A3 修订锚点（plan §4 修复）：`packages/agent/src/types.ts:44`（不是 `harness/types.ts:44`） | `${PI}/packages/agent/src/types.ts` | 44 |
 
 ---
@@ -159,14 +159,14 @@ phase = Turn                                       steer_queue   in-flight
   │  drain steer (空) → spawn LLM req
   │  stream chunks ...                                  []           -
   │  tool_call("run_tests")                             []           -
-  │  ── reverse-RPC permission/request id=A ────►       []           -
+  │  ── reverse-RPC session/request_permission id=A ──► []           -
   │     pending_approvals[A] = oneshot::Sender
   │
   │  ◄── client: enqueue_steer("also run lint")
   │     phase==Turn ⇒ steer.push                       [lint]        -
   │     emit queue_update broadcast                     │            │
   │                                                     │            │
-  │  ◄── client: permission/request response Allow ─    │            │
+  │  ◄── client: session/request_permission response Allow ─        │
   │     pending_approvals.remove(A).send(Selected)      │            │
   │  ── tool exec begins (real syscall fired) ────►    [lint]      ⚙ run_tests
   │                                                     │            │
@@ -233,12 +233,12 @@ phase = Turn                  next_turn_queue   pending_approvals
   │    for (id, sender) in pending_approvals.drain()  │
   │       sender.send(RequestPermissionResponse {     │
   │          outcome: Cancelled, meta: None,          │
-  │       })  ── ACP 0.12 硬约束                       │
+  │       })  ── ACP 0.13 硬约束                       │
   │    pending_approvals 现在为空                      │ {}
   │
   │  await active_turn 任务退出（AbortOnDropHandle 兜底）
   │  phase → Idle
-  │  emit session/aborted {
+  │  emit events/session_aborted {
   │     cleared_steer, cleared_follow_up,
   │     next_turn_retained_count: 1                    [retry] ✓
   │  }
@@ -255,7 +255,7 @@ phase = Idle                                       next_turn_queue
 
 **核心断言**：
 - NextTurn 是**跨 abort 持久化**的队列（Pi 模式 agent-harness.ts:936-963，A3 §8）
-- Pending `permission/request` **必须**在 abort 时用 ACP `Cancelled` outcome 显式回 client（不能让请求悬挂）；这是 zhive 与 Pi 的关键差：Pi 是 in-process `resolve(default)`，zhive 是跨进程 wire-level Cancelled
+- Pending `session/request_permission` **必须**在 abort 时用 ACP `Cancelled` outcome 显式回 client（不能让请求悬挂）；这是 zhive 与 Pi 的关键差：Pi 是 in-process `resolve(default)`，zhive 是跨进程 wire-level Cancelled
 
 ---
 
@@ -288,7 +288,7 @@ pub(crate) struct TurnState {
 | **创建** | tool_call 需要 permission，host 发 `session/request_permission` reverse-RPC | `pending_approvals.insert(req_id, oneshot::Sender)` | dispatcher loop |
 | **正常完成** | client 回 `RequestPermissionResponse` | `pending_approvals.remove(req_id)?.send(response)?` | dispatcher loop（response 入站时） |
 | **超时**（待 B6 决定 timeout 默认） | 内部 timer | `pending_approvals.remove(req_id)?.send(Selected{default_deny})` 或同 cancel 路径回 `Cancelled` —— 倾向后者保持语义一致 | dispatcher loop |
-| **abort / cancel** | `session/cancel` notification | **遍历 drain**：`for (id, sender) in pending_approvals.drain() { sender.send(Cancelled outcome); }` —— ACP 0.12 硬约束 verbatim | abort handler（dispatcher 内串行执行） |
+| **abort / cancel** | `session/cancel` notification | **遍历 drain**：`for (id, sender) in pending_approvals.drain() { sender.send(Cancelled outcome); }` —— ACP 0.13 硬约束 verbatim | abort handler（dispatcher 内串行执行） |
 | **turn 自然结束**（无 pending 残留预期但要兜底） | turn_end event | `if !pending_approvals.is_empty() { warn!("leak"); for ... { send(Cancelled) } }` —— **fail-safe**，正常情况应为空 | turn_end handler |
 | **engine shutdown** | `Engine.shutdown.cancel()` | 各 thread 的 ActiveTurn drop ⇒ `pending_approvals` drop ⇒ 各 `oneshot::Sender` drop ⇒ 接收端得 `RecvError`；但 wire-level 不发任何回包（ACP 不要求 shutdown 时发响应） | RAII（drop） |
 
@@ -307,19 +307,19 @@ pub(crate) struct TurnState {
 
 ### 5.1 采纳范围决策（关键问题 #5）
 
-**决策**：**全面采纳，但语义对齐 EnginePhase 6 态而不是 Pi 5 态**。
+**决策**：**全面采纳，但语义对齐 EnginePhase 5 态而不是 Pi 5 态**。
 
 | 维度 | Pi 现状（agent-harness.ts） | zhive 决策 |
 |---|---|---|
-| 触发入 buffer 的条件 | `phase !== "idle"`（5 态中除 idle 全入） | `phase != EnginePhase::Idle`（6 态中除 Idle 全入：Turn / Compaction / BranchSummary / Retry / SubagentSpawn） |
+| 触发入 buffer 的条件 | `phase !== "idle"`（5 态中除 idle 全入） | `phase != EnginePhase::Idle`（5 态中除 Idle 全入：Turn / Compaction / BranchSummary / Retry） |
 | Buffer 项种类 | 8 种：`message / model_change / thinking_level_change / custom / custom_message / label / session_info / leaf` | 同语义。Rust 层 enum `PendingSessionWrite`，每 variant 对应一种 `Session::append_*` 方法 |
-| Save point（flush 触发点） | 4 个：`prepareNextTurn` / `turn_end` / `agent_end` / `executeTurn finally` | 同 4 个 + **新增 1 个**：每次 `EnginePhase` 转回 `Idle` 时强制 flush（覆盖 compaction/branch_summary/retry/subagent 4 个非 turn phase 的退出路径） |
+| Save point（flush 触发点） | 4 个：`prepareNextTurn` / `turn_end` / `agent_end` / `executeTurn finally` | 同 4 个 + **新增 1 个**：每次 `EnginePhase` 转回 `Idle` 时强制 flush（覆盖 compaction/branch_summary/retry 3 个非 turn phase 的退出路径） |
 | Flush 失败的处理 | Pi: `await ...` 失败往上抛 | zhive: 失败先 emit `session_persistence_failed` event + 保留未 drain 项；不丢数据 |
 
 **为什么"全面采纳"而不只 compaction phase 用**：
 - Pi 实测 4 个 save point 中**每个**都依赖 buffer：`prepareNextTurn` 在 turn-内 inner loop 也调（agent-harness.ts:440），不限于 compaction
 - "phase ≠ idle 入 buffer" 的核心目的是**避免 turn 中途写持久化引入 race**（一个 turn 还没结束时如果中途写盘，crash 恢复看到"半个 turn"）；compaction 只是其中一例
-- 6 态都符合这个 race 风险（compaction/branch_summary 同样可能中途崩）
+- 5 态都符合这个 race 风险（compaction/branch_summary 同样可能中途崩）
 
 **为什么不只在 compaction 用**：会引入 phase-条件不一致——`appendMessage` 在 Turn phase 走"立即写"，在 Compaction phase 走"buffer"——同一 API 双语义反而更难推理。统一 "非 Idle 必入 buffer" 简单可证。
 
@@ -407,7 +407,7 @@ async fn apply_write<S: Session>(session: &S, write: PendingSessionWrite) -> Res
 | 2 | `turn_end` event handler 内 | agent-harness.ts:497-499 | emit `EngineEvent::SavePoint { had_pending_mutations }` |
 | 3 | `agent_end` event handler 内（agent loop 正常退出） | agent-harness.ts:503 | 切 phase 到 Idle（在 flush 之后） |
 | 4 | `execute_turn` 的 finally 块（错误兜底） | agent-harness.ts:594-600 | 无 |
-| 5 | **zhive 新增**：任何 phase → Idle 转换前（覆盖 compaction/branch_summary/retry/subagent 退出） | 无 Pi 直接对应；Pi 这些 phase 退出靠 finally + 0 buffer 写入因 phase 自身不调 appendXxx | emit `EngineEvent::SavePoint { had_pending_mutations }` |
+| 5 | **zhive 新增**：任何 phase → Idle 转换前（覆盖 compaction/branch_summary/retry 退出） | 无 Pi 直接对应；Pi 这些 phase 退出靠 finally + 0 buffer 写入因 phase 自身不调 appendXxx | emit `EngineEvent::SavePoint { had_pending_mutations }` |
 
 ### 5.4 与 cancel 的交互
 
@@ -512,7 +512,7 @@ where H: Hook<E, Ctx>
 
 ### 7.1 段落 A（精炼，3-5 句版）
 
-> **Steering does not interrupt the current tool call.** When you send a steer message while the agent is mid-turn, the message is queued and injected into the **next** LLM request within the same turn. Any tool call already in flight (file write, network request, subprocess) continues to completion. If you need to abort the current tool execution, use `session/cancel` instead — this will cancel the turn, return any queued `steer` / `followUp` messages to you via the `session/aborted` notification, and respond to all pending permission requests with the `Cancelled` outcome (per ACP).
+> **Steering does not interrupt the current tool call.** When you send a steer message while the agent is mid-turn, the message is queued and injected into the **next** LLM request within the same turn. Any tool call already in flight (file write, network request, subprocess) continues to completion. If you need to abort the current tool execution, use `session/cancel` instead — this will cancel the turn, return any queued `steer` / `followUp` messages to you via the `events/session_aborted` notification, and respond to all pending permission requests with the `Cancelled` outcome (per ACP).
 
 ### 7.2 段落 B（长版本，含 nextTurn 区别）
 
@@ -557,7 +557,7 @@ where H: Hook<E, Ctx>
 ### Q5. `PendingSessionWrites` zhive 是否全面采纳
 **答**：**全面采纳，但 5 个 save point 而非 4 个**（多 1 个：任何 phase → Idle 转换前）。详见 §5。理由：
 - 4 个原 save point 实测每个都依赖 buffer（不只 compaction）
-- "phase ≠ idle 入 buffer" 核心目的是**防 turn 半成品落盘** —— 6 态全适用
+- "phase ≠ idle 入 buffer" 核心目的是**防 turn 半成品落盘** —— 5 态全适用
 - 双语义（phase A 直写 / phase B buffer）反而难推理
 - 仅在 compaction 用会出现 `appendMessage` 在 Turn phase 直写 / Compaction phase buffer，破坏 API 一致性
 
@@ -583,7 +583,7 @@ where H: Hook<E, Ctx>
 
 > TODO(开放项 B7-5)：`Engine.compaction_cancel` 与 `Engine.branch_summary_cancel` 是 per-engine 单例还是 per-call 重建？Pi 是 per-call `new AbortController()`。zhive 倾向 **per-call 重建**（避免 stale state），但需要 `Engine::start_compaction()` 入口构造新 token 并存入 `Mutex<Option<CancellationToken>>` 字段供 `cancel_compaction()` 取用。
 
-> TODO(开放项 B7-6)：`session/aborted` notification 中 `cleared_steer / cleared_follow_up` 内容是否含完整 Item payload 还是只 ID？A3 §8 草图含完整 payload；wire 大小可能爆（用户连续 steer 100 条）—— 倾向仅返回前 N 条 + 总数，B4 决定。
+> TODO(开放项 B7-6)：`events/session_aborted` notification 中 `cleared_steer / cleared_follow_up` 内容是否含完整 Item payload 还是只 ID？A3 §8 草图含完整 payload；wire 大小可能爆（用户连续 steer 100 条）—— 倾向仅返回前 N 条 + 总数，B4 决定。
 
 > TODO(开放项 B7-7)：非 abort-aware hook 长时间（30s+）阻塞时是否记 warning。tracing log 倾向 emit warn，但 threshold 暂占位 5s；B5 hook host 落定。
 
@@ -598,7 +598,7 @@ where H: Hook<E, Ctx>
 | abort 清理范围 | 清 steer/followUp、保留 nextTurn（A3 §6.2 + §8.1） | `ActiveTurn.cancel.cancel()` + `pending_approvals` drain | §3.3 + §4 |
 | `Cancelled outcome` 回收 | 必填 ACP wire 响应（A3 §6.3） | `pending_approvals` HashMap（B1 §6.1） | §4 lifecycle 表 |
 | CancellationToken 选型 | — | `tokio_util::sync::CancellationToken`（B1 §6.1） | §2.2 token 选型表沿用 |
-| Engine phase 枚举 | — | 6 态（B1 §2.1） | §5.1 phase→Idle 转换是新 save point |
+| Engine phase 枚举 | — | 5 态（B1 §2.1） | §5.1 phase→Idle 转换是新 save point |
 | broadcast 1024 / mpsc 容量 | — | B1 §6.2 表 | 本 deliverable 不动 |
 | Hook 14 事件 schema | A4 owns | — | §6 仅决定 signature；事件枚举由 A4 |
 | Subagent 继承 | A3 §7 | — | §2.1 subagent 子树 cancel token 父→子 |

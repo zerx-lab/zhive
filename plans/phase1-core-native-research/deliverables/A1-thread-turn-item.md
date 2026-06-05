@@ -2,7 +2,7 @@
 task: A1
 title: 三层原语 Thread / Turn / Item domain schema（D-006 落地）
 date: 2026-05-28
-status: draft
+status: implemented
 depends_on:
   - research/99-decisions D-006 (Thread/Turn/Item + serde+schemars 单 schema 源)
   - research/99-decisions D-005 (rmcp/ACP 仅在 bridge crate)
@@ -22,7 +22,7 @@ references:
   - crates/zhive-core/src/state.rs                                 (待补 Thread/Turn/Item)
 ---
 
-> 说明：以下所有“ACP schema”都指 `agent-client-protocol-schema v0.12.0`（被 `agent-client-protocol = "=0.12.1"`（D-005 锁定版本）依赖；本地源码位于 `~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/agent-client-protocol-schema-0.12.0/`）。
+> 说明：以下所有“ACP schema”锚点都引自 `agent-client-protocol-schema v0.12.0`（本调研基线，本地源码位于 `~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/agent-client-protocol-schema-0.12.0/`）；运行时依赖 `agent-client-protocol = "0.13"`。
 
 ---
 
@@ -103,9 +103,9 @@ references:
 
 - **manifest / wire JSON**：camelCase（与 ACP `#[serde(rename_all = "camelCase")]` / codex v2 `#[serde(rename_all = "camelCase")]` 双方一致）
 - **Rust 内部类型**：PascalCase enum case + snake_case 字段
-- **discriminator**：`#[serde(tag = "kind")]`（值用 `snake_case`，与 D-006 §决策 "rename_all = snake_case" 习惯对齐；codex 用 `type` + camelCase，ACP 用 `sessionUpdate` + snake_case，**zhive 选 `kind` 避开两个 keyword 复用**）
+- **discriminator**：`#[serde(tag = "itemKind")]`（值用 `snake_case`，与 D-006 §决策 "rename_all = snake_case" 习惯对齐；codex 用 `type` + camelCase，ACP 用 `sessionUpdate` + snake_case，**zhive 选 `itemKind` 避开两个 keyword 复用**）
 
-> 决策冲突警告：codex v2 `ThreadItem` 用 `#[serde(tag = "type")]`（`item.rs:209`），ACP `SessionUpdate` 用 `#[serde(tag = "sessionUpdate")]`（`client.rs:81`），rmcp `RawContent` 用 `#[serde(tag = "type")]`（`content.rs:150`）。zhive 选 `kind` 是为了：(a) 不与 ACP `sessionUpdate` 冲突（bridge 不会同 key 撞名）；(b) `type` 在 JSON Schema 里和 schemars 的 `"type"` 元字段易混。如果用户要求"严格对齐 codex"，可在 plan §10 回流改为 `type`。
+> 决策冲突来源：codex v2 `ThreadItem` 用 `#[serde(tag = "type")]`（`item.rs:209`），ACP `SessionUpdate` 用 `#[serde(tag = "sessionUpdate")]`（`client.rs:81`），rmcp `RawContent` 用 `#[serde(tag = "type")]`（`content.rs:150`）。zhive 选 `itemKind` 是为了：(a) 不与 ACP `sessionUpdate`、codex/rmcp `type` 任一冲突（bridge 不会同 key 撞名）；(b) `type` 在 JSON Schema 里和 schemars 的 `"type"` 元字段易混。叶子 enum（`ItemContent` / `ItemToolCallContent`）则沿用 ACP 的 `tag = "type"` 以保持 1:1 wire 兼容。
 
 ### 2.2 Q2：`Thread.id ↔ ACP.SessionId` namespace 设计（D-006 「桥接表 + ID 命名空间」具体怎么编码？）
 
@@ -142,12 +142,12 @@ struct ThreadAcpBinding {
 
 ### 2.3 Q3：MCP 侧无 Turn → core 怎么暴露 "Turn 开始 / 结束" 给 bridge？
 
-**决策**：core 暴露 **JSON-RPC notification 一对** `turn/started` / `turn/completed`（method 名直接抄 codex `turn/started` / `turn/completed`，见 `turn.rs:350-373`），bridge-stdio 订阅这两个 notification 并在自己内部映射成「`tools/call` 序列开始 / 结束」。
+**决策**：core 暴露 **JSON-RPC notification 一对** `events/turn_started` / `events/turn_completed`（语义对照 codex `turn/started` / `turn/completed`，见 `turn.rs:350-373`），bridge-stdio 订阅这两个 notification 并在自己内部映射成「`tools/call` 序列开始 / 结束」。
 
 bridge 侧合成 Turn 的具体动作：
-1. **`Server::handle_session_prompt` 进入时**：core 自动 `engine.start_turn(thread_id, user_inputs)` → 发 `turn/started` notification（payload = `TurnStartedNotification { thread_id, turn }`）
-2. **agent loop 结束时**（无更多 LLM 调用 / 全部 tool_call 完成 / cancel 触发）：core `engine.finish_turn(turn_id, status)` → 发 `turn/completed` notification（payload 含 `TurnStatus` 四态：`Completed / Interrupted / Failed / InProgress`，但 `InProgress` 永远不会出现在 completed 通知中，仅作为 read-time 状态）
-3. **bridge-mcp（Phase 2）**：监听 `turn/started` → 启动一段 stdout 缓冲；监听 `turn/completed` → 把缓冲打包成单个 `CallToolResult` 返回给 MCP 客户端
+1. **`Server::handle_session_prompt` 进入时**：core 自动 `engine.start_turn(thread_id, user_inputs)` → 发 `events/turn_started` notification（payload = `TurnStartedNotification { thread_id, turn }`）
+2. **agent loop 结束时**（无更多 LLM 调用 / 全部 tool_call 完成 / cancel 触发）：core `engine.finish_turn(turn_id, status)` → 发 `events/turn_completed` notification（payload 含 `TurnStatus` 四态：`Completed / Interrupted / Failed / InProgress`，但 `InProgress` 永远不会出现在 completed 通知中，仅作为 read-time 状态）
+3. **bridge-mcp（Phase 2）**：监听 `events/turn_started` → 启动一段 stdout 缓冲；监听 `events/turn_completed` → 把缓冲打包成单个 `CallToolResult` 返回给 MCP 客户端
 
 **为何选 notification 而非 subscribe-only stream**（D-006 没指定）：
 - D-003 已锁定 JSON-RPC 2.0（notification 是 spec § 4.1 标准 message type）；不需要新机制
@@ -159,7 +159,7 @@ bridge 侧合成 Turn 的具体动作：
 ```text
 on session/prompt(thread_id, user_inputs):
     turn = state.start_turn(thread_id, user_inputs)
-    emit notification { method: "turn/started", params: TurnStartedNotification { thread_id, turn } }
+    emit notification { method: "events/turn_started", params: TurnStartedNotification { thread_id, turn } }
     spawn agent_loop(turn.id):
         loop:
             if cancel.is_cancelled(): break Interrupted
@@ -168,7 +168,7 @@ on session/prompt(thread_id, user_inputs):
                 state.append_item(turn.id, item)  // 同步发 item-level notification
                 if item is ToolCall: dispatch_tool_call(item).await
             if llm_resp.is_final: break Completed
-    emit notification { method: "turn/completed", params: TurnCompletedNotification { thread_id, turn: turn.with_status(...) } }
+    emit notification { method: "events/turn_completed", params: TurnCompletedNotification { thread_id, turn: turn.with_status(...) } }
 ```
 
 ---
@@ -196,7 +196,7 @@ on session/prompt(thread_id, user_inputs):
 | `turns: Vec<Turn>` | codex `turns`（`thread_data.rs:147`） | 仅在 `thread/read?includeTurns=true` 等响应里 populate |
 
 **砍掉 codex 字段**（zhive Phase 1 不需要）：
-- `path: Option<PathBuf>` —— D-011 把 JSONL 路径标准化为 `~/.zhive/rollouts/<thread_id>.jsonl`，可推导，不冗余存
+- `path: Option<PathBuf>` —— D-011 把 JSONL 路径标准化为 `<data_dir>/rollouts/<thread_id>.jsonl`（`data_dir` 解析顺序 `$ZHIVE_DATA_DIR` → `$XDG_DATA_HOME/zhive` → `$HOME/.local/share/zhive`），可推导，不冗余存
 - `cli_version: String` —— zhive 由 SystemNotice item 记录
 - `agent_nickname / agent_role` —— codex AgentControl 私有
 - `git_info: Option<GitInfo>` —— Phase 1 不收 git 元数据，留到 Phase 2 hook
@@ -211,8 +211,8 @@ on session/prompt(thread_id, user_inputs):
 | `items_view: TurnItemsView` | codex `items_view`（`thread_data.rs:159`） | `NotLoaded / Summary / Full` 三态（`thread_data.rs:174-185`）|
 | `status: TurnStatus` | codex `status`（`turn.rs:25-33`） | `Completed / Interrupted / Failed / InProgress` |
 | `error: Option<TurnError>` | codex `error`（`thread_data.rs:162` + `TurnError` `thread_data.rs:187-196`） | 仅在 `status = Failed` 时填；含 `thiserror::Error` 派生 |
-| `started_at: Option<i64>` | codex `started_at`（`thread_data.rs:165`） | unix ts；`turn/started` 落地点 |
-| `completed_at: Option<i64>` | codex `completed_at`（`thread_data.rs:168`） | unix ts；`turn/completed` 落地点 |
+| `started_at: Option<i64>` | codex `started_at`（`thread_data.rs:165`） | unix ts；`events/turn_started` 落地点 |
+| `completed_at: Option<i64>` | codex `completed_at`（`thread_data.rs:168`） | unix ts；`events/turn_completed` 落地点 |
 | `duration_ms: Option<i64>` | codex `duration_ms`（`thread_data.rs:171`） | `completed_at - started_at`（毫秒） |
 
 ### Item（关键字段）
@@ -302,7 +302,7 @@ Item::ToolCall {
 }
 ```
 
-且**整个 `tools/call` 序列被 bridge 合成为一个 Turn**（D-006 §依据）：`tools/call` 进 → `turn/started`；`CallToolResult` 出 → `turn/completed`。
+且**整个 `tools/call` 序列被 bridge 合成为一个 Turn**（D-006 §依据）：`tools/call` 进 → `events/turn_started`；`CallToolResult` 出 → `events/turn_completed`。
 
 > TODO(开放项 OP-3)：MCP 单次 `tools/call` 合成一个 Turn，多次连续 call 是新 Turn 还是 append 到同一 Thread？建议「新 Turn / 同 Thread」（与 ACP `session/prompt` 多次发同 Session 行为一致）。
 
@@ -461,11 +461,11 @@ pub struct TurnError {
 }
 
 // ============================================================
-// Item（14 case；discriminator = "kind"；snake_case）
+// Item（14 case；discriminator = "itemKind"；snake_case）
 // ============================================================
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "itemKind", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum Item {
     UserMessage {
@@ -730,8 +730,8 @@ pub enum NoticeLevel {
 // ============================================================
 // Turn lifecycle notification payloads（对齐 codex turn.rs:350-373）
 // 这两个 notification method 名：
-//   - "turn/started"     params = TurnStartedNotification
-//   - "turn/completed"   params = TurnCompletedNotification
+//   - "events/turn_started"     params = TurnStartedNotification
+//   - "events/turn_completed"   params = TurnCompletedNotification
 // （由 server 通过 zhive-proto::Notification 发出）
 // ============================================================
 
@@ -783,9 +783,9 @@ pub enum BridgeKind {
 
 ## 7. 设计选择小结（与 §2 三大问题答案合并复述）
 
-1. **Item enum 全集 = 14 case**（D-006 列 8 + ACP/codex 补 6）；字段命名 = codex 骨架 + ACP 叶子（含 `ItemContent / ItemToolCallContent` 1:1 同构 5/3 case）；discriminator 选 `kind`（避开 ACP `sessionUpdate` 与 codex `type`）
+1. **Item enum 全集 = 14 case**（D-006 列 8 + ACP/codex 补 6）；字段命名 = codex 骨架 + ACP 叶子（含 `ItemContent / ItemToolCallContent` 1:1 同构 5/3 case）；discriminator 选 `itemKind`（避开 ACP `sessionUpdate` 与 codex/rmcp `type`）
 2. **ThreadId namespace = `thread:<provenance>/<uuid-v7>`** + 桥接表（`ThreadBridgeBinding`） —— **不 1:1**，多 ACP session / 多 MCP 合成 session 可挂同一 thread
-3. **Turn 边界 = JSON-RPC notification `turn/started` / `turn/completed`** + bridge 侧把 `tools/call` 序列合成 Turn（MCP）/ 把 `session/prompt` 起止合成 Turn（ACP）
+3. **Turn 边界 = JSON-RPC notification `events/turn_started` / `events/turn_completed`** + bridge 侧把 `tools/call` 序列合成 Turn（MCP）/ 把 `session/prompt` 起止合成 Turn（ACP）
 
 ---
 
@@ -798,7 +798,5 @@ pub enum BridgeKind {
 > TODO(开放项 OP-3)：MCP 一次 `tools/call` 合成一个 Turn 是确定的，但**多次连续 call** 是新 Turn / append 到同一 Thread。建议「新 Turn / 同 Thread」（与 ACP `session/prompt` 多发同 Session 行为一致），但与 D-006「Turn = 一次用户输入 + 全部 agent 响应」字面有出入。需 §10 确认。
 >
 > TODO(开放项 OP-4)：草图 §6 中 `Item::Resource { resource: Value }` 类型暂时占位；落地时补 `ResourceContents` 强类型（5 字段，二级结构对齐 ACP `EmbeddedResource.resource`）。不阻塞编译。
->
-> TODO(开放项 OP-5)：discriminator 选 `kind` 与 codex 选 `type` 不一致；如果用户期望「字面照搬 codex 减少 bridge code」，可改 `type`（仅文本替换，不影响语义）。
 >
 > TODO(开放项 OP-6)：草图 `Reasoning.summary: Vec<String>` 与 `AgentThought.text: String` 是两个 item case，对齐 codex `Reasoning { summary, content }` 拆分。但 ACP 只有 `AgentThoughtChunk` 一个对应概念 —— bridge 侧从 ACP 入只能填 `AgentThought`，不能填 `Reasoning.summary`。建议把 `Reasoning` 标为 "codex-only" 入口；ACP/MCP bridge 仅写 `AgentThought`。

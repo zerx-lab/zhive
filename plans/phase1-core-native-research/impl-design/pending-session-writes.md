@@ -1,15 +1,5 @@
 # B7 PendingSessionWrites buffer + flush
 
-## currentState
-无任何 PendingSessionWrites/pending_session_writes 实现。
-- `crates/zhive-core/src/persistence/writer.rs:48-95` — `StorageWriteOp` enum 仅含 `ThreadUpserted / TurnStarted / ItemAppended / TurnEnded / Flush`，是 JSONL+SQL 写入的底层 op，不含 session 元数据写（model_change / label 等）。
-- `crates/zhive-core/src/engine/inner.rs:274-288` — `enqueue_storage_op()` 非阻塞 try_send，直接投递 `StorageWriteOp`，**无 phase 判断**，即当前 turn 期间所有写入立即排队。
-- `crates/zhive-core/src/engine/turn.rs:193-664` — `run_turn_inner` 在 steer drain (行208)、stream fold (行311-318)、follow-up drain (行425-437)、tool commit (行628-634) 多处直接调用 `inner.enqueue_storage_op(StorageWriteOp::ItemAppended {...})`，没有任何缓冲层。
-- `crates/zhive-core/src/engine/lifecycle.rs:209-333` — `finish_turn` 在 turn 结束后调 `enqueue_storage_op(TurnEnded)` 触发 fsync save point（writer.rs:73 的 `TurnEnded` 处理会调 `sync_all`）。
-- `crates/zhive-core/src/engine/compaction.rs:107-191` — `run_compaction` 不发任何 `StorageWriteOp`（in-memory only，注释行15-20）。
-- `crates/zhive-core/src/state/thread.rs:29-196` — `ThreadHandle` / `ActiveTurn` 无 `pending_session_writes` 字段。
-- `crates/zhive-proto/src/hook.rs:105-116` — `EnginePhase` 5 态: `Idle / Turn / Compaction / BranchSummary / Retry`，无 `SubagentSpawn` 单独态。
-
 ## harnessRef
 pi agent-harness.ts:174 (字段声明) / :439-481 (flushPendingSessionWrites + prepareNextTurn save point #1) / :483-510 (turn_end save point #2, agent_end save point #3) / :552-600 (executeTurn finally save point #4) / :669-679 (appendMessage 智能分发)
 
@@ -28,7 +18,7 @@ pi agent-harness.ts:174 (字段声明) / :439-481 (flushPendingSessionWrites + p
 
 ## files
 
-- `crates/zhive-core/src/state/pending_writes.rs` — 新建文件。定义 pub enum PendingSessionWrite（6 个 variant，Phase 1 可用的：Item/ModelChange/SessionInfo/Leaf；ThinkingLevelChange/Label/Custom/CustomMessage 占位但不挂 StorageWriteOp 实装，因为 StorageWriteOp 尚无对应 variant）。定义 pub(crate) struct PendingSessionWrites { queue: VecDeque<PendingSessionWrite> }，实现 push_or_enqueue(phase, write) 和 flush(enqueue_fn) 两个方法。flush 按 variant 转换为 StorageWriteOp 并通过传入的 enqueue 闭包发出；失败立即返回 Err，已 drain 的不回填（对齐 Pi 行为）。提供 is_empty()/len() 辅助方法。每个 public 类型和方法须带 doc comment + doctest。
+- `crates/zhive-core/src/state/pending_writes.rs` — 新建文件。定义 pub enum PendingSessionWrite（8 个 variant，Phase 1 可用的：Item/ModelChanged/SessionInfo/Leaf；ThinkingLevelChange/Label/Custom/CustomMessage 占位但不挂 StorageWriteOp 实装，因为 StorageWriteOp 尚无对应 variant）。定义 pub(crate) struct PendingSessionWrites { queue: VecDeque<PendingSessionWrite> }，实现 push_or_enqueue(phase, write) 和 flush(enqueue_fn) 两个方法。flush 按 variant 转换为 StorageWriteOp 并通过传入的 enqueue 闭包发出；失败立即返回 Err，已 drain 的不回填（对齐 Pi 行为）。提供 is_empty()/len() 辅助方法。每个 public 类型和方法须带 doc comment + doctest。
 - `crates/zhive-core/src/state.rs` — 新增 pub mod pending_writes; 声明，并在 pub use 处导出 pending_writes::PendingSessionWrites（pub(crate)），使 engine 子模块可通过 crate::state::PendingSessionWrites 访问。
 - `crates/zhive-core/src/state/thread.rs` — 在 ThreadHandle 结构体新增字段 pub(crate) pending_session_writes: std::sync::Mutex<PendingSessionWrites>。在 new_idle / with_capacity / new_child 三处构造器中初始化为 Mutex::new(PendingSessionWrites::new())。新增 pending_writes_lock() 辅助方法（同 injection_lock 模式，recover from poison）。
 - `crates/zhive-core/src/persistence/writer.rs` — 在 StorageWriteOp 枚举新增两个 variant（Phase 1 实装的 session 元数据写入）：ModelChanged { thread_id, provider: String, model_id: String } 和 SessionNameSet { thread_id, name: String }。在 apply_op / run_writer 处添加对应 match arm，写入 JSONL RolloutEntry::Session 的 metadata 字段（或追加为新 metadata 行）；SQL 端 best-effort 更新 threads 表的 model_provider / name 列。ThinkingLevelChange / Label / Custom / CustomMessage 的 StorageWriteOp variant 推迟到 B5/Phase2，pending_writes.rs 的 flush 对这些 variant 只 emit warn log 并 skip（不丢失 in-memory 数据，仅不落盘）。

@@ -2,24 +2,24 @@
 task: B9 — tracing spans + 字段命名（OTel-aligned）
 title: tracing spans 覆盖矩阵 / 字段命名 / 日志级别 / subscriber 初始化
 date: 2026-05-28
-status: draft
+status: implemented
 depends_on:
   - D-014（tracing 进核心；OTel exporter feature gate）
-  - R-6（Phase 1 不装 tracing-opentelemetry，但字段名按 OTel semconv 预先对齐）
-  - B1 deliverable（EnginePhase 6 态 / broadcast event 1024 / watch phase / mpsc submission 512）
-  - A1 deliverable（Turn lifecycle + `turn/started` / `turn/completed` notification）
+  - R-6（Phase 1 不在默认 features 启用 tracing-opentelemetry，但字段名按 OTel semconv 预先对齐）
+  - B1 deliverable（EnginePhase 5 态 / broadcast event 1024 / watch phase / mpsc submission 512）
+  - A1 deliverable（Turn lifecycle + `events/turn_started` / `events/turn_completed` notification）
   - A4 deliverable（Hook 14 事件 + `HookEventBase`）
 references:
   - https://docs.rs/tracing/latest/tracing/                                     (tracing 6 macro: trace/debug/info/warn/error + span/instrument)
   - https://docs.rs/tracing-subscriber/latest/tracing_subscriber/               (fmt + env-filter + Registry layered subscriber)
-  - https://docs.rs/tracing-opentelemetry/latest/tracing_opentelemetry/         (Phase 1 不装，仅命名对齐参考)
+  - https://docs.rs/tracing-opentelemetry/latest/tracing_opentelemetry/         (Phase 1 默认不启用，仅命名对齐参考)
   - https://opentelemetry.io/docs/specs/semconv/gen-ai/gen-ai-spans/            (GenAI spans: gen_ai.operation.name / gen_ai.request.model / gen_ai.usage.* / gen_ai.tool.name / gen_ai.conversation.id)
   - https://opentelemetry.io/docs/specs/semconv/rpc/json-rpc/                   (JSON-RPC: rpc.system.name=jsonrpc / rpc.method / jsonrpc.protocol.version / jsonrpc.request.id / rpc.response.status_code)
   - https://opentelemetry.io/docs/specs/semconv/registry/attributes/session/    (session.id —— 通用 conversation/thread id)
   - https://opentelemetry.io/docs/specs/semconv/attributes-registry/#error      (error.type 通用属性)
   - research/99-decisions/README.md                                              L364-376 (D-014 决策原文 + 强制覆盖 6 个 span 名)
   - plans/phase1-core-native-research/phase1-core-native-research.md             L494-515 (B9 任务定义) / L700 (R-6 风险)
-  - plans/phase1-core-native-research/deliverables/B1-engine-loop.md             L72-179 (EnginePhase 6 态定义) / L614-712 (channel 拓扑)
+  - plans/phase1-core-native-research/deliverables/B1-engine-loop.md             L72-179 (EnginePhase 5 态定义) / L614-712 (channel 拓扑)
   - plans/phase1-core-native-research/deliverables/A1-thread-turn-item.md       L738-750 (TurnStartedNotification / TurnCompletedNotification wire)
   - plans/phase1-core-native-research/deliverables/A4-hook-event-schema.md      L82-122 (HookEvent 14 case enum) / L139-167 (HookEventBase + PreToolUse 示例)
 ---
@@ -37,9 +37,9 @@ references:
 | 主题 | 路径 | 行号 |
 |---|---|---|
 | D-014 决策原文：6 个 span 强制覆盖 + OTel feature gate + subscriber 仅 fmt+env-filter | `research/99-decisions/README.md` | 364-376 |
-| R-6 风险：Phase 1 不装 tracing-opentelemetry，字段名按 OTel semconv 起避免后悔 | `plans/phase1-core-native-research/phase1-core-native-research.md` | 700 |
+| R-6 风险：Phase 1 默认不启用 tracing-opentelemetry，字段名按 OTel semconv 起避免后悔 | `plans/phase1-core-native-research/phase1-core-native-research.md` | 700 |
 | B9 任务定义本身 | `plans/phase1-core-native-research/phase1-core-native-research.md` | 494-515 |
-| EnginePhase 6 态（Idle / Turn / Compaction / BranchSummary / Retry / SubagentSpawn） | `plans/phase1-core-native-research/deliverables/B1-engine-loop.md` | 72-98 |
+| EnginePhase 5 态（Idle / Turn / Compaction / BranchSummary / Retry），定义于 `zhive-proto::hook` | `plans/phase1-core-native-research/deliverables/B1-engine-loop.md` | 72-98 |
 | EnginePhase 与 TurnStatus 正交矩阵 | `plans/phase1-core-native-research/deliverables/B1-engine-loop.md` | 183-196 |
 | broadcast event 容量 1024 / watch phase / mpsc submission 512 选型 | `plans/phase1-core-native-research/deliverables/B1-engine-loop.md` | 714-731 |
 | `TurnStartedNotification { thread_id, turn }` / `TurnCompletedNotification { thread_id, turn }` wire 形态 | `plans/phase1-core-native-research/deliverables/A1-thread-turn-item.md` | 738-750 |
@@ -68,23 +68,22 @@ references:
 
 | # | span 名（zhive） | OTel 推荐命名 | instrument 位置（B1 锚点） | 关键字段（zhive 字段 / OTel 对照） | 父 span | EnginePhase 对应 |
 |---|---|---|---|---|---|---|
-| 1 | `zhive.turn` | `chat {gen_ai.request.model}`（GenAI Inference 命名规约） | `Engine::start_turn` 入口（B1 §4 `start_turn` 方法）；持续到 `turn/completed` notification 发出 | `thread_id` → `gen_ai.conversation.id` / `session.id`，`turn_id` → `gen_ai.conversation.id.subspan`（zhive 自有），`model` → `gen_ai.request.model`，`gen_ai.operation.name=chat`，`gen_ai.usage.input_tokens`，`gen_ai.usage.output_tokens`，`turn.status` → `error.type` 当 Failed / Interrupted | root | `EnginePhase::Turn`（含 in-turn `Retry` 子状态） |
+| 1 | `zhive.turn` | `chat {gen_ai.request.model}`（GenAI Inference 命名规约） | `Engine::start_turn` 入口（B1 §4 `start_turn` 方法）；持续到 `events/turn_completed` notification 发出 | `thread_id` → `gen_ai.conversation.id` / `session.id`，`turn_id` → `gen_ai.conversation.id.subspan`（zhive 自有），`model` → `gen_ai.request.model`，`gen_ai.operation.name=chat`，`gen_ai.usage.input_tokens`，`gen_ai.usage.output_tokens`，`turn.status` → `error.type` 当 Failed / Interrupted | root | `EnginePhase::Turn`（含 in-turn `Retry` 子状态） |
 | 2 | `zhive.hook` | `execute_tool {gen_ai.tool.name}` 不适用 —— hook 不是 tool；采用 zhive 自有命名 `hook.{hook_event_name}`（如 `hook.PreToolUse`） | B5 `HookHost::dispatch(event)` 单一入口（A4 §3 `HookEvent` enum） | `hook_event_name` → 内嵌在 span name，`session_id` → `session.id`，`registered_by.id` → `code.namespace`，`registered_by.source` → zhive 自有 `zhive.extension.source`，`agent_id` / `agent_type` / `parent_tool_use_id` → 都 Option 转 `gen_ai.agent.id` / `gen_ai.agent.name` / zhive 自有 `zhive.parent_tool_call_id` | `zhive.turn`（多数）/ `zhive.subagent`（subagent 内）/ root（SessionStart） | 任何 phase 都可能触发，但每个 hook event 类型与 phase 有强相关（PreToolUse ⊂ Turn / PreCompact ⊂ Compaction） |
-| 3 | `zhive.subagent` | `chat {model}` 子 span，加 `gen_ai.agent.id` / `gen_ai.agent.name` | `Engine::spawn_subagent` 入口（B1 §4）；持续直到 child engine 上首个 turn 结束并 final message 回流父 | `parent_thread_id` → `zhive.parent.session.id` (zhive 自有)，`child_thread_id` → `session.id`，`agent_type` → `gen_ai.agent.name`，`spawn_reason` → zhive 自有 `zhive.subagent.spawn_reason` | `zhive.turn`（父 turn） | `EnginePhase::SubagentSpawn` 期间，结束后父回 `Turn` |
-| 4 | `zhive.permission` | 无 OTel 对应 —— zhive 自有；span name `permission.{tool_name}` | A3 `PermissionReducer::evaluate` 入口；反向 RPC `permission/request` 发出到 `permission/response` 回收 | `tool_name` → `gen_ai.tool.name`，`tool_call_id` → `gen_ai.tool.call.id`，`decision` → zhive 自有 `zhive.permission.decision`（`allow / deny / once / always_allow`），`source` → zhive 自有 `zhive.permission.source`（user / policy / inherited） | `zhive.tool_call` 或 `zhive.hook`（PermissionRequest） | 通常 `Turn` 内；subagent 时在 `SubagentSpawn` 内 |
+| 3 | `zhive.subagent` | `chat {model}` 子 span，加 `gen_ai.agent.id` / `gen_ai.agent.name` | `Engine::spawn_subagent` 入口（B1 §4）；持续直到 child engine 上首个 turn 结束并 final message 回流父 | `parent_thread_id` → `zhive.parent.session.id` (zhive 自有)，`child_thread_id` → `session.id`，`agent_type` → `gen_ai.agent.name`，`spawn_reason` → zhive 自有 `zhive.subagent.spawn_reason` | `zhive.turn`（父 turn） | 父 `EnginePhase::Turn` 内——subagent spawn 走 `agent` 工具调用，不占独立 phase |
+| 4 | `zhive.permission` | 无 OTel 对应 —— zhive 自有；span name `permission.{tool_name}` | A3 `PermissionReducer::evaluate` 入口；反向 RPC `session/request_permission` 请求发出到响应回收 | `tool_name` → `gen_ai.tool.name`，`tool_call_id` → `gen_ai.tool.call.id`，`decision` → zhive 自有 `zhive.permission.decision`（`allow / deny / once / always_allow`），`source` → zhive 自有 `zhive.permission.source`（user / policy / inherited） | `zhive.tool_call` 或 `zhive.hook`（PermissionRequest） | `Turn` 内；subagent 内的权限请求落在父 turn 的 `zhive.subagent` 子 span 下 |
 | 5 | `zhive.tool_call` | `execute_tool {gen_ai.tool.name}`（OTel GenAI 标准） | LLM provider stream 解析出 `tool_call` item 时打开 span；tool 返回 result 时关闭 | `tool_name` → `gen_ai.tool.name`，`tool_call_id` → `gen_ai.tool.call.id`，`tool_input` → 不上 wire（PII / 体积大；只在 debug! 级日志中），`tool_result.status` → `error.type` 当失败 | `zhive.turn` | `EnginePhase::Turn` 内 |
 | 6 | `zhive.rollback_point` | 无 OTel 对应 —— zhive 自有；span name `rollback_point` | B2 state-memory rollback 触发点（fork / undo / branch_summary 时记录的"可回滚锚点"创建） | `thread_id` → `session.id`，`rollback_id` → zhive 自有 `zhive.rollback.id`，`reason` → zhive 自有 `zhive.rollback.reason`（user_fork / auto_branch_summary） | `zhive.turn` 或 root（用户主动 fork 在 Idle） | `Idle` / `BranchSummary` / `Turn` 内都可能 |
 
-### 2.2 span 与 EnginePhase 6 态对应矩阵
+### 2.2 span 与 EnginePhase 5 态对应矩阵
 
 | EnginePhase | 哪个 span active？ | 备注 |
 |---|---|---|
-| `Idle` | 无 `zhive.turn` / `zhive.subagent`；可能有 root `zhive.hook`（SessionStart / Notification）/ `zhive.rollback_point`（用户主动 fork） | engine 顶层 phase 自身**不开 span**——通过 `subscribe_phase()` 的 watch::Receiver 在 `phase/changed` 事件触发时 emit `info!("phase_changed", from=?, to=?)` 即可，不需要 phase span（phase 是状态而非工作单元） |
-| `Turn` | `zhive.turn` 必 active；其中嵌 `zhive.tool_call` * N + `zhive.permission` * N + `zhive.hook(PreToolUse|PostToolUse|...)` * N | turn 是 span 的天然边界 |
+| `Idle` | 无 `zhive.turn` / `zhive.subagent`；可能有 root `zhive.hook`（SessionStart / Notification）/ `zhive.rollback_point`（用户主动 fork） | engine 顶层 phase 自身**不开 span**——通过 `subscribe_phase()` 的 watch::Receiver 在 `events/phase_changed` 事件触发时 emit `info!("phase_changed", from=?, to=?)` 即可，不需要 phase span（phase 是状态而非工作单元） |
+| `Turn` | `zhive.turn` 必 active；其中嵌 `zhive.tool_call` * N + `zhive.permission` * N + `zhive.hook(PreToolUse|PostToolUse|...)` * N；subagent 经 `agent` 工具调用打开 `zhive.subagent` 子 span（其中再嵌父 `zhive.hook(SubagentStart)` + 子 thread 自己的 `zhive.turn`） | turn 是 span 的天然边界；subagent spawn 是 turn 内的一次工具调用，不占独立 phase |
 | `Compaction` | `zhive.hook(PreCompact)` + `zhive.hook(PostCompact)`；**no** dedicated `zhive.compaction` span（D-014 没列） | TODO B9-1 见 §7 |
 | `BranchSummary` | `zhive.rollback_point`（fork 时）+ `zhive.hook(?)`（A4 暂未列 BranchSummary 事件） | TODO B9-2 |
 | `Retry` | `zhive.turn` 仍 active（在内部 backoff 循环上发 `warn!("turn_retry", attempt=N, backoff_ms=M)`） | retry 不开新 span；仅日志事件 |
-| `SubagentSpawn` | `zhive.subagent` 必 active；其中嵌 父 `zhive.hook(SubagentStart)` 触发后；子 thread 自己的 `zhive.turn` 作为子 span | 父 `zhive.turn` 仍持有 |
 
 ### 2.3 instrument 推荐方式
 
@@ -123,13 +122,13 @@ D-014 没说"用 `#[instrument]` 还是手写 `span!`"。本 deliverable 定下�
 | `usage.input_tokens` | u64 | `gen_ai.usage.input_tokens` | ✅ `zhive.turn` close 时 set | LLM 层 | 直接对齐 |
 | `usage.output_tokens` | u64 | `gen_ai.usage.output_tokens` | ✅ `zhive.turn` close 时 set | LLM 层 | 直接对齐 |
 | `turn_status` | `TurnStatus`（4 态） | 部分进 `error.type` —— Failed / Interrupted 时 set `error.type = "turn_interrupted" / "turn_failed"` | ✅ `zhive.turn` close 时 set | turn 层 | OTel `error.type` 是 free-form 字符串；zhive 推荐值见 §3.3 |
-| `engine_phase` | `EnginePhase`（6 态） | 无标准 —— zhive 自有 | 不进 span（是状态而非工作单元）—— 仅在 `phase/changed` 时 emit `info!("phase_changed", from = ?prev, to = ?next)` | n/a（log event） | TODO B9-3 |
+| `engine_phase` | `EnginePhase`（5 态） | 无标准 —— zhive 自有 | 不进 span（是状态而非工作单元）—— 仅在 `events/phase_changed` 时 emit `info!("phase_changed", from = ?prev, to = ?next)` | n/a（log event） | TODO B9-3 |
 | `hook_event_name` | String（来自 A4 14 case） | 无标准 —— zhive 自有 | 内嵌在 span name `hook.PreToolUse` 而非 field | `zhive.hook` | |
 | `registered_by.id` | String（"builtin:filesystem" / "user:my-skill" / ...） | `code.namespace` 大致语义 | ✅ `zhive.hook` | hook 层 | 用 zhive 自有 `zhive.extension.id`（命名空间清晰）+ 双写 `code.namespace` 供 OTel backend 用 |
 | `registered_by.source` | `ExtensionSource`（builtin / user / project / local / mcp） | 无标准 —— zhive 自有 | ✅ `zhive.hook` | hook 层 | `zhive.extension.source` |
 | `permission_decision` | `PermissionDecision`（A3 四态：allow / deny / once / always） | 无标准 —— zhive 自有 | ✅ `zhive.permission` close 时 set | permission 层 | `zhive.permission.decision` |
 | `permission_source` | "user" / "policy" / "inherited" | 无标准 | ✅ `zhive.permission` | permission 层 | `zhive.permission.source` |
-| `rpc.method` | String（"session/prompt" / "session/cancel" / ...） | `rpc.method`（标准） | ✅ JSON-RPC server 入口（B4） —— 由 server 层在 dispatch 时开一个独立 `zhive.rpc` span 包裹整个 RPC 请求 | server 层 | TODO B9-4：B9 是否要把 RPC span 列入"6 个必覆盖"？D-014 没列。本 deliverable 倾向**不列入硬清单**——server 层 RPC span 由 B4 定义，B9 只规约字段名 |
+| `rpc.method` | String（"engine/start_turn" / "session/cancel" / ...） | `rpc.method`（标准） | ✅ JSON-RPC server 入口（B4） —— 由 server 层在 dispatch 时开一个独立 `zhive.rpc` span 包裹整个 RPC 请求 | server 层 | TODO B9-4：B9 是否要把 RPC span 列入"6 个必覆盖"？D-014 没列。本 deliverable 倾向**不列入硬清单**——server 层 RPC span 由 B4 定义，B9 只规约字段名 |
 | `rpc.system.name` | "jsonrpc" 常量 | `rpc.system.name=jsonrpc` | ✅ server 层 span 常量字段 | server 层 | |
 | `jsonrpc.protocol.version` | "2.0" 常量 | `jsonrpc.protocol.version` | ✅ server 层 | server 层 | |
 | `jsonrpc.request.id` | String / Number | `jsonrpc.request.id` | ✅ server 层 | server 层 | |
@@ -171,7 +170,7 @@ OTel `error.type` 是 free-form string；zhive 规约下面 8 个值（其余 fa
 |---|---|---|---|
 | `error!` | **不可恢复**错误 / 进程级失败 / 数据完整性损坏风险 | LLM provider 5xx 不可重试、Storage commit 失败、JSON-RPC framing 解析失败、`unwrap_or_else(\|e\| error!(...))` 等 fallback 路径 | ✅ default `RUST_LOG=info` 时仍打 |
 | `warn!` | **可恢复**异常 / 用户应该知道但 zhive 自己能处理 | Turn retry（每次 retry 发一条 warn）、Permission denied、Hook callback timeout（在 graceful 超时阈值内）、Tool call 失败但 LLM 还能继续 | ✅ default 打 |
-| `info!` | **生命周期里程碑** / 不频繁的状态变化 | Engine spawn / shutdown、Thread 创建 / 关闭、`phase/changed`（每次 EnginePhase transition）、Subagent spawn / final message 回流、SessionStart hook、`turn/started` / `turn/completed`（一对 / turn） | ✅ default 打 |
+| `info!` | **生命周期里程碑** / 不频繁的状态变化 | Engine spawn / shutdown、Thread 创建 / 关闭、`events/phase_changed`（每次 EnginePhase transition）、Subagent spawn / final message 回流、SessionStart hook、`events/turn_started` / `events/turn_completed`（一对 / turn） | ✅ default 打 |
 | `debug!` | **每 turn / 每 tool_call 内部步骤** / 排查问题时需要的细节 | tool_call dispatch 前的参数预览（trim 到 200 char）、reasoning chunk 计数、`registered_by` 解析过程、permission reducer 评估的中间态、watch::Receiver lag | 默认关；`RUST_LOG=zhive=debug` 开 |
 | `trace!` | **逐 event / 逐 chunk** / 含完整 PII 数据 / 性能热点 | 每个 reasoning chunk 字面内容、每个 LLM streaming SSE frame、完整 tool_input / tool_result JSON、channel send/recv 时序 | 默认关；`RUST_LOG=zhive=trace` 开 |
 
@@ -271,7 +270,7 @@ fn init_tracing() {
     #[cfg(feature = "otel")]
     let registry = registry.with({
         let tracer = opentelemetry_sdk::trace::TracerProvider::builder()
-            .with_batch_exporter(/* OTLP gRPC/HTTP exporter; Phase 1 不实装 */)
+            .with_batch_exporter(/* OTLP gRPC/HTTP exporter; Phase 1 默认不启用 */)
             .build()
             .tracer("zhive");
         tracing_opentelemetry::layer().with_tracer(tracer)
@@ -290,7 +289,7 @@ async fn main() -> anyhow::Result<()> {
 **编译性约束**：
 - `tracing_subscriber::EnvFilter::try_from_default_env()` 失败时回落 `zhive=info,warn`（不 `unwrap` —— CLAUDE.md 红线）
 - `tracing_subscriber::Registry::init()` 在多次调用时 panic；CLI bin 仅一次 entry 调用，安全
-- OTel layer 在 cargo feature gate 后；Phase 1 主路径不引 `tracing-opentelemetry` / `opentelemetry-sdk` crate 依赖（CLAUDE.md "禁止新增 dependency"，仅作 Phase 2 扩展位）
+- OTel layer 在 cargo feature gate 后；`tracing-opentelemetry` / `opentelemetry` / `opentelemetry_sdk` 三个 crate 已声明但被 `otel` feature 门控（默认 off），默认构建路径不编译它们，仅在 `--features otel` 时拉入。Phase 2 把 `otel` 纳入默认 feature 集即激活
 
 ---
 
@@ -298,9 +297,9 @@ async fn main() -> anyhow::Result<()> {
 
 | # | 问题 | 答案（≤ 8 行） |
 |---|---|---|
-| 1 | 6 个必覆盖 span 的 instrument 位置 + 与 B1 EnginePhase 6 态对应关系 | §2 完整矩阵。要点：`zhive.turn`（`Engine::start_turn` 入口 → `turn/completed`，对应 `EnginePhase::Turn`）/ `zhive.hook`（B5 `HookHost::dispatch` 单一入口，跨所有 phase）/ `zhive.subagent`（`Engine::spawn_subagent`，`SubagentSpawn` phase）/ `zhive.permission`（A3 reducer + 反向 RPC，多在 `Turn` 内）/ `zhive.tool_call`（LLM stream 解析 tool_call item 时打开，`Turn` 内）/ `zhive.rollback_point`（B2 rollback 触发点，`Idle/BranchSummary/Turn` 内都可能）。EnginePhase 自身**不开 span**，仅用 `phase/changed` event + `info!` 记录。 |
+| 1 | 6 个必覆盖 span 的 instrument 位置 + 与 B1 EnginePhase 5 态对应关系 | §2 完整矩阵。要点：`zhive.turn`（`Engine::start_turn` 入口 → `events/turn_completed`，对应 `EnginePhase::Turn`）/ `zhive.hook`（B5 `HookHost::dispatch` 单一入口，跨所有 phase）/ `zhive.subagent`（`Engine::spawn_subagent`，经 `agent` 工具调用在父 `Turn` 内打开）/ `zhive.permission`（A3 reducer + 反向 RPC，多在 `Turn` 内）/ `zhive.tool_call`（LLM stream 解析 tool_call item 时打开，`Turn` 内）/ `zhive.rollback_point`（B2 rollback 触发点，`Idle/BranchSummary/Turn` 内都可能）。EnginePhase 自身**不开 span**，仅用 `events/phase_changed` event + `info!` 记录。 |
 | 2 | span 字段命名是否对齐 OTel semconv？ | **对齐**。规约总则见 §3.1，逐项映射表见 §3.2。关键决策：(a) `thread_id` 双写 `session.id` + `gen_ai.conversation.id`；(b) `tool_name / tool_call_id` 直接用 `gen_ai.tool.name` / `gen_ai.tool.call.id`；(c) `provider_name` 用 OTel 最新 `gen_ai.provider.name`（不用旧 `gen_ai.system`）；(d) `turn_id` 无 OTel 对应，用 zhive 自有 `zhive.turn.id`；(e) RPC 层用 `rpc.system.name=jsonrpc` / `rpc.method` / `jsonrpc.protocol.version` / `jsonrpc.request.id` / `rpc.response.status_code`；(f) zhive 自有扩展统一加 `zhive.` 前缀。 |
-| 3 | 何时 `error!` / `warn!` / `info!` / `debug!` / `trace!`？ | §4 完整表 + 示例。要点：error = 不可恢复 / 进程级失败；warn = 可恢复异常（含 retry / permission denied / hook timeout）；info = 生命周期里程碑（engine spawn / phase/changed / turn lifecycle / subagent lifecycle）；debug = 每 turn / 每 tool_call 内部步骤（含 trim 过的 tool_input preview）；trace = 逐 chunk / 完整 PII。default `RUST_LOG=info,warn` 打 error+warn+info，debug/trace 需显式开。 |
+| 3 | 何时 `error!` / `warn!` / `info!` / `debug!` / `trace!`？ | §4 完整表 + 示例。要点：error = 不可恢复 / 进程级失败；warn = 可恢复异常（含 retry / permission denied / hook timeout）；info = 生命周期里程碑（engine spawn / events/phase_changed / turn lifecycle / subagent lifecycle）；debug = 每 turn / 每 tool_call 内部步骤（含 trim 过的 tool_input preview）；trace = 逐 chunk / 完整 PII。default `RUST_LOG=info,warn` 打 error+warn+info，debug/trace 需显式开。 |
 | 4 | tracing-subscriber 初始化在哪一层？ | **CLI bin 入口**（`zhive-cli/src/main.rs::init_tracing()`），core / proto / 其他 lib crate **绝对不**调用 `registry.init()`（lib 不 init subscriber 是 tracing 生态惯例，参 tracing docs §"In Libraries"）。OTel layer 通过 cargo feature `otel` gate 在 CLI bin 处条件注册，core 完全不感知。留扩展位 C（`Engine::set_dispatch_for_tests` test-only 钩子）供 nextest 用例装 in-memory subscriber 验证 span 触发，但**不暴露公开 builder**。详见 §5。 |
 
 ---
@@ -311,13 +310,13 @@ async fn main() -> anyhow::Result<()> {
 
 > TODO(开放项 B9-2)：`EnginePhase::BranchSummary` 同 B9-1 —— A4 deliverable 14 hook 事件里没列 `BranchSummary` 类，导致这个 phase 期间唯一 span 是 `zhive.rollback_point`（仅在 fork 瞬间）。建议补 `zhive.branch_summary` 容器 span + A4 新增 `PreBranchSummary / PostBranchSummary` reserved hook（与 A4 已经建议的 `PostCompact` 一起回流到 `decision-diffs.md`）。
 
-> TODO(开放项 B9-3)：`EnginePhase` 是状态而非工作单元，本 deliverable §2.2 决策"不开 phase span，用 `phase/changed` log event"。但 OTel backend 通常按 span 时间轴可视化，没有 phase span 时无法在 timeline 上看到"engine 此刻在 Idle vs Turn vs Compaction"。备选：在 watch::Receiver<EnginePhase> 变化时开 / 关一个 `zhive.phase.{name}` 长 span。倾向**不实装**——会让 span 数翻倍，且与 `zhive.turn` 高度重叠。落地时观察 B9-1/B9-2 之后是否还需要。
+> TODO(开放项 B9-3)：`EnginePhase` 是状态而非工作单元，本 deliverable §2.2 决策"不开 phase span，用 `events/phase_changed` log event"。但 OTel backend 通常按 span 时间轴可视化，没有 phase span 时无法在 timeline 上看到"engine 此刻在 Idle vs Turn vs Compaction"。备选：在 watch::Receiver<EnginePhase> 变化时开 / 关一个 `zhive.phase.{name}` 长 span。倾向**不实装**——会让 span 数翻倍，且与 `zhive.turn` 高度重叠。落地时观察 B9-1/B9-2 之后是否还需要。
 
-> TODO(开放项 B9-4)：RPC 层 span（含 `rpc.method` / `jsonrpc.request.id`）是否进"D-014 必覆盖清单"？D-014 字面只列 6 个业务 span。本 deliverable §3.2 把 RPC 字段命名规约写下，但 instrument 位置（推荐 B4 在 server dispatcher 入口）属于 B4 deliverable 范畴。建议 B4 落地时确认"RPC span 与 zhive.turn 父子关系"（zhive.turn 由 rpc `session/prompt` 入口开启，应是 RPC span 的子 span）。
+> TODO(开放项 B9-4)：RPC 层 span（含 `rpc.method` / `jsonrpc.request.id`）是否进"D-014 必覆盖清单"？D-014 字面只列 6 个业务 span。本 deliverable §3.2 把 RPC 字段命名规约写下，但 instrument 位置（推荐 B4 在 server dispatcher 入口）属于 B4 deliverable 范畴。建议 B4 落地时确认"RPC span 与 zhive.turn 父子关系"（zhive.turn 由 rpc `engine/start_turn` 入口开启，应是 RPC span 的子 span）。
 
 > TODO(开放项 B9-5)：`broadcast::Sender<EngineEvent>` 容量 1024（B1 §6）+ tracing 强制覆盖事件流可能造成 channel lag。建议在 B9 实装后用真实 turn 量测一次（每 turn event 数 × 客户端订阅数 × 并发 turn 数），如有 lag 调容量或上 watch::Sender<latest_snapshot> 模式。本 deliverable 不解决，仅作回流到 B1 TODO B1-6。
 
-> TODO(开放项 B9-6)：`tracing-opentelemetry` 在 Phase 1 不装（D-014 + R-6），但本 deliverable §5.3 草图里 `#[cfg(feature = "otel")]` 块需要在 Cargo.toml 写 optional dependency。**这意味着 Phase 1 要在 Cargo.toml 加 `tracing-opentelemetry` / `opentelemetry-sdk` 作为 optional dep**——但不进默认 features。是否触发 CLAUDE.md "禁止新增 dependency" 红线需要用户确认。备选：Phase 1 完全不在 Cargo.toml 提 OTel crate 名，feature gate 代码用 stub trait + 文档注释占位，等 Phase 2 装时再加 dep。**倾向后者**（更严守红线）。
+> TODO(开放项 B9-6)：OTel 三个 crate（`tracing-opentelemetry` / `opentelemetry` / `opentelemetry_sdk`）已在 Cargo.toml 声明：workspace 侧为普通声明（Cargo 无法把 `workspace.dependencies` 标 optional），`zhive-core` crate 侧为 `optional = true` 并由 `otel` feature 门控（`otel = ["dep:tracing-opentelemetry", "dep:opentelemetry", "dep:opentelemetry_sdk"]`），默认 features 不启用。§5.3 草图里 `#[cfg(feature = "otel")]` 块即落在此 feature 之后。Phase 2 在确认 OTLP exporter 目标后把 `otel` 纳入默认 feature 集即可激活，无需再加 dep。
 
 > TODO(开放项 B9-7)：日志事件字段命名（`tracing::info!(field = value, ...)`）与 span field 命名是否要严格一致？本 deliverable §3 / §4 示例用同名（如 `session.id` 在 span field 与 log event 字段同名）。但 tracing macro 字段名带 `.` 需要 raw identifier 或字符串 key（`r#"session.id"#` 形式），人体工学差。备选：log event 用 `session_id` snake_case，span field 用 `session.id`，由 OTel exporter layer 在 mapping 时翻译（`tracing-opentelemetry` 自动把 `.` 翻成 OTel attribute）。**倾向 log event `session_id` 简写 + span field `session.id` 标准**——双轨命名，落地时在 B9 实装文档里给 mapping 表。
 

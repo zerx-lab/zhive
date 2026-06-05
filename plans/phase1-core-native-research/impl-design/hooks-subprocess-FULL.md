@@ -1,17 +1,6 @@
 # 【全量】Subprocess hook 执行体协议 — HookExecutor::Subprocess 真正 spawn 子进程（JSON stdin → JSON stdout + exit-code 语义 + timeout/cancel/隔离）
 
 ## currentState
-zhive 当前 hook host 是「纯 in-process trait 单轨」，无任何 executor 抽象、无子进程能力：
-
-- `crates/zhive-core/src/hooks/mod.rs:30-37` `trait HookFn { async fn call(&self, event:&HookEvent)->Option<HookOutput> }`，是唯一执行体。
-- `crates/zhive-core/src/hooks/mod.rs:101-113` `struct HookRegistration { id, registered_by, filter, priority, callback: Arc<dyn HookFn> }` —— callback 是裸 `Arc<dyn HookFn>`，**无 HookExecutor enum**。
-- `crates/zhive-core/src/hooks/mod.rs:172-208` `HookHost::register(self:&Arc<Self>, registered_by, filter, priority, callback:Arc<dyn HookFn>) -> Result<ExtensionScope,HookHostError>`，红线 10 校验 id/version 非空后按 priority 降序插入。
-- `crates/zhive-core/src/hooks/mod.rs:277-317` `dispatch_inner`：read 锁拍快照成 `Vec<(RegistrationId, Arc<dyn HookFn>)>`，串行 for-loop，每个 `std::panic::AssertUnwindSafe(callback.call(event)).catch_unwind().await`，panic 隔离 warn+continue（mod.rs:296-313），返回 `Vec<HookOutput>`。**无 tokio::time::timeout 包裹**。
-- `crates/zhive-core/src/hooks/scope.rs:42-89` `ExtensionScope` RAII Drop 注销。
-- `crates/zhive-core/src/hooks/validator.rs` `SchemaCache`（红线 11 复用，subprocess updated_input 也走它）。
-- dispatch 调用点：`crates/zhive-core/src/engine/tool_dispatch/mod.rs:413`（PreToolUse，HookOutput 折叠见 mod.rs:433-485：读 continue_loop / HookSpecificOutput::PreToolUse{permission_decision, updated_input}）、mod.rs:962（PostToolUse）、mod.rs:1009（PostToolUseFailure）、`crates/zhive-core/src/engine/compaction.rs:223`。
-- HookHost 构造点（全部 builtin，无 subprocess loader）：`engine/inner.rs:158`、`engine.rs:221`、`subagent_spawn.rs:888`。
-
 子进程基建已存在（关键复用锚点）：`crates/zhive-core/src/tools/builtin/bash.rs:159-209` 已有生产级 `tokio::process::Command` + `kill_on_drop(true)`(bash.rs:161) + `Stdio::piped()`(165-166) + `child.wait_with_output()` pin + `tokio::select!{ wait | sleep(timeout) | cancel.cancelled() }`(186-208)。
 
 依赖现状：`crates/zhive-core/Cargo.toml:31` `tokio = { workspace=true, features=["io-std","process"] }` —— **process feature 已启用**，无需改 Cargo.toml。`tokio::time::timeout` 走 workspace time feature（root Cargo.toml:47 已含 "time"）。chrono **不是** zhive 依赖（验证：root+core Cargo.toml grep 空）—— 故不能学 codex 用 chrono 打时间戳，时序字段用 `std::time::Instant`/`Duration`。

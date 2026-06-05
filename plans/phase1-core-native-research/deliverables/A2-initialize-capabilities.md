@@ -2,7 +2,7 @@
 task: A2
 title: initialize 握手 + capabilities 协商（D-007 落地）
 date: 2026-05-28
-status: draft
+status: implemented
 depends_on:
   - research/99-decisions D-007 (强制 initialize 握手 + v1/v2 命名空间 + capabilities 协商)
   - research/99-decisions D-005 (rmcp/ACP 仅在 bridge crate)
@@ -18,7 +18,7 @@ references:
 ---
 
 > 范围声明：本 deliverable 仅为 A2 子任务调研产出；**不**包含任何 zhive crate 实现代码改动。
-> ACP 路径均指 `~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/agent-client-protocol-schema-0.12.0/`，被 `agent-client-protocol = "=0.12.1"`（D-005）传递依赖。
+> ACP 调研路径均指 `~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/agent-client-protocol-schema-0.12.0/`（调研基线版本）；运行时依赖为 `agent-client-protocol = "0.13"`（D-005）。
 > codex 路径均指 `~/Desktop/code/github/codex/codex-rs/`。
 > **重要前提**：codex 没有把 `Initialize` 放进 `protocol/v2/` 子目录；`v2` 仅承载 thread/turn/item 等新原语，而握手类型留在 `v1.rs`，通过 `protocol::v1::InitializeParams` 在 `common.rs` 的 `client_request_definitions!` 宏中被引用。**zhive v1/v2 命名空间共存的证据未直接定位**——本 deliverable 关于 zhive 双命名空间编码规则的结论基于 plan §4 A2 + codex `client_request_definitions!` 宏的字面行为推断。
 
@@ -56,7 +56,7 @@ references:
 | zhive `ErrorObject { code: i64, message, data }` 已就位 | `crates/zhive-proto/src/lib.rs` | 174-181 |
 
 > TODO(开放项-A2.1)：codex `protocol/v2/` 目录下 28 个文件均未提及 `Initialize`；`v2` 命名空间是否有独立握手类型未直接定位。本 deliverable 假设 codex 的「双命名空间共存」表现为：**同一个 `initialize` 入口 + `capabilities.experimental_api: bool` 单 flag 控制是否启用 v2 方法**，而非两个不同的 `vN/initialize` 方法字符串。
-> TODO(开放项-A2.2)：ACP 端版本协商失败的具体错误码未在 ACP schema crate 里发现常量（agent.rs error 模块、`error.rs`、`elicitation.rs` 内 grep `INITIALIZE` / `VERSION` / `negotiation` 均无明文）。需查 ACP 主 crate `agent-client-protocol = 0.12.1` 而非 schema sub-crate；本次按 ACP 文档常见做法 + zhive ErrorObject.code 设计推断。
+> TODO(开放项-A2.2)：ACP 端版本协商失败的具体错误码未在 ACP schema crate 里发现常量（agent.rs error 模块、`error.rs`、`elicitation.rs` 内 grep `INITIALIZE` / `VERSION` / `negotiation` 均无明文）。需查 ACP 主 crate `agent-client-protocol = 0.13` 而非 schema sub-crate；本次按 ACP 文档常见做法 + zhive ErrorObject.code 设计推断。
 
 ---
 
@@ -266,7 +266,7 @@ fn default_true() -> bool { true }
 ## 7. 未决项汇总（TODO）
 
 1. **TODO(开放项-A2.1)**：codex `protocol/v2/` 没有 `Initialize` 类型；本 deliverable 对「双命名空间共存」的解读为「源码模块层 v1/v2 + wire 层无前缀 + capability 协商」三件套。该解读需在 D-007 决策文档里固化。
-2. **TODO(开放项-A2.2)**：ACP 端版本协商失败的精确错误码常量未在 `agent-client-protocol-schema-0.12.0` sub-crate 内定位；建议 B1 阶段查 `agent-client-protocol = 0.12.1` 主 crate `error.rs` 确认。
+2. **TODO(开放项-A2.2)**：ACP 端版本协商失败的精确错误码常量未在 `agent-client-protocol-schema-0.12.0` sub-crate 内定位；建议 B1 阶段查 `agent-client-protocol = 0.13` 主 crate `error.rs` 确认。
 3. **TODO(开放项-A2.3)**：是否纳入 `initialized` notification（codex 有，ACP 无）——本文档建议**纳入**，但 D-007 文本未声明，需 PR 走流程。
 4. **TODO(开放项-A2.4)**：`Capabilities.cancellation` 默认 `true` 与其他 flag 默认 `false` 不对称，会让 `Capabilities::default()` 含非零字段，需 A3 review serde `#[serde(default = "default_true")]` 是否引发歧义。
 5. **TODO(开放项-A2.5)**：ACP `SessionCapabilities` (agent.rs L3883) 内子字段未深挖，A3 (permission/streaming) 若涉及需补对齐表。

@@ -1,17 +1,13 @@
 # 【全量】父子 permission reducer 完整逐 tool-call 实时握手（档 B 生产版）
 
-## currentState
-基线已落地的部分（仍保留，全量版在其上叠加）：
-- Defer wire/Suspended 三件由基线 permission-suspend-resume.md 覆盖：PermissionOutcome::Defer、ResumeOutcome、ResumePermissionParams、TurnSuspended/Resumed、SubagentFinalEvent::Suspended — 这些仍要做，全量版不改其形状，只新增子→父逐 tool-call 通道。
+## foundation
+基线底座（全量版在其上叠加）：
+- Defer wire/Suspended 三件由 permission-suspend-resume.md 覆盖：PermissionOutcome::Defer、ResumeOutcome、ResumePermissionParams、TurnSuspended/Resumed、SubagentFinalEvent::Suspended — 全量版不改其形状，只新增子→父逐 tool-call 通道。
 
-父子双调的当前精确缺口（这正是本全量特性要补的）：
-- 子 turn 自洽跑完、父阻塞 rx.recv()：crates/zhive-core/src/engine/subagent_spawn.rs:96-224 `spawn_subagent_awaitable` 创建 child ThreadHandle 后 tokio::spawn(run_child_turn_and_deliver)（:207-214），父侧 `EngineSubagentSpawner::spawn_and_await`（:517-548）单纯 `rx.recv().await`（:539）只 match Completed/Errored，**期间对子的每一步 tool-call 零干预**。
-- 子 dispatch 用子自己 narrowed scope 单次 fold，决策不上报父：crates/zhive-core/src/engine/tool_dispatch/mod.rs:488 `evaluate(scope,&decisions)`，scope 来自 run_turn 读 handle.active_turn.scope（turn.rs:169-174），子 turn 拿的是 child_scope（subagent_spawn.rs:198）。Allow 分支（:490-492）/Deny（:493-501）/Ask|Defer（:503-757）全程没有把决策发回父的通道。
-- ThreadHandle 无 subagent_decision_tx：crates/zhive-core/src/state/thread.rs:29-76 只有 subagent_final_tx（:75），new_child（:136-159）只建一条 final channel（容量 1）。
-- SubagentFinalEvent 仅 Completed/Errored：crates/zhive-core/src/subagent.rs:57-84，:39-41 注释明确「Suspended 省略，TODO B8-O6」。
-- reducer 基础设施齐备可直接复用：crates/zhive-core/src/permission.rs PermissionReducer::{enroll,wait,wait_unbounded,resolve_by_wire_id,cancel_all}（:228-330），evaluate（:97-108，含 BypassPermissions 短路），PendingPermissions（permission/pending.rs，单 EngineInner 全局共享一个 reducer，permission.rs:124 Arc）。
-- 子 turn 在独立 tokio task：subagent_spawn.rs:207；父 turn 在另一独立 task（inner.rs start_turn → turn.rs run_turn）。两 task 之间唯一通道是 final channel — 这是死锁与握手设计的核心约束点。
-- SubagentSpawner trait：crates/zhive-core/src/tools.rs:181-200，spawn_and_await(name,description,prompt)->Result<String,String>，被 builtin/agent.rs:128 调用。父对子的「等待 final」就发生在父 turn 的 tool execute 阶段（turn.rs:583 execute_resolved_tool → agent 工具 → spawn_and_await）。
+全量握手所复用的既有架构（设计约束）：
+- reducer 基础设施直接复用：crates/zhive-core/src/permission.rs PermissionReducer::{enroll,wait,wait_unbounded,resolve_by_wire_id,cancel_all}，evaluate（含 BypassPermissions 短路），PendingPermissions（permission/pending.rs，单 EngineInner 全局共享一个 reducer，Arc）。
+- 子 turn 在独立 tokio task：subagent_spawn/mod.rs；父 turn 在另一独立 task（inner.rs start_turn → turn.rs run_turn）。两 task 之间的 final channel 是死锁与握手设计的核心约束点。
+- SubagentSpawner trait：crates/zhive-core/src/tools.rs:181-200，spawn_and_await(name,description,prompt)->Result<String,String>，被 builtin/agent.rs 调用。父对子的「等待 final」发生在父 turn 的 tool execute 阶段（execute_resolved_tool → agent 工具 → spawn_and_await）。
 
 ## harnessRef
 **唯一权威全量参考 = codex（不是 pi）**。

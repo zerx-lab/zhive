@@ -9,19 +9,17 @@
 
 3. `PersistenceWriter` actor 已实现 write-through（writer.rs:204-235）：唯一 consumer，per-thread `RolloutWriter`，fsync 仅在 TurnEnded/Flush（writer.rs:369-415, 433-444），shutdown drain（writer.rs:218-229）。引擎侧 `enqueue_storage_op` 非阻塞 try_send（inner.rs:274-288）。
 
-4. 内存模型现状是 per-handle `items_tail: RwLock<VecDeque<Item>>` + `items_tail_capacity`（thread.rs:38-41, 179-185 push_item 截断兜底），无 Turn 维度、无 TurnItemsView 三态、无 lazy_unloaded_count、无 write_queue。`ThreadStore` 是 `RwLock<HashMap<ThreadId, Arc<ThreadHandle>>>`（thread.rs:343-345）。
+4. `ThreadStore` 是 `RwLock<HashMap<ThreadId, Arc<ThreadHandle>>>`（thread.rs:343-345）。
 
-5. 无 thread 级 `ThreadEvent`——只有 engine 级 `EngineEvent` broadcast（event.rs:38-159，已含 TurnStarted/ItemAppended/ItemDelta/TurnCompleted/TurnFailed/PhaseChanged/Usage/SubagentCompleted 等），由 `EngineInner.events_tx`（inner.rs:83, 211-213）单一 fan-out，`Engine::subscribe()`（engine.rs:508）暴露。
+5. engine 级 `EngineEvent` broadcast（event.rs:38-159，已含 TurnStarted/ItemAppended/ItemDelta/TurnCompleted/TurnFailed/PhaseChanged/Usage/SubagentCompleted 等），由 `EngineInner.events_tx`（inner.rs:83, 211-213）单一 fan-out，`Engine::subscribe()`（engine.rs:508）暴露。本任务的 thread 级 `ThreadEvent` 与之并列两层（见 approach 块2）。
 
-6. 无 `ThreadStorage` trait——持久化是具体类型 `Storage`/`StateDb`（非 trait，无 mock 注入点）。`EngineConfig.storage: Option<Arc<Storage>>`（engine.rs:187），spawn_with_config 据此 spawn writer（engine.rs:403-416）。
+6. 生产持久化路径是具体类型 `Storage`/`StateDb`。`EngineConfig.storage: Option<Arc<Storage>>`（engine.rs:187），spawn_with_config 据此 spawn writer（engine.rs:403-416）。本任务的 `ThreadStorage` trait 仅供测试 mock 与 lazy-load 泛型读，不改 EngineConfig 类型（见 approach 块3）。
 
-7. 无 session_index.jsonl（mod.rs 整文件无），无独立多文件 rebuild。已有 per-file `rebuild_state_from_rollout(state, rollout_path)`（writer.rs:479-571，逐行 replay Session/Item，best-effort 标 turn Completed）。RolloutEntry 仅 3 case：Session/Item/Leaf（rollout.rs:28-60），无 turn_start/turn_end/branch_summary/leaf-with-parent。Leaf 当前总写 target_id:None（writer.rs:384）。
+7. 已有 per-file `rebuild_state_from_rollout(state, rollout_path)`（writer.rs:479-571，逐行 replay Session/Item，best-effort 标 turn Completed），本任务在其上加目录遍历层做多文件 rebuild（见 approach 块4）。RolloutEntry 仅 3 case：Session/Item/Leaf（rollout.rs:28-60），无 turn_start/turn_end/branch_summary/leaf-with-parent。Leaf 当前总写 target_id:None（writer.rs:384）。
 
-8. 无 thread/read、thread/list、turn/get_items 等读 handler——server/handlers.rs 只注册写/控制类（handlers.rs:49-97），读路径在 server 层完全缺失。
+8. migration 文件实际名为 0001_init.sql（不是草图的 0001_threads.sql），state schema 是 threads/turns/items 三表（state/0001_init.sql:8-47），无 forked_from 索引外的 turn_index 单独表（turns 表已含 thread_id+started_at 索引）。
 
-9. migration 文件实际名为 0001_init.sql（不是草图的 0001_threads.sql），state schema 是 threads/turns/items 三表（state/0001_init.sql:8-47），无 forked_from 索引外的 turn_index 单独表（turns 表已含 thread_id+started_at 索引）。
-
-10. domain 已就位且复用：Thread{turns:Vec<Turn>}(domain.rs:124-155)、Turn{items,items_view:TurnItemsView,status,...}(domain.rs:218-241)、TurnItemsView{NotLoaded/Summary/Full}(domain.rs:248-256, Full 是 default)。D-006 单源已落地，B2 直接复用这些类型。
+9. domain 已就位且复用：Thread{turns:Vec<Turn>}(domain.rs:124-155)、Turn{items,items_view:TurnItemsView,status,...}(domain.rs:218-241)、TurnItemsView{NotLoaded/Summary/Full}(domain.rs:248-256, Full 是 default)。D-006 单源已落地，B2 直接复用这些类型。
 
 ## harnessRef
 codex ~/Desktop/code/github/codex/codex-rs/rollout/src/session_index.rs:16-80（SESSION_INDEX_FILE 常量 + SessionIndexEntry{id,thread_name,updated_at:Rfc3339} + append_thread_name/append_session_index_entry append-only OpenOptions append+create + find_thread_name_by_id 用 spawn_blocking 倒序扫——zhive 借鉴 append-only + 倒序最新胜，但用 i64 unix-seconds 替 Rfc3339 与现有 created_at 一致，且全 async tokio::fs 不引 spawn_blocking）。codex thread-store/src/store.rs:38-65,98-103（ThreadStore trait：create/resume/append_items/load_history/list_items 分页——借鉴 trait 方法集做 ThreadStorage trait 抽象，使 mock 可注入）。pi packages/agent/src/harness/session/jsonl-storage.ts:109-111,250-259（leafIdAfterEntry：普通 append leaf 隐式=entry.id，仅 fork 显式写 leaf——zhive 现在总写 None，本阶段沿用 None 不做 fork tree，fork 推到 client-native 任务#8）。本任务现有 writer.rs/state_db.rs 本身就是最权威 harness。

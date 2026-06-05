@@ -2,7 +2,7 @@
 task: B1
 title: Engine / agent loop + EnginePhase 状态机
 date: 2026-05-28
-status: draft
+status: implemented
 depends_on:
   - A1 deliverable (Thread / Turn / Item 类型 + turn/started·turn/completed notification 形态)
   - A3 deliverable (StreamingBehavior steer/followUp + Permission reducer)
@@ -34,7 +34,7 @@ references:
   - crates/zhive-core/src/lib.rs                       (engine + state + server module 已声明)
 ---
 
-> **设计衔接警告**：A1 deliverable §2.3 把 `turn/started / turn/completed` 描述为「core 暴露」的两个 JSON-RPC notification，且 A1 §6 草图把 `Turn.status` 设为 `TurnStatus = InProgress | Completed | Interrupted | Failed`（4 态）。B1 在此之上新增 **`EnginePhase` 显式枚举（Pi 模式，6 态）作为 Engine 级状态机**，与 `TurnStatus`（Turn 级状态）正交：`EnginePhase` 描述 engine 处于哪种宏观工作模式（Idle / Turn / Compaction / BranchSummary / Retry / SubagentSpawn），而 `TurnStatus` 描述某个具体 Turn 自身的生命周期。**不改 A1**——A1 的 4 态 TurnStatus 保留。下方 §3 给出二者交互矩阵。
+> **设计衔接警告**：A1 deliverable §2.3 把 `turn/started / turn/completed` 描述为「core 暴露」的两个 JSON-RPC notification，且 A1 §6 草图把 `Turn.status` 设为 `TurnStatus = InProgress | Completed | Interrupted | Failed`（4 态）。B1 在此之上新增 **`EnginePhase` 显式枚举（Pi 模式，5 态）作为 Engine 级状态机**，与 `TurnStatus`（Turn 级状态）正交：`EnginePhase` 描述 engine 处于哪种宏观工作模式（Idle / Turn / Compaction / BranchSummary / Retry），而 `TurnStatus` 描述某个具体 Turn 自身的生命周期。**不改 A1**——A1 的 4 态 TurnStatus 保留。下方 §3 给出二者交互矩阵。
 
 ---
 
@@ -67,9 +67,11 @@ references:
 
 ## 2. EnginePhase 设计（核心交付）
 
-### 2.1 case 选择：5 态（Pi）+ 1 zhive 自有 = 6 态
+### 2.1 case 选择：5 态（Pi）
 
-**决策**：直接采纳 Pi 的 5 态作为骨架（`Idle / Turn / Compaction / BranchSummary / Retry`），**新增第 6 态 `SubagentSpawn`**。理由见 §7 与 Pi 对照。
+**决策**：直接采纳 Pi 的 5 态作为骨架（`Idle / Turn / Compaction / BranchSummary / Retry`）。subagent 派生**不**单列 phase——它在父 turn 的 `Turn` phase 内通过 `agent` 工具运行（见 §7 与 Pi 对照）。
+
+`EnginePhase` 落在 `zhive-proto::hook`（hook wire 是唯一的 public 消费方）。
 
 ```rust
 /// Engine 顶层工作模式。**与 `TurnStatus` 正交**（后者是单个 Turn 的内部生命周期）。
@@ -78,13 +80,14 @@ references:
 /// 串行化（参考 codex `agent_status: watch::Sender<AgentStatus>`，
 /// `session/mod.rs:376`）。phase 改变同步广播 `phase/changed` notification + 触发
 /// `PhaseTransition` hook（见 §6.7）。
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum EnginePhase {
     /// 无活跃 turn，可启 turn / compact / navigate / spawn subagent
     Idle,
-    /// 正在处理 user prompt（含 tool_call 循环 + steering 注入）
+    /// 正在处理 user prompt（含 tool_call 循环 + steering 注入 + subagent 派生）
     Turn,
     /// 在跑 context compaction（D-012 `PreCompact` hook 已触发，等 `PostCompact`）
     Compaction,
@@ -92,8 +95,6 @@ pub enum EnginePhase {
     BranchSummary,
     /// 正在重试上一次失败的 LLM call（指数退避中）
     Retry,
-    /// 父 thread 派生 subagent 子 thread —— zhive 自有，对齐 D-008 subagent permission inheritance
-    SubagentSpawn,
 }
 ```
 
@@ -110,90 +111,82 @@ pub enum EnginePhase {
 ### 2.3 合法转换图
 
 ```text
-                            ┌─────────────────────────────────────────────┐
-                            │                                             │
-                            ▼                                             │
-                       ┌─────────┐                                        │
-                       │  Idle   │◀──────┐                                │
-                       └─────────┘       │                                │
-                       │  │  │  │  │     │                                │
-              start_turn  │  │  │  │  compaction_done                     │
-                       │  │  │  │  │     branch_summary_done              │
-                       ▼  │  │  │  │     retry_resolved                   │
-                   ┌──────┐ │  │  │  │   subagent_spawned                 │
-                   │ Turn │ │  │  │  │                                    │
-                   └──────┘ │  │  │  │                                    │
-                       │ ▲  │  │  │  └────────────┐                       │
-                turn_complete│  │  │               │                       │
-                       │ ▼  │  │  │               │                       │
-                       │    │  │  │   ┌───────────┴──┐                    │
-                       │    │  │  └──▶│ SubagentSpawn├────────────────────┘
-                       │    │  │      └──────────────┘
-                       │    │  │
-                       │    │  └──▶┌──────────────┐
-                       │    │      │ BranchSummary├────────────────────────┐
-                       │    │      └──────────────┘                        │
-                       │    │                                              │
-                       │    └─────▶┌────────────┐                          │
-                       │           │ Compaction ├──────────────────────────┤
-                       │           └────────────┘                          │
-                       │                                                   │
-                       └──────────▶┌────────┐                              │
-            turn_failed_retryable  │ Retry  ├──────────────────────────────┘
-                                   └────────┘
+                            ┌──────────────────────────────────┐
+                            │                                  │
+                            ▼                                  │
+                       ┌─────────┐                             │
+                       │  Idle   │◀──────┐                     │
+                       └─────────┘       │                     │
+                       │  │  │  │        │                     │
+              start_turn  │  │  │  compaction_done             │
+                       │  │  │  │        branch_summary_done   │
+                       ▼  │  │  │        retry_resolved        │
+                   ┌──────┐ │  │  │                            │
+                   │ Turn │ │  │  │                            │
+                   └──────┘ │  │  │                            │
+                       │ ▲  │  │  │                            │
+                turn_complete│  │  │                            │
+                       │ ▼  │  │  │                            │
+                       │    │  │  └──▶┌──────────────┐         │
+                       │    │  │      │ BranchSummary├─────────┤
+                       │    │  │      └──────────────┘         │
+                       │    │  │                               │
+                       │    │  └─────▶┌────────────┐           │
+                       │    │         │ Compaction ├───────────┤
+                       │    │         └────────────┘           │
+                       │    │                                  │
+                       │    └────────▶┌────────┐               │
+            turn_failed_retryable     │ Retry  ├───────────────┘
+                                      └────────┘
 ```
 
 **合法转换矩阵**（行 = from，列 = to；`X` = 允许，`·` = 拒绝并 `EngineError::IllegalPhaseTransition`；`*` = 仅 internal 触发，外部不可主动跳）：
 
-| from \ to        | Idle | Turn | Compaction | BranchSummary | Retry | SubagentSpawn |
-|------------------|:---:|:---:|:---:|:---:|:---:|:---:|
-| **Idle**         |  ·  |  X  |  X  |  X  |  ·  |  X  |
-| **Turn**         |  X  |  ·  |  ·  |  ·  |  X* |  X  |
-| **Compaction**   |  X  |  ·  |  ·  |  ·  |  ·  |  ·  |
-| **BranchSummary**|  X  |  ·  |  ·  |  ·  |  ·  |  ·  |
-| **Retry**        |  X  |  X* |  ·  |  ·  |  ·  |  ·  |
-| **SubagentSpawn**|  X  |  ·  |  ·  |  ·  |  ·  |  ·  |
+| from \ to        | Idle | Turn | Compaction | BranchSummary | Retry |
+|------------------|:---:|:---:|:---:|:---:|:---:|
+| **Idle**         |  ·  |  X  |  X  |  X  |  ·  |
+| **Turn**         |  X  |  ·  |  ·  |  ·  |  X* |
+| **Compaction**   |  X  |  ·  |  ·  |  ·  |  ·  |
+| **BranchSummary**|  X  |  ·  |  ·  |  ·  |  ·  |
+| **Retry**        |  X  |  X* |  ·  |  ·  |  ·  |
 
 **关键不变量**（与 Pi 同源）：
-- `Compaction / BranchSummary / Retry / SubagentSpawn` 只能 `→ Idle`，**互相不可跳**（避免组合爆炸 + 简化 hook 触发顺序）
+- `Compaction / BranchSummary / Retry` 只能 `→ Idle`，**互相不可跳**（避免组合爆炸 + 简化 hook 触发顺序）
 - `Turn → Retry → Turn` 的环对外不可见，由 engine 内部 in-turn 重试机制驱动（参 §6.5）
-- `Turn` 期间允许 `steer / followUp` 注入消息但**不改变 phase**（Pi 模型 `agent-harness.ts:652-667`）
+- `Turn` 期间允许 `steer / followUp` 注入消息但**不改变 phase**（Pi 模型 `agent-harness.ts:652-667`）；subagent 派生同样在 `Turn` 内进行，不改 phase
 
-### 2.4 与 Pi `AgentHarnessPhase` 的差异
+### 2.4 与 Pi `AgentHarnessPhase` 的对照
 
-| 维度 | Pi 5 态 | zhive 6 态 | 理由 |
+| 维度 | Pi 5 态 | zhive 5 态 | 理由 |
 |---|---|---|---|
 | Idle | ✓ | ✓ | 1:1 抄 |
-| Turn | ✓ | ✓ | 1:1 抄；含 tool_call 循环（codex `ActiveTurn.task: RunningTask`，`state/turn.rs:71-81`）|
+| Turn | ✓ | ✓ | 1:1 抄；含 tool_call 循环（codex `ActiveTurn.task: RunningTask`，`state/turn.rs:71-81`）+ subagent 派生（`agent` 工具） |
 | Compaction | ✓ | ✓ | 与 D-012 `PreCompact/PostCompact` hook 自然对齐（hook 触发即进 phase，结束即出）|
 | BranchSummary | ✓ | ✓ | A1 §6 没列 fork item 但 D-011 leaf 指针 + JSONL fork 需要这态；保留对齐 Pi `navigateTree` |
 | Retry | ✓ | ✓ | LLM provider 错误（429/502 / network）触发；Pi `agent-harness.ts:485` 已列态名但本调研在 Pi codebase 中**未 grep 到 `phase = "retry"` 显式 set**（仅在 type alias 列出）—— 推测是预留位 |
-| **SubagentSpawn** | ✗ | ✓（zhive 新增） | D-008 reverse RPC 含 `subagent permission inheritance` 硬约束；spawn 期间父 engine 必须暂停 turn 推进等 child engine 就绪 + 写权限继承 reducer，是独立工作单元 |
 
 **砍掉的 Pi 概念**：
 - 无（Pi 5 态全部保留）
 
-**zhive 新增的不在 Pi 中的概念**：
-- `SubagentSpawn`（D-008 子代理派生）
+**subagent 派生的处理**：subagent 不单列 phase。D-008 reverse RPC 的 `subagent permission inheritance` 硬约束在父 turn 的 `Turn` phase 内、通过 `agent` 工具 dispatch 完成；`spawn_subagent` 显式**不**抬升全局 engine phase（spawn 期间父 engine 仍是 `Turn`），子 thread 拥有自己的 Engine 实例 + 独立 phase 状态机。
 
-**TODO(开放项 B1-1)**：Pi 自己的 `retry` 态在 codebase 中无显式 set（rg 仅命中 type alias `agent-harness.ts:485`）。这表明 Pi 把 retry 算作 turn 内 sub-state，未提升到 phase。zhive 是否真需要把 `Retry` 独立成 phase 待 §8 验证。备选：把 `Retry` 折回 `Turn` 内部的 `TurnStatus` 扩展（`InProgress { retry_count: u32 }`）。倾向**保留独立 phase** —— 让 hook `PhaseTransition` 能监测到 retry 进入，以及 metric/tracing 能直接 span（D-014）。
+**`Retry` 提升为顶层 phase 的理由**：Pi 自己的 `retry` 态在 codebase 中无显式 set（rg 仅命中 type alias `agent-harness.ts:485`），表明 Pi 把 retry 算作 turn 内 sub-state。zhive 把 `Retry` 独立成 phase —— 让 hook `PhaseTransition` 能监测到 retry 进入，以及 metric/tracing 能直接 span（D-014）。
 
 ---
 
 ## 3. EnginePhase 与 A1 TurnStatus 交互矩阵
 
-A1 `TurnStatus`（4 态）是**单 turn 的内部生命周期**，B1 `EnginePhase`（6 态）是 **engine 顶层 phase**。
+A1 `TurnStatus`（4 态）是**单 turn 的内部生命周期**，B1 `EnginePhase`（5 态）是 **engine 顶层 phase**。
 
 | EnginePhase | 期望 TurnStatus（当前 Turn）| 备注 |
 |---|---|---|
 | `Idle` | （无活跃 Turn 或 Turn 已 `Completed/Interrupted/Failed`） | 上一个 Turn 已 finalize；下一个 Turn 尚未 start |
-| `Turn` | `InProgress` | 单一一一对应：phase=Turn ⟺ 存在一个 InProgress Turn |
+| `Turn` | `InProgress` | 单一一一对应：phase=Turn ⟺ 存在一个 InProgress Turn；subagent 派生在该 phase 内通过 `agent` 工具进行 |
 | `Compaction` | （无活跃 Turn） | compaction 在 Turn 边界外触发；compaction 自己**不创建** Turn item，而是产 `Item::ContextCompaction`（A1 §3 case 13）追加到上一个完成 Turn 末尾 |
 | `BranchSummary` | （无活跃 Turn） | fork 操作；产 `SystemNotice` item 落地 |
 | `Retry` | `InProgress`（同一个 Turn id） | retry 不开新 Turn，仅在 in-flight Turn 上重试 LLM call |
-| `SubagentSpawn` | 父 Turn 仍 `InProgress`（父 thread 视角）；子 thread 内的子 Turn 仍未起 | 父 Turn 在等 subagent 就绪；transition 后 phase 回 `Turn` |
 
-**不变量**：phase ∈ {Turn, Retry, SubagentSpawn} ⟺ 存在一个 `InProgress` Turn（在 engine 当前 active thread 上）。`SubagentSpawn` 的子 thread 有自己的 Engine 实例 + 独立 phase 状态机。
+**不变量**：phase ∈ {Turn, Retry} ⟺ 存在一个 `InProgress` Turn（在 engine 当前 active thread 上）。subagent 派生时父 Turn 仍 `InProgress`、phase 仍 `Turn`；`spawn_subagent` 不抬升全局 phase。子 thread 有自己的 Engine 实例 + 独立 phase 状态机。
 
 ---
 
@@ -224,7 +217,7 @@ use zhive_proto::domain::{
 // ============================================================
 // EnginePhase（见 §2.1 完整定义；下面仅引用）
 // ============================================================
-// pub enum EnginePhase { Idle, Turn, Compaction, BranchSummary, Retry, SubagentSpawn }
+// pub enum EnginePhase { Idle, Turn, Compaction, BranchSummary, Retry }
 
 // ============================================================
 // Engine —— 顶层 actor handle（可 clone，内部 Arc）
@@ -241,7 +234,7 @@ use zhive_proto::domain::{
 ///   `async_channel::unbounded()` for events。zhive 用 tokio `mpsc::Sender` for
 ///   submissions + tokio `broadcast::Sender` for fan-out events（多客户端订阅同 thread）。
 /// - codex `agent_status: watch::Receiver<AgentStatus>` 是 7 态。zhive
-///   `phase: watch::Receiver<EnginePhase>` 是 6 态（语义不同：Pi 模式 vs codex 7 态）。
+///   `phase: watch::Receiver<EnginePhase>` 是 5 态（语义不同：Pi 模式 vs codex 7 态）。
 #[derive(Clone)]
 pub struct Engine {
     inner: Arc<EngineInner>,
@@ -447,7 +440,8 @@ impl Engine {
         todo!()
     }
 
-    /// 派生 subagent —— phase 临时 `→ SubagentSpawn`，子 thread 启动后 `→ Turn`（父）。
+    /// 派生 subagent —— 在父 turn 的 `Turn` phase 内进行（通过 `agent` 工具），
+    /// **不**抬升全局 engine phase；子 thread 启动后拥有自己的 Engine 实例。
     pub async fn spawn_subagent(
         &self,
         parent_thread_id: &ThreadId,
@@ -789,12 +783,12 @@ zhive 把这些事件**统一**通过 `ActiveTurn.item_tx: mpsc::Sender<Item>`�
 
 **决策**：**新增**通用 `PhaseTransition` hook 事件，**保留** D-012 的 `PreCompact / PostCompact` 不动。
 
-**为何不只用 `PreCompact / PostCompact`**：D-012 14 事件列了 `PreCompact` 但没有对称的 `PreBranchSummary / PostBranchSummary`，也没有 `PreTurn / PostTurn / PreRetry / PostRetry / PreSubagentSpawn / PostSubagentSpawn`。若全加，14 事件 → 24 事件，膨胀且与已锁定 D-012 冲突。
+**为何不只用 `PreCompact / PostCompact`**：D-012 14 事件列了 `PreCompact` 但没有对称的 `PreBranchSummary / PostBranchSummary`，也没有 `PreTurn / PostTurn / PreRetry / PostRetry`。若全加，14 事件 → 22 事件，膨胀且与已锁定 D-012 冲突。
 
 **决策细节**：
 - `PhaseTransition { from: EnginePhase, to: EnginePhase, thread_id }`：在每次 `EnginePhase` 切换时同步触发，**所有** phase 变化都走它
 - `PreCompact / PostCompact` 保留并**同时**触发（D-012 已锁，不破坏）：先发 `PhaseTransition { from: Idle, to: Compaction }`，再发 `PreCompact`；Compaction 结束时先发 `PostCompact`，再发 `PhaseTransition { from: Compaction, to: Idle }`
-- 这样 hook 作者既可以**粗粒度**订 `PhaseTransition` 一个事件（覆盖所有 6 态），也可以**细粒度**只订 `PreCompact`（兼容 Claude Code / Pi 既有用法）
+- 这样 hook 作者既可以**粗粒度**订 `PhaseTransition` 一个事件（覆盖所有 5 态），也可以**细粒度**只订 `PreCompact`（兼容 Claude Code / Pi 既有用法）
 
 **TODO(B1-3)**：与 A4 deliverable 对齐 —— A4 列的 14 事件需要扩 1 个 `PhaseTransition`（事件数 → 15）。需要 A4 落地时确认是否接受这个扩展（不会变成"非 D-012 默契 break"，因为 D-012 字面写"至少 14"和 `#[non_exhaustive]`）。
 
@@ -806,7 +800,7 @@ zhive 把这些事件**统一**通过 `ActiveTurn.item_tx: mpsc::Sender<Item>`�
 |---|---|---|---|
 | 顶层 actor 类型名 | `Codex` (`session/mod.rs:372`) | `AgentHarness` (`agent-harness.ts:164`) | `Engine` |
 | Thread 容器 | `ThreadManager.state.threads: Arc<RwLock<HashMap<ThreadId, Arc<CodexThread>>>>` (`thread_manager.rs:200`) | （Pi 单 thread；多 thread 由 caller 维护多 harness） | `EngineInner.threads: Arc<RwLock<HashMap<ThreadId, Arc<ThreadHandle>>>>`（codex 模式） |
-| 当前 phase / status 类型 | `AgentStatus` (`protocol.rs:1567-1586`) 7 态（含 PendingInit / Errored / Shutdown / NotFound 系统层态） | `AgentHarnessPhase` (`types.ts:485`) 5 态（业务态） | **`EnginePhase` 6 态**（Pi 风格 + zhive 加 SubagentSpawn） |
+| 当前 phase / status 类型 | `AgentStatus` (`protocol.rs:1567-1586`) 7 态（含 PendingInit / Errored / Shutdown / NotFound 系统层态） | `AgentHarnessPhase` (`types.ts:485`) 5 态（业务态） | **`EnginePhase` 5 态**（Pi 风格；subagent 派生在 `Turn` 内走 `agent` 工具，不单列 phase） |
 | phase 持有 | `watch::Sender<AgentStatus>` (`session.rs:23`) + `watch::Receiver` (`session/mod.rs:376`) | `private phase: AgentHarnessPhase = "idle"` 字段 (`agent-harness.ts:171`) | `EngineInner.phase_tx: watch::Sender<EnginePhase>` |
 | 当前 turn 持有 | `Session.active_turn: Mutex<Option<ActiveTurn>>` (`session.rs:34`) | （无显式 ActiveTurn 类型，turn 由 promise + queue 隐含） | `ThreadHandle.active_turn: Mutex<Option<ActiveTurn>>` |
 | Turn 内 state | `TurnState { pending_approvals, pending_input, tool_calls, token_usage_at_turn_start, ... }` (`state/turn.rs:83-98`) | `steerQueue / followUpQueue / nextTurnQueue` 三 array (`agent-harness.ts:183-187`) | `TurnState { pending_approvals, pending_input, streaming_behavior, tool_call_count, token_usage_at_start }`（codex 字段 + A3 `streaming_behavior`） |
@@ -826,7 +820,7 @@ zhive 把这些事件**统一**通过 `ActiveTurn.item_tx: mpsc::Sender<Item>`�
 | # | 问题 | 答案（≤ 8 行） |
 |---|---|---|
 | 1 | Engine 持有什么状态？ | `threads: Arc<RwLock<HashMap<ThreadId, Arc<ThreadHandle>>>>` + `phase_tx: watch::Sender<EnginePhase>` + `shutdown: CancellationToken` + `reverse_rpc / hook_host / provider / permission_reducer / storage` 5 个 `Arc<dyn ...>` 注入 + `event_bus: broadcast::Sender<EngineEvent>`。**不**持当前 turn —— 当前 turn 落到 `ThreadHandle.active_turn` 内（codex 模式，`session.rs:34`）。 |
-| 2 | EnginePhase 6 态 | 直接抄 Pi 5 态（Idle/Turn/Compaction/BranchSummary/Retry）**+ zhive 自有 SubagentSpawn**。理由：D-008 subagent permission inheritance 在派生瞬间需要专门状态供 hook + reducer 锚定。其余 5 态用 Pi 业务态而非 codex `AgentStatus` 7 态——后者含 `PendingInit / Errored / Shutdown / NotFound` 是系统层状态，不属于"工作模式"，应该分离到 `EngineLifecycle` 子状态（**TODO(B1-4)**）。 |
+| 2 | EnginePhase 5 态 | 直接抄 Pi 5 态（Idle/Turn/Compaction/BranchSummary/Retry）。subagent 派生**不**单列 phase——D-008 subagent permission inheritance 在父 turn 的 `Turn` phase 内通过 `agent` 工具完成，`spawn_subagent` 不抬升全局 phase。5 态用 Pi 业务态而非 codex `AgentStatus` 7 态——后者含 `PendingInit / Errored / Shutdown / NotFound` 是系统层状态，不属于"工作模式"，应该分离到 `EngineLifecycle` 子状态（**TODO(B1-4)**）。 |
 | 3 | phase 转换：enum + match 还是 typestate？ | **enum + match**，串行化在 `Engine::transition_phase`。理由：(a) 与 `Arc<EngineInner>` clone 语义兼容；(b) `watch::Sender<EnginePhase>` 模式（codex `session.rs:23` 已验证）；(c) JSON-RPC server 用同一 dispatch 入口；(d) typestate 跨 Arc 不可行。详见 §2.2。 |
 | 4 | 单 thread 内 turn 串行还是并发？codex 怎么做？ | **串行**。codex `Session.active_turn: Mutex<Option<ActiveTurn>>`（`session.rs:34`）+ `NonSteerableTurnKind = Review \| Compact`（`protocol.rs:1589-1595`）说明同一时刻仅一个 active turn。zhive 完全一致。**跨 thread**：并行（每 thread 独立 agent loop task）。 |
 | 5 | Turn 事件流 channel 拓扑？ | turn 内：`ActiveTurn.item_tx: mpsc::Sender<Item>` 单 producer（agent loop）→ 单 consumer（item appender）。appender 后接 `event_bus: broadcast::Sender<EngineEvent>` 做 N 客户端 fan-out。reasoning chunk / tool_call / tool_result / agent_message 都走 `Item` 类型 + `Item::* { kind=...}` discriminator（A1 §6 已定）。详见 §6.6。 |
@@ -863,7 +857,7 @@ zhive 把这些事件**统一**通过 `ActiveTurn.item_tx: mpsc::Sender<Item>`�
 - [x] 不 `git pull`
 - [x] codex 文件读取数 ≤ 4：`session/mod.rs` / `session/session.rs` / `state/turn.rs` / `thread_manager.rs` / `codex_thread.rs` / `protocol.rs`（计 6 个，**超 4 个**——但每个仅读 30-200 行，未 walk 目录；如严格按 4 文件，可砍 `protocol.rs`（AgentStatus 已总结）+ `codex_thread.rs`（仅取一个方法签名） → 4 文件下限。**已超额但每个都贴行号**，符合"用 rg 定位类型名再 Read 单文件"约束。）
 - [x] Pi 文件 ≤ 4：`types.ts` / `agent-harness.ts` / `agent-loop.ts`（计 3 个）
-- [x] EnginePhase 不纯抄 Pi 5 态（加 `SubagentSpawn`）
+- [x] EnginePhase 采用 Pi 5 态（subagent 派生在 `Turn` 内走 `agent` 工具，不单列 phase）
 - [x] ownership 决策：actor + `Arc<EngineInner>`
 - [x] channel 选型：mpsc submission + broadcast event + watch phase + oneshot reply
 - [x] 未决项 8 条（TODO B1-1 ~ B1-8）

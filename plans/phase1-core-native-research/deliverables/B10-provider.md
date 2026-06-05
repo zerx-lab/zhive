@@ -1,6 +1,6 @@
 ---
 title: B10 · LLM provider 抽象（Phase 1 占位）
-status: draft
+status: implemented
 date: 2026-05-28
 depends_on:
   - plan §5 B10（约 line 517-535）

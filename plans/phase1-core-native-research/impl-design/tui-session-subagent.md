@@ -11,9 +11,8 @@
 - 子 thread 的 `events/turn_started`/`item_appended`/`turn_completed` 已广播（带子 thread id），TUI 据 parent↔child 路由。
 
 ## 1. 数据模型（conversation.rs）
-现状：`Conversation { thread_id, turns: Vec<TurnView>, busy, streaming, last_error }`，`apply` 按 turn_id fold，**不看 thread_id**。
+`Conversation` 在主 turns 之外携带本会话派生的子 agent，`apply` 先按 thread_id 分发再 fold：
 
-改造：
 ```rust
 pub struct Conversation {
     pub thread_id: ThreadId,
@@ -43,7 +42,7 @@ pub enum SubagentStatus { Running, Completed { has_final: bool }, Failed }
 - 新增 `EngineNotification::SubagentCompleted` → 对应 SubagentView 置 Completed。
 - 未知 thread_id 的事件（既非主也非已知子）→ 忽略（防御，记 last_error 可选）。
 
-注意：`EngineNotification` 各 variant 已带 `thread_id` 字段（protocol.rs 已解析），apply 现在要真正用它。
+注意：`EngineNotification` 各 variant 已带 `thread_id` 字段（protocol.rs 已解析），apply 据此路由。
 
 ## 3. protocol.rs：解析两个新事件
 `decode` 加：

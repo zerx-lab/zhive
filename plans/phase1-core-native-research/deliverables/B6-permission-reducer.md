@@ -2,10 +2,10 @@
 task: B6
 title: Permission reducer 接入 Engine + Hook + Subagent 调用图
 date: 2026-05-28
-status: draft
+status: implemented
 depends_on:
   - A3 deliverable (`PermissionDecision` 四态 + `fn reduce` 签名 + Cancelled outcome 硬约束 + Subagent 无 wire `inherited_permissions` 字段)
-  - B1 deliverable (`EnginePhase` 6 态含 `SubagentSpawn` + actor pattern + `pending_approvals: HashMap<String, oneshot::Sender<PermissionDecision>>`)
+  - B1 deliverable (`EnginePhase` 5 态 `Idle / Turn / Compaction / BranchSummary / Retry` + actor pattern + `pending_approvals: HashMap<String, oneshot::Sender<PermissionDecision>>`)
   - D-008 (Permission decision + Streaming + Subagent inheritance)
   - D-012 (Hook events 14)
 non_goals:
@@ -31,10 +31,10 @@ non_goals:
 | A3 ACP `Cancelled` outcome 硬约束（pending request_permission abort 时必须返回 Cancelled） | 同上 | §1 (44-45) + §6.3 (437-447) |
 | A3 Subagent **不存在** wire 字段 `inherited_permissions`（继承靠 `SubagentDefinition` 上 `Option` 字段缺省） | 同上 | §7.3 (521-553) |
 | A3 reducer 父子双调（child 结果作为 parent 一项参与 reduce） | 同上 | §7.4 (556-576) |
-| A3 reverse-RPC `permission/request` 默认 timeout 未决（B6 落定） | 同上 | §10 TODO A3-O3 (652) |
+| A3 reverse-RPC `session/request_permission` 默认 timeout 未决（B6 落定） | 同上 | §10 TODO A3-O3 (652) |
 | A3 BypassPermissions 模式下 child reducer 是否短路未决（B6 落定） | 同上 | §10 TODO A3-O4 (654) |
-| B1 `EnginePhase::SubagentSpawn`（zhive 新增第 6 态，父 thread 在派生瞬间进入） | `plans/phase1-core-native-research/deliverables/B1-engine-loop.md` | §2.1 (74-97) + §2.4 (177) |
-| B1 `EnginePhase` 转换矩阵：`Turn → SubagentSpawn → Turn` | 同上 | §2.3 (148-155) |
+| B1 `EnginePhase` 5 态（`Idle / Turn / Compaction / BranchSummary / Retry`，定义在 `zhive-proto::hook`）；subagent 派生作为 `agent` 工具在 `Turn` 内调度，不占独立 phase | `plans/phase1-core-native-research/deliverables/B1-engine-loop.md` | §2.1 (74-97) + §2.4 (177) |
+| B1 `EnginePhase` 转换矩阵：父 thread 派生 subagent 期间始终停在 `Turn` | 同上 | §2.3 (148-155) |
 | B1 `TurnState.pending_approvals: HashMap<String, oneshot::Sender<PermissionDecision>>` —— pending permission decision sink | 同上 | §4 (319-330) + §6.2 (724) |
 | B1 actor pattern：`mpsc::Sender<Submission>` for inbound + `broadcast::Sender<EngineEvent>` for outbound + `oneshot::Sender<Result>` for sync reply | 同上 | §6.2 channel 类型选择理由表 (715-727) |
 | B1 反向 RPC sink trait 占位 `Arc<dyn ReverseRpcSink + Send + Sync>` | 同上 | §4 (262-263, 494) |
@@ -77,7 +77,7 @@ pub(crate) async fn reduce_for_tool_call(
         .await?;  // Vec<PermissionDecision>，每个 hook 超时/panic 已降级为 Deny
 
     // 2. 拉取用户态 ask 响应（reducer 内若任一 hook 给 Ask，需 reverse-RPC 等用户）
-    //    注意：Ask 不是终态——hook 给 Ask 后，engine 必须发 reverse-RPC permission/request
+    //    注意：Ask 不是终态——hook 给 Ask 后，engine 必须发 reverse-RPC session/request_permission
     //    收回 user decision (Allow/Deny)，把该结果替换原 Ask 项再 fold
     let mut decisions = Vec::with_capacity(hook_decisions.len() + 1);
     for d in hook_decisions {
@@ -124,14 +124,14 @@ pub enum ReducerError {
 |---|---|---|
 | client → `session/cancel` notification | engine `CancellationToken::cancel()` | 遍历 `pending_approvals`，对每个 `oneshot::Sender<PermissionDecision>` 发 **不通过 Sender**：而是由 ReverseRpcSink 单独发 `Cancelled` outcome 给 client（**ACP 硬约束**），同时让 reducer await future 收到 `ReverseRpcError::Cancelled`，把该项以 `Deny` 参与 fold |
 | reducer 内 hook timeout（B6 默认 30s） | hook 视为没返回，**该 hook 不参与 fold**（不是 Deny） | hook_host 已在拉取阶段 timeout，不入 `decisions` slice；空 slice ⇒ `reduce` 返回 `Allow`（A3 §3 不变式） |
-| reverse-RPC `permission/request` server-side timeout（B6 默认 30s，见 §7） | server 主动发 `Cancelled` outcome 给 client + 让 await future 解出 | 同 client cancel 路径：该项 fold 为 `Deny` |
+| reverse-RPC `session/request_permission` server-side timeout（B6 默认 30s，见 §7） | server 主动发 `Cancelled` outcome 给 client + 让 await future 解出 | 同 client cancel 路径：该项 fold 为 `Deny` |
 | Subagent 父侧 cancel ⇒ child engine.shutdown() | child reducer 内的所有 pending Cancelled | child 整个返回 `Deny`（子 thread 关闭，所有 in-flight 资源回收） |
 
-**关键不变式**：`Cancelled` 是 ACP wire outcome 字面值，**reducer 内部不直接用 `PermissionDecision::Cancelled`**（A3 四态没有 Cancelled）—— Cancelled 在 wire 上是 `RequestPermissionOutcome::Cancelled`，在 reducer 内部一律降级为 `Deny`（安全默认）。
+**关键不变式**：`Cancelled` 是 ACP wire outcome 字面值，**reducer 内部不直接用 `PermissionDecision::Cancelled`**（A3 四态没有 Cancelled）—— Cancelled 在 wire 上是 `PermissionOutcome::Cancelled`，在 reducer 内部一律降级为 `Deny`（安全默认）。
 
 ---
 
-## 3. 父子 subagent 调用图（ASCII，含 B1 SubagentSpawn phase 衔接）
+## 3. 父子 subagent 调用图（ASCII，含 B1 `EnginePhase` 衔接）
 
 > A3 §7.4 已给伪码（child reducer 先跑、结果作为 parent 一项再 fold）。B6 在此之上**补完时序**：phase 切换 + reverse-RPC 走向 + reducer 触发点。
 
@@ -141,14 +141,13 @@ pub enum ReducerError {
                   父 thread (parent engine)                                    子 thread (child engine)
                   EnginePhase = Turn                                            EnginePhase = (尚未存在)
                           │
-                          │ LLM 返回 tool_call(name="Agent", subagent_def)
+                          │ LLM 返回 tool_call(name="agent", subagent_def)
                           │
                           ▼
               ┌────────────────────────────┐
               │ parent engine.spawn_subagent│
               │  - validate scope            │ (A3 §7.2 narrowed_into)
-              │  - phase: Turn → SubagentSpawn│ (B1 §2.3 转换矩阵)
-              │  - emit PhaseTransition hook │ (B1 §6.7)
+              │  - phase 保持 Turn           │ (B1 §2.3：agent 工具在 Turn 内派生)
               │  - child engine = Engine::spawn(child_cfg, parent_scope)
               └────────────────────────────┘
                           │
@@ -158,8 +157,8 @@ pub enum ReducerError {
                           │                                  │  - 继承 parent_scope          │
                           │                                  └──────────────────────────────┘
                           │                                              │
-                          │  父 phase 切回 Turn                          │  child LLM 流跑
-                          │  (B1 §2.3: SubagentSpawn → Turn)             │
+                          │  父 phase 始终为 Turn                        │  child LLM 流跑
+                          │  (B1 §2.3: agent 工具不切 phase)             │
                           ▼                                              │
               ┌────────────────────────────┐                             │
               │ parent engine.phase = Turn │                             │
@@ -224,7 +223,7 @@ pub enum ReducerError {
 | **child fold → parent** | `child engine` 把 `fold_child` 通过 **in-process channel** `subagent_decision_tx: mpsc::Sender<PermissionDecision>` 发回 parent | 不走 wire（parent/child 同进程，per B1 §6.3 actor pattern） | 这是 zhive 的设计选择：subagent **不是** 跨进程 thread，child engine 与 parent engine 共享 EngineInner.threads HashMap，只在 phase / cancel 隔离 |
 | **parent reducer 二次触发** | `parent engine` 在 `subagent_decision_rx.recv()` 之后调 `reduce_for_tool_call(parent_ctx, carry=fold_child)` | 把 `fold_child` append 到 `decisions_parent` 末尾 | A3 §7.4 字面：把 child 视为"一个额外的 hook"参与 parent reduce |
 | **短路条件** | child `fold_child ∈ {Deny, Defer}` ⇒ 不通知 parent 也不再 fold | child engine 直接把 `fold_child` 当作最终决策返回到 tool_call dispatcher | 优化：Deny/Defer 不可能被 parent 上调到更松，提前短路省 parent hook dispatch |
-| **`SubagentSpawn` phase 何时切换** | phase 仅在 `child engine` **派生瞬间**短暂持续（毫秒级） —— child 一旦 `Engine::spawn` 完成 + child.start_turn 入队，parent 立即切回 `Turn` | B1 §2.3 转换矩阵：`Turn → SubagentSpawn → Turn` | **不是**整个 child turn 期间都是 SubagentSpawn —— 那样会让 parent steer/followUp 无法接受。SubagentSpawn 是 spawn 仪式，不是 child 运行时态 |
+| **父 phase 在派生期间** | 父 engine 自始至终停在 `Turn` —— subagent 派生是 `agent` 工具的一次 dispatch（`Engine::spawn` + child.start_turn 入队），不切换父 phase | B1 §2.3：`agent` 工具在 `Turn` 内运行，`EnginePhase` 无独立的 subagent 态 | 父 phase 不因派生离开 `Turn` —— 这样 parent steer/followUp 在 child 运行期间仍可接受。child engine 自己的 phase 独立演进 |
 
 ### 3.3 BypassPermissions 模式下短路语义（解决 A3 TODO A3-O4）
 
@@ -242,12 +241,12 @@ pub enum ReducerError {
 
 > A3 已定 `Defer` 四态字面值 + "挂起 turn 等 client 续命"语义。B6 落地具体 wire 路径。
 
-### 4.1 设计选择：**defer 不需要独立 RPC method**，复用 `permission/request` 二轮交互
+### 4.1 设计选择：**defer 不需要独立 RPC method**，复用 `session/request_permission` 二轮交互
 
 | 备选方案 | 选 / 不选 | 理由 |
 |---|---|---|
-| A. 独立 `permission/defer` notification + `session/resume` request | **不选** | 增加两个 RPC method 但语义可由 `permission/request` 的回响延迟天然表达：client 可以"先回 Defer 占位 + 后续主动 resolve"；不必另开 method |
-| B. 复用 `permission/request` reverse-RPC：client 第一次回 `{ outcome: "defer" }`，server 把 future **保留**在 pending_approvals 不 resolve，等 client 后续发 `session/resume_permission { request_id, outcome: Selected/Cancelled }` | **选** | (a) RPC method 数最小化；(b) `pending_approvals: HashMap<RequestId, oneshot>` 现成结构即可承载（B1 §4 已定 `TurnState.pending_approvals`）；(c) 与 ACP `Cancelled` 路径同形态：cancel 也是后置事件 |
+| A. 独立 `permission/defer` notification + `session/resume` request | **不选** | 增加两个 RPC method 但语义可由 `session/request_permission` 的回响延迟天然表达：client 可以"先回 Defer 占位 + 后续主动 resolve"；不必另开 method |
+| B. 复用 `session/request_permission` reverse-RPC：client 第一次回 `{ outcome: "defer" }`，server 把 future **保留**在 pending_approvals 不 resolve，等 client 后续发 `session/resume_permission { request_id, outcome: Selected/Cancelled }` | **选** | (a) RPC method 数最小化；(b) `pending_approvals: HashMap<RequestId, oneshot>` 现成结构即可承载（B1 §4 已定 `TurnState.pending_approvals`）；(c) 与 ACP `Cancelled` 路径同形态：cancel 也是后置事件 |
 | C. server 把 defer 当 Deny 立即拒（"暂不允许"） | **不选** | 破坏 A3 四态语义；client 失去 user-intervention 入口 |
 
 ### 4.2 时序图：defer 路径
@@ -255,34 +254,34 @@ pub enum ReducerError {
 ```text
 client (CLI/TUI/IDE)                   zhive engine (server)
        │                                     │
-       │ ◀── permission/request id=R1 ────── │  TurnState.pending_approvals[R1] = oneshot::Sender
+       │ ◀── session/request_permission id=R1 │  TurnState.pending_approvals[R1] = oneshot::Sender
        │     { tool_call, scope, ... }       │  reducer task await rx
        │                                     │
        │ ── response id=R1 ─────────────────►│
        │     { outcome: "defer",             │  reducer 收 Defer ⇒ engine 切 turn 内部 sub-state
        │       reason: "user away" }         │  "Suspended"（不是 EnginePhase，是 Turn 内）
        │                                     │
-       │                                     │  发 turn/suspended notification
-       │ ◀── turn/suspended ─────────────────│  { turn_id, request_id: R1, suspended_at }
-       │     { turn_id, request_id: R1, ... }│
+       │                                     │  发 events/turn_suspended notification
+       │ ◀── events/turn_suspended ──────────│  { turnId, requestId: R1, suspendedAt }
+       │     { turnId, requestId: R1, ... }  │
        │                                     │
        │   ......（user 回来）..............│
        │                                     │
-       │ ── session/resume_permission ──────►│  request_id = R1
-       │     { request_id: R1,               │  pending_approvals[R1] 仍存在
-       │       outcome: { kind: "selected",  │  → 用 user 决策 resolve oneshot::Sender
-       │                  option_id: "allow_once" } } │
+       │ ── session/resume_permission ──────►│  requestId = R1
+       │     { requestId: R1,                │  pending_approvals[R1] 仍存在
+       │       outcome: { outcome: "selected",│  → 用 user 决策 resolve oneshot::Sender
+       │                  optionId: "allow_once" } } │
        │                                     │
        │ ◀── ack（response 200）─────────────│
        │                                     │
        │                                     │  reducer await 解出 Allow
        │                                     │  → 重新 fold（剩余 hooks 已 cached 在 step 2 内）
-       │                                     │  → 若新 fold 仍 Defer ⇒ 再次挂起（递归无限期）
-       │                                     │  → 若新 fold = Allow/Deny ⇒ 续 turn
+       │                                     │  → ResumeOutcome 类型上不含 Defer ⇒ 不可能再次挂起
+       │                                     │  → 新 fold = Allow/Deny ⇒ 续 turn
        │                                     │
-       │ ◀── turn/resumed ───────────────────│  { turn_id, resumed_at }
+       │ ◀── events/turn_resumed ────────────│  { turnId, resumedAt }
        │ ◀── item/appended (tool_result) ───│  ...continue turn...
-       │ ◀── turn/completed ────────────────│
+       │ ◀── events/turn_completed ─────────│
 ```
 
 ### 4.3 wire schema（B4 transport 接力实现，B6 仅给形状）
@@ -290,16 +289,17 @@ client (CLI/TUI/IDE)                   zhive engine (server)
 ```rust
 // crates/zhive-proto/src/permission.rs  追加 wire 类型
 
-/// Reverse-RPC `permission/request` 的 outcome 字面值。
-/// 对齐 ACP 0.12 `RequestPermissionOutcome` + zhive 扩展 `defer`。
+/// Reverse-RPC `session/request_permission` 的 outcome 字面值。
+/// 对齐 ACP `RequestPermissionOutcome` + zhive 扩展 `defer`。
 ///
 /// 注意：`PermissionDecision`（四态）是 hook/reducer 内部用；
-/// `RequestPermissionOutcome` 是 wire 出参（与 ACP 对齐 + 加 defer）。
+/// `PermissionOutcome` 是 wire 出参（与 ACP 对齐 + 加 defer）。
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(tag = "kind", rename_all = "lowercase")]
+#[serde(tag = "outcome", rename_all = "camelCase")]
 #[non_exhaustive]
-pub enum RequestPermissionOutcome {
+pub enum PermissionOutcome {
     /// ACP 标准：user 选了一个 PermissionOption（含 option_id "allow_once" / "allow_always" / "reject_once" / "reject_always"）
+    #[serde(rename_all = "camelCase")]
     Selected { option_id: String },
     /// ACP 硬约束：session/cancel 后所有 pending request_permission 必须用此响应
     Cancelled,
@@ -321,9 +321,10 @@ pub struct ResumePermissionParams {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(tag = "kind", rename_all = "lowercase")]
+#[serde(tag = "outcome", rename_all = "camelCase")]
 #[non_exhaustive]
 pub enum ResumeOutcome {
+    #[serde(rename_all = "camelCase")]
     Selected { option_id: String },
     Cancelled,
 }
@@ -363,14 +364,14 @@ location: TurnState.pending_approvals: HashMap<RequestId, PermissionResolver>
 事件                              对 pending_approvals 的影响
 ─────────────────────────────    ────────────────────────────────────────
 reducer 内 hook 给 Ask           insert(req_id, oneshot::Sender)
-                                  发 permission/request notification 给 client
+                                  发 session/request_permission reverse-RPC 给 client
 client response Selected/Allow   pending_approvals.remove(req_id).send(Allow)
 client response Selected/Deny    pending_approvals.remove(req_id).send(Deny)
 client response Cancelled        pending_approvals.remove(req_id) + drop sender（不 send）
                                   reducer await 收到 RecvError ⇒ ReverseRpcError::Cancelled
                                   reducer 内把该项 fold 为 Deny（§2.1）
 client response Defer            **不** remove；保留 sender 在 map 中
-                                  发 turn/suspended notification
+                                  发 events/turn_suspended notification
                                   reducer 任务 await 阻塞在 oneshot::Receiver
 client session/resume_permission pending_approvals[req_id] 仍存在
                                   → 把 ResumeOutcome 翻译为 PermissionDecision
@@ -475,29 +476,29 @@ async fn dispatch_pre_tool_use(
 | 1.A | 多 hook 并行还是顺序？ | **并行 `join_all`**。每 hook 包 `timeout(30s) + catch_unwind` 降级为 `Deny`；hook 副作用独立、PreToolUse 设计禁止跨 hook 状态依赖。详见 §5.3 伪码。 |
 | 1.B | first-deny 短路在哪种语义下可行？ | 仅在**顺序 + 副作用语义**下可行。zhive 选并行 ⇒ 不启用短路。理由：(a) 副作用 + audit 完整性；(b) hook 数 ≤ 32，max(hook_i) 已是延迟 dominant；(c) `Defer/Ask` 不应短路。详见 §5.2。 |
 | 2.A | 父子 reducer 怎么传值？ | child 在 `tool_call` dispatch 前内部跑 `reduce_for_tool_call(child_ctx)`，得 `fold_child`；通过 **in-process channel** `subagent_decision_tx: mpsc::Sender<PermissionDecision>` 发回 parent（不走 wire，per B1 §6.3 actor pattern）；parent 把 `fold_child` 作为额外一项 append 到 `decisions_parent` 末尾再 fold（A3 §7.4 字面）。详见 §3.1 时序图。 |
-| 2.B | 谁触发？与 B1 SubagentSpawn phase 衔接？ | parent engine 在 `spawn_subagent` 内切 phase `Turn → SubagentSpawn`（**毫秒级**仪式），child engine 创建 + start_turn 入队完成后 parent 立即切回 `Turn`；child 整个 turn 期间 parent phase = `Turn`，**不是** SubagentSpawn（否则 parent steer/followUp 无法接受）；child engine 自己的 phase 独立。详见 §3.2 表格。 |
+| 2.B | 谁触发？与 B1 `EnginePhase` 衔接？ | parent engine 在 `spawn_subagent` 内派生 child（`agent` 工具的一次 dispatch），全程**不切 phase**：父 phase 自始至终为 `Turn`，child 整个 turn 期间亦然，因此 parent steer/followUp 在 child 运行期间仍可接受；child engine 自己的 phase 独立演进。详见 §3.2 表格。 |
 | 2.C | 短路条件 | child `fold_child ∈ {Deny, Defer}` ⇒ 不通知 parent reducer（child 直接把 `fold_child` 作为最终决策返回）。Deny/Defer 不可能被 parent 上调到更松，提前短路省 parent hook dispatch。 |
-| 3.A | defer 怎么实现？需要独立 RPC 吗？ | **不需要独立 RPC method**。复用 `permission/request` reverse-RPC：client 第一次回 `{ outcome: "defer" }`，server 把 `pending_approvals[req_id]` 的 oneshot::Sender **保留不 resolve**，发 `turn/suspended` notification；client 后续调 `session/resume_permission { request_id, outcome }` 续命 → server 用 outcome resolve oneshot → reducer 解出 → 续 fold。详见 §4.1-4.2。 |
-| 3.B | defer 的 UI / RPC 路径形状 | 见 §4.3 wire schema：(a) `RequestPermissionOutcome::Defer { reason }` 复用现有 `permission/request` response；(b) 新增 `TurnSuspendedNotification` + `TurnResumedNotification` 两个 notification；(c) 新增 `session/resume_permission` 一个 request method。**总新增 wire surface：1 method + 2 notifications + 2 outcome variant**。 |
+| 3.A | defer 怎么实现？需要独立 RPC 吗？ | **不需要独立 RPC method**。复用 `session/request_permission` reverse-RPC：client 第一次回 `{ outcome: "defer" }`，server 把 `pending_approvals[req_id]` 的 oneshot::Sender **保留不 resolve**，发 `events/turn_suspended` notification；client 后续调 `session/resume_permission { request_id, outcome }` 续命 → server 用 outcome resolve oneshot → reducer 解出 → 续 fold。详见 §4.1-4.2。 |
+| 3.B | defer 的 UI / RPC 路径形状 | 见 §4.3 wire schema：(a) `PermissionOutcome::Defer { reason }` 复用现有 `session/request_permission` response；(b) 新增 `TurnSuspendedNotification` + `TurnResumedNotification` 两个 notification；(c) 新增 `session/resume_permission` 一个 request method。**总新增 wire surface：1 method + 2 notifications + 2 outcome variant**。 |
 | 3.C | defer 二次能否再 Defer（无限挂起）？ | **不允许**。`ResumePermissionParams.outcome: ResumeOutcome` 类型限定只能 `Selected / Cancelled`（schema 强制）；server 若收到任何非法形态返回 `invalid_params` 错误。理由：防 client bug / 恶意无限挂起；user UI 上 defer 应是"暂存待办"而不是"无限期延后"。详见 §7 未决 B6-O2。 |
 
 ---
 
 ## 7. 未决项（回流到 plan §9）
 
-> TODO(开放项 B6-O1)：reducer 返回 `Defer` 后，Turn 在 B1 `TurnStatus` 4 态（A1 已定 `InProgress / Completed / Interrupted / Failed`）中处于何态？倾向**保持 `InProgress`**（不新增 `Suspended` 态，避免改 A1），但通过 turn/suspended notification 让 client 可见挂起状态。`InProgress` 期间允许 client 调 steer/followUp 吗？**倾向 disallow**（Pi 模式：steer/followUp 要求 phase ≠ Idle，但 Defer 期间 engine 在等用户而非在跑 LLM；语义模糊）—— 由 B7 cancel-streaming deliverable 落定，与 `pendingSessionWrites` 一起设计。
+> TODO(开放项 B6-O1)：reducer 返回 `Defer` 后，Turn 在 B1 `TurnStatus` 4 态（A1 已定 `InProgress / Completed / Interrupted / Failed`）中处于何态？倾向**保持 `InProgress`**（不新增 `Suspended` 态，避免改 A1），但通过 events/turn_suspended notification 让 client 可见挂起状态。`InProgress` 期间允许 client 调 steer/followUp 吗？**倾向 disallow**（Pi 模式：steer/followUp 要求 phase ≠ Idle，但 Defer 期间 engine 在等用户而非在跑 LLM；语义模糊）—— 由 B7 cancel-streaming deliverable 落定，与 `pendingSessionWrites` 一起设计。
 
-> TODO(开放项 B6-O2)：`ResumeOutcome` 是否要允许再次 Defer？当前 schema 禁止（§4.3 type-level）。若 user 需要多次延后，client 可以自己缓存 + UI 提示后续 resume 时机，不必 server 支持。若未来用户反馈强烈要求 chained Defer，可放开为 `RequestPermissionOutcome::*` 全集（含 Defer）—— 是 wire-compat 兼容扩展，无 breaking。
+> TODO(开放项 B6-O2)：`ResumeOutcome` 是否要允许再次 Defer？当前 schema 禁止（§4.3 type-level）。若 user 需要多次延后，client 可以自己缓存 + UI 提示后续 resume 时机，不必 server 支持。若未来用户反馈强烈要求 chained Defer，可放开为 `PermissionOutcome::*` 全集（含 Defer）—— 是 wire-compat 兼容扩展，无 breaking。
 
-> TODO(开放项 B6-O3)：reverse-RPC `permission/request` 的 server-side timeout 默认值（解决 A3 TODO A3-O3）。**B6 决策：默认 30s 超时**，timeout 后 server 主动发 `Cancelled` outcome（同 client cancel 路径），reducer 把该项 fold 为 `Deny`。超时值通过 `EngineConfig.permission_request_timeout: Duration` 暴露给 client 端可配（默认 30s，最小 5s，最大 600s）。
+> TODO(开放项 B6-O3)：reverse-RPC `session/request_permission` 的 server-side timeout 默认值（解决 A3 TODO A3-O3）。**B6 决策：默认 30s 超时**，timeout 后 server 主动发 `Cancelled` outcome（同 client cancel 路径），reducer 把该项 fold 为 `Deny`。超时值通过 `EngineConfig.permission_request_timeout: Duration` 暴露给 client 端可配（默认 30s，最小 5s，最大 600s）。
 
 > TODO(开放项 B6-O4)：subagent `permission_mode == BypassPermissions` 时 child hooks 的处理（解决 A3 TODO A3-O4）。**B6 决策**：child hooks **仍然 dispatch**（保留 audit/log/trace 副作用），但所有 hook 返回值由 `hook_host` 统一**替换为 `Allow`**（hook 作者本身不感知）；`fold_child` 因此恒为 `Allow`；**parent 仍能 deny**。详见 §3.3。
 
 > TODO(开放项 B6-O5)：`session/resume_permission` 在 client 端的 UI 触发器是什么？CLI 模式下用户可能离开终端 →  defer + 后续 `zhive resume-permission <req_id> --allow`；TUI 模式下持续显示 banner；IDE 集成可弹通知。具体 UI / CLI 形态由 D-002（TUI 客户端）+ Phase 2 落地，B6 仅保证 wire schema 已就绪。
 
-> TODO(开放项 B6-O6)：reducer 在 child engine 内 `fold_child = Defer` 时，**父也会挂起 turn 吗**？倾向**是**：child Defer ⇒ child turn suspended（发 `turn/suspended` for child）⇒ parent engine 收到 `subagent_decision_rx.recv()` 阻塞 ⇒ parent turn 也 suspended（发 `turn/suspended` for parent）。两个 suspended notification 让 client 知道两层挂起。client 续命任一方都会传导：resume child request_id ⇒ child reducer 解出 ⇒ fold_child 重新计算 ⇒ child 通过 subagent_decision_tx 通知 parent ⇒ parent reducer 续 fold。具体实现细节由 B8（subagent 调度）+ B6 二阶段落地。
+> TODO(开放项 B6-O6)：reducer 在 child engine 内 `fold_child = Defer` 时，**父也会挂起 turn 吗**？倾向**是**：child Defer ⇒ child turn suspended（发 `events/turn_suspended` for child）⇒ parent engine 收到 `subagent_decision_rx.recv()` 阻塞 ⇒ parent turn 也 suspended（发 `events/turn_suspended` for parent）。两个 suspended notification 让 client 知道两层挂起。client 续命任一方都会传导：resume child request_id ⇒ child reducer 解出 ⇒ fold_child 重新计算 ⇒ child 通过 subagent_decision_tx 通知 parent ⇒ parent reducer 续 fold。具体实现细节由 B8（subagent 调度）+ B6 二阶段落地。
 
-> TODO(开放项 B6-O7)：`Cancelled` outcome 在 `RequestPermissionOutcome` wire enum 上是 `Cancelled`（A3 §1 line 44）还是 `{ kind: "cancelled" }`（本 §4.3 写的 internally tagged）？A3 引用 ACP 0.12 字面 schema 是 `Cancelled` 独立 variant；zhive 本 deliverable 选 internally tagged + lowercase（`#[serde(tag = "kind", rename_all = "lowercase")]`）以便与 `Selected / Defer` 一致。**与 ACP wire 兼容性需要 B4 transport deliverable 决定是否走 ACP bridge 时翻译；in-zhive wire 用 internally tagged**。
+> TODO(开放项 B6-O7)：`Cancelled` outcome 在 zhive `PermissionOutcome` wire enum 上是 internally tagged 的独立 variant，序列化为 `{ "outcome": "cancelled" }`（`#[serde(tag = "outcome", rename_all = "camelCase")]`），与 `Selected / Defer` 同形态；ACP 0.12 字面 schema（A3 §1 line 44）则把 `Cancelled` 写成独立 variant。**与 ACP wire 兼容性需要 B4 transport deliverable 决定是否走 ACP bridge 时翻译；in-zhive wire 用 internally tagged**。
 
 ---
 
@@ -509,7 +510,7 @@ async fn dispatch_pre_tool_use(
 - [x] 不 `git pull`
 - [x] 参考输入 ≤ 4：A3 + B1 deliverable（2 个）+ plan §5 B6（1 节） = 3 个；可选 Pi rpc-mode.ts 1 个（未展开 Read）
 - [x] reducer fn 签名复用 A3 §3 字面（不重定义）
-- [x] 父子调用图与 B1 `SubagentSpawn` phase 衔接（§3.2 表格）
+- [x] 父子调用图与 B1 `EnginePhase`（`agent` 工具在 `Turn` 内派生）衔接（§3.2 表格）
 - [x] defer 流程图含 client reverse handler 持续 await + server pending Map（§4.2 + §4.4）
 - [x] 并行 vs 顺序明确选型 + first-deny 短路开关决策（§5.1-5.2）
 - [x] 关键问题 #1/#2/#3 逐条作答（§6）

@@ -3,7 +3,7 @@ task: C2
 title: 连接管理 / 重连策略（zhive-client-native lifecycle）
 plan: phase1-core-native-research
 date: 2026-05-28
-status: draft
+status: implemented
 crate: zhive-client-native（仅依赖 zhive-proto）
 depends_on:
   - deliverables/C1-client-api.md           (ClientError::Disconnected / shutdown 5s / ClientEvent 四 case)
@@ -44,7 +44,7 @@ non-goals:
 | tower-lsp transport 读循环结束后 `server_tasks_tx.disconnect() / client_abort.abort()` —— 不重启 | `${LSP}/src/transport.rs` | 158-160 |
 | tower-lsp `refuses_requests_after_shutdown` 测试：shutdown→exit 后再 call 永远返回 `ExitedError` | `${LSP}/src/service.rs` | 307-335 |
 | C1 `ClientError::Disconnected(String)` —— 断连后所有 `request*` 立即返回此错 | `deliverables/C1-client-api.md` §2.2 / §3.5 | — |
-| C1 `ClientEvent::Disconnected { message }` —— 事件流终态 | `deliverables/C1-client-api.md` §2.2 / §4 | — |
+| C1 `ClientEvent::Disconnected { reason }` —— 事件流终态 | `deliverables/C1-client-api.md` §2.2 / §4 | — |
 | C1 `Client::shutdown()` 带 5s SHUTDOWN_TIMEOUT 兜底 abort | `deliverables/C1-client-api.md` §2.2, §3.1 | — |
 | A2 initialize 是强协商（ProtocolVersion + capabilities 必须重新拿） | `deliverables/A2-initialize-capabilities.md` §2-§3 | — |
 
@@ -52,7 +52,7 @@ non-goals:
 
 ## 2. 连接 lifecycle 状态机
 
-> 单一公开 `Client` 内部 worker task 的状态。Phase 1 不做自动重连 ⇒ 一旦进入 `Closed`/`Disconnected` 即为**终态**；caller 想恢复 ⇒ 走 `Client::builder()...connect_*()` 从头建一个新 `Client`。
+> 单一公开 `Client` 内部 worker task 的状态。Phase 1 不做自动重连 ⇒ 一旦进入 `Closed`/`Disconnected` 即为**终态**；caller 想恢复 ⇒ 走 `ClientBuilder::new()...connect_*()` 从头建一个新 `Client`。
 
 ```
                        ┌──────────────────────────────────────────┐
@@ -71,7 +71,7 @@ non-goals:
           ▼                                                                   
    ┌──────────────┐                                                           
    │ Initializing │  ◀── 发 `initialize` request，等 InitializeResponse        
-   │              │      10s timeout (A2 §6.Q1 / C1.initialize_timeout 默认值)
+   │              │      2s timeout (A2 §6.Q1 / C1.initialize_timeout 默认值)
    │              │      失败 ⇒ Err(ClientError::Transport / Server)，         
    │              │              transport 立即 drop（worker 不进 Ready）       
    └──────┬───────┘                                                           
@@ -89,7 +89,7 @@ non-goals:
           ▼                                                                   
    ┌──────────────┐                                                           
    │ Closing      │  ◀── 1) 遍历 pending_requests，全 resolve(Err(Disconnected)
-   │              │      2) 发 ClientEvent::Disconnected { message }          
+   │              │      2) 发 ClientEvent::Disconnected { reason }           
    │              │      3) Drop transport（kill child / close stream）        
    │              │      此态最长持续 SHUTDOWN_TIMEOUT = 5s（C1）              
    └──────┬───────┘                                                           
@@ -145,7 +145,7 @@ non-goals:
 
 ## 4. Phase 1 自动重连决策
 
-### 决策：**不做自动重连，也不提供 `client.reconnect()` 方法。Disconnected = 终态。caller 想恢复 = 走 `Client::builder()` 从头建一个新 `Client`。**
+### 决策：**不做自动重连，也不提供 `client.reconnect()` 方法。Disconnected = 终态。caller 想恢复 = 走 `ClientBuilder::new()` 从头建一个新 `Client`。**
 
 ### 选 A 不选 B 的理由
 
@@ -165,7 +165,7 @@ non-goals:
    - UDS path 变更 / child PID 变更检测（§6）。
    - Drop / shutdown / reconnect 三态互锁。
    Phase 1 目标是「跑通 stdio + uds」（D-004），自动重连属于 Phase 2/3 的 robustness layer。
-4. **caller 侧重建成本低**：`Client::builder().client_info(...).capabilities(...).connect_stdio(child).await?` 三行复用——caller 比 client 更知道是否要重启（例如 TUI 可能想提示用户、bridge 可能想直接 fail）。这是 Unix 哲学：library 不替 caller 决策。
+4. **caller 侧重建成本低**：`ClientBuilder::new().client_info(...).capabilities(...).connect_stdio().await?` 三行复用——caller 比 client 更知道是否要重启（例如 TUI 可能想提示用户、bridge 可能想直接 fail）。这是 Unix 哲学：library 不替 caller 决策。
 5. **A2 协商语义干净**：每次新 Client 一定走完整 `initialize`，不存在「上次 capabilities 还能不能信」的歧义——见 §5。
 
 **不选 B 的理由**：
@@ -206,7 +206,7 @@ non-goals:
 
 ## 6. UDS path 变更检测
 
-### 决策：**Phase 1 不监听 UDS path；caller 调 `Client::builder().connect_uds(path)` 时按当下路径 connect，之后 path 变没变不关心。断连后 caller 自己重新解析路径再建新 Client。**
+### 决策：**Phase 1 不监听 UDS path；caller 调 `ClientBuilder::new().connect_uds(path)` 时按当下路径 connect，之后 path 变没变不关心。断连后 caller 自己重新解析路径再建新 Client。**
 
 ### 三种方案对比
 
@@ -232,7 +232,7 @@ non-goals:
 
 ### Q1：Phase 1 是否做自动重连？codex 怎么做？
 
-**Phase 1 不做。** codex 也不做：`app-server-client/src/` 全文 grep `reconnect|retry|backoff` 仅 1 命中（lib.rs:278 文档 comment 提示 caller 自决）。Disconnected 是 `AppServerEvent` 终态一案（lib.rs:136）；worker break 后没有 restart 路径，pending 全 reject `BrokenPipe`（remote.rs:459-467）。tower-lsp 同样把 server exit 当终态（service.rs:27-37 `ExitedError`）。zhive 直接采纳：`Disconnected` 终态 + caller 自己 `Client::builder()...connect_*()` 重建。**不**给 explicit `reconnect()` method（避开「reconnect 后旧 pending 怎么办」语义陷阱，详见 §4 「不选 C」）。
+**Phase 1 不做。** codex 也不做：`app-server-client/src/` 全文 grep `reconnect|retry|backoff` 仅 1 命中（lib.rs:278 文档 comment 提示 caller 自决）。Disconnected 是 `AppServerEvent` 终态一案（lib.rs:136）；worker break 后没有 restart 路径，pending 全 reject `BrokenPipe`（remote.rs:459-467）。tower-lsp 同样把 server exit 当终态（service.rs:27-37 `ExitedError`）。zhive 直接采纳：`Disconnected` 终态 + caller 自己 `ClientBuilder::new()...connect_*()` 重建。**不**给 explicit `reconnect()` method（避开「reconnect 后旧 pending 怎么办」语义陷阱，详见 §4 「不选 C」）。
 
 ### Q2：重连后已发出未回的请求怎么办？
 
@@ -240,7 +240,7 @@ non-goals:
 
 ### Q3：UDS 路径 server 重启后变了怎么发现？
 
-**不主动发现。** caller 在 `Client::builder().connect_uds(path)` 调用时按当下 path lookup；之后 path 不再 tracked。断连信号走 `transport.recv() = Eof/Err`（不依赖 path 状态）。caller 想重连 ⇒ caller 自己 resolve 新 path（例如读 `/run/zhive/agent.sock` 的 symlink 目标 / 查 service registry）→ 新 `connect_uds(new_path)`。理由：(a) inotify 跨平台烂（Windows 无）+ 需新 crate（CLAUDE.md 禁）；(b) poll path 需后台 timer task + 选择 poll 间隔；(c) Phase 1 不引这俩复杂度。codex `RemoteAppServerEndpoint::UnixSocket` 同模式：path 只在 connect 时用一次（remote.rs:78-80）。
+**不主动发现。** caller 在 `ClientBuilder::new().connect_uds(path)` 调用时按当下 path lookup；之后 path 不再 tracked。断连信号走 `transport.recv() = Eof/Err`（不依赖 path 状态）。caller 想重连 ⇒ caller 自己 resolve 新 path（例如读 `/run/zhive/agent.sock` 的 symlink 目标 / 查 service registry）→ 新 `connect_uds(new_path)`。理由：(a) inotify 跨平台烂（Windows 无）+ 需新 crate（CLAUDE.md 禁）；(b) poll path 需后台 timer task + 选择 poll 间隔；(c) Phase 1 不引这俩复杂度。codex `RemoteAppServerEndpoint::UnixSocket` 同模式：path 只在 connect 时用一次（remote.rs:78-80）。
 
 ---
 
@@ -248,7 +248,7 @@ non-goals:
 
 > TODO(开放项 C2-N1)：Phase 2/3 引入自动重连时的设计草案。建议形态：`ClientBuilder::reconnect_policy(ReconnectPolicy)` 三态枚举 —— `Never`（Phase 1 默认）/ `Bounded { max_attempts, backoff }` / `Unbounded { backoff }`；in-flight pending 在重连开始时全 `Err(Disconnected)`（即 B 方案不 retry pending，只重连 transport），caller 拿到 Err 自行决定是否重发。**依赖**：B 系列引入 `Idempotency-Key` header（thread/turn create 类操作幂等化）后才稳妥；否则任何 retry 都可能创建鬼影 thread。
 
-> TODO(开放项 C2-N2)：`connect_stdio(child)` 在 child 进程退出后的语义。child 死 ⇒ stdin/stdout 被内核关闭 ⇒ `transport.recv = Eof` ⇒ 走 §2 `Ready → Closing`。但 child 的 exit_status 此时已可读，caller 想拿这个 exit_status 做 diagnostic 怎么办？建议在 `ClientEvent::Disconnected.message` 里附加 child 的 `try_wait()` 结果字符串（best-effort，不阻塞 worker）。C2 调研期不动 API surface，仅记录。
+> TODO(开放项 C2-N2)：`connect_stdio(child)` 在 child 进程退出后的语义。child 死 ⇒ stdin/stdout 被内核关闭 ⇒ `transport.recv = Eof` ⇒ 走 §2 `Ready → Closing`。但 child 的 exit_status 此时已可读，caller 想拿这个 exit_status 做 diagnostic 怎么办？建议在 `ClientEvent::Disconnected.reason` 里附加 child 的 `try_wait()` 结果字符串（best-effort，不阻塞 worker）。C2 调研期不动 API surface，仅记录。
 
 > TODO(开放项 C2-N3)：`Closing` 状态下 `shutdown().await` 与 `Drop` 的相互作用。若 caller 在 worker 已自然 break 后再调 `shutdown()`，oneshot 的另一端可能已被 drop ⇒ 应返回 `Ok(())` 而非 `Err`（语义：已经关了，无需操作）。codex `shutdown` 走 5s timeout 后强 abort（lib.rs:780-795），但没明确处理「worker 已退」case，需 zhive 实现期 review。
 

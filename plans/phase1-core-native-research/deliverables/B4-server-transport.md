@@ -2,7 +2,7 @@
 task: B4
 title: Server module · JSON-RPC over stdio + UDS（D-001 + D-003 + D-004 落地）
 date: 2026-05-28
-status: draft
+status: implemented
 depends_on:
   - research/99-decisions D-001 (zhive-server 不独立 crate；zhive-core::server module)
   - research/99-decisions D-003 (Phase 1 RPC = JSON-RPC 2.0 over stdio + UDS；framing 自写住在 zhive-proto)
@@ -443,13 +443,13 @@ fn default_uds_socket_path() -> PathBuf {
     } else {
         // tmpfs fallback：/tmp/zhive-<uid>.sock
         // 用 uid 隔离同机多用户；通过 fchmod 0600 + 父目录不可写也能挡同用户其他进程
-        let uid = unsafe { libc::getuid() }; // CLAUDE.md 红线：unsafe 需批准 → TODO(B4-2)
+        let uid = rustix::process::getuid().as_raw(); // rustix 的纯 safe wrapper，避开 unsafe libc::getuid
         PathBuf::from(format!("/tmp/zhive-{uid}.sock"))
     }
 }
 ```
 
-> **TODO(开放项 B4-2)**：`libc::getuid()` 是 unsafe，违反 CLAUDE.md 红线 2。替代方案：用 `rustix` crate（已成熟、纯 safe wrapper），但属新增依赖（红线 1）；或仅依赖 `XDG_RUNTIME_DIR`，没有则报错让用户配置。Phase 1 推荐**后者**（拒 fallback），减少依赖且语义清晰。
+> **uid 获取**：`libc::getuid()` 是 unsafe，违反 CLAUDE.md 红线 2，因此回退路径走 `rustix::process::getuid()`（纯 safe wrapper），保留 `XDG_RUNTIME_DIR` 缺失时的 `/tmp/zhive-<uid>.sock` 兜底而非直接报错，让无 runtime dir 的环境也能起 server。
 
 ### 6.2 权限设置
 
@@ -630,7 +630,7 @@ impl Drop for UdsFileGuard {
 ## 9. 未决项汇总（TODO）
 
 1. **TODO(开放项 B4-1)**：UDS / stdio 连接断开时，挂在该 connection 上的反向 RPC pending_callbacks 必须批量解绑（返回 `ConnectionClosed` 错误）。codex `abort_pending_server_requests_for` 直接抄即可，但需要在 zhive `OutgoingMessageSender` 加 `connection_id → Vec<Id>` 二级索引。
-2. **TODO(开放项 B4-2)**：`/tmp/zhive-<uid>.sock` 回退路径需要 `getuid()`，触发 CLAUDE.md unsafe 红线；建议 Phase 1 强制要求 `XDG_RUNTIME_DIR`，没有则报错；Phase 2 加 `rustix` 依赖（走 PR 审批）。
+2. **uid 获取（已定）**：`/tmp/zhive-<uid>.sock` 回退路径需要 `getuid()`，为避开 CLAUDE.md unsafe 红线走 `rustix::process::getuid()`（纯 safe wrapper）；`XDG_RUNTIME_DIR` 缺失时仍保留 `/tmp` 兜底而非报错。
 3. **TODO(开放项 B4-3)**：D-004 的 Windows 第三 transport（lockfile + 127.0.0.1）—— Phase 1 是否暴露 CLI flag 占位？建议**暴露 flag、运行时报 `TransportNotImplementedInPhase1` 错误**，给 Windows 用户提前迁移信号。
 4. **TODO(开放项 B4-4)**：A2 落定的 `ClientRequest` enum 在 zhive-proto 还是 zhive-core？影响 router 的 import 方向 + bridge-stdio 的依赖图。建议**放 zhive-proto**。
 5. **TODO(开放项 B4-5)**：JSON-RPC 错误码编号方案需固化：`-32001 ServerOverloaded` 是抄 codex 还是另起？建议 zhive 从 `-32010` 起编号自身错误，前面留给框架级（framing/parse 失败）。

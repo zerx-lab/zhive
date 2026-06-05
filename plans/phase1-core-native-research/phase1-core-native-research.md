@@ -1,7 +1,7 @@
 ---
 plan: phase1-core-native-research
 date: 2026-05-28
-status: draft
+status: implemented
 scope: Phase 1 / 第一步
 crates: zhive-proto, zhive-core, zhive-client-native
 depends:
@@ -46,7 +46,7 @@ depends:
 - ❌ 写任何 zhive crate 的实现代码（除非是为验证设计假设的最小 prototype，且写完即移到 deliverable 目录）
 - ❌ TUI、CLI、bridge-stdio 三块（属于 Phase 1 但不在本调研范围）
 - ❌ rmcp / ACP runtime 在 core 内的接入（D-005 明确只在 bridge crate 引用；本调研只看 schema 字段命名）
-- ❌ 任何 Phase 2 / Phase 3 内容（remote / Web / A2A / 多 SQLite 拆库）
+- ❌ 任何 Phase 2 / Phase 3 内容（remote / Web / A2A）
 - ❌ 新增 dependency 评估（除非命中 [§ 9 开放项](#9-风险与开放项)，否则按 CLAUDE.md 红线 1 拒绝）
 
 ---
@@ -263,7 +263,7 @@ zhive-client-native 完全空白（除 `version()`）。
 **关键问题**：
 
 1. Engine 持有什么状态？（thread map / 当前 turn / cancel token / hook host / permission reducer / provider / **`phase: EnginePhase`**）
-2. `EnginePhase` 枚举 case：直接抄 Pi 的 5 态（Idle/Turn/Compaction/BranchSummary/Retry）还是 zhive 自有补充（如 SubagentSpawn）？
+2. `EnginePhase` 枚举 case：抄 Pi 的 5 态（Idle/Turn/Compaction/BranchSummary/Retry），不设独立的 subagent phase —— subagent spawn 走 Turn 内的 `agent` 工具，不占 phase。
 3. phase 转换的合法图（哪些转换允许 / 哪些非法）—— state machine 应该用 enum + match 还是 typestate？
 4. 单 thread 内的 turn 是串行还是允许并发？（codex 怎么做的？）
 5. Turn 的事件流（reasoning chunk → tool_call → tool_result → agent_message）如何在 engine 内组织？channel 拓扑？
@@ -300,7 +300,7 @@ zhive-client-native 完全空白（除 `version()`）。
 - 读 / 写 / 订阅访问路径（hooks 要订阅 item 流，怎么暴露）
 - 与 persistence 层（B3）的 sync 点
 
-### B3 · Persistence（rusqlite **多库** + JSONL+Leaf rollout）
+### B3 · Persistence（sqlx **多库** + JSONL+Leaf rollout）
 
 **目的**：[D-011 修订版](../../research/99-decisions/README.md#d-011-session-持久化--rusqlite-多库--jsonl-rollout) 落地。**4 库并行起步**，不走"单库 → 拆库"的演进路径。
 
@@ -313,17 +313,15 @@ zhive-client-native 完全空白（除 `version()`）。
   - `${CODEX}/state/memory_migrations/`（1 文件）—— memories 从主 DB 搬出（PR #24591）
 - `${CODEX}/state/src/lib.rs / paths.rs / migrations.rs / model/ / runtime/` —— 库管理 / 路径 / 迁移 / 模型
 - `${CODEX}/rollout/src/` —— JSONL rollout crate（含 `recorder.rs / list.rs / search.rs / session_index.rs / state_db.rs`）；codex 自己也把 rollout 拆成独立 crate
-- ⚠️ `${CODEX}/state/Cargo.toml` 用 **sqlx**（不抄，zhive 仍 rusqlite =0.40 + bundled）
+- `${CODEX}/state/Cargo.toml` 用 **sqlx**（zhive 同样采 sqlx 0.8：`SqlitePool` 自带异步连接池，`sqlx::migrate!` 内嵌 SQL 文件）
 - `${PI}/packages/agent/src/harness/session/jsonl-storage.ts:8-15` —— `SessionHeader { type: "session", version: 3, id, timestamp, cwd, parentSession? }`
 - `${PI}/packages/agent/src/harness/types.ts:399-402` —— `LeafEntry { type: "leaf", targetId: string | null }` —— fork/branch 关键
-- `${SQL}/src/lib.rs` 0.40 公共 API；`${SQL}/Cargo.toml` `bundled` feature
-- rusqlite connection pool 候选：`r2d2-sqlite` 或 `deadpool-sqlite`（本任务调研定，需评估是否触发新依赖红线）
 
 **关键问题**：
 
-1. **4 库分离的目录布局**（per D-011 修订）：
+1. **4 库分离的目录布局**（per D-011 修订）。base dir 解析顺序 `$ZHIVE_DATA_DIR` → `$XDG_DATA_HOME/zhive` → `$HOME/.local/share/zhive`：
    ```
-   ~/.zhive/db/
+   <base>/
      state.db
      logs.db
      memories.db
@@ -336,21 +334,21 @@ zhive-client-native 完全空白（除 `version()`）。
    ```
    每个 DB 的 `0001_*.sql` 初始 schema 应该长什么样？（对照 codex `*_migrations/0001_*.sql`）
 2. `Storage` trait 4 子接口的具体方法签名（state: `append_item / list_threads / get_thread`；logs: `record_log / query_logs`；memories: `upsert_memory / search_memories`；goals: `add_goal / mark_done`）
-3. 每库独立 connection pool 还是共享 pool？rusqlite 同进程下多 connection 的 `journal_mode = WAL` 行为？
+3. 每库独立 `SqlitePool` 还是共享 pool？同进程下多 connection 的 `journal_mode = WAL` 行为？
 4. **跨库事务**问题：`append_item`（state）+ `record_log`（logs）原子吗？不原子的话失败语义？
-5. JSONL rollout 文件结构：路径布局（`~/.zhive/rollouts/<thread_id>.jsonl`？）+ 每行 schema
+5. JSONL rollout 文件结构：路径布局（`<base>/rollouts/<sanitised thread_id>.jsonl`）+ 每行 schema
 6. **Leaf 指针**（Pi 模式）写入策略：每次 append 后改 leaf 还是只在 fork 时改？fork 后旧 leaf 是否保留？
 7. rollout 与 4 个 DB 的同步点：JSONL 是 source of truth，DB 是索引（崩溃后能否从 JSONL 重建 4 个 DB？应该可以，本任务给出 rebuild 流程）
-8. `rusqlite 0.40` + `bundled` + 4 DB 文件下 cold build 时间 / 二进制体积（R-2 实测）
+8. sqlx 0.8 + 4 DB 文件下 cold build 时间 / 二进制体积（R-2 实测）
 
 **Deliverable**：`deliverables/B3-persistence.md`
 
 - 4 库 DDL（每库 `0001_*.sql`，对照 codex 同名 migration）
 - JSONL 行 schema + Leaf entry schema + 文件路径布局
 - `Storage` trait + 4 子 trait（`StateDb / LogsDb / MemoriesDb / GoalsDb`）草图
-- Connection pool 选型决定（含是否触发"禁新依赖"红线 + 用户确认路径）
+- sqlx `SqlitePool`（每库一池）的初始化与 `journal_mode = WAL` 配置
 - 跨库一致性策略（"JSONL 总是先写成功，DB 失败可异步重建"还是其他）
-- bundled + 4 DB 编译实测数据（cold build / 二进制体积 / 启动时 4 DB 打开耗时）
+- 4 DB 编译实测数据（cold build / 二进制体积 / 启动时 4 DB 打开耗时）
 - 崩溃恢复流程：从 JSONL 重建 4 DB 的伪码
 - 与 codex 当前实现的逐项对照：哪些表 zhive 抄 / 哪些重命名 / 哪些拒
 
@@ -693,12 +691,11 @@ done
 | ID | 项 | 来源 | 应对 |
 |---|---|---|---|
 | ~~R-1~~ | ~~Pi CLI 仓库地址未知~~ | ~~92 § 六 + R6~~ | ✅ **2026-05-28 解决**：Pi 仓库已 clone 至 `${PI}`；A3/A4/A5/B1/B3/B5/B7 已直接引用具体行号 |
-| R-2 | rusqlite 0.40 + bundled + **4 库** 编译开销可能比估算大 | D-011 修订；D-009 估算未含 bundled + 多库 | B3 必须实测一次 cold build + 二进制体积，超 60s 或体积 > 30MB 就向用户确认是否回退 |
+| R-2 | sqlx 0.8 + **4 库** 编译开销可能比估算大 | D-011 修订；D-009 估算未含多库 | B3 必须实测一次 cold build + 二进制体积，超 60s 或体积 > 30MB 就向用户确认是否回退 |
 | R-3 | tower-lsp 已经数年无更新（最后 release 2022），事件循环模式是否还代表"现代 stdio JSON-RPC 标杆"？ | clone 列表 | B4 先扫一眼 last commit，若太旧考虑 alternative（async-lsp / lsp-server） |
 | R-4 | `llmsdk` 内部 trait 表面未审，B10 可能给不出"直接复用"结论 | B10 | 若发现不能直接用，本调研只产出"差距清单"，trait 设计推到后续 |
 | R-5 | A1 决定的 `Item` enum 字段若后续与 ACP / MCP runtime 冲突 | D-005 已承诺 bridge crate 内适配 | 容忍：bridge 侧适配是 D-005 既定路线，不为此修 A1 |
-| R-6 | tracing-opentelemetry 在 Phase 1 不装可能导致 span 字段命名后悔（OTel 有命名规约） | D-014 | B9 提前查 OTel semantic conventions，字段名按 OTel 起 |
-| R-7 | rusqlite connection pool 候选（`r2d2-sqlite` / `deadpool-sqlite`）触发"禁新依赖"红线 | D-011 修订；CLAUDE.md 红线 1 | B3 调研给两个候选 + 第三选项"自写最简 pool"；由用户决策开口子 |
+| R-6 | OTel 三 crate 已声明但 `otel` feature 默认关闭，Phase 1 不激活；span 字段命名若不按 OTel 规约会后悔 | D-014 | B9 提前查 OTel semantic conventions，字段名按 OTel 起 |
 | R-8 | 4 库跨库事务无原子保证 | D-011 修订 | B3 给 fail-strategy；JSONL 始终先写成功，DB 失败可异步重建（参照 § 崩溃恢复） |
 | R-9 | Pi 反例：`tool_call` mutate input 后未重验证 schema → 工具崩溃 | Pi 调研 | 红线 11 已上锁；B5 必须落地 mutate 后强制 re-validate |
 | R-10 | Pi 反例：缺 hook source metadata 导致后续无法定位注册者 | Pi 调研 | 红线 10 已上锁；A4 + B5 双向落地 `registered_by` 必填 |

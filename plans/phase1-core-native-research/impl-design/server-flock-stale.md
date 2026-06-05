@@ -1,15 +1,12 @@
 # Server 启动锁 flock + stale socket 探活
 
-## currentState
-crates/zhive-core/src/server.rs:276-291：`serve_uds_inner` 在 bind 前仅做 `tokio::fs::remove_file`，遇 `NotFound` 静默跳过，遇其他错误仅 warn 不阻止继续；完全没有 connect 探活（无法区分 stale socket 与活跃 server）。无 `ServerStartupLock` / flock 防多进程竞争。crates/zhive-core/src/server.rs:128-140：`ServerError` 枚举缺少 `UdsAlreadyRunning` variant。crates/zhive-core/src/server/path.rs:1-64：`default_socket_path()` 已用 `rustix::process::getuid` fallback（decision-diffs 已拍板方案 b，但 path.rs 还保留了 fallback 路径；本缺口不改 path.rs，聚焦 server.rs）。工作区 Cargo.toml:95：rustix 已有 features `["process", "std"]`，**没有** `"fs"` feature。std::fs::File::lock() Rust 1.83+ 已稳定（当前 1.95.0）。
-
 ## harnessRef
 codex-rs/app-server-transport/src/transport/unix_socket.rs:93-132（prepare_control_socket_path：connect 探活→ConnectionRefused=stale→remove），134-156（acquire_app_server_startup_lock：spawn_blocking + OpenOptions + file.lock()），174-190（ControlSocketFileGuard Drop unlink）。codex-rs/app-server-transport/src/transport/mod.rs:46-48（APP_SERVER_CONTROL_SOCKET_DIR_NAME / FILE_NAME / STARTUP_LOCK_FILE_NAME 三常量）。codex-rs/app-server-transport/src/transport/unix_socket_tests.rs:144-164（app_server_startup_lock_serializes_waiters：验证第二个 acquire 阻塞直到 drop 第一个）。
 
 ## approach
 **选定方案：std::fs::File::lock() + rustix::fs 不引入**。
 
-codex 用 `file.lock()`（对应 `std::fs::File::lock`，Rust 1.83 稳定），zhive 直接沿用——不需要 `rustix::fs::flock`，不需要加 rustix "fs" feature，零 redline impact。替代方案（rustix::fs::flock）需要在工作区 rustix features 加 "fs"，属于「加现有 crate feature」，虽不触新增 dep 红线，但 std 已满足需求故否决。
+codex 用 `file.lock()`（对应 `std::fs::File::lock`，Rust 1.89 稳定，工作区 `rust-version = "1.89"`），zhive 直接沿用——不需要 `rustix::fs::flock`，不需要加 rustix "fs" feature，零 redline impact。替代方案（rustix::fs::flock）需要在工作区 rustix features 加 "fs"，属于「加现有 crate feature」，虽不触新增 dep 红线，但 std 已满足需求故否决。
 
 实现分为两个相互正交的函数，放在 `crates/zhive-core/src/server.rs`（内部），通过新增的 `path::startup_lock_path()` 辅助推锁文件路径：
 
@@ -93,12 +90,12 @@ UdsAlreadyRunning { path: String },
 
 （将 `prepare_uds_path` 返回的 `io::ErrorKind::AddrInUse` 在 `serve_uds_inner` 入口处转为此 variant）
 
-**被否决方案**：直接用 `rustix::fs::flock` — 功能等效但需要在 Cargo.toml 加 rustix "fs" feature；std 1.83 已有等效 API，在 Rust 1.95 环境下无需绕行。
+**被否决方案**：直接用 `rustix::fs::flock` — 功能等效但需要在 Cargo.toml 加 rustix "fs" feature；std 1.89 已有等效 API，在工作区 `rust-version = "1.89"` 下无需绕行。
 
 ## files
 
 - `crates/zhive-core/src/server.rs` — （1）ServerError 新增 `UdsAlreadyRunning { path: String }` variant（server.rs:128-140）；（2）新增 #[cfg(unix)] 内部函数 prepare_uds_path(path: &Path) -> io::Result<()>，替换 server.rs:276-291 的裸 remove_file；（3）新增 #[cfg(unix)] struct UdsFileGuard(PathBuf) + Drop impl；（4）新增 #[cfg(unix)] struct ServerStartupLock { _file: std::fs::File } + acquire_startup_lock(path: PathBuf) -> io::Result<ServerStartupLock>；（5）serve_uds_inner 流程改为：acquire_startup_lock → prepare_uds_path → bind → chmod → UdsFileGuard → accept loop
-- `crates/zhive-core/src/server/path.rs` — 新增 pub fn startup_lock_path() -> Option<PathBuf>：从 default_socket_path() 的父目录推出 `zhive-startup.lock`；带 doc comment + doctest（assert ends_with('.lock')）
+- `crates/zhive-core/src/server/path.rs` — 新增 pub fn startup_lock_path() -> PathBuf：从 default_socket_path() 的父目录推出 `zhive-startup.lock`；带 doc comment + doctest（assert ends_with('.lock')）
 
 ## newTypes
 
@@ -106,11 +103,11 @@ UdsAlreadyRunning { path: String },
 - pub(crate) async fn acquire_startup_lock(path: PathBuf) -> std::io::Result<ServerStartupLock>  // spawn_blocking + OpenOptions + file.lock()
 - struct UdsFileGuard(PathBuf);  // #[cfg(unix)], Drop unlinks socket file
 - async fn prepare_uds_path(path: &Path) -> std::io::Result<()>  // #[cfg(unix)], connect探活+stale remove
-- pub fn startup_lock_path() -> Option<PathBuf>  // path.rs, 与 default_socket_path() 同目录 zhive-startup.lock
+- pub fn startup_lock_path() -> PathBuf  // path.rs, 与 default_socket_path() 同目录 zhive-startup.lock
 - ServerError::UdsAlreadyRunning { path: String }  // 已有活跃 server 时的明确 error
 
 ## redlineImpact
-**rustix "fs" feature：不需要加**。std::fs::File::lock() 在 Rust 1.83 稳定（当前环境 1.95.0），直接可用，无需 rustix::fs::flock。工作区 rustix features 保持 ["process", "std"] 不变。
+**rustix "fs" feature：不需要加**。std::fs::File::lock() 在 Rust 1.89 稳定（工作区 `rust-version = "1.89"`），直接可用，无需 rustix::fs::flock。工作区 rustix features 保持 ["process", "std"] 不变。
 
 **unsafe：无**。std::fs::File::lock() 是 safe API。spawn_blocking 内无 unsafe。
 
@@ -118,7 +115,7 @@ UdsAlreadyRunning { path: String },
 
 **新增 dependency：无**。std + tokio（已有 features）+ rustix（已有）。
 
-**唯一的轻微注意点**：path.rs 的 `startup_lock_path()` 可能返回 `None`（当 default_socket_path() 返回的路径无父目录时，理论上不可能，但类型签名应反映）。建议返回 `PathBuf` 直接 panic-free 推导（与 socket path 同父目录），文档说明依赖 `default_socket_path()`。
+**唯一的轻微注意点**：path.rs 的 `startup_lock_path()` 返回 `PathBuf`，panic-free 推导（与 socket path 同父目录）；当 default_socket_path() 返回的路径理论上无父目录时回退到 `"."`，文档说明依赖 `default_socket_path()`。
 
 ## crossModuleDeps
 

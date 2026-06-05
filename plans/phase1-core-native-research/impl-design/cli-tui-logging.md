@@ -8,8 +8,8 @@ crates/zhive-cli/src/run.rs 是唯一含裸输出的文件。其他 crate 全部
 - run.rs:325  println!("\n[tool] {name}")        ← exec headless ToolCall 用户输出
 - run.rs:338  print!("{delta}")                  ← exec headless delta 流 用户输出
 - run.rs:343  println!()                         ← exec turn_completed 尾换行 用户输出
-- run.rs:425-430 eprintln!("zhive engine serving on ...") ← serve 启动状态
-- run.rs:442  eprintln!("zhive: shutting down")  ← serve 关机状态
+- run.rs:425-430 tracing::info!(name: "server.serve.start", ...) ← serve 启动状态
+- run.rs:442  tracing::info!(name: "server.shutdown", "engine shutting down") ← serve 关机状态
 - run.rs:566  println!("{}", path.display())     ← config path 用户输出
 - run.rs:576  println!("wrote sample config to ...") ← config init 用户输出
 - run.rs:603-604 println!("config: ...")         ← doctor 用户输出

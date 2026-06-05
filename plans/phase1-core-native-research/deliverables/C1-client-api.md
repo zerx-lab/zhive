@@ -2,7 +2,7 @@
 task: C1
 plan: phase1-core-native-research
 date: 2026-05-28
-status: draft
+status: implemented
 crate: zhive-client-native（仅依赖 zhive-proto；不依赖 zhive-core）
 depends_on:
   - deliverables/A1-thread-turn-item.md   (Thread / Turn / Item / TurnStarted/CompletedNotification)
@@ -165,14 +165,14 @@ pub trait ReverseHandler: Send + Sync {
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum ClientEvent {
-    /// 服务端发来的 notification（如 `turn/started` / `session/aborted`）。
+    /// 服务端发来的 notification（如 `events/turn_started` / `events/session_aborted`）。
     Notification(Notification),
     /// 服务端发来的反向请求。**caller 不需要自己应答**——已注册 `ReverseHandler`
     /// 的方法由 worker 自动 dispatch；此 case 仅在 caller 想旁路观测时用。
     /// 若没有匹配的 handler，worker 在 emit 此事件**之前**已用 `MethodNotFound` 应答了。
     ServerRequest(ServerRequest),
     /// Backpressure：consumer 落后，期间 best-effort 通知丢了 `skipped` 条。
-    /// Lossless 通知（`turn/completed` / `item/completed` 等）会阻塞通道而不是落入此 case，
+    /// Lossless 通知（`events/turn_completed` / `events/item_appended` 等）会阻塞通道而不是落入此 case，
     /// 与 codex `event_requires_delivery` 同语义（lib.rs:151-186）。
     Lagged { skipped: usize },
     /// 连接断开。**到达此事件后所有 `request()` 立即返回 `ClientError::Disconnected`**；
@@ -511,8 +511,8 @@ impl Drop for Client {
 |---|---|---|
 | `request_typed::<_, ThreadStartResponse>("thread/start", &params)` | `Thread` / `ThreadId` / `ThreadSource` | server 响应反序列化 |
 | `request_typed::<_, Turn>("turn/start", &params)` | `Turn` / `TurnId` / `TurnStatus` | 同上 |
-| `ClientEvent::Notification(...)` 携带 | `TurnStartedNotification { thread_id, turn }` / `TurnCompletedNotification { thread_id, turn }` | wire method = `turn/started` / `turn/completed`（A1 §2.3 决策） |
-| `ClientEvent::Notification(...)` 携带 | `SessionAbortedNotification { cleared_steer, cleared_follow_up, next_turn_retained_count }` | wire method = `session/aborted`（A3 §8） |
+| `ClientEvent::Notification(...)` 携带 | `TurnStartedNotification { thread_id, turn }` / `TurnCompletedNotification { thread_id, turn }` | wire method = `events/turn_started` / `events/turn_completed`（A1 §2.3 决策） |
+| `ClientEvent::Notification(...)` 携带 | `SessionAbortedNotification { cleared_steer, cleared_follow_up, next_turn_retained_count }` | wire method = `events/session_aborted`（A3 §8） |
 
 ### 6.2 初始化用什么 A2 字段
 
@@ -527,7 +527,7 @@ impl Drop for Client {
 
 | `ReverseHandler::methods()` 项 | A3 来源 | params 类型 | 返回值 |
 |---|---|---|---|
-| `"permission/request"` | A3 §2 `PermissionDecision` 四态 + ACP `RequestPermissionRequest`（client.rs:555-756） | `{ thread_id, turn_id, item_id, tool_name, tool_input, scope }` | `{ decision: "allow" \| "deny" \| "ask" \| "defer", reason?, updated_input? }`（A3 §5 `HookSpecificOutput::PreToolUse`） |
+| `"session/request_permission"` | A3 §2 `PermissionDecision` 四态 + ACP `RequestPermissionRequest`（client.rs:555-756） | `{ threadId, turnId, itemId, toolName, toolInput, scope }` | `{ decision: "allow" \| "deny" \| "ask" \| "defer", reason?, updated_input? }`（A3 §5 `HookSpecificOutput::PreToolUse`） |
 | `"hook/run"` | A4（依赖 A3） | `{ hook_event_name, ... }` | `HookOutput`（A3 §5） |
 | `"session/request_user_input"` | codex `ToolRequestUserInputParams` 移植（lib.rs:957-958） | `{ thread_id, turn_id, item_id, questions: [...] }` | `{ answers: [...] }` |
 
