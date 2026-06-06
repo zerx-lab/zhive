@@ -368,6 +368,35 @@ impl ThinkingEffort {
         }
     }
 
+    /// Parses a [`label`](Self::label) string back into a depth, if recognized.
+    ///
+    /// The inverse of [`label`](Self::label): it accepts exactly the lowercase
+    /// tokens that method emits, so a value can round-trip through a config file
+    /// or RPC string. Unknown tokens yield `None` (the caller can then fall back
+    /// to [`Off`](Self::Off)).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use zhive_proto::domain::ThinkingEffort;
+    /// assert_eq!(ThinkingEffort::from_label("high"), Some(ThinkingEffort::High));
+    /// assert_eq!(ThinkingEffort::from_label("off"), Some(ThinkingEffort::Off));
+    /// assert_eq!(ThinkingEffort::from_label("bogus"), None);
+    /// ```
+    #[must_use]
+    pub fn from_label(label: &str) -> Option<Self> {
+        match label {
+            "off" => Some(Self::Off),
+            "minimal" => Some(Self::Minimal),
+            "low" => Some(Self::Low),
+            "medium" => Some(Self::Medium),
+            "high" => Some(Self::High),
+            "xhigh" => Some(Self::Xhigh),
+            "max" => Some(Self::Max),
+            _ => None,
+        }
+    }
+
     /// Returns the depth levels a model supports, in cycle order (always Off-first).
     ///
     /// The single source of truth for which depths the UI offers and the engine
@@ -427,10 +456,10 @@ impl ThinkingEffort {
                     &[Off, High] // pro: `high` only (Responses-only model)
                 } else if model_id.contains("codex-max") {
                     &[Off, Low, Medium, High, Xhigh]
-                } else if model_id.contains("codex") {
+                } else if model_id.contains("codex") || model_id.contains("gpt-5.1") {
+                    // codex and 5.1 share low/medium/high (5.1 dropped the
+                    // `minimal` tier that base GPT-5 had).
                     &[Off, Low, Medium, High]
-                } else if model_id.contains("gpt-5.1") {
-                    &[Off, Low, Medium, High] // 5.1 dropped `minimal`
                 } else if model_id.contains("gpt-5.2")
                     || model_id.contains("gpt-5.3")
                     || model_id.contains("gpt-5.4")

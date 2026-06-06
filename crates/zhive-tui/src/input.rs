@@ -74,6 +74,61 @@ impl Input {
         self.insert_char('\n');
     }
 
+    /// The buffer text from the start up to (but not including) the cursor.
+    ///
+    /// Used to detect a live `@`-mention token, whose query is the run of
+    /// non-whitespace characters between the last `@` and the cursor.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use zhive_tui::input::Input;
+    /// let mut input = Input::new();
+    /// input.insert_str("hello");
+    /// input.move_left();
+    /// assert_eq!(input.before_cursor(), "hell");
+    /// ```
+    #[must_use]
+    pub fn before_cursor(&self) -> &str {
+        &self.value[..self.cursor_byte()]
+    }
+
+    /// Replaces the `token_len` chars before the cursor with `@<path> `.
+    ///
+    /// Removes the `@`-mention token (its `@` plus `token_len - 1` query chars)
+    /// ending at the cursor and inserts the resolved `path` wrapped as
+    /// `@<path> `, leaving the cursor just past the trailing space so the mention
+    /// popup closes. A `token_len` larger than the available prefix is clamped.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use zhive_tui::input::Input;
+    /// let mut input = Input::new();
+    /// input.insert_str("see @ma");
+    /// input.replace_mention(3, "src/main.rs");
+    /// assert_eq!(input.value(), "see @src/main.rs ");
+    /// ```
+    pub fn replace_mention(&mut self, token_len: usize, path: &str) {
+        let end_char = self.cursor;
+        let start_char = end_char.saturating_sub(token_len);
+        let start_byte = self
+            .value
+            .char_indices()
+            .nth(start_char)
+            .map_or(self.value.len(), |(b, _)| b);
+        let end_byte = self
+            .value
+            .char_indices()
+            .nth(end_char)
+            .map_or(self.value.len(), |(b, _)| b);
+        let insert = format!("@{path} ");
+        let insert_chars = insert.chars().count();
+        self.value.replace_range(start_byte..end_byte, &insert);
+        self.cursor = start_char + insert_chars;
+        self.history_pos = None;
+    }
+
     /// Inserts a whole string at the cursor (used for bracketed paste).
     pub fn insert_str(&mut self, s: &str) {
         let at = self.cursor_byte();

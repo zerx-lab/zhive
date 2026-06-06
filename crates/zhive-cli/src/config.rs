@@ -80,6 +80,8 @@ impl Default for ProviderSection {
                 api_version: None,
                 deployment: None,
                 workspace_id: None,
+                context_window: None,
+                thinking: None,
             },
         );
         providers.insert(
@@ -97,6 +99,8 @@ impl Default for ProviderSection {
                 api_version: None,
                 deployment: None,
                 workspace_id: None,
+                context_window: None,
+                thinking: None,
             },
         );
         providers.insert(
@@ -114,6 +118,8 @@ impl Default for ProviderSection {
                 api_version: None,
                 deployment: None,
                 workspace_id: None,
+                context_window: None,
+                thinking: None,
             },
         );
         Self {
@@ -169,6 +175,21 @@ pub struct ProviderEntry {
     pub deployment: Option<String>,
     /// Anthropic-on-AWS workspace id (`anthropic-workspace-id` header).
     pub workspace_id: Option<String>,
+    /// Manual context-window override (maximum input tokens) for this provider.
+    ///
+    /// When set, it takes precedence over the value the `/models` endpoint
+    /// reports for the active model and drives the auto-compaction budget.
+    /// Leave unset to let zhive use the endpoint's `max_input_tokens`, falling
+    /// back to a conservative default when neither is available.
+    pub context_window: Option<u64>,
+    /// Remembered reasoning depth for this provider, as a lowercase label.
+    ///
+    /// Persisted by the TUI when the user cycles depth (Ctrl+T) or switches
+    /// models, and restored at the next launch. Holds one of the
+    /// [`ThinkingEffort`](zhive_proto::domain::ThinkingEffort) labels (`off`,
+    /// `low`, `medium`, `high`, `xhigh`, `max`, `minimal`); `None` or an
+    /// unrecognized value means depth control starts at `off`.
+    pub thinking: Option<String>,
 }
 
 /// The `[ui]` section: palette and layout preferences for the TUI.
@@ -488,6 +509,124 @@ impl Config {
     pub fn active_provider_label(&self) -> &str {
         self.provider.default.as_str()
     }
+
+    /// The active provider's manual context-window override, if configured.
+    ///
+    /// `Some(n)` wins over the `/models` endpoint's reported window when seeding
+    /// the auto-compaction budget; `None` defers to the endpoint.
+    #[must_use]
+    pub fn active_context_window(&self) -> Option<u64> {
+        self.provider
+            .providers
+            .get(&self.provider.default)
+            .and_then(|e| e.context_window)
+    }
+
+    /// The active provider's remembered thinking-depth label, if any.
+    ///
+    /// One of the [`ThinkingEffort`](zhive_proto::domain::ThinkingEffort)
+    /// labels; `None` when no depth has been remembered for this provider.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use zhive_cli::config::Config;
+    /// assert_eq!(Config::default().active_thinking(), None);
+    /// ```
+    #[must_use]
+    pub fn active_thinking(&self) -> Option<&str> {
+        self.provider
+            .providers
+            .get(&self.provider.default)
+            .and_then(|e| e.thinking.as_deref())
+    }
+
+    /// Sets the active provider entry's model id and remembered thinking depth.
+    ///
+    /// A no-op when the active provider name is absent from the map. `thinking`
+    /// is the lowercase [`ThinkingEffort`](zhive_proto::domain::ThinkingEffort)
+    /// label, or `None` to clear any remembered depth.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use zhive_cli::config::Config;
+    /// let mut cfg = Config::default();
+    /// cfg.set_active_selection("claude-opus-4-8".to_owned(), Some("high".to_owned()));
+    /// assert_eq!(cfg.active_model(), "claude-opus-4-8");
+    /// assert_eq!(cfg.active_thinking(), Some("high"));
+    /// ```
+    pub fn set_active_selection(&mut self, model: String, thinking: Option<String>) {
+        let name = self.provider.default.clone();
+        if let Some(entry) = self.provider.providers.get_mut(&name) {
+            entry.model = model;
+            entry.thinking = thinking;
+        }
+    }
+}
+
+/// Writes the active provider's `model` and `thinking` back to `path` in place.
+///
+/// Format-preserving when `path` already exists: only those two keys under
+/// `[provider.<active>]` are rewritten (or inserted), leaving every comment,
+/// blank line, and unrelated key untouched. When `path` does not yet exist, a
+/// fresh fully-serialized config is written (no comments to preserve) so a
+/// first-run selection still persists. A `None` thinking depth removes the key.
+///
+/// # Errors
+///
+/// Returns an error if the file cannot be read, parsed as TOML, or written, or
+/// if its parent directory cannot be created.
+pub(crate) fn persist_active_selection(path: &Path, config: &Config) -> anyhow::Result<()> {
+    use toml_edit::{DocumentMut, Item, Table, value};
+
+    let provider = config.provider.default.clone();
+    let Some(entry) = config.provider.providers.get(&provider) else {
+        // No entry for the active provider name; nothing sensible to persist.
+        return Ok(());
+    };
+
+    if !path.exists() {
+        // No file to preserve — emit a complete, valid serialization.
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| anyhow::anyhow!("creating {}: {e}", parent.display()))?;
+        }
+        let text =
+            toml::to_string(config).map_err(|e| anyhow::anyhow!("serializing config: {e}"))?;
+        return std::fs::write(path, text)
+            .map_err(|e| anyhow::anyhow!("writing {}: {e}", path.display()));
+    }
+
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| anyhow::anyhow!("reading {}: {e}", path.display()))?;
+    let mut doc: DocumentMut = text
+        .parse()
+        .map_err(|e| anyhow::anyhow!("parsing {}: {e}", path.display()))?;
+
+    let provider_tbl = doc
+        .entry("provider")
+        .or_insert(Item::Table(Table::new()))
+        .as_table_mut()
+        .ok_or_else(|| anyhow::anyhow!("[provider] is not a table in {}", path.display()))?;
+    let prov_entry = provider_tbl
+        .entry(&provider)
+        .or_insert(Item::Table(Table::new()))
+        .as_table_mut()
+        .ok_or_else(|| {
+            anyhow::anyhow!("[provider.{provider}] is not a table in {}", path.display())
+        })?;
+
+    prov_entry["model"] = value(entry.model.as_str());
+    match &entry.thinking {
+        Some(depth) => prov_entry["thinking"] = value(depth.as_str()),
+        None => {
+            prov_entry.remove("thinking");
+        }
+    }
+
+    std::fs::write(path, doc.to_string())
+        .map_err(|e| anyhow::anyhow!("writing {}: {e}", path.display()))
 }
 
 /// Computes the default config path from the XDG / HOME environment.
@@ -528,6 +667,13 @@ kind = \"anthropic\"
 model = \"claude-sonnet-4-6\"
 api_key_env = \"ANTHROPIC_API_KEY\"
 # base_url = \"https://api.anthropic.com/v1\"
+# Manual context-window (max input tokens) override for the auto-compaction
+# budget. Omit to use the value the provider's /models endpoint reports.
+# context_window = 200000
+# Remembered reasoning depth (off | low | medium | high | xhigh | max | minimal).
+# Written by the TUI when you cycle depth (Ctrl+T) or switch models; restored at
+# the next launch. Omit to start at `off`.
+# thinking = \"high\"
 
 [provider.openai]
 kind = \"openai\"
@@ -819,6 +965,8 @@ bogus = "nope"
                         api_version: Some("v1".to_owned()),
                         deployment: Some("dep".to_owned()),
                         workspace_id: Some("ws".to_owned()),
+                        context_window: Some(200_000),
+                        thinking: Some("high".to_owned()),
                     },
                 )]),
             },
@@ -933,6 +1081,79 @@ auth_token = "inline-token"
             }
             zhive_mcp::McpTransport::Stdio { .. } => panic!("expected http transport"),
         }
+    }
+
+    #[test]
+    fn persist_preserves_comments_and_rewrites_selection() {
+        let original = "\
+# my hand-written config
+[provider]
+default = \"anthropic\"
+
+[provider.anthropic]
+kind = \"anthropic\"  # keep this comment
+model = \"claude-sonnet-4-6\"
+api_key_env = \"ANTHROPIC_API_KEY\"
+";
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, original).expect("seed config");
+
+        let mut cfg: Config = toml::from_str(original).expect("parse");
+        cfg.set_active_selection("claude-opus-4-8".to_owned(), Some("high".to_owned()));
+        persist_active_selection(&path, &cfg).expect("persist");
+
+        let rewritten = std::fs::read_to_string(&path).expect("read back");
+        // Comments and unrelated keys survive.
+        assert!(rewritten.contains("# my hand-written config"));
+        assert!(rewritten.contains("# keep this comment"));
+        assert!(rewritten.contains("api_key_env = \"ANTHROPIC_API_KEY\""));
+        // The two selected values are rewritten.
+        assert!(rewritten.contains("model = \"claude-opus-4-8\""));
+        assert!(rewritten.contains("thinking = \"high\""));
+        // And it still parses, with the new selection live.
+        let reparsed: Config = toml::from_str(&rewritten).expect("reparse");
+        assert_eq!(reparsed.active_model(), "claude-opus-4-8");
+        assert_eq!(reparsed.active_thinking(), Some("high"));
+    }
+
+    #[test]
+    fn persist_creates_file_when_absent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("nested").join("config.toml");
+        let mut cfg = Config::default();
+        cfg.set_active_selection("claude-opus-4-8".to_owned(), Some("max".to_owned()));
+        persist_active_selection(&path, &cfg).expect("persist creates file");
+
+        let reparsed: Config =
+            toml::from_str(&std::fs::read_to_string(&path).expect("read")).expect("reparse");
+        assert_eq!(reparsed.active_model(), "claude-opus-4-8");
+        assert_eq!(reparsed.active_thinking(), Some("max"));
+    }
+
+    #[test]
+    fn persist_clears_thinking_when_none() {
+        let original = "\
+[provider]
+default = \"anthropic\"
+
+[provider.anthropic]
+kind = \"anthropic\"
+model = \"claude-sonnet-4-6\"
+thinking = \"high\"
+";
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, original).expect("seed");
+
+        let mut cfg: Config = toml::from_str(original).expect("parse");
+        cfg.set_active_selection("claude-sonnet-4-6".to_owned(), None);
+        persist_active_selection(&path, &cfg).expect("persist");
+
+        let rewritten = std::fs::read_to_string(&path).expect("read back");
+        assert!(!rewritten.contains("thinking"));
+        let reparsed: Config = toml::from_str(&rewritten).expect("reparse");
+        assert_eq!(reparsed.active_thinking(), None);
     }
 }
 

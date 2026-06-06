@@ -11,9 +11,11 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
+use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
+
 use zhive_client_native::Client;
-use zhive_core::engine::{Engine, EngineConfig};
+use zhive_core::engine::{Engine, EngineConfig, ModelCatalog};
 use zhive_core::hooks::HookHost;
 use zhive_core::provider::DynLanguageModel;
 use zhive_core::server::{
@@ -45,6 +47,10 @@ impl Host {
     /// capability handles such as the MCP manager, which the `Host` keeps alive
     /// for the engine's lifetime and shuts down in [`Host::stop`].
     ///
+    /// `catalog` (when present) backs the `models/list` / `engine/set_model`
+    /// RPCs, and `context_window` seeds the auto-compaction budget for the
+    /// initially-bound model.
+    ///
     /// # Errors
     ///
     /// Returns an error if the socket never appears or the client cannot
@@ -53,6 +59,8 @@ impl Host {
         provider: DynLanguageModel,
         runtime: RuntimeTools,
         socket: PathBuf,
+        catalog: Option<Arc<dyn ModelCatalog>>,
+        context_window: Option<u64>,
     ) -> anyhow::Result<Self> {
         // A stale socket from a crashed run would block binding.
         let _ = std::fs::remove_file(&socket);
@@ -74,7 +82,13 @@ impl Host {
             compaction_prompt: runtime.compaction_prompt.clone(),
             compact_token_threshold: None,
             cwd: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
-        });
+        })
+        .with_context_window(context_window);
+        // Wire the host model catalogue when the provider kind supports one.
+        let engine = match catalog {
+            Some(cat) => engine.with_model_catalog(cat),
+            None => engine,
+        };
         let mut router = Router::new();
         register_engine_handlers(&mut router, engine.clone());
         let router = std::sync::Arc::new(router);

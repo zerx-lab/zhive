@@ -60,20 +60,42 @@ pub(in crate::engine) const AUTO_COMPACT_ITEM_THRESHOLD: usize = 50;
 ///
 /// Conservative: modern large models have ≥ 128 k tokens, so 32 k leaves
 /// ample headroom and avoids over-eager compaction on tool-heavy sessions.
-/// The engine uses [`COMPACT_BUDGET_FRACTION`] of this value as the actual
-/// trigger threshold, giving a default of 24 k tokens.
+/// The engine uses [`COMPACT_BUDGET_NUMERATOR`] / [`COMPACT_BUDGET_DENOMINATOR`]
+/// of this value as the actual trigger threshold, giving a default of 24 k tokens.
 pub(in crate::engine) const DEFAULT_CONTEXT_BUDGET_TOKENS: u64 = 32_000;
+
+/// Numerator of the fraction of a context window used as the compaction trigger.
+///
+/// Paired with [`COMPACT_BUDGET_DENOMINATOR`] for a 75 % (× 3 / 4) budget:
+/// compaction fires once observed input tokens reach three quarters of the
+/// window, leaving a quarter for the in-flight turn's output before a provider
+/// rejects an over-length request. Integer fractions keep it floating-point-lint
+/// clean. Applied by [`default_compact_threshold`] and
+/// [`threshold_for_context_window`].
+const COMPACT_BUDGET_NUMERATOR: u64 = 3;
+
+/// Denominator paired with [`COMPACT_BUDGET_NUMERATOR`] (75 % budget).
+const COMPACT_BUDGET_DENOMINATOR: u64 = 4;
+
+/// Returns the auto-compaction trigger for a model whose context window is `window`.
+///
+/// 75 % of `window` (see [`COMPACT_BUDGET_NUMERATOR`]), so a 200 k-token model
+/// compacts near 150 k input tokens and a 1 M-token model near 750 k, rather
+/// than at the conservative default. `saturating_mul` guards the multiply for
+/// very large windows.
+pub(in crate::engine) fn threshold_for_context_window(window: u64) -> u64 {
+    window.saturating_mul(COMPACT_BUDGET_NUMERATOR) / COMPACT_BUDGET_DENOMINATOR
+}
 
 /// Returns the default token-budget trigger when no explicit threshold is set.
 ///
 /// Equals 75 % of [`DEFAULT_CONTEXT_BUDGET_TOKENS`] (24 000 tokens), leaving
-/// 8 k overhead for the current turn's output before a provider 400. Uses
-/// integer arithmetic (multiply by 3 / 4) to avoid floating-point lint errors.
-/// This is the threshold used when
-/// [`super::EngineConfig::compact_token_threshold`] is `None`.
+/// 8 k overhead for the current turn's output before a provider 400. This is
+/// the threshold used when neither a host
+/// [`super::EngineConfig::compact_token_threshold`] nor a known model context
+/// window is available.
 pub(in crate::engine) fn default_compact_threshold() -> u64 {
-    // 75 % via integer fractions: × 3 / 4, lint-clean.
-    DEFAULT_CONTEXT_BUDGET_TOKENS * 3 / 4
+    threshold_for_context_window(DEFAULT_CONTEXT_BUDGET_TOKENS)
 }
 
 /// Estimates the token count of a transcript from raw UTF-8 character counts.
@@ -287,8 +309,11 @@ impl EngineInner {
         // 4. Summarise via the provider, streaming each delta to subscribers,
         //    inside the `zhive.compaction` span. Use `.instrument()` (not
         //    `.enter()`) so the span survives the await on a multi-thread runtime.
+        // Bind the active provider to a local: `provider()` clones it out of the
+        // lock and `summarize_streaming` borrows it across the await.
+        let provider = self.provider();
         let summary = summarize_streaming(
-            self.provider(),
+            &provider,
             &snapshot,
             self.compaction_instruction(),
             |delta| {
@@ -694,6 +719,26 @@ mod tests {
     use crate::provider::ScriptedModel;
     use tokio::sync::broadcast;
     use zhive_proto::domain::ItemContent;
+
+    #[test]
+    fn threshold_is_three_quarters_of_window() {
+        // 75 % via integer fractions for a few representative windows.
+        assert_eq!(threshold_for_context_window(200_000), 150_000);
+        assert_eq!(threshold_for_context_window(1_000_000), 750_000);
+        assert_eq!(threshold_for_context_window(128_000), 96_000);
+        // The default budget routes through the same helper.
+        assert_eq!(default_compact_threshold(), 24_000);
+        // Zero window yields zero (callers treat 0 as "unknown" upstream).
+        assert_eq!(threshold_for_context_window(0), 0);
+    }
+
+    #[test]
+    fn threshold_saturates_on_overflow() {
+        // A pathological window must not panic on the × 3 multiply.
+        let huge = u64::MAX;
+        let got = threshold_for_context_window(huge);
+        assert_eq!(got, u64::MAX / 4);
+    }
 
     fn inner_with_summary(text: &str) -> Arc<EngineInner> {
         let (tx, _rx) = broadcast::channel::<EngineEvent>(64);

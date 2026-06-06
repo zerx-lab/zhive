@@ -60,8 +60,12 @@ const TOOL_HEADER_ARG_MAX: usize = 56;
 const CMD_OUTPUT_LINES: usize = 8;
 
 /// Draws the entire frame for the current [`App`] state.
-pub fn draw(frame: &mut Frame, app: &App) {
-    let p = &app.palette;
+///
+/// Takes `&mut App` so the transcript renderer can anchor the scroll position
+/// when streaming output lands while the user is reading history (see
+/// [`render_body`]).
+pub fn draw(frame: &mut Frame, app: &mut App) {
+    let p = app.palette;
     let area = frame.area();
     // Background fill.
     frame.render_widget(Paragraph::new("").style(Style::new().bg(p.bg)), area);
@@ -93,9 +97,12 @@ pub fn draw(frame: &mut Frame, app: &App) {
         }
     }
 
-    // The slash palette floats above the composer while a command is typed.
+    // The slash palette floats above the composer while a command is typed;
+    // the `@`-mention file picker takes the same slot while a mention is typed.
     if app.overlay.is_none() && app.palette_query().is_some() {
         crate::overlays::render_palette(frame, app, composer);
+    } else if app.overlay.is_none() && app.mention_query().is_some() {
+        crate::overlays::render_mention(frame, app, composer);
     }
 
     if let Some(overlay) = &app.overlay {
@@ -175,8 +182,14 @@ fn render_top_bar(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 /// Renders the conversation body (or the welcome view when empty).
-fn render_body(frame: &mut Frame, app: &App, area: Rect) {
-    let p = &app.palette;
+///
+/// Takes `&mut App` to anchor the scroll position: when the user has scrolled
+/// up and the transcript grows, [`App::scrollback`] is bumped by the growth so
+/// the viewed content stays put instead of sliding up under streaming output.
+/// `p` is an owned [`Palette`] copy so the later scroll mutation does not clash
+/// with a live borrow of `app`.
+fn render_body(frame: &mut Frame, app: &mut App, area: Rect) {
+    let p = app.palette;
 
     // The welcome screen draws on the bare body area — no `conversation` panel
     // frame — so the guidance floats on open whitespace below the top bar.
@@ -191,7 +204,7 @@ fn render_body(frame: &mut Frame, app: &App, area: Rect) {
         format!("idle · {} msgs", app.conversation.item_count())
     };
     // Border carries the activity signal: accent while busy, dim when idle.
-    let block = widgets::panel("conversation", Some(&status), app.conversation.busy, p);
+    let block = widgets::panel("conversation", Some(&status), app.conversation.busy, &p);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -199,6 +212,17 @@ fn render_body(frame: &mut Frame, app: &App, area: Rect) {
     let total = u16::try_from(lines.len()).unwrap_or(u16::MAX);
     let visible = inner.height;
     let max_scroll = total.saturating_sub(visible);
+    // Anchor the viewport when the user has scrolled up and new output streamed
+    // in below the fold: bump scrollback by the line growth so the content under
+    // the eye stays fixed. Skipped at the tail (`scrollback == 0` keeps
+    // following) and on a width change (a resize reflows lines, so the delta is
+    // not newly streamed output).
+    if app.scrollback > 0 && inner.width == app.last_width && total > app.last_total {
+        let grew = total - app.last_total;
+        app.scrollback = app.scrollback.saturating_add(grew).min(max_scroll);
+    }
+    app.last_total = total;
+    app.last_width = inner.width;
     // Record the rendered max so the key handler's ctrl+Home can pin to the
     // exact top (see `App::viewport_max_scroll`).
     app.viewport_max_scroll.set(max_scroll);
@@ -276,6 +300,23 @@ fn drop_leading_cells(text: &str, cells: u16) -> &str {
     ""
 }
 
+/// Recolors every span on `line` to the muted foreground, preserving modifiers.
+///
+/// Used to render a compaction handoff summary as folded history: the markdown
+/// structure (bold, code) is kept but uniformly dimmed so it reads as condensed
+/// context rather than a fresh agent message.
+fn dim_line(line: Line<'static>, p: &Palette) -> Line<'static> {
+    let spans: Vec<Span<'static>> = line
+        .spans
+        .into_iter()
+        .map(|span| {
+            let style = span.style.fg(p.fg_dim);
+            Span::styled(span.content, style)
+        })
+        .collect();
+    Line::from(spans)
+}
+
 /// Overpaints the selection background onto the visible transcript rows.
 ///
 /// Sets the background of each selected content cell to `sel_bg`. Uses
@@ -317,10 +358,15 @@ fn paint_selection(
 const SUBAGENT_TOOL_NAME: &str = "agent";
 
 /// Builds the fully-wrapped, gutter-prefixed transcript lines.
+///
+/// Also rebuilds [`App::toggle_zones`]: one clickable region per collapsible
+/// item, recording the transcript line range its block occupies so a left click
+/// can toggle just that item.
 fn transcript_lines(app: &App, inner_width: u16) -> Vec<Line<'static>> {
     let p = &app.palette;
     let content_width = inner_width.saturating_sub(GUTTER);
     let mut out: Vec<Line<'static>> = Vec::new();
+    let mut zones: Vec<crate::app::ToggleZone> = Vec::new();
     // Subagents are consumed in spawn order: each `agent` tool call in the main
     // flow pulls the next registered subagent's live summary in beneath it.
     let mut next_subagent = 0usize;
@@ -328,9 +374,10 @@ fn transcript_lines(app: &App, inner_width: u16) -> Vec<Line<'static>> {
     for turn in &app.conversation.turns {
         for item in &turn.items {
             let (label, color) = role_of(item, p);
+            let start = out.len();
             let body = item_body(
                 item,
-                app.details_expanded,
+                app.item_is_expanded(item.id()),
                 p,
                 content_width,
                 &app.render_cache,
@@ -341,6 +388,15 @@ fn transcript_lines(app: &App, inner_width: u16) -> Vec<Line<'static>> {
             {
                 out.extend(subagent_summary_lines(sub, app.spinner_tick, p));
                 next_subagent += 1;
+            }
+            // Register the rendered block as clickable so a left click toggles
+            // just this item's expansion (mirrors the global ctrl+o baseline).
+            if item_collapsible(item) {
+                zones.push(crate::app::ToggleZone::new(
+                    start,
+                    out.len(),
+                    item.id().clone(),
+                ));
             }
             out.push(Line::raw(""));
         }
@@ -393,7 +449,24 @@ fn transcript_lines(app: &App, inner_width: u16) -> Vec<Line<'static>> {
             p,
         ));
     }
+    // Hand the freshly-built click regions to the event loop for hit-testing.
+    *app.toggle_zones.borrow_mut() = zones;
     out
+}
+
+/// Whether `item` renders as a collapsible block (so a click can toggle it).
+///
+/// Tool calls, command executions, diffs, and file edits always collapse their
+/// output; a user message collapses only when it is a `/skill:<name>` chip.
+fn item_collapsible(item: &Item) -> bool {
+    match item {
+        Item::ToolCall { .. }
+        | Item::CommandExecution { .. }
+        | Item::Diff { .. }
+        | Item::FileEdit { .. } => true,
+        Item::UserMessage { content, .. } => skill_invocation_name(&user_text(content)).is_some(),
+        _ => false,
+    }
 }
 
 /// Builds the live compaction panel: a streaming summary, or a failure notice.
@@ -554,22 +627,32 @@ fn item_body(
         Item::UserMessage { content, .. } => user_message_lines(content, expanded, p, width),
         Item::AgentMessage { text, .. } => {
             // A compaction handoff summary carries the "[context summary]"
-            // prefix; strip that marker line so the body reads as a clean
-            // summary (the `─── Compaction ───` divider above already labels it).
-            let body = text.strip_prefix("[context summary]\n").unwrap_or(text);
-            let mut out = Vec::new();
-            for line in cache.render(body, p) {
-                out.extend(wrap::wrap_line(&line, width));
+            // prefix. Strip that marker line and dim the body so the folded
+            // history reads as muted, visually distinct from live agent output
+            // (the `─── Compaction ───` divider above already labels it).
+            if let Some(body) = text.strip_prefix("[context summary]\n") {
+                let mut out = Vec::new();
+                for line in cache.render(body, p) {
+                    for wrapped in wrap::wrap_line(&line, width) {
+                        out.push(dim_line(wrapped, p));
+                    }
+                }
+                out
+            } else {
+                let mut out = Vec::new();
+                for line in cache.render(text, p) {
+                    out.extend(wrap::wrap_line(&line, width));
+                }
+                out
             }
-            out
         }
         Item::AgentThought { text, .. } => wrap_plain(
-            &format!("💭 {text}"),
+            text,
             Style::new().fg(p.fg_dim).add_modifier(Modifier::ITALIC),
             width,
         ),
         Item::Reasoning { summary, .. } => wrap_plain(
-            &format!("💭 {}", summary.join(" ")),
+            &summary.join(" "),
             Style::new().fg(p.fg_dim).add_modifier(Modifier::ITALIC),
             width,
         ),
@@ -673,9 +756,75 @@ fn user_message_lines(
     let text = user_text(content);
     if let Some(name) = skill_invocation_name(&text) {
         skill_invocation_lines(name, &text, expanded, p, width)
+    } else if text.contains("<file path=\"") && text.contains("</file>") {
+        mention_message_lines(&text, p, width)
     } else {
         wrap_plain(&text, Style::new().fg(p.fg), width)
     }
+}
+
+/// Renders a user message carrying inlined `@`-mention file blocks as chips.
+///
+/// Each `<file path="…" type="…">…</file>` block — appended by
+/// [`crate::files::expand_mentions`] so the model receives the referenced
+/// contents — is collapsed to a compact `dir|file <path>` chip. The block body
+/// is intentionally dropped from the transcript: the user only needs to see
+/// *which* path was attached (mirroring opencode / codex / pi), while the full
+/// content still reaches the model. Surrounding prose (the typed `@path`)
+/// renders normally.
+fn mention_message_lines(text: &str, p: &Palette, width: u16) -> Vec<Line<'static>> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("<file path=\"") {
+        // Prose preceding this block (trim the blank separator lines).
+        let lead = rest[..start].trim_matches('\n');
+        if !lead.is_empty() {
+            out.extend(wrap_plain(lead, Style::new().fg(p.fg), width));
+        }
+        let after = &rest[start..];
+        let Some(end) = after.find("</file>") else {
+            // Malformed (no closing tag): show the remainder verbatim and stop.
+            out.extend(wrap_plain(after, Style::new().fg(p.fg), width));
+            return out;
+        };
+        out.push(file_chip(&after[..end], p));
+        rest = &after[end + "</file>".len()..];
+    }
+    let tail = rest.trim_matches('\n');
+    if !tail.is_empty() {
+        out.extend(wrap_plain(tail, Style::new().fg(p.fg), width));
+    }
+    out
+}
+
+/// Builds a compact `dir|file <path>` chip from a `<file …>` opening tag.
+fn file_chip(block: &str, p: &Palette) -> Line<'static> {
+    let path = tag_attr(block, "path=\"").unwrap_or_default();
+    let kind = match tag_attr(block, "type=\"").as_deref() {
+        Some("directory") => "dir",
+        _ => "file",
+    };
+    Line::from(vec![
+        Span::styled(
+            format!(" {kind} "),
+            Style::new()
+                .fg(p.bg)
+                .bg(p.accent)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+        Span::styled(path, Style::new().fg(p.fg_dim)),
+    ])
+}
+
+/// Extracts the double-quoted value following the first `key` in `block`.
+///
+/// `key` is the attribute lead-in including the opening quote, e.g. `path="`.
+/// Returns `None` when the attribute or its closing quote is absent.
+fn tag_attr(block: &str, key: &str) -> Option<String> {
+    let rest = block.split(key).nth(1)?;
+    let (value, _) = rest.split_once('"')?;
+    Some(value.to_owned())
 }
 
 /// Extracts the skill name when `text` is a `<skill name="…">…</skill>` block.
@@ -706,9 +855,9 @@ fn skill_invocation_lines(
     width: u16,
 ) -> Vec<Line<'static>> {
     let hint = if expanded {
-        "ctrl+o to collapse"
+        "click or ctrl+o to collapse"
     } else {
-        "ctrl+o to expand"
+        "click or ctrl+o to expand"
     };
     let header = Line::from(vec![
         Span::styled(
@@ -837,12 +986,12 @@ fn detail_output_lines(
     let hidden = lines.len() - visible;
     if hidden > 0 {
         out.push(Line::styled(
-            format!("  … {hidden} more lines · ctrl+o to expand"),
+            format!("  … {hidden} more lines · click or ctrl+o"),
             Style::new().fg(p.fg_mute),
         ));
     } else if expanded && lines.len() > preview {
         out.push(Line::styled(
-            "  ctrl+o to collapse".to_owned(),
+            "  click or ctrl+o to collapse".to_owned(),
             Style::new().fg(p.fg_mute),
         ));
     }
@@ -1229,6 +1378,52 @@ mod tests {
 
         let expanded = skill_invocation_lines("commit", raw, true, &p, 80);
         assert!(expanded.len() > 1, "expanded shows the header plus body");
+    }
+
+    // ---- @ mention file chip ----
+
+    #[test]
+    fn at_mention_renders_compact_chip_hiding_body() {
+        let p = Palette::resolve(crate::theme::Theme::Dark, crate::theme::Accent::default());
+        let text = "@plans/\n\n<file path=\"plans/\" type=\"directory\">\nphase1-core-native-research/\n</file>";
+        let lines = mention_message_lines(text, &p, 80);
+        let rendered: String = lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        // The typed `@path` prose stays visible.
+        assert!(rendered.contains("@plans/"));
+        // A compact `dir <path>` chip is shown.
+        assert!(rendered.contains("dir"));
+        assert!(rendered.contains("plans/"));
+        // The inlined directory body is dropped from the transcript.
+        assert!(!rendered.contains("phase1-core-native-research"));
+    }
+
+    #[test]
+    fn at_mention_file_chip_uses_file_badge() {
+        let p = Palette::resolve(crate::theme::Theme::Dark, crate::theme::Accent::default());
+        let text = "@a.rs\n\n<file path=\"a.rs\" type=\"file\">\nfn main() {}\n</file>";
+        let lines = mention_message_lines(text, &p, 80);
+        let rendered: String = lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("file"));
+        assert!(rendered.contains("a.rs"));
+        assert!(!rendered.contains("fn main"));
     }
 
     #[test]

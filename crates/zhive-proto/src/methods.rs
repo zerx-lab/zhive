@@ -189,6 +189,39 @@ pub const METHOD_THREAD_SEARCH: &str = "thread/search";
 pub const METHOD_TOOLS_LIST: &str = "tools/list";
 
 // ============================================================
+// models/* — provider model discovery and runtime switching
+// ============================================================
+
+/// Client-to-server: list the models the active provider exposes.
+///
+/// The engine forwards to its host-injected model catalogue, which queries the
+/// provider's `/models` endpoint. The reply lets a client populate a model
+/// picker with per-model context windows and reasoning-depth support. See
+/// [`crate::rpc::ListModelsResult`].
+///
+/// # Examples
+///
+/// ```
+/// use zhive_proto::methods::METHOD_LIST_MODELS;
+/// assert_eq!(METHOD_LIST_MODELS, "models/list");
+/// ```
+pub const METHOD_LIST_MODELS: &str = "models/list";
+
+/// Client-to-server: hot-swap the active model on the running engine.
+///
+/// Rebuilds the provider for the requested model id and applies the model's
+/// context window to the auto-compaction budget, without restarting the engine.
+/// See [`crate::rpc::SetModelParams`] and [`crate::rpc::SetModelResult`].
+///
+/// # Examples
+///
+/// ```
+/// use zhive_proto::methods::METHOD_SET_MODEL;
+/// assert_eq!(METHOD_SET_MODEL, "engine/set_model");
+/// ```
+pub const METHOD_SET_MODEL: &str = "engine/set_model";
+
+// ============================================================
 // session/* — injection queues, cancel, and permission resume
 // ============================================================
 

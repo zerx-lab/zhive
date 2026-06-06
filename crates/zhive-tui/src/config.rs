@@ -23,6 +23,17 @@ pub struct TuiConfig {
     pub provider_label: String,
     /// Model label for the model pill, e.g. `"claude-sonnet-4-6"`.
     pub model_label: String,
+    /// Reasoning depth restored from config; the app starts the cycle here.
+    ///
+    /// Clamped by [`crate::app::App::new`] to a level the active model supports,
+    /// so a remembered depth that the model cannot honor falls back to `Off`.
+    pub thinking_effort: zhive_proto::domain::ThinkingEffort,
+    /// The active model's live Off-first reasoning-depth cycle, fetched at boot.
+    ///
+    /// `Some` when the host resolved it from the `/models` endpoint, so Ctrl+T
+    /// reflects the model's real capabilities before the `/model` picker is ever
+    /// opened. `None` falls back to the static per-provider table.
+    pub effort_cycle: Option<Vec<zhive_proto::domain::ThinkingEffort>>,
     /// Working directory shown in the breadcrumb.
     pub cwd: PathBuf,
     /// Optional VCS branch shown in the breadcrumb.
@@ -39,6 +50,8 @@ impl Default for TuiConfig {
             density: Density::default(),
             provider_label: "scripted".to_owned(),
             model_label: "demo".to_owned(),
+            thinking_effort: zhive_proto::domain::ThinkingEffort::default(),
+            effort_cycle: None,
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             branch: None,
             session_name: None,

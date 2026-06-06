@@ -20,6 +20,7 @@ pub mod conversation;
 mod diff;
 pub mod error;
 mod farewell;
+mod files;
 mod heal;
 pub mod id;
 pub mod input;
@@ -40,6 +41,26 @@ pub mod wrap;
 pub use config::TuiConfig;
 #[doc(inline)]
 pub use error::{Result, TuiError};
+
+/// The user's final model/depth selection when the TUI exits.
+///
+/// Returned by [`run`] so the host can persist the choice (model and reasoning
+/// depth) back to its config, restoring it at the next launch.
+#[derive(Debug, Clone)]
+pub struct TuiOutcome {
+    /// Active provider label at exit, e.g. `"anthropic"`.
+    pub provider_label: String,
+    /// Active model id at exit, e.g. `"claude-opus-4-8"`.
+    pub model_label: String,
+    /// Reasoning depth in effect at exit.
+    pub thinking_effort: zhive_proto::domain::ThinkingEffort,
+    /// Whether the user changed the model or depth during the session.
+    ///
+    /// `false` for an untouched session, letting the host skip the config
+    /// rewrite entirely (and never clobber a remembered depth on a boot where
+    /// the `/models` fetch failed and the depth was clamped).
+    pub selection_changed: bool,
+}
 #[doc(inline)]
 pub use theme::{Accent, Density, Theme};
 
@@ -87,6 +108,18 @@ enum LoopMsg {
         /// The scope these rows were listed under (cwd vs. all).
         filter: crate::app::SessionFilter,
     },
+    /// Populate and open the `/models` picker with the fetched models.
+    ShowModels {
+        /// The models the active provider advertises, in endpoint order.
+        models: Vec<zhive_proto::rpc::ModelDescriptor>,
+    },
+    /// A completed model hot-swap: update the pill and reasoning-depth cycle.
+    ModelSwitched {
+        /// The model now bound to the engine.
+        model_id: String,
+        /// Its `Off`-first reasoning-depth cycle from the endpoint capabilities.
+        supported_efforts: Vec<zhive_proto::domain::ThinkingEffort>,
+    },
     /// A resumed thread's restored history, to fold into a fresh view.
     Resumed {
         /// The thread that was resumed.
@@ -133,11 +166,14 @@ pub fn version() -> &'static str {
 ///
 /// `skills` are the Agent-Skills discovered at boot, surfaced through the
 /// `/skills` picker and `/skill:<name>` slash execution.
+///
+/// On a clean exit it returns a [`TuiOutcome`] carrying the active model and
+/// reasoning depth, so the host can persist the selection for the next launch.
 pub async fn run(
     client: Client,
     config: TuiConfig,
     skills: Vec<crate::app::SkillCommand>,
-) -> Result<()> {
+) -> Result<TuiOutcome> {
     let thread = id::new_thread_id();
     let mut app = App::new(config, thread);
     // Register discovered skills: stored for `/skill:<name>` execution and the
@@ -208,7 +244,13 @@ pub async fn run(
         let session = (!app.conversation.is_empty()).then(|| app.conversation.thread_id.0.as_ref());
         farewell::print(&app.palette, session);
     }
-    outcome
+    outcome?;
+    Ok(TuiOutcome {
+        provider_label: app.config.provider_label.clone(),
+        model_label: app.config.model_label.clone(),
+        thinking_effort: app.thinking_effort,
+        selection_changed: app.selection_dirty,
+    })
 }
 
 /// Augments the panic hook to disable mouse capture before unwinding.
@@ -307,8 +349,10 @@ async fn event_loop(
                             MouseEventKind::Drag(MouseButton::Left) => {
                                 app.selection_update(mouse.column, mouse.row);
                             }
+                            // A release ends the drag; a plain click (no drag)
+                            // toggles the collapsible block under the pointer.
                             MouseEventKind::Up(MouseButton::Left) => {
-                                app.selection_finish();
+                                app.pointer_release(mouse.column, mouse.row);
                             }
                             _ => {} // other clicks / moves
                         }
@@ -318,6 +362,13 @@ async fn event_loop(
                         app.flash = Some(format!("input error: {err}"));
                     }
                     None => return Ok(()),        // stdin closed
+                }
+                // The `@`-mention popup needs the workspace file index; build it
+                // lazily (once, cached) the first time a mention becomes active,
+                // so projects that never use `@` pay nothing for the scan.
+                if app.needs_file_index() {
+                    let files = files::scan(&app.config.cwd);
+                    app.set_file_index(files);
                 }
                 // Any handled terminal event warrants a repaint.
                 dirty = true;
@@ -411,6 +462,11 @@ fn handle_engine(
 ///
 /// Engine round-trips never block the render loop — each spawns a task that
 /// performs the call and reports any user-facing outcome back through `cmd_tx`.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one cohesive Action dispatch table; splitting arms into helpers would \
+              scatter the single match and obscure the per-action flow"
+)]
 fn perform(
     client: &Client,
     app: &mut App,
@@ -432,9 +488,15 @@ fn perform(
             // Capture the current depth (Copy) so the moved closure sends the
             // level the UI shows at submit time.
             let reasoning = app.thinking_effort;
+            // Resolve `@file` / `@dir/` mentions against the workspace so the
+            // model receives their contents (zhive stays WYSIWYG: the engine
+            // echoes the expanded text back into the transcript). The original
+            // text is kept verbatim for retry on failure.
+            let cwd = app.config.cwd.clone();
             spawn_rpc(client, cmd_tx, move |client, _tx| async move {
                 let failed = text.clone();
-                rpc::start_turn(&client, &thread, &text, reasoning)
+                let expanded = files::expand_mentions(&text, &cwd);
+                rpc::start_turn(&client, &thread, &expanded, reasoning)
                     .await
                     .err()
                     .map(|e| LoopMsg::SubmitFailed {
@@ -520,6 +582,31 @@ fn perform(
                 })
             });
         }
+        Action::OpenModelList => {
+            spawn_rpc(client, cmd_tx, move |client, _tx| async move {
+                match rpc::list_models(&client).await {
+                    Ok(models) if models.is_empty() => Some(LoopMsg::Flash(
+                        "no models available for this provider".to_owned(),
+                    )),
+                    Ok(models) => Some(LoopMsg::ShowModels { models }),
+                    Err(e) => Some(LoopMsg::Flash(format!("model list failed: {e}"))),
+                }
+            });
+        }
+        Action::SwitchModel { model } => {
+            let model_id = model.id.clone();
+            let context_window = model.context_window;
+            let supported_efforts = model.supported_efforts.clone();
+            spawn_rpc(client, cmd_tx, move |client, _tx| async move {
+                match rpc::set_model(&client, &model_id, context_window).await {
+                    Ok(_result) => Some(LoopMsg::ModelSwitched {
+                        model_id,
+                        supported_efforts,
+                    }),
+                    Err(e) => Some(LoopMsg::Flash(format!("switch failed: {e}"))),
+                }
+            });
+        }
     }
 }
 
@@ -548,6 +635,21 @@ fn apply_loop_msg(app: &mut App, msg: LoopMsg) {
                 filter_mode: filter,
             });
             app.flash = Some(format!("{count} session(s) · {}", filter.label()));
+        }
+        LoopMsg::ShowModels { models } => {
+            let count = models.len();
+            app.overlay = Some(crate::app::Overlay::ModelList {
+                models,
+                selected: 0,
+                query: String::new(),
+            });
+            app.flash = Some(format!("{count} model(s) · ↵ to switch"));
+        }
+        LoopMsg::ModelSwitched {
+            model_id,
+            supported_efforts,
+        } => {
+            app.apply_model_switch(model_id, supported_efforts);
         }
         LoopMsg::Resumed {
             thread_id,

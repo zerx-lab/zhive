@@ -59,12 +59,39 @@ async fn run_tui(config_path: Option<std::path::PathBuf>, args: crate::cli::TuiA
         })
         .collect();
     let socket = crate::engine_host::tui_socket_path();
-    let host = crate::engine_host::Host::start(provider, runtime, socket).await?;
+    // Build the host model catalogue (for the `/models` picker + hot-swap) and
+    // resolve the active model's context window AND live reasoning-depth cycle in
+    // one `/models` fetch, so Ctrl+T works at launch without opening the picker.
+    let catalog = crate::models::build_catalog(&cfg);
+    let model_info = crate::models::resolve_active_model_info(&cfg, catalog.as_ref()).await;
+    let context_window = model_info.context_window;
+    let host =
+        crate::engine_host::Host::start(provider, runtime, socket, catalog, context_window).await?;
 
-    let tui_config = build_tui_config(&cfg);
+    let mut tui_config = build_tui_config(&cfg);
+    tui_config.effort_cycle = model_info.supported_efforts;
     let result = zhive_tui::run(host.client.clone(), tui_config, skills).await;
     host.stop().await;
-    Ok(result?)
+    let outcome = result?;
+
+    // Persist the final model and reasoning depth so the next launch restores
+    // them — but only when the user actually changed something, so an untouched
+    // session never rewrites config and a boot-time clamp cannot erase a
+    // remembered depth. A disabled (`Off`) depth clears the remembered value.
+    // Best-effort: a write failure is logged but never fails the clean exit.
+    if outcome.selection_changed {
+        let thinking = outcome
+            .thinking_effort
+            .is_enabled()
+            .then(|| outcome.thinking_effort.label().to_owned());
+        cfg.set_active_selection(outcome.model_label, thinking);
+        if let Some(path) = config_path.or_else(crate::config::default_config_path)
+            && let Err(e) = crate::config::persist_active_selection(&path, &cfg)
+        {
+            tracing::warn!(error = %e, path = %path.display(), "failed to persist model selection");
+        }
+    }
+    Ok(())
 }
 
 /// Attempts to install a file-backed `tracing` subscriber for the TUI.
@@ -170,6 +197,14 @@ fn build_tui_config(cfg: &crate::config::Config) -> zhive_tui::TuiConfig {
         density: parse_density(&cfg.ui.density),
         provider_label: cfg.active_provider_label().to_owned(),
         model_label: cfg.active_model().to_owned(),
+        // Restore the remembered reasoning depth; an absent or unrecognized
+        // label defers to the default (`Off`). The TUI re-clamps to the model.
+        thinking_effort: cfg
+            .active_thinking()
+            .and_then(zhive_proto::domain::ThinkingEffort::from_label)
+            .unwrap_or_default(),
+        // Seeded by the caller from the boot-time `/models` fetch.
+        effort_cycle: None,
         cwd: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
         branch: detect_branch(),
         session_name: None,
@@ -269,7 +304,11 @@ async fn run_exec(
     let provider = crate::provider::build(&cfg)?;
     let runtime = crate::boot::build_runtime(&cfg).await?;
     let socket = crate::engine_host::tui_socket_path();
-    let host = crate::engine_host::Host::start(provider, runtime, socket).await?;
+    let catalog = crate::models::build_catalog(&cfg);
+    let context_window =
+        crate::models::resolve_initial_context_window(&cfg, catalog.as_ref()).await;
+    let host =
+        crate::engine_host::Host::start(provider, runtime, socket, catalog, context_window).await?;
 
     // Generate a fresh thread id and subscribe to events before start_turn so
     // no event is missed between the call and subscription. Built locally (no
@@ -403,6 +442,9 @@ async fn run_serve(
     // active server's socket causing the live-server check to see NotFound and
     // mis-classify a running peer as "clean".
 
+    let catalog = crate::models::build_catalog(&cfg);
+    let context_window =
+        crate::models::resolve_initial_context_window(&cfg, catalog.as_ref()).await;
     let engine = Engine::spawn_with_config(EngineConfig {
         provider,
         tools: Arc::clone(&runtime.registry),
@@ -413,7 +455,12 @@ async fn run_serve(
         compaction_prompt: runtime.compaction_prompt.clone(),
         compact_token_threshold: None,
         cwd: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
-    });
+    })
+    .with_context_window(context_window);
+    let engine = match catalog {
+        Some(cat) => engine.with_model_catalog(cat),
+        None => engine,
+    };
     let mut router = Router::new();
     register_engine_handlers(&mut router, engine.clone());
     let router = Arc::new(router);
@@ -539,6 +586,9 @@ async fn run_acp(config_path: Option<std::path::PathBuf>) -> Result<()> {
     let provider = crate::provider::build(&cfg)?;
     let runtime = crate::boot::build_runtime(&cfg).await?;
 
+    let catalog = crate::models::build_catalog(&cfg);
+    let context_window =
+        crate::models::resolve_initial_context_window(&cfg, catalog.as_ref()).await;
     let engine = Engine::spawn_with_config(EngineConfig {
         provider,
         tools: Arc::clone(&runtime.registry),
@@ -549,7 +599,12 @@ async fn run_acp(config_path: Option<std::path::PathBuf>) -> Result<()> {
         compaction_prompt: runtime.compaction_prompt.clone(),
         compact_token_threshold: None,
         cwd: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
-    });
+    })
+    .with_context_window(context_window);
+    let engine = match catalog {
+        Some(cat) => engine.with_model_catalog(cat),
+        None => engine,
+    };
 
     // `serve` owns the engine and drives it until the ACP client disconnects.
     let result = zhive_bridge_acp::serve(engine.clone()).await;

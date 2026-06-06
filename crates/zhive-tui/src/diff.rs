@@ -259,12 +259,12 @@ pub(crate) fn truncate_styled_lines(
     let hidden = total - visible;
     if hidden > 0 {
         out.push(Line::styled(
-            format!("  … {hidden} more lines · ctrl+o to expand"),
+            format!("  … {hidden} more lines · click or ctrl+o"),
             Style::new().fg(p.fg_mute),
         ));
     } else if expanded && total > preview {
         out.push(Line::styled(
-            "  ctrl+o to collapse".to_owned(),
+            "  click or ctrl+o to collapse".to_owned(),
             Style::new().fg(p.fg_mute),
         ));
     }

@@ -30,11 +30,13 @@
 //!
 //! [`EnginePhase`]: zhive_proto::hook::EnginePhase
 
+mod cache;
 mod compaction;
 pub mod event;
 mod fork;
 mod inner;
 mod lifecycle;
+mod model_catalog;
 pub mod phase;
 mod prompt;
 mod reasoning;
@@ -65,6 +67,8 @@ use crate::tools::ToolRegistry;
 
 #[doc(inline)]
 pub use event::{EngineEvent, TurnRejectionReason};
+#[doc(inline)]
+pub use model_catalog::{ModelCatalog, ModelCatalogError, SwitchedModel};
 #[doc(inline)]
 pub use phase::allows_transition;
 #[doc(inline)]
@@ -289,6 +293,15 @@ pub enum EngineError {
     /// the parent LLM rather than propagating it as a hard error.
     #[error("subagent spawn rejected: {0}")]
     SubagentSpawnFailed(submission::SubagentSpawnError),
+
+    /// A `models/list` or `engine/set_model` call arrived but no host model
+    /// catalogue was injected (see [`Engine::with_model_catalog`]).
+    #[error("model management is unavailable: no model catalogue is configured")]
+    ModelManagementUnavailable,
+
+    /// The injected model catalogue failed to list or switch models.
+    #[error("model catalogue error: {0}")]
+    ModelCatalog(#[from] model_catalog::ModelCatalogError),
 }
 
 impl EngineError {
@@ -303,13 +316,36 @@ impl EngineError {
 /// last clone goes out of scope only after [`Engine::shutdown`] (or
 /// after every clone is dropped without an explicit shutdown — in
 /// which case the actor exits because its submission channel closes).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Engine {
     submission_tx: mpsc::Sender<SubmissionEnvelope>,
     events_tx: broadcast::Sender<EngineEvent>,
     threads: Arc<crate::state::ThreadStore>,
     permission: crate::permission::PermissionReducer,
     reply_timeout: Duration,
+    /// Shared engine state, retained so handle-side methods
+    /// ([`Engine::set_model`], [`Engine::with_context_window`]) can read and
+    /// hot-swap interior-mutable fields without a round-trip through the actor.
+    inner: Arc<inner::EngineInner>,
+    /// Optional host-injected catalogue backing `models/list` / `engine/set_model`.
+    ///
+    /// `None` keeps the prior behaviour: both model-management RPCs report
+    /// [`EngineError::ModelManagementUnavailable`].
+    model_catalog: Option<Arc<dyn ModelCatalog>>,
+}
+
+impl std::fmt::Debug for Engine {
+    /// Renders the handle's identity without its non-`Debug` shared state.
+    ///
+    /// Skips `inner` (the engine state graph) and shows only whether a model
+    /// catalogue is wired, keeping the output small and free of provider
+    /// internals.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Engine")
+            .field("reply_timeout", &self.reply_timeout)
+            .field("has_model_catalog", &self.model_catalog.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 /// Backwards-compatible alias retained while callers migrate to
@@ -381,6 +417,9 @@ impl Engine {
         let inner = Arc::new(EngineInner::new(events_tx.clone(), provider));
         let threads = Arc::clone(inner.threads());
         let permission = inner.permission_reducer();
+        // Retain a handle-side clone before moving `inner` into the actor task,
+        // so model-management methods can mutate its interior-mutable fields.
+        let inner_handle = Arc::clone(&inner);
         tokio::spawn(inner.run(submission_rx));
         Self {
             submission_tx,
@@ -388,6 +427,8 @@ impl Engine {
             threads,
             permission,
             reply_timeout: DEFAULT_REPLY_TIMEOUT,
+            inner: inner_handle,
+            model_catalog: None,
         }
     }
 
@@ -489,6 +530,9 @@ impl Engine {
         ));
         let threads = Arc::clone(inner.threads());
         let permission = inner.permission_reducer();
+        // Retain a handle-side clone before moving `inner` into the actor task,
+        // so model-management methods can mutate its interior-mutable fields.
+        let inner_handle = Arc::clone(&inner);
         tokio::spawn(inner.run(submission_rx));
         Self {
             submission_tx,
@@ -496,6 +540,8 @@ impl Engine {
             threads,
             permission,
             reply_timeout: DEFAULT_REPLY_TIMEOUT,
+            inner: inner_handle,
+            model_catalog: None,
         }
     }
 
@@ -505,6 +551,107 @@ impl Engine {
     pub fn with_reply_timeout(mut self, timeout: Duration) -> Self {
         self.reply_timeout = timeout;
         self
+    }
+
+    /// Injects the host model catalogue backing the model-management RPCs.
+    ///
+    /// Enables [`Self::list_models`] and [`Self::set_model`]; without it both
+    /// return [`EngineError::ModelManagementUnavailable`]. Hosts call this once
+    /// after [`Self::spawn_with_config`], before cloning the handle.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::sync::Arc;
+    /// use zhive_core::engine::{Engine, ModelCatalog};
+    /// # fn demo(engine: Engine, catalogue: Arc<dyn ModelCatalog>) {
+    /// let engine = engine.with_model_catalog(catalogue);
+    /// # let _ = engine;
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn with_model_catalog(mut self, catalog: Arc<dyn ModelCatalog>) -> Self {
+        self.model_catalog = Some(catalog);
+        self
+    }
+
+    /// Seeds the active model's context window for the auto-compaction budget.
+    ///
+    /// `Some(window)` makes compaction trigger at a fraction of the model's real
+    /// window instead of the conservative default; `None` clears it. Updated
+    /// automatically on every [`Self::set_model`]; hosts call this once at boot
+    /// for the initially-bound model.
+    #[must_use]
+    pub fn with_context_window(self, window: Option<u64>) -> Self {
+        self.inner.set_context_window(window);
+        self
+    }
+
+    /// Lists the models the active provider exposes, via the host catalogue.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError::ModelManagementUnavailable`] when no catalogue is
+    /// configured, or [`EngineError::ModelCatalog`] when the listing fails.
+    pub async fn list_models(&self) -> Result<Vec<zhive_proto::rpc::ModelDescriptor>, EngineError> {
+        let catalog = self
+            .model_catalog
+            .as_ref()
+            .ok_or(EngineError::ModelManagementUnavailable)?;
+        let mut models = catalog.list().await?;
+        // Mark the model currently bound to the engine as active. The provider
+        // is the authoritative source (it survives hot swaps), so the flag is
+        // always correct even if the catalogue does not track it.
+        let active_id = self.inner.provider().model_id().to_owned();
+        for model in &mut models {
+            model.active = model.id == active_id;
+        }
+        Ok(models)
+    }
+
+    /// Hot-swaps the engine's active model to `model_id` without a restart.
+    ///
+    /// Rebuilds the provider through the host catalogue and applies the model's
+    /// resolved context window to the auto-compaction budget. The change takes
+    /// effect on the next provider call; a turn already streaming finishes on
+    /// the prior model. `context_window_hint` is the value the caller already
+    /// knows from a prior listing, used unless the host has a configured
+    /// override.
+    ///
+    /// Synchronous because the swap is a lock write plus a provider rebuild; the
+    /// asymmetry with the async [`Self::list_models`] (which performs network
+    /// I/O) is intentional.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError::ModelManagementUnavailable`] when no catalogue is
+    /// configured, or [`EngineError::ModelCatalog`] when the switch fails.
+    pub fn set_model(
+        &self,
+        model_id: &str,
+        context_window_hint: Option<u64>,
+    ) -> Result<zhive_proto::rpc::SetModelResult, EngineError> {
+        let catalog = self
+            .model_catalog
+            .as_ref()
+            .ok_or(EngineError::ModelManagementUnavailable)?;
+        let switched = catalog.switch(model_id, context_window_hint)?;
+        let context_window = switched.context_window;
+        // Swap the provider and apply the new window for compaction. Both are
+        // interior-mutable, so no actor round-trip is needed; the running turn
+        // loop picks up the new provider on its next call.
+        let _previous = self.inner.swap_provider(switched.provider);
+        self.inner.set_context_window(context_window);
+        tracing::info!(
+            name: "zhive.engine.model_switched",
+            model_id = %model_id,
+            context_window = context_window.unwrap_or(0),
+            "switched active model"
+        );
+        Ok(zhive_proto::rpc::SetModelResult::new(
+            model_id.to_owned(),
+            context_window,
+        ))
     }
 
     /// Hands a fire-and-forget [`Submission`] to the actor.
@@ -6090,6 +6237,105 @@ mod inc6_tests {
         // is well below AUTO_COMPACT_ITEM_THRESHOLD=50, so no compaction.
         // Phase must be Idle, not Compaction.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        engine.shutdown().await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod model_management_tests {
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use zhive_proto::domain::ThinkingEffort;
+    use zhive_proto::rpc::ModelDescriptor;
+
+    use super::{Engine, EngineError, ModelCatalog, ModelCatalogError, SwitchedModel};
+    use crate::provider::ScriptedModel;
+
+    /// A deterministic in-memory catalogue for exercising the handle methods.
+    #[derive(Debug)]
+    struct StubCatalog;
+
+    #[async_trait]
+    impl ModelCatalog for StubCatalog {
+        async fn list(&self) -> Result<Vec<ModelDescriptor>, ModelCatalogError> {
+            Ok(vec![
+                ModelDescriptor::new("model-a".to_owned())
+                    .with_context_window(Some(200_000))
+                    .with_supported_efforts(vec![ThinkingEffort::Off, ThinkingEffort::High])
+                    .with_active(true),
+                ModelDescriptor::new("model-b".to_owned()).with_context_window(Some(1_000_000)),
+            ])
+        }
+
+        fn switch(
+            &self,
+            model_id: &str,
+            context_window_hint: Option<u64>,
+        ) -> Result<SwitchedModel, ModelCatalogError> {
+            if model_id == "missing" {
+                return Err(ModelCatalogError::UnknownModel(model_id.to_owned()));
+            }
+            // Resolve the window: hint wins, else a stub default keyed by id.
+            let window = context_window_hint.or(Some(123_456));
+            Ok(SwitchedModel::new(
+                ScriptedModel::new("stub", model_id, vec![]).into_dyn(),
+                window,
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn list_models_without_catalogue_is_unavailable() {
+        let engine = Engine::spawn();
+        let err = engine.list_models().await.unwrap_err();
+        assert!(matches!(err, EngineError::ModelManagementUnavailable));
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn set_model_without_catalogue_is_unavailable() {
+        let engine = Engine::spawn();
+        let err = engine.set_model("model-a", None).unwrap_err();
+        assert!(matches!(err, EngineError::ModelManagementUnavailable));
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn list_models_returns_catalogue_entries() {
+        // Bind a provider whose model id matches a catalogue row so the engine
+        // marks it active authoritatively (regardless of the catalogue's flag).
+        let engine =
+            Engine::spawn_with_provider(ScriptedModel::new("stub", "model-a", vec![]).into_dyn())
+                .with_model_catalog(Arc::new(StubCatalog));
+        let models = engine.list_models().await.unwrap();
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].id, "model-a");
+        assert_eq!(models[0].context_window, Some(200_000));
+        // model-a is the bound provider's model → active; model-b is not.
+        assert!(models[0].active);
+        assert!(!models[1].active);
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn set_model_resolves_window_from_hint() {
+        let engine = Engine::spawn().with_model_catalog(Arc::new(StubCatalog));
+        // Hint wins when provided.
+        let result = engine.set_model("model-b", Some(999_000)).unwrap();
+        assert_eq!(result.model_id, "model-b");
+        assert_eq!(result.context_window, Some(999_000));
+        // Falls back to the catalogue's resolution when no hint is given.
+        let result = engine.set_model("model-a", None).unwrap();
+        assert_eq!(result.context_window, Some(123_456));
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn set_model_unknown_id_surfaces_catalogue_error() {
+        let engine = Engine::spawn().with_model_catalog(Arc::new(StubCatalog));
+        let err = engine.set_model("missing", None).unwrap_err();
+        assert!(matches!(err, EngineError::ModelCatalog(_)));
         engine.shutdown().await.unwrap();
     }
 }

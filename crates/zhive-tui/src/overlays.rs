@@ -20,7 +20,6 @@ use crate::widgets;
 pub(crate) fn render_overlay(frame: &mut Frame, app: &App, overlay: &Overlay, area: Rect) {
     match overlay {
         Overlay::Help => render_help(frame, app, area),
-        Overlay::ModelInfo => render_model_info(frame, app, area),
         Overlay::Settings => render_settings(frame, app, area),
         Overlay::Approval { request, .. } => render_approval(frame, app, area, request),
         Overlay::SessionList {
@@ -32,6 +31,11 @@ pub(crate) fn render_overlay(frame: &mut Frame, app: &App, overlay: &Overlay, ar
         Overlay::SkillList { selected, query } => {
             render_skill_list(frame, app, area, *selected, query);
         }
+        Overlay::ModelList {
+            models,
+            selected,
+            query,
+        } => render_model_list(frame, app, area, models, *selected, query),
     }
 }
 
@@ -96,10 +100,7 @@ pub(crate) fn render_select_list(
     ]));
 
     if rows.is_empty() {
-        lines.push(Line::styled(
-            "  no matching sessions",
-            Style::new().fg(p.fg_mute),
-        ));
+        lines.push(Line::styled("  no matches", Style::new().fg(p.fg_mute)));
     }
     for (i, row) in rows.iter().enumerate().skip(start).take(end - start) {
         let is_sel = i == selected;
@@ -159,7 +160,7 @@ fn hint_row(key: &str, desc: &str, p: &Palette) -> Line<'static> {
 /// Renders the help overlay (keybindings and commands).
 fn render_help(frame: &mut Frame, app: &App, area: Rect) {
     let p = &app.palette;
-    let popup = area.centered(Constraint::Length(60), Constraint::Length(21));
+    let popup = area.centered(Constraint::Length(60), Constraint::Length(22));
     let inner = open_popup(frame, popup, "⌘ help", p);
     let lines = vec![
         hint_row("↵", "send · queue while busy · run command", p),
@@ -173,34 +174,12 @@ fn render_help(frame: &mut Frame, app: &App, area: Rect) {
         hint_row("drag", "select transcript text · ⌃C copies it", p),
         hint_row("shift+drag", "native select (bypasses mouse capture)", p),
         hint_row("/ then ⌃N ⌃P", "navigate the command palette", p),
+        hint_row("@ then ⌃N ⌃P", "fuzzy-pick a file or folder", p),
         hint_row("/copy", "copy the last assistant message", p),
         hint_row("/clear, /compact", "fresh thread · summarize", p),
         hint_row("/theme, /accent", "restyle the UI", p),
         hint_row("⌃C", "copy selection · else clear the composer", p),
         hint_row("⌃D", "quit (on a blank composer)", p),
-        Line::raw(""),
-        Line::styled("press any key to close", Style::new().fg(p.fg_mute)),
-    ];
-    frame.render_widget(Paragraph::new(Text::from(lines)), inner);
-}
-
-/// Renders the current-model overlay.
-fn render_model_info(frame: &mut Frame, app: &App, area: Rect) {
-    let p = &app.palette;
-    let popup = area.centered(Constraint::Length(54), Constraint::Length(9));
-    let inner = open_popup(frame, popup, "⌘ model", p);
-    let lines = vec![
-        hint_row("provider", app.config.provider_label.as_str(), p),
-        hint_row("model", app.config.model_label.as_str(), p),
-        Line::raw(""),
-        Line::styled(
-            "the model is bound when zhive launches; change it in",
-            Style::new().fg(p.fg_dim),
-        ),
-        Line::styled(
-            "config.toml or with --provider/--model, then relaunch.",
-            Style::new().fg(p.fg_dim),
-        ),
         Line::raw(""),
         Line::styled("press any key to close", Style::new().fg(p.fg_mute)),
     ];
@@ -374,6 +353,90 @@ fn render_skill_list(frame: &mut Frame, app: &App, area: Rect, selected: usize, 
     render_select_list(frame, p, inner, query, &rows, selected, hint);
 }
 
+/// Renders the `/models` picker: a filterable list of provider models.
+///
+/// Reuses [`render_select_list`]; filters the fetched models live by the typed
+/// query. Each row shows the active marker, the model label, and a dimmed line
+/// of id / context window / reasoning depth. Selecting a row hot-swaps the
+/// engine's active model (handled in the app key reducer, not here).
+fn render_model_list(
+    frame: &mut Frame,
+    app: &App,
+    area: Rect,
+    models: &[zhive_proto::rpc::ModelDescriptor],
+    selected: usize,
+    query: &str,
+) {
+    let p = &app.palette;
+    let popup = area.centered(Constraint::Percentage(70), Constraint::Percentage(70));
+    let inner = open_popup(frame, popup, "✦ switch model", p);
+
+    let rows: Vec<SelectRow> = crate::app::filter_models(models, query)
+        .into_iter()
+        .map(|m| {
+            let primary = m.display_name.clone().unwrap_or_else(|| m.id.clone());
+            // Dimmed context: the id (when it differs from the label), context
+            // window, and the deepest reasoning depth the model supports.
+            let mut bits: Vec<String> = Vec::new();
+            if primary != m.id {
+                bits.push(m.id.clone());
+            }
+            bits.push(format_context_window(m.context_window));
+            if let Some(depth) = depth_badge(m) {
+                bits.push(depth);
+            }
+            SelectRow {
+                prefix: if m.active {
+                    "● ".to_owned()
+                } else {
+                    "  ".to_owned()
+                },
+                primary,
+                secondary: truncate(&bits.join(" · "), 64),
+            }
+        })
+        .collect();
+
+    let hint = "↑↓ select · ↵ switch · esc cancel · type to filter";
+    render_select_list(frame, p, inner, query, &rows, selected, hint);
+}
+
+/// Formats a context window (max input tokens) as a compact `ctx` badge.
+///
+/// Uses integer K/M suffixes to avoid float precision lints; `None` renders as
+/// an em dash. Examples: `Some(1_000_000)` → `"1M ctx"`, `Some(200_000)` →
+/// `"200K ctx"`.
+fn format_context_window(window: Option<u64>) -> String {
+    /// One million tokens — the M-suffix threshold.
+    const MILLION: u64 = 1_000_000;
+    /// One thousand tokens — the K-suffix threshold.
+    const THOUSAND: u64 = 1_000;
+    match window {
+        None => "— ctx".to_owned(),
+        Some(n) if n >= MILLION => format!("{}M ctx", n / MILLION),
+        Some(n) if n >= THOUSAND => format!("{}K ctx", n / THOUSAND),
+        Some(n) => format!("{n} ctx"),
+    }
+}
+
+/// Returns a reasoning-depth badge for a model, or `None` when it has none.
+///
+/// Shows the deepest supported effort (the last of the `Off`-first cycle) as
+/// `↯<level>`; a model with only `Off` but thinking support shows `↯think`;
+/// a model with neither returns `None`.
+fn depth_badge(model: &zhive_proto::rpc::ModelDescriptor) -> Option<String> {
+    let deepest = model
+        .supported_efforts
+        .iter()
+        .rev()
+        .find(|e| e.is_enabled());
+    match deepest {
+        Some(level) => Some(format!("↯{}", level.label())),
+        None if model.thinking_supported => Some("↯think".to_owned()),
+        None => None,
+    }
+}
+
 /// Truncates `s` to at most `max` chars, appending `…` when shortened.
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
@@ -460,6 +523,79 @@ pub(crate) fn render_palette(frame: &mut Frame, app: &App, composer: Rect) {
                 Span::styled(if is_sel { "▸ " } else { "  " }, Style::new().fg(p.accent)),
                 Span::styled(format!("/{:<10}", cmd.name), name_style),
                 Span::styled(cmd.help.clone(), Style::new().fg(p.fg_dim)),
+            ]);
+            if is_sel {
+                line.style(Style::new().bg(p.sel_bg))
+            } else {
+                line
+            }
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(Text::from(lines)), inner);
+}
+
+/// Renders the `@`-mention file picker floating just above the composer.
+///
+/// Mirrors [`render_palette`]: a rounded popup of fuzzy-ranked workspace paths
+/// with the highlighted row reverse-styled. The window scrolls to keep the
+/// selection visible, and long paths are clipped to the popup width. Shows a
+/// `no matching files` line when the query rules everything out.
+pub(crate) fn render_mention(frame: &mut Frame, app: &App, composer: Rect) {
+    const MAX_ROWS: usize = 8;
+    let p = &app.palette;
+    let matches = app.mention_matches();
+    let visible = matches.len().clamp(1, MAX_ROWS);
+    let rows = u16::try_from(visible).unwrap_or(8);
+    let height = rows + 2;
+    let width = composer.width.min(72);
+    let popup = Rect {
+        x: composer.x,
+        y: composer.y.saturating_sub(height),
+        width,
+        height,
+    };
+    frame.render_widget(Clear, popup);
+    let block = widgets::panel("@ files", None, true, p);
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    if matches.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                "  no matching files",
+                Style::new().fg(p.fg_mute),
+            )),
+            inner,
+        );
+        return;
+    }
+
+    let selected = app.mention_index.min(matches.len().saturating_sub(1));
+    let start = if selected >= visible {
+        selected + 1 - visible
+    } else {
+        0
+    };
+    // Leave room for the two-cell marker before clipping the path.
+    let path_width = usize::from(inner.width).saturating_sub(2);
+    let lines: Vec<Line<'static>> = matches
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(visible)
+        .map(|(i, path)| {
+            let is_sel = i == selected;
+            let name_style = if is_sel {
+                Style::new().fg(p.accent).add_modifier(Modifier::BOLD)
+            } else {
+                Style::new().fg(p.fg)
+            };
+            let line = Line::from(vec![
+                Span::styled(
+                    if is_sel { "\u{25b8} " } else { "  " },
+                    Style::new().fg(p.accent),
+                ),
+                Span::styled(truncate(path, path_width), name_style),
             ]);
             if is_sel {
                 line.style(Style::new().bg(p.sel_bg))

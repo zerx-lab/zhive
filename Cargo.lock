@@ -2142,7 +2142,6 @@ checksum = "11d3d7f243d5c5a8b9bb5d6dd2b1602c0cb0b9db1621bafc7ed66e35ff9fe092"
 [[package]]
 name = "llmsdk"
 version = "0.1.1"
-source = "git+https://github.com/zerx-lab/llmsdk?branch=main#57c02fc3e46c3a9de0fcbce2e08375170dda1c22"
 dependencies = [
  "llmsdk-amazon-bedrock",
  "llmsdk-anthropic",
@@ -2160,7 +2159,6 @@ dependencies = [
 [[package]]
 name = "llmsdk-amazon-bedrock"
 version = "0.1.1"
-source = "git+https://github.com/zerx-lab/llmsdk?branch=main#57c02fc3e46c3a9de0fcbce2e08375170dda1c22"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -2179,7 +2177,6 @@ dependencies = [
 [[package]]
 name = "llmsdk-anthropic"
 version = "0.1.1"
-source = "git+https://github.com/zerx-lab/llmsdk?branch=main#57c02fc3e46c3a9de0fcbce2e08375170dda1c22"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -2193,7 +2190,6 @@ dependencies = [
 [[package]]
 name = "llmsdk-anthropic-aws"
 version = "0.1.1"
-source = "git+https://github.com/zerx-lab/llmsdk?branch=main#57c02fc3e46c3a9de0fcbce2e08375170dda1c22"
 dependencies = [
  "async-trait",
  "llmsdk-anthropic",
@@ -2204,7 +2200,6 @@ dependencies = [
 [[package]]
 name = "llmsdk-azure"
 version = "0.1.1"
-source = "git+https://github.com/zerx-lab/llmsdk?branch=main#57c02fc3e46c3a9de0fcbce2e08375170dda1c22"
 dependencies = [
  "llmsdk-openai",
  "llmsdk-provider",
@@ -2214,7 +2209,6 @@ dependencies = [
 [[package]]
 name = "llmsdk-cohere"
 version = "0.1.1"
-source = "git+https://github.com/zerx-lab/llmsdk?branch=main#57c02fc3e46c3a9de0fcbce2e08375170dda1c22"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -2230,7 +2224,6 @@ dependencies = [
 [[package]]
 name = "llmsdk-google"
 version = "0.1.1"
-source = "git+https://github.com/zerx-lab/llmsdk?branch=main#57c02fc3e46c3a9de0fcbce2e08375170dda1c22"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -2246,7 +2239,6 @@ dependencies = [
 [[package]]
 name = "llmsdk-google-vertex"
 version = "0.1.1"
-source = "git+https://github.com/zerx-lab/llmsdk?branch=main#57c02fc3e46c3a9de0fcbce2e08375170dda1c22"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2265,7 +2257,6 @@ dependencies = [
 [[package]]
 name = "llmsdk-mistral"
 version = "0.1.1"
-source = "git+https://github.com/zerx-lab/llmsdk?branch=main#57c02fc3e46c3a9de0fcbce2e08375170dda1c22"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -2281,7 +2272,6 @@ dependencies = [
 [[package]]
 name = "llmsdk-openai"
 version = "0.1.1"
-source = "git+https://github.com/zerx-lab/llmsdk?branch=main#57c02fc3e46c3a9de0fcbce2e08375170dda1c22"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -2295,7 +2285,6 @@ dependencies = [
 [[package]]
 name = "llmsdk-provider"
 version = "0.1.1"
-source = "git+https://github.com/zerx-lab/llmsdk?branch=main#57c02fc3e46c3a9de0fcbce2e08375170dda1c22"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2311,7 +2300,6 @@ dependencies = [
 [[package]]
 name = "llmsdk-provider-utils"
 version = "0.1.1"
-source = "git+https://github.com/zerx-lab/llmsdk?branch=main#57c02fc3e46c3a9de0fcbce2e08375170dda1c22"
 dependencies = [
  "async-trait",
  "aws-credential-types",
@@ -2331,7 +2319,6 @@ dependencies = [
 [[package]]
 name = "llmsdk-xai"
 version = "0.1.1"
-source = "git+https://github.com/zerx-lab/llmsdk?branch=main#57c02fc3e46c3a9de0fcbce2e08375170dda1c22"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -4364,6 +4351,7 @@ dependencies = [
  "indexmap 2.14.0",
  "toml_datetime",
  "toml_parser",
+ "toml_writer",
  "winnow",
 ]
 
@@ -5503,12 +5491,14 @@ dependencies = [
  "futures",
  "llmsdk",
  "minijinja",
+ "reqwest",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
  "tokio-util",
  "toml",
+ "toml_edit",
  "tracing",
  "tracing-subscriber",
  "zhive-bridge-acp",

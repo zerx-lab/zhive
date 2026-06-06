@@ -155,6 +155,45 @@ pub async fn shutdown(client: &Client) -> Result<()> {
     Ok(())
 }
 
+/// Lists the models the active provider exposes, for the `/models` picker.
+///
+/// The engine forwards to its host model catalogue; the active model is flagged
+/// in the returned [`ModelDescriptor`]s. An empty list comes back when no
+/// catalogue is configured for the provider kind.
+///
+/// [`ModelDescriptor`]: zhive_proto::rpc::ModelDescriptor
+///
+/// # Errors
+///
+/// Returns [`crate::error::TuiError::Client`] on transport or engine failure
+/// (e.g. the provider's `/models` endpoint is unreachable).
+pub async fn list_models(client: &Client) -> Result<Vec<zhive_proto::rpc::ModelDescriptor>> {
+    let result = client.call("models/list", None).await?;
+    let reply: zhive_proto::rpc::ListModelsResult =
+        serde_json::from_value(result).unwrap_or_default();
+    Ok(reply.models)
+}
+
+/// Hot-swaps the engine's active model, returning the resolved context window.
+///
+/// `context_window` is the value the picker already knows for the model, sent as
+/// a hint so the engine need not re-fetch; the engine prefers a host override
+/// when one is configured.
+///
+/// # Errors
+///
+/// Returns [`crate::error::TuiError::Client`] when the switch fails (unknown
+/// model id, provider build error, or transport failure).
+pub async fn set_model(
+    client: &Client,
+    model_id: &str,
+    context_window: Option<u64>,
+) -> Result<zhive_proto::rpc::SetModelResult> {
+    let params = json!({ "modelId": model_id, "contextWindow": context_window });
+    let result = client.call("engine/set_model", Some(params)).await?;
+    Ok(serde_json::from_value(result).unwrap_or_default())
+}
+
 /// Lists persisted threads for the `/session` resume picker, newest first.
 ///
 /// When `cwd` is `Some(path)`, the engine scopes the listing to threads created

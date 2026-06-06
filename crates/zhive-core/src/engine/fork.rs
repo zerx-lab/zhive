@@ -222,12 +222,11 @@ impl EngineInner {
         // Optional branch summary: reuse the compaction provider path so we do
         // not build a parallel summariser.
         let summary_item = if summarize {
-            match super::compaction::summarize(
-                self.provider(),
-                &replayed,
-                self.compaction_instruction(),
-            )
-            .await
+            // Bind the active provider to a local: `provider()` clones it out of
+            // the lock and `summarize` borrows it across the await.
+            let provider = self.provider();
+            match super::compaction::summarize(&provider, &replayed, self.compaction_instruction())
+                .await
             {
                 Ok(text) => Some(Item::AgentMessage {
                     id: ItemId(Arc::from(format!(

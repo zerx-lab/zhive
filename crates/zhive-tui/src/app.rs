@@ -55,6 +55,14 @@ pub enum Action {
         /// The thread to resume.
         thread_id: zhive_proto::domain::ThreadId,
     },
+    /// Open the model picker (populated by an async `models/list`).
+    OpenModelList,
+    /// Hot-swap the engine's active model to the picked one.
+    SwitchModel {
+        /// The chosen model: its id drives the RPC, its capabilities update the
+        /// top-bar pill and reasoning-depth cycle on success.
+        model: Box<zhive_proto::rpc::ModelDescriptor>,
+    },
     /// Write `text` to the system clipboard (transcript selection or `/copy`).
     ///
     /// The event loop performs the actual OSC 52 / native clipboard write; the
@@ -145,6 +153,29 @@ impl SelGeom {
     /// Builds geometry from the body rect and top-line index.
     pub(crate) fn new(body: Rect, scroll_y: u16) -> Self {
         Self { body, scroll_y }
+    }
+}
+
+/// A clickable transcript region that toggles one item's expansion.
+///
+/// Rebuilt each frame by the transcript renderer, one per collapsible item
+/// (tool call, command, diff, skill chip), and read by the event loop to map a
+/// left click onto the item whose block was clicked. Mirrors the [`SelGeom`]
+/// render-to-handler hand-off.
+#[derive(Debug, Clone)]
+pub(crate) struct ToggleZone {
+    /// First transcript line index of the item's block (inclusive).
+    start: usize,
+    /// One-past-the-last transcript line index of the block (exclusive).
+    end: usize,
+    /// The item whose expansion a click in `[start, end)` toggles.
+    id: zhive_proto::domain::ItemId,
+}
+
+impl ToggleZone {
+    /// Builds a zone spanning `[start, end)` for item `id`.
+    pub(crate) fn new(start: usize, end: usize, id: zhive_proto::domain::ItemId) -> Self {
+        Self { start, end, id }
     }
 }
 
@@ -266,8 +297,6 @@ fn slice_by_cells(text: &str, from_cell: u16, to_cell: u16) -> &str {
 pub enum Overlay {
     /// Keybinding / help reference.
     Help,
-    /// Current provider and model information.
-    ModelInfo,
     /// Current settings: theme, accent, density, keybindings.
     Settings,
     /// A pending permission decision.
@@ -294,6 +323,18 @@ pub enum Overlay {
     /// selecting an entry fills the composer with `/skill:<name> ` so the user
     /// can add arguments before submitting.
     SkillList {
+        /// Index of the highlighted entry among the filtered rows.
+        selected: usize,
+        /// Live fuzzy-filter query typed by the user.
+        query: String,
+    },
+    /// The model picker (`/models`): a filterable list of provider models.
+    ///
+    /// Populated by an async `models/list`; selecting a row hot-swaps the
+    /// engine's active model. The active model is flagged in each entry.
+    ModelList {
+        /// All models the provider advertises, in endpoint order.
+        models: Vec<zhive_proto::rpc::ModelDescriptor>,
         /// Index of the highlighted entry among the filtered rows.
         selected: usize,
         /// Live fuzzy-filter query typed by the user.
@@ -378,7 +419,7 @@ pub struct SkillCommand {
 pub fn builtin_commands() -> Vec<SlashCommand> {
     [
         ("help", "show keybindings and commands", false),
-        ("model", "show the current provider and model", false),
+        ("model", "switch the active model", false),
         ("settings", "show theme, accent, and keys", false),
         ("theme", "switch theme — dark | light | mono", true),
         (
@@ -433,19 +474,65 @@ pub struct App {
     /// arbitrary large value (which would leave relative scrolling stuck). It
     /// mirrors the [`Self::logo_hit`] render-to-handler hand-off pattern.
     pub viewport_max_scroll: Cell<u16>,
-    /// Whether collapsible detail blocks show their full content (ctrl+o).
+    /// Transcript line count of the last rendered frame.
     ///
-    /// A single global toggle covering `/skill:<name>` chips, tool-call output,
-    /// and command output: ctrl+o expands/collapses all of them at once (the
-    /// transcript has no per-message focus).
+    /// Paired with [`Self::last_width`] to anchor the viewport: when the user
+    /// has scrolled up and the transcript grows (streaming output landing below
+    /// the fold), the renderer bumps [`Self::scrollback`] by the growth so the
+    /// viewed content stays fixed instead of sliding up.
+    pub(crate) last_total: u16,
+    /// Content width of the last rendered frame, paired with [`Self::last_total`].
+    ///
+    /// Anchoring is skipped when the width changed: a resize reflows every line,
+    /// so a line-count delta then is not newly streamed output.
+    pub(crate) last_width: u16,
+    /// Baseline expansion of collapsible detail blocks, toggled by ctrl+o.
+    ///
+    /// Covers `/skill:<name>` chips, tool-call output, command output, and
+    /// diffs. ctrl+o flips this baseline for every block at once (and clears
+    /// [`Self::item_expanded`]); a mouse click instead overrides a single block.
     pub details_expanded: bool,
+    /// Per-item expansion overrides layered on [`Self::details_expanded`].
+    ///
+    /// A left click on a collapsible block flips just that item here; the
+    /// effective state is the override when present, else the baseline (see
+    /// [`Self::item_is_expanded`]). Cleared by ctrl+o and on thread reset.
+    item_expanded: std::collections::HashMap<zhive_proto::domain::ItemId, bool>,
+    /// Clickable expand/collapse regions captured each frame, for hit-tests.
+    ///
+    /// Rebuilt every render by the transcript renderer (which only borrows
+    /// `&App`) and read by the event loop on a left click. Mirrors the
+    /// [`Self::sel_lines`] render-to-handler hand-off.
+    pub(crate) toggle_zones: RefCell<Vec<ToggleZone>>,
     /// Current reasoning depth, cycled with Ctrl+T and sent with every turn.
     ///
     /// Defaults to [`zhive_proto::domain::ThinkingEffort::Off`]; the top bar
     /// shows the active level whenever it is above `Off`.
     pub thinking_effort: zhive_proto::domain::ThinkingEffort,
+    /// Reasoning-depth cycle for the active model, from a live `/models` fetch.
+    ///
+    /// `Some` once a model is switched via the picker (the endpoint's
+    /// `capabilities.effort` drives the exact `Off`-first cycle); `None` falls
+    /// back to the static [`zhive_proto::domain::ThinkingEffort::cycle_for`]
+    /// table keyed on the provider/model labels.
+    pub active_effort_cycle: Option<Vec<zhive_proto::domain::ThinkingEffort>>,
+    /// Set once the user changes the model or reasoning depth this session.
+    ///
+    /// Gates persistence on exit: the host writes the selection back to config
+    /// only when this is `true`, so an untouched session never rewrites config
+    /// (and a boot-time clamp from a failed `/models` fetch cannot erase the
+    /// remembered depth). The boot-time clamp in [`App::new`] does not set it.
+    pub selection_dirty: bool,
     /// Highlighted entry in the slash-command palette.
     pub palette_index: usize,
+    /// Highlighted entry in the `@`-mention file picker.
+    pub mention_index: usize,
+    /// Cached workspace file index for the `@`-mention picker.
+    ///
+    /// `None` until the first `@` becomes active, then a flat, sorted list of
+    /// project-relative file and folder paths (see [`crate::files::scan`]).
+    /// Built once and reused; never refreshed for the app's lifetime.
+    pub file_index: Option<Vec<String>>,
     /// Set once the user asks to quit.
     pub should_quit: bool,
     /// Most recently received token usage `(input, output)`, if any.
@@ -548,6 +635,23 @@ impl App {
     pub fn new(config: TuiConfig, thread: zhive_proto::domain::ThreadId) -> Self {
         let theme = config.theme;
         let accent = config.accent;
+        // The active model's depth cycle: the live endpoint cycle fetched at boot
+        // when available, else the static per-provider table.
+        let active_effort_cycle = config.effort_cycle.clone();
+        // Clamp the restored depth to a level the active model actually supports,
+        // so a remembered depth the model cannot honor resets to Off rather than
+        // being sent on the next turn.
+        let thinking_effort = {
+            use zhive_proto::domain::ThinkingEffort;
+            let levels: Vec<ThinkingEffort> = active_effort_cycle.clone().unwrap_or_else(|| {
+                ThinkingEffort::cycle_for(&config.provider_label, &config.model_label).to_vec()
+            });
+            if levels.contains(&config.thinking_effort) {
+                config.thinking_effort
+            } else {
+                ThinkingEffort::Off
+            }
+        };
         Self {
             palette: Palette::resolve(theme, accent),
             theme,
@@ -559,9 +663,17 @@ impl App {
             spinner_tick: 0,
             scrollback: 0,
             viewport_max_scroll: Cell::new(0),
+            last_total: 0,
+            last_width: 0,
             details_expanded: false,
-            thinking_effort: zhive_proto::domain::ThinkingEffort::default(),
+            item_expanded: std::collections::HashMap::new(),
+            toggle_zones: RefCell::new(Vec::new()),
+            thinking_effort,
+            active_effort_cycle,
+            selection_dirty: false,
             palette_index: 0,
+            mention_index: 0,
+            file_index: None,
             should_quit: false,
             last_usage: None,
             disconnected: false,
@@ -624,8 +736,14 @@ impl App {
     /// ```
     pub fn cycle_thinking_effort(&mut self) {
         use zhive_proto::domain::ThinkingEffort;
-        let levels =
-            ThinkingEffort::cycle_for(&self.config.provider_label, &self.config.model_label);
+        // Prefer the active model's live cycle (from a `/models` switch); fall
+        // back to the static per-provider table keyed on the labels. Cloned to
+        // an owned Vec (at most a handful of entries) so the two sources share a
+        // type without borrow gymnastics.
+        let levels: Vec<ThinkingEffort> = self.active_effort_cycle.clone().unwrap_or_else(|| {
+            ThinkingEffort::cycle_for(&self.config.provider_label, &self.config.model_label)
+                .to_vec()
+        });
         // A single-entry cycle is `[Off]`: the model has no depth control.
         if levels.len() <= 1 {
             self.flash = Some(format!(
@@ -634,8 +752,38 @@ impl App {
             ));
             return;
         }
-        self.thinking_effort = self.thinking_effort.cycle_next(levels);
+        self.thinking_effort = self.thinking_effort.cycle_next(&levels);
+        self.selection_dirty = true;
         self.flash = Some(format!("thinking: {}", self.thinking_effort.label()));
+    }
+
+    /// Applies a completed model switch to the top-bar pill and reasoning cycle.
+    ///
+    /// Updates [`TuiConfig::model_label`] to the new model id, installs the
+    /// model's `Off`-first reasoning-depth cycle (empty/`[Off]` means no depth
+    /// control), and clamps the current [`Self::thinking_effort`] to a level the
+    /// new model supports (resetting to `Off` when the prior level is gone).
+    pub fn apply_model_switch(
+        &mut self,
+        model_id: String,
+        supported_efforts: Vec<zhive_proto::domain::ThinkingEffort>,
+    ) {
+        use zhive_proto::domain::ThinkingEffort;
+        self.config.model_label = model_id;
+        self.selection_dirty = true;
+        // Clamp the current depth to the new model's supported set.
+        let supports_current = supported_efforts.contains(&self.thinking_effort);
+        if !supports_current {
+            self.thinking_effort = ThinkingEffort::Off;
+        }
+        self.active_effort_cycle = if supported_efforts.is_empty() {
+            // An empty set means the endpoint reported nothing; defer to the
+            // static table rather than locking the model out of depth control.
+            None
+        } else {
+            Some(supported_efforts)
+        };
+        self.flash = Some(format!("switched to {}", self.config.model_label));
     }
 
     /// Registers the discovered skills for `/skill:<name>` and the `/skills`
@@ -746,6 +894,128 @@ impl App {
         self.run_slash(&cmd.name)
     }
 
+    /// The active `@`-mention query, or `None` when no mention is being typed.
+    ///
+    /// A mention is the run of non-whitespace characters after the last `@`
+    /// before the cursor, where that `@` starts a token (it is at the buffer
+    /// start or follows whitespace). Suppressed while an overlay or the slash
+    /// palette is open, so the two pickers never fight over the same keystrokes.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use zhive_tui::app::App;
+    /// use zhive_tui::TuiConfig;
+    /// use zhive_proto::domain::ThreadId;
+    /// let mut app = App::new(TuiConfig::default(), ThreadId(Arc::from("thread:native/t")));
+    /// app.input.insert_str("look @sr");
+    /// assert_eq!(app.mention_query(), Some("sr"));
+    /// // A space ends the token, closing the picker.
+    /// app.input.insert_str(" done");
+    /// assert_eq!(app.mention_query(), None);
+    /// ```
+    #[must_use]
+    pub fn mention_query(&self) -> Option<&str> {
+        if self.overlay.is_some() || self.palette_query().is_some() {
+            return None;
+        }
+        let before = self.input.before_cursor();
+        let at = before.rfind('@')?;
+        // The `@` must open a token: at the start or right after whitespace.
+        if !before[..at]
+            .chars()
+            .next_back()
+            .is_none_or(char::is_whitespace)
+        {
+            return None;
+        }
+        let query = &before[at + 1..];
+        if query.contains(char::is_whitespace) {
+            None
+        } else {
+            Some(query)
+        }
+    }
+
+    /// `true` once a mention is active but the file index has not been built.
+    ///
+    /// The event loop polls this to scan the workspace lazily (once) before the
+    /// next draw, so the popup has paths to rank.
+    #[must_use]
+    pub fn needs_file_index(&self) -> bool {
+        self.mention_query().is_some() && self.file_index.is_none()
+    }
+
+    /// Installs the scanned workspace file index for the `@`-mention picker.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use zhive_tui::app::App;
+    /// use zhive_tui::TuiConfig;
+    /// use zhive_proto::domain::ThreadId;
+    /// let mut app = App::new(TuiConfig::default(), ThreadId(Arc::from("thread:native/t")));
+    /// app.input.insert_str("@");
+    /// assert!(app.needs_file_index());
+    /// app.set_file_index(vec!["src/main.rs".to_owned()]);
+    /// assert!(!app.needs_file_index());
+    /// assert_eq!(app.mention_matches(), vec!["src/main.rs"]);
+    /// ```
+    pub fn set_file_index(&mut self, files: Vec<String>) {
+        self.file_index = Some(files);
+    }
+
+    /// Workspace paths ranked against the active mention query, best first.
+    ///
+    /// Empty when no mention is active or the file index is not yet built.
+    #[must_use]
+    pub fn mention_matches(&self) -> Vec<&str> {
+        let Some(query) = self.mention_query() else {
+            return Vec::new();
+        };
+        let Some(files) = self.file_index.as_deref() else {
+            return Vec::new();
+        };
+        crate::files::fuzzy_filter(files, query)
+    }
+
+    /// Moves the mention highlight one step, wrapping around the match list.
+    ///
+    /// Mirrors [`Self::palette_move`]: only the sign of `delta` matters.
+    fn mention_move(&mut self, delta: i32) {
+        let len = self.mention_matches().len();
+        if len == 0 {
+            self.mention_index = 0;
+            return;
+        }
+        self.mention_index = if delta < 0 {
+            (self.mention_index + len - 1) % len
+        } else {
+            (self.mention_index + 1) % len
+        };
+    }
+
+    /// Inserts the highlighted file path in place of the active mention token.
+    ///
+    /// Replaces `@<query>` with `@<path> `; a no-op when nothing matches.
+    fn mention_accept(&mut self) -> Action {
+        let chosen = {
+            let matches = self.mention_matches();
+            matches
+                .get(self.mention_index)
+                .or_else(|| matches.first())
+                .map(|s| (*s).to_owned())
+        };
+        if let Some(path) = chosen {
+            let token_len = self.mention_query().map_or(0, |q| q.chars().count() + 1);
+            self.input.replace_mention(token_len, &path);
+            self.mention_index = 0;
+        }
+        Action::None
+    }
+
     /// Advances animation clocks; called on each redraw tick.
     ///
     /// Live logo ripples age (and prune), and the spinner only moves while a
@@ -840,6 +1110,52 @@ impl App {
         self.selection = None;
     }
 
+    /// Effective expansion of a collapsible block: its override, else baseline.
+    ///
+    /// A click records a per-item override in [`Self::item_expanded`]; absent
+    /// one, the block follows the ctrl+o baseline [`Self::details_expanded`].
+    pub(crate) fn item_is_expanded(&self, id: &zhive_proto::domain::ItemId) -> bool {
+        self.item_expanded
+            .get(id)
+            .copied()
+            .unwrap_or(self.details_expanded)
+    }
+
+    /// Ends a left-button gesture, toggling a collapsible block on a plain click.
+    ///
+    /// A drag (the selection moved) finalizes the text selection; a click that
+    /// did not move and landed on a collapsible block flips just that block's
+    /// expansion instead.
+    pub(crate) fn pointer_release(&mut self, col: u16, row: u16) {
+        let was_click = matches!(self.selection, Some(sel) if sel.anchor == sel.cursor);
+        self.selection_finish();
+        if was_click {
+            self.toggle_detail_at(col, row);
+        }
+    }
+
+    /// Toggles the collapsible block whose rendered region contains `(col, row)`.
+    ///
+    /// A no-op when the click misses every recorded [`ToggleZone`]. Toggling
+    /// shifts the lines below, so any selection is dropped (as ctrl+o does).
+    fn toggle_detail_at(&mut self, col: u16, row: u16) {
+        let Some((line_idx, _)) = hit_to_content(self.sel_geom.get(), col, row) else {
+            return;
+        };
+        let hit = self
+            .toggle_zones
+            .borrow()
+            .iter()
+            .find(|z| line_idx >= z.start && line_idx < z.end)
+            .map(|z| z.id.clone());
+        let Some(id) = hit else {
+            return;
+        };
+        let next = !self.item_is_expanded(&id);
+        self.item_expanded.insert(id, next);
+        self.clear_selection();
+    }
+
     /// Takes the selected text and clears the selection.
     ///
     /// Returns `None` when there is no selection or it is empty, so the caller
@@ -878,6 +1194,11 @@ impl App {
         self.queue_halted = false;
         // The line indices a selection referenced no longer exist.
         self.selection = None;
+        // The old thread's item ids are gone; drop their expansion overrides.
+        self.item_expanded.clear();
+        // Token usage belongs to the old thread; a fresh thread has none yet, so
+        // the top bar must not keep showing the previous thread's counts.
+        self.last_usage = None;
     }
 
     /// Records that the engine connection was lost.
@@ -928,13 +1249,11 @@ impl App {
                     summary: String::new(),
                     error: None,
                 });
-                self.scrollback = 0;
             }
             EngineNotification::CompactionDelta { delta, .. } => {
                 if let Some(view) = self.compaction.as_mut() {
                     view.summary.push_str(delta);
                 }
-                self.scrollback = 0;
             }
             EngineNotification::CompactionCompleted {
                 entries_compacted, ..
@@ -942,6 +1261,11 @@ impl App {
                 // The marker + summary items arrive via ItemAppended; the live
                 // panel has done its job, so drop it.
                 self.compaction = None;
+                // The pre-compaction token count no longer reflects the trimmed
+                // context; clear it so the top bar updates immediately instead
+                // of showing the stale (large) pre-compaction figure until the
+                // next provider call reports fresh usage.
+                self.last_usage = None;
                 self.flash = Some(format!("compacted {entries_compacted} entries"));
             }
             EngineNotification::CompactionFailed { reason, .. } => {
@@ -967,13 +1291,10 @@ impl App {
             _ => {}
         }
         self.conversation.apply(event);
-        // Snap to the tail when new output lands so the user sees it.
-        if matches!(
-            event,
-            EngineNotification::ItemAppended { .. } | EngineNotification::ItemDelta { .. }
-        ) {
-            self.scrollback = 0;
-        }
+        // New output does NOT yank the view to the tail. When the user is at the
+        // bottom (`scrollback == 0`) the renderer keeps following it; when they
+        // have scrolled up to read history, the renderer anchors their position
+        // so streaming output below the fold cannot snatch it away.
         // Queue behaviour at terminal turn states: a failure keeps the queue but
         // surfaces it (the user resumes with Enter); an interrupt drops it. A
         // normal completion auto-drains via `take_next_queued` in the loop.
@@ -1018,7 +1339,7 @@ impl App {
     fn on_overlay_key(&mut self, key: KeyEvent) -> Action {
         match self.overlay.take() {
             // Any key dismisses an informational overlay (already taken above).
-            Some(Overlay::Help | Overlay::ModelInfo | Overlay::Settings) | None => Action::None,
+            Some(Overlay::Help | Overlay::Settings) | None => Action::None,
             Some(Overlay::Approval {
                 request_id,
                 request,
@@ -1032,6 +1353,11 @@ impl App {
             Some(Overlay::SkillList { selected, query }) => {
                 self.on_skill_list_key(key, selected, query)
             }
+            Some(Overlay::ModelList {
+                models,
+                selected,
+                query,
+            }) => self.on_model_list_key(key, models, selected, query),
         }
     }
 
@@ -1079,6 +1405,62 @@ impl App {
             _ => {}
         }
         self.overlay = Some(Overlay::SkillList { selected, query });
+        Action::None
+    }
+
+    /// Key handling for the `/models` picker: navigate, filter, switch, cancel.
+    ///
+    /// The overlay was `take`n by the caller; this re-installs it (with updated
+    /// state) for every key except Enter (hot-swap the highlighted model) and
+    /// Esc (cancel). Navigation and filtering keep the highlight within the
+    /// filtered rows.
+    fn on_model_list_key(
+        &mut self,
+        key: KeyEvent,
+        models: Vec<zhive_proto::rpc::ModelDescriptor>,
+        selected: usize,
+        mut query: String,
+    ) -> Action {
+        let filtered = filter_models(&models, &query);
+        let max = filtered.len().saturating_sub(1);
+        let mut selected = selected.min(max);
+        match key.code {
+            KeyCode::Esc => return Action::None,
+            KeyCode::Up => selected = selected.saturating_sub(1),
+            KeyCode::Down => selected = (selected + 1).min(max),
+            // Ctrl+P / Ctrl+N mirror Up / Down (consistent with the palette).
+            KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                selected = selected.saturating_sub(1);
+            }
+            KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                selected = (selected + 1).min(max);
+            }
+            KeyCode::Enter => {
+                // Clone the chosen model (ends the `filtered` borrow) before
+                // returning the switch action.
+                let chosen = filtered.get(selected).map(|m| (*m).clone());
+                if let Some(model) = chosen {
+                    return Action::SwitchModel {
+                        model: Box::new(model),
+                    };
+                }
+                // Empty list: nothing to switch to; keep the overlay open.
+            }
+            KeyCode::Backspace => {
+                query.pop();
+                selected = 0;
+            }
+            KeyCode::Char(c) => {
+                query.push(c);
+                selected = 0;
+            }
+            _ => {}
+        }
+        self.overlay = Some(Overlay::ModelList {
+            models,
+            selected,
+            query,
+        });
         Action::None
     }
 
@@ -1203,6 +1585,7 @@ impl App {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         let palette = self.palette_query().is_some();
+        let mention = self.mention_query().is_some();
 
         match key.code {
             // Ctrl+C copies an active transcript selection (opencode parity).
@@ -1273,6 +1656,28 @@ impl App {
                 self.palette_autocomplete();
                 Action::None
             }
+            // The `@`-mention file picker mirrors the slash palette: arrows or
+            // Ctrl+P/Ctrl+N move the highlight, Tab/Enter insert the path. These
+            // precede the generic Enter/Up/Down arms and are mutually exclusive
+            // with the palette (a mention is suppressed while a command is typed).
+            KeyCode::Up if mention => {
+                self.mention_move(-1);
+                Action::None
+            }
+            KeyCode::Char('p') if ctrl && mention => {
+                self.mention_move(-1);
+                Action::None
+            }
+            KeyCode::Down if mention => {
+                self.mention_move(1);
+                Action::None
+            }
+            KeyCode::Char('n') if ctrl && mention => {
+                self.mention_move(1);
+                Action::None
+            }
+            KeyCode::Tab if mention => self.mention_accept(),
+            KeyCode::Enter if mention && !alt => self.mention_accept(),
             // Alt+Enter always inserts a newline, even with the palette open.
             KeyCode::Enter if palette && !alt => self.palette_submit(),
             KeyCode::Enter if alt => {
@@ -1300,11 +1705,13 @@ impl App {
                 self.unqueue();
                 Action::None
             }
-            // Toggle expansion of every `/skill:<name>` invocation chip.
+            // Flip the expansion baseline for every collapsible block at once,
+            // discarding any per-click overrides so ctrl+o is a true "all".
             KeyCode::Char('o') if ctrl => {
                 self.details_expanded = !self.details_expanded;
-                // Expanding/collapsing chips shifts every line below them, so a
-                // selection's absolute line indices would point at the wrong rows.
+                self.item_expanded.clear();
+                // Expanding/collapsing shifts every line below, so a selection's
+                // absolute line indices would point at the wrong rows.
                 self.clear_selection();
                 Action::None
             }
@@ -1316,11 +1723,13 @@ impl App {
             KeyCode::Char(c) if !ctrl => {
                 self.input.insert_char(c);
                 self.palette_index = 0;
+                self.mention_index = 0;
                 Action::None
             }
             KeyCode::Backspace => {
                 self.input.backspace();
                 self.palette_index = 0;
+                self.mention_index = 0;
                 Action::None
             }
             KeyCode::Delete => {
@@ -1414,6 +1823,8 @@ impl App {
                 && let Some(next) = self.message_queue.pop_front()
             {
                 self.queue_halted = false;
+                // A deliberate send returns to the tail to show the new turn.
+                self.scrollback = 0;
                 return Action::Submit(next);
             }
             return Action::None;
@@ -1432,6 +1843,8 @@ impl App {
         }
         // A fresh idle submit clears any halt so the queue resumes after it.
         self.queue_halted = false;
+        // A deliberate send returns to the tail to show the new turn.
+        self.scrollback = 0;
         Action::Submit(text)
     }
 
@@ -1502,10 +1915,9 @@ impl App {
                 self.overlay = Some(Overlay::Help);
                 Action::None
             }
-            "model" => {
-                self.overlay = Some(Overlay::ModelInfo);
-                Action::None
-            }
+            // Open the model picker (populated by an async `models/list`). The
+            // `models` plural is kept as a hidden alias for muscle memory.
+            "model" | "models" => Action::OpenModelList,
             "settings" => {
                 self.overlay = Some(Overlay::Settings);
                 Action::None
@@ -1697,6 +2109,44 @@ pub fn filter_skills<'a>(skills: &'a [SkillCommand], query: &str) -> Vec<&'a Ski
         .filter(|s| {
             s.name.to_lowercase().contains(&needle)
                 || s.description.to_lowercase().contains(&needle)
+        })
+        .collect()
+}
+
+/// Filters models by a case-insensitive substring over id + display name.
+///
+/// An empty query keeps every model in endpoint order.
+///
+/// # Examples
+///
+/// ```
+/// use zhive_tui::app::filter_models;
+/// use zhive_proto::rpc::ModelDescriptor;
+/// let models = vec![
+///     ModelDescriptor::new("claude-opus-4-8".to_owned())
+///         .with_display_name(Some("Claude Opus 4.8".to_owned())),
+///     ModelDescriptor::new("gpt-4o".to_owned()),
+/// ];
+/// assert_eq!(filter_models(&models, "opus").len(), 1);
+/// assert_eq!(filter_models(&models, "gpt").len(), 1);
+/// assert_eq!(filter_models(&models, "").len(), 2);
+/// ```
+#[must_use]
+pub fn filter_models<'a>(
+    models: &'a [zhive_proto::rpc::ModelDescriptor],
+    query: &str,
+) -> Vec<&'a zhive_proto::rpc::ModelDescriptor> {
+    if query.is_empty() {
+        return models.iter().collect();
+    }
+    let needle = query.to_lowercase();
+    models
+        .iter()
+        .filter(|m| {
+            m.id.to_lowercase().contains(&needle)
+                || m.display_name
+                    .as_deref()
+                    .is_some_and(|d| d.to_lowercase().contains(&needle))
         })
         .collect()
 }
@@ -1909,6 +2359,196 @@ mod tests {
         assert!(a.details_expanded);
         a.on_key(ctrl(KeyCode::Char('o')));
         assert!(!a.details_expanded);
+    }
+
+    /// Two sample models for the picker tests: an active Opus and a Haiku.
+    fn sample_models() -> Vec<zhive_proto::rpc::ModelDescriptor> {
+        use zhive_proto::domain::ThinkingEffort::{High, Low, Medium, Off};
+        vec![
+            zhive_proto::rpc::ModelDescriptor::new("claude-opus-4-8".to_owned())
+                .with_display_name(Some("Claude Opus 4.8".to_owned()))
+                .with_context_window(Some(1_000_000))
+                .with_supported_efforts(vec![Off, Low, Medium, High])
+                .with_active(true),
+            zhive_proto::rpc::ModelDescriptor::new("claude-haiku-4-5".to_owned())
+                .with_context_window(Some(200_000)),
+        ]
+    }
+
+    fn open_model_list(a: &mut App) {
+        a.overlay = Some(Overlay::ModelList {
+            models: sample_models(),
+            selected: 0,
+            query: String::new(),
+        });
+    }
+
+    #[test]
+    fn slash_models_requests_the_picker() {
+        let mut a = app();
+        assert_eq!(a.run_slash("models"), Action::OpenModelList);
+    }
+
+    #[test]
+    fn model_picker_enter_returns_switch_for_highlighted() {
+        let mut a = app();
+        open_model_list(&mut a);
+        match a.on_overlay_key(key(KeyCode::Enter)) {
+            Action::SwitchModel { model } => assert_eq!(model.id, "claude-opus-4-8"),
+            other => panic!("expected SwitchModel, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn model_picker_filters_then_switches() {
+        let mut a = app();
+        open_model_list(&mut a);
+        for c in "haiku".chars() {
+            a.on_overlay_key(key(KeyCode::Char(c)));
+        }
+        match a.on_overlay_key(key(KeyCode::Enter)) {
+            Action::SwitchModel { model } => assert_eq!(model.id, "claude-haiku-4-5"),
+            other => panic!("expected SwitchModel, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn model_picker_esc_cancels() {
+        let mut a = app();
+        open_model_list(&mut a);
+        assert_eq!(a.on_overlay_key(key(KeyCode::Esc)), Action::None);
+        assert!(a.overlay.is_none());
+    }
+
+    #[test]
+    fn apply_model_switch_clamps_unsupported_effort() {
+        use zhive_proto::domain::ThinkingEffort;
+        let mut a = app();
+        a.thinking_effort = ThinkingEffort::High;
+        // The new model supports only Off/Low → High is no longer valid.
+        a.apply_model_switch(
+            "m-low".to_owned(),
+            vec![ThinkingEffort::Off, ThinkingEffort::Low],
+        );
+        assert_eq!(a.config.model_label, "m-low");
+        assert_eq!(a.thinking_effort, ThinkingEffort::Off);
+        // Cycling now follows the live cycle: Off → Low.
+        a.cycle_thinking_effort();
+        assert_eq!(a.thinking_effort, ThinkingEffort::Low);
+    }
+
+    #[test]
+    fn boot_seeds_live_cycle_and_keeps_supported_depth() {
+        use zhive_proto::domain::{ThinkingEffort, ThreadId};
+        // A restored High depth with a live cycle that supports it: kept, the
+        // live cycle is installed, and nothing is marked dirty by boot alone.
+        let config = TuiConfig {
+            thinking_effort: ThinkingEffort::High,
+            effort_cycle: Some(vec![
+                ThinkingEffort::Off,
+                ThinkingEffort::Low,
+                ThinkingEffort::High,
+            ]),
+            ..Default::default()
+        };
+        let a = App::new(config, ThreadId(Arc::from("thread:native/t")));
+        assert_eq!(a.thinking_effort, ThinkingEffort::High);
+        assert!(a.active_effort_cycle.is_some());
+        assert!(
+            !a.selection_dirty,
+            "boot clamp must not mark the session dirty"
+        );
+    }
+
+    #[test]
+    fn boot_clamps_depth_unsupported_by_live_cycle() {
+        use zhive_proto::domain::{ThinkingEffort, ThreadId};
+        // Restored High but the live cycle tops out at Low → clamp to Off.
+        let config = TuiConfig {
+            thinking_effort: ThinkingEffort::High,
+            effort_cycle: Some(vec![ThinkingEffort::Off, ThinkingEffort::Low]),
+            ..Default::default()
+        };
+        let a = App::new(config, ThreadId(Arc::from("thread:native/t")));
+        assert_eq!(a.thinking_effort, ThinkingEffort::Off);
+        assert!(!a.selection_dirty);
+    }
+
+    #[test]
+    fn apply_model_switch_keeps_supported_effort() {
+        use zhive_proto::domain::ThinkingEffort;
+        let mut a = app();
+        a.thinking_effort = ThinkingEffort::Low;
+        a.apply_model_switch(
+            "m".to_owned(),
+            vec![
+                ThinkingEffort::Off,
+                ThinkingEffort::Low,
+                ThinkingEffort::Medium,
+            ],
+        );
+        // Low is in the new model's set, so it survives the switch.
+        assert_eq!(a.thinking_effort, ThinkingEffort::Low);
+        assert_eq!(
+            a.active_effort_cycle.as_deref(),
+            Some(
+                [
+                    ThinkingEffort::Off,
+                    ThinkingEffort::Low,
+                    ThinkingEffort::Medium
+                ]
+                .as_slice()
+            )
+        );
+    }
+
+    #[test]
+    fn item_override_beats_baseline_and_ctrl_o_clears_it() {
+        let mut a = app();
+        let id = zhive_proto::domain::ItemId(Arc::from("item:x"));
+        let other = zhive_proto::domain::ItemId(Arc::from("item:y"));
+        // A per-item override expands just this block off the collapsed baseline.
+        a.item_expanded.insert(id.clone(), true);
+        assert!(a.item_is_expanded(&id), "override wins over baseline");
+        assert!(!a.item_is_expanded(&other), "others follow the baseline");
+        // ctrl+o flips the baseline for all blocks and drops every override.
+        a.on_key(ctrl(KeyCode::Char('o')));
+        assert!(a.details_expanded);
+        assert!(
+            a.item_expanded.is_empty(),
+            "ctrl+o clears per-item overrides"
+        );
+        assert!(a.item_is_expanded(&id));
+        assert!(a.item_is_expanded(&other));
+    }
+
+    #[test]
+    fn new_output_does_not_yank_scrolled_up_view() {
+        let mut a = app();
+        let turn = start_turn(&mut a);
+        let tid = a.conversation.thread_id.clone();
+        // The user scrolled up to read history.
+        a.scrollback = 10;
+        // Streaming output lands; the view must NOT snap back to the tail.
+        a.on_engine(&EngineNotification::ItemAppended {
+            thread_id: tid,
+            turn_id: turn,
+            item: Box::new(zhive_proto::domain::Item::AgentMessage {
+                id: zhive_proto::domain::ItemId(Arc::from("item:a0")),
+                text: "streamed".to_owned(),
+            }),
+        });
+        assert_eq!(a.scrollback, 10, "scrolled-up view preserved on new output");
+    }
+
+    #[test]
+    fn deliberate_submit_returns_to_tail() {
+        let mut a = app();
+        // The user had scrolled up before composing a message.
+        a.scrollback = 25;
+        type_text(&mut a, "hello");
+        assert!(matches!(a.submit(), Action::Submit(_)));
+        assert_eq!(a.scrollback, 0, "sending a message snaps back to the tail");
     }
 
     #[test]
@@ -2276,15 +2916,22 @@ mod tests {
     }
 
     #[test]
-    fn slash_model_opens_and_any_key_closes_overlay() {
+    fn slash_model_requests_the_picker() {
+        // `/model` now opens the switch picker (the read-only info overlay is
+        // gone); the async `OpenModelList` action populates it from `models/list`.
         let mut app = app();
         for c in "/model".chars() {
             app.on_key(key(KeyCode::Char(c)));
         }
-        assert_eq!(app.on_key(key(KeyCode::Enter)), Action::None);
-        assert!(matches!(app.overlay, Some(Overlay::ModelInfo)));
-        app.on_key(key(KeyCode::Char('x')));
+        assert_eq!(app.on_key(key(KeyCode::Enter)), Action::OpenModelList);
         assert!(app.overlay.is_none());
+    }
+
+    #[test]
+    fn slash_model_singular_and_plural_both_open_picker() {
+        let mut a = app();
+        assert_eq!(a.run_slash("model"), Action::OpenModelList);
+        assert_eq!(a.run_slash("models"), Action::OpenModelList);
     }
 
     #[test]
@@ -2322,6 +2969,44 @@ mod tests {
             output_tokens: 80,
         });
         assert_eq!(app.last_usage, Some((200, 80)));
+    }
+
+    #[test]
+    fn reset_thread_clears_last_usage() {
+        let mut app = app();
+        app.on_engine(&EngineNotification::Usage {
+            input_tokens: 120,
+            output_tokens: 45,
+        });
+        app.reset_thread(ThreadId(Arc::from("thread:native/t2")));
+        assert!(
+            app.last_usage.is_none(),
+            "a fresh thread must not carry the old thread's token counts"
+        );
+    }
+
+    #[test]
+    fn compaction_completed_clears_last_usage() {
+        use zhive_proto::hook::CompactTrigger;
+        let mut app = app();
+        let tid = app.conversation.thread_id.clone();
+        app.on_engine(&EngineNotification::Usage {
+            input_tokens: 5_000,
+            output_tokens: 200,
+        });
+        app.on_engine(&EngineNotification::CompactionStarted {
+            thread_id: tid.clone(),
+            trigger: CompactTrigger::Manual,
+            entries: 5,
+        });
+        app.on_engine(&EngineNotification::CompactionCompleted {
+            thread_id: tid,
+            entries_compacted: 5,
+        });
+        assert!(
+            app.last_usage.is_none(),
+            "compaction trims the context; the stale pre-compaction count must clear"
+        );
     }
 
     // ---- runtime slash commands ----
@@ -2730,6 +3415,81 @@ mod tests {
                 text: "the answer".to_owned(),
             }]);
         assert_eq!(a.run_slash("copy"), Action::Copy("the answer".to_owned()));
+    }
+
+    // ---- @ file mention ----
+
+    fn app_with_files(files: &[&str]) -> App {
+        let mut a = app();
+        a.set_file_index(files.iter().map(|s| (*s).to_owned()).collect());
+        a
+    }
+
+    #[test]
+    fn typing_at_activates_mention_after_whitespace_only() {
+        let mut a = app();
+        // Mid-word `@` (e.g. an email) does not open the picker.
+        for c in "mail@host".chars() {
+            a.on_key(key(KeyCode::Char(c)));
+        }
+        assert_eq!(a.mention_query(), None);
+        // A fresh token after a space does.
+        a.on_key(key(KeyCode::Char(' ')));
+        a.on_key(key(KeyCode::Char('@')));
+        a.on_key(key(KeyCode::Char('s')));
+        assert_eq!(a.mention_query(), Some("s"));
+    }
+
+    #[test]
+    fn mention_enter_inserts_path_instead_of_submitting() {
+        let mut a = app_with_files(&["src/main.rs", "src/lib.rs"]);
+        for c in "see @lib".chars() {
+            a.on_key(key(KeyCode::Char(c)));
+        }
+        // Enter accepts the highlighted match rather than sending the message.
+        assert_eq!(a.on_key(key(KeyCode::Enter)), Action::None);
+        assert_eq!(a.input.value(), "see @src/lib.rs ");
+        // The trailing space closed the picker.
+        assert_eq!(a.mention_query(), None);
+    }
+
+    #[test]
+    fn mention_arrow_then_accept_picks_second_row() {
+        let mut a = app_with_files(&["alpha.rs", "alphabet.rs"]);
+        for c in "@alpha".chars() {
+            a.on_key(key(KeyCode::Char(c)));
+        }
+        // Two matches; Down moves to the second (longer) one before accepting.
+        a.on_key(key(KeyCode::Down));
+        a.on_key(key(KeyCode::Tab));
+        assert_eq!(a.input.value(), "@alphabet.rs ");
+    }
+
+    #[test]
+    fn mention_suppressed_while_slash_palette_open() {
+        let mut a = app();
+        for c in "/he @x".chars() {
+            a.on_key(key(KeyCode::Char(c)));
+        }
+        // A space after `/he` already closed the palette, so `@x` is a mention.
+        assert_eq!(a.mention_query(), Some("x"));
+        // But a pure command name keeps the slash palette and no mention.
+        let mut b = app();
+        for c in "/help".chars() {
+            b.on_key(key(KeyCode::Char(c)));
+        }
+        assert!(b.palette_query().is_some());
+        assert_eq!(b.mention_query(), None);
+    }
+
+    #[test]
+    fn needs_file_index_only_while_mention_active_and_unbuilt() {
+        let mut a = app();
+        assert!(!a.needs_file_index());
+        a.on_key(key(KeyCode::Char('@')));
+        assert!(a.needs_file_index());
+        a.set_file_index(vec!["x.rs".to_owned()]);
+        assert!(!a.needs_file_index());
     }
 }
 

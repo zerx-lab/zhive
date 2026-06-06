@@ -1408,4 +1408,268 @@ impl ToolListResult {
     }
 }
 
+// ============================================================
+// models/* — provider model discovery and runtime switching
+// ============================================================
+
+/// One model advertised by the active provider's `/models` endpoint.
+///
+/// Distilled, provider-neutral projection of a `/models` row: the fields a
+/// model picker needs (id, label, context window) plus the reasoning-depth
+/// levels the model supports. Optional numeric fields are `None` when the
+/// endpoint omits them (e.g. the stock Anthropic/OpenAI list with no
+/// per-model metadata), so a client must tolerate their absence.
+///
+/// # Examples
+///
+/// ```
+/// use zhive_proto::rpc::ModelDescriptor;
+/// use zhive_proto::domain::ThinkingEffort;
+/// let m = ModelDescriptor::new("claude-opus-4-8".into())
+///     .with_display_name(Some("Claude Opus 4.8".into()))
+///     .with_context_window(Some(1_000_000))
+///     .with_supported_efforts(vec![ThinkingEffort::Off, ThinkingEffort::High])
+///     .with_active(true);
+/// let v = serde_json::to_value(&m).unwrap();
+/// assert_eq!(v["id"], "claude-opus-4-8");
+/// assert_eq!(v["contextWindow"], 1_000_000);
+/// assert_eq!(v["active"], true);
+/// let back: ModelDescriptor = serde_json::from_value(v).unwrap();
+/// assert_eq!(back, m);
+/// ```
+#[derive(Default, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct ModelDescriptor {
+    /// Stable model id passed back to the provider (e.g. `claude-opus-4-8`).
+    pub id: String,
+    /// Human-readable label for the picker row; falls back to `id` when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    /// Maximum input tokens the model accepts — its context window.
+    ///
+    /// Feeds the auto-compaction budget when this model is the active one.
+    /// `None` when the endpoint does not report it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
+    /// Maximum output tokens the model can produce in one response, if reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u64>,
+    /// Reasoning-depth levels the model supports, as an `Off`-first cycle.
+    ///
+    /// Empty or `[Off]` means the model has no depth control. A client cycles
+    /// through exactly these levels so the displayed depth is always one the
+    /// model accepts.
+    #[serde(default)]
+    pub supported_efforts: Vec<ThinkingEffort>,
+    /// Whether the model supports a thinking phase at all.
+    #[serde(default)]
+    pub thinking_supported: bool,
+    /// `true` for the model currently bound to the engine.
+    #[serde(default)]
+    pub active: bool,
+}
+
+impl ModelDescriptor {
+    /// Constructs a descriptor for `id` with all metadata unset.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use zhive_proto::rpc::ModelDescriptor;
+    /// let m = ModelDescriptor::new("gpt-4o".into());
+    /// assert_eq!(m.id, "gpt-4o");
+    /// assert!(m.context_window.is_none());
+    /// assert!(!m.active);
+    /// ```
+    #[must_use]
+    pub fn new(id: String) -> Self {
+        Self {
+            id,
+            display_name: None,
+            context_window: None,
+            max_output_tokens: None,
+            supported_efforts: Vec::new(),
+            thinking_supported: false,
+            active: false,
+        }
+    }
+
+    /// Sets the human-readable label.
+    #[must_use]
+    pub fn with_display_name(mut self, display_name: Option<String>) -> Self {
+        self.display_name = display_name;
+        self
+    }
+
+    /// Sets the context window (maximum input tokens).
+    #[must_use]
+    pub fn with_context_window(mut self, context_window: Option<u64>) -> Self {
+        self.context_window = context_window;
+        self
+    }
+
+    /// Sets the maximum output token count.
+    #[must_use]
+    pub fn with_max_output_tokens(mut self, max_output_tokens: Option<u64>) -> Self {
+        self.max_output_tokens = max_output_tokens;
+        self
+    }
+
+    /// Sets the `Off`-first cycle of supported reasoning depths.
+    #[must_use]
+    pub fn with_supported_efforts(mut self, supported_efforts: Vec<ThinkingEffort>) -> Self {
+        self.supported_efforts = supported_efforts;
+        self
+    }
+
+    /// Sets whether the model supports a thinking phase.
+    #[must_use]
+    pub fn with_thinking_supported(mut self, thinking_supported: bool) -> Self {
+        self.thinking_supported = thinking_supported;
+        self
+    }
+
+    /// Marks the descriptor as the engine's active model.
+    #[must_use]
+    pub fn with_active(mut self, active: bool) -> Self {
+        self.active = active;
+        self
+    }
+}
+
+/// Result of the `models/list` RPC: every model the provider exposes.
+///
+/// # Examples
+///
+/// ```
+/// use zhive_proto::rpc::{ListModelsResult, ModelDescriptor};
+/// let r = ListModelsResult::new(vec![ModelDescriptor::new("gpt-4o".into())]);
+/// let v = serde_json::to_value(&r).unwrap();
+/// assert_eq!(v["models"][0]["id"], "gpt-4o");
+/// let back: ListModelsResult = serde_json::from_value(v).unwrap();
+/// assert_eq!(back.models.len(), 1);
+/// ```
+#[derive(Default, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct ListModelsResult {
+    /// All models the active provider advertises, in endpoint order.
+    pub models: Vec<ModelDescriptor>,
+}
+
+impl ListModelsResult {
+    /// Constructs a model-list result.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use zhive_proto::rpc::ListModelsResult;
+    /// let r = ListModelsResult::new(vec![]);
+    /// assert!(r.models.is_empty());
+    /// ```
+    #[must_use]
+    pub fn new(models: Vec<ModelDescriptor>) -> Self {
+        Self { models }
+    }
+}
+
+/// Params of the `engine/set_model` RPC: which model to switch to.
+///
+/// `context_window` is an optional hint the client already knows from the
+/// listing; the engine prefers a host-configured override, then this hint,
+/// then a conservative default. Sending it avoids a re-fetch on switch.
+///
+/// # Examples
+///
+/// ```
+/// use zhive_proto::rpc::SetModelParams;
+/// let p = SetModelParams::new("claude-opus-4-8".into(), Some(1_000_000));
+/// let v = serde_json::to_value(&p).unwrap();
+/// assert_eq!(v["modelId"], "claude-opus-4-8");
+/// assert_eq!(v["contextWindow"], 1_000_000);
+/// let back: SetModelParams = serde_json::from_value(v).unwrap();
+/// assert_eq!(back, p);
+/// ```
+#[derive(Default, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct SetModelParams {
+    /// Stable id of the model to bind to the running engine.
+    pub model_id: String,
+    /// Optional context-window hint (maximum input tokens) from the listing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
+}
+
+impl SetModelParams {
+    /// Constructs switch params for `model_id` with an optional window hint.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use zhive_proto::rpc::SetModelParams;
+    /// let p = SetModelParams::new("gpt-4o".into(), None);
+    /// assert_eq!(p.model_id, "gpt-4o");
+    /// assert!(p.context_window.is_none());
+    /// ```
+    #[must_use]
+    pub fn new(model_id: String, context_window: Option<u64>) -> Self {
+        Self {
+            model_id,
+            context_window,
+        }
+    }
+}
+
+/// Result of the `engine/set_model` RPC: the model now bound to the engine.
+///
+/// `context_window` is the value the engine resolved and applied to its
+/// compaction budget (host override, hint, or default), so a client can show
+/// the effective window after the switch.
+///
+/// # Examples
+///
+/// ```
+/// use zhive_proto::rpc::SetModelResult;
+/// let r = SetModelResult::new("claude-opus-4-8".into(), Some(1_000_000));
+/// let v = serde_json::to_value(&r).unwrap();
+/// assert_eq!(v["modelId"], "claude-opus-4-8");
+/// let back: SetModelResult = serde_json::from_value(v).unwrap();
+/// assert_eq!(back, r);
+/// ```
+#[derive(Default, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct SetModelResult {
+    /// Id of the model now bound to the engine.
+    pub model_id: String,
+    /// Context window the engine resolved and applied, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
+}
+
+impl SetModelResult {
+    /// Constructs a switch result.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use zhive_proto::rpc::SetModelResult;
+    /// let r = SetModelResult::new("gpt-4o".into(), None);
+    /// assert_eq!(r.model_id, "gpt-4o");
+    /// ```
+    #[must_use]
+    pub fn new(model_id: String, context_window: Option<u64>) -> Self {
+        Self {
+            model_id,
+            context_window,
+        }
+    }
+}
+
 // Rust guideline compliant 2026-02-21

@@ -75,12 +75,16 @@ fn apply_openai_reasoning(opts: &mut CallOptions, level: ThinkingEffort) {
     }
     opts.reasoning = Some(openai_reasoning_effort(level));
 
-    let mut openai = serde_json::Map::new();
+    // Read-modify-write the `openai` bucket rather than replacing it, so this
+    // composes with whatever else writes there (notably the `promptCacheKey`
+    // from `super::cache`) regardless of call order — only `reasoningEffort` is
+    // (re)set; sibling keys survive.
+    let mut po = opts.provider_options.take().unwrap_or_default();
+    let mut openai = po.remove("openai").unwrap_or_default();
     openai.insert(
         "reasoningEffort".to_owned(),
         serde_json::Value::String(openai_effort_str(level).to_owned()),
     );
-    let mut po = opts.provider_options.take().unwrap_or_default();
     po.insert("openai".to_owned(), openai);
     opts.provider_options = Some(po);
 }
@@ -200,10 +204,10 @@ fn to_reasoning_effort(level: ThinkingEffort) -> ReasoningEffort {
         ThinkingEffort::Low => ReasoningEffort::Low,
         ThinkingEffort::Medium => ReasoningEffort::Medium,
         ThinkingEffort::High => ReasoningEffort::High,
-        ThinkingEffort::Xhigh => ReasoningEffort::Xhigh,
-        // The portable enum has no `max`; map to its highest tier. (Non-Anthropic
-        // models never offer `Max` via `cycle_for`, so this is defensive only.)
-        ThinkingEffort::Max => ReasoningEffort::Xhigh,
+        // The portable enum has no `max`; map `Max` to its highest tier
+        // alongside `Xhigh`. (Non-Anthropic models never offer `Max` via
+        // `cycle_for`, so the `Max` case is defensive only.)
+        ThinkingEffort::Xhigh | ThinkingEffort::Max => ReasoningEffort::Xhigh,
         // Unknown future (non_exhaustive) variant: defer to the provider.
         _ => ReasoningEffort::ProviderDefault,
     }

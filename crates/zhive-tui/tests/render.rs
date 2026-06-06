@@ -66,7 +66,9 @@ fn renders_user_and_agent_messages() {
     });
 
     let mut terminal = Terminal::new(TestBackend::new(70, 20)).expect("terminal");
-    terminal.draw(|frame| ui::draw(frame, &app)).expect("draw");
+    terminal
+        .draw(|frame| ui::draw(frame, &mut app))
+        .expect("draw");
 
     let text = screen_text(&terminal);
     // The user message carries the `❯` role glyph; the agent message has no
@@ -103,7 +105,9 @@ fn renders_skill_invocation_as_collapsible_chip() {
     });
 
     let mut terminal = Terminal::new(TestBackend::new(70, 20)).expect("terminal");
-    terminal.draw(|frame| ui::draw(frame, &app)).expect("draw");
+    terminal
+        .draw(|frame| ui::draw(frame, &mut app))
+        .expect("draw");
     let collapsed = screen_text(&terminal);
     assert!(collapsed.contains("[skill]"), "skill chip marker present");
     assert!(collapsed.contains("commit"), "skill name present");
@@ -119,7 +123,9 @@ fn renders_skill_invocation_as_collapsible_chip() {
 
     // ctrl+o (global toggle) expands every chip → the body becomes visible.
     app.details_expanded = true;
-    terminal.draw(|frame| ui::draw(frame, &app)).expect("draw");
+    terminal
+        .draw(|frame| ui::draw(frame, &mut app))
+        .expect("draw");
     let expanded = screen_text(&terminal);
     assert!(
         expanded.contains("the full body"),
@@ -158,11 +164,13 @@ fn command_output_collapses_by_default_and_expands_on_ctrl_o() {
     });
 
     let mut terminal = Terminal::new(TestBackend::new(70, 30)).expect("terminal");
-    terminal.draw(|frame| ui::draw(frame, &app)).expect("draw");
+    terminal
+        .draw(|frame| ui::draw(frame, &mut app))
+        .expect("draw");
     let collapsed = screen_text(&terminal);
     assert!(collapsed.contains("file1.txt"), "first output line shown");
     assert!(
-        collapsed.contains("ctrl+o to expand"),
+        collapsed.contains("click or ctrl+o"),
         "expand hint present; got: {collapsed}"
     );
     assert!(
@@ -172,7 +180,9 @@ fn command_output_collapses_by_default_and_expands_on_ctrl_o() {
 
     // ctrl+o reveals the full output.
     app.details_expanded = true;
-    terminal.draw(|frame| ui::draw(frame, &app)).expect("draw");
+    terminal
+        .draw(|frame| ui::draw(frame, &mut app))
+        .expect("draw");
     let expanded = screen_text(&terminal);
     assert!(
         expanded.contains("file12.txt"),
@@ -208,7 +218,9 @@ fn tool_call_header_is_compact_with_inline_arg() {
     });
 
     let mut terminal = Terminal::new(TestBackend::new(70, 20)).expect("terminal");
-    terminal.draw(|frame| ui::draw(frame, &app)).expect("draw");
+    terminal
+        .draw(|frame| ui::draw(frame, &mut app))
+        .expect("draw");
     let text = screen_text(&terminal);
     assert!(text.contains("bash"), "tool name shown; got: {text}");
     assert!(text.contains("ls"), "primary command arg inline in header");
@@ -273,7 +285,9 @@ fn tool_call_persists_in_view_after_turn_completes_with_agent_reply() {
     });
 
     let mut terminal = Terminal::new(TestBackend::new(70, 20)).expect("terminal");
-    terminal.draw(|frame| ui::draw(frame, &app)).expect("draw");
+    terminal
+        .draw(|frame| ui::draw(frame, &mut app))
+        .expect("draw");
     let text = screen_text(&terminal);
     assert!(
         text.contains("bash"),
@@ -330,7 +344,9 @@ fn renders_subagent_summary_under_agent_tool_call() {
     });
 
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("terminal");
-    terminal.draw(|frame| ui::draw(frame, &app)).expect("draw");
+    terminal
+        .draw(|frame| ui::draw(frame, &mut app))
+        .expect("draw");
 
     let text = screen_text(&terminal);
     assert!(
@@ -349,9 +365,11 @@ fn renders_subagent_summary_under_agent_tool_call() {
 
 #[test]
 fn renders_welcome_when_empty() {
-    let app = App::new(TuiConfig::default(), thread());
+    let mut app = App::new(TuiConfig::default(), thread());
     let mut terminal = Terminal::new(TestBackend::new(70, 20)).expect("terminal");
-    terminal.draw(|frame| ui::draw(frame, &app)).expect("draw");
+    terminal
+        .draw(|frame| ui::draw(frame, &mut app))
+        .expect("draw");
 
     let text = screen_text(&terminal);
     assert!(text.contains("demo"), "model label shown in top bar");
@@ -373,7 +391,9 @@ fn renders_queued_messages_preview() {
         .push_back("queued message text".to_owned());
 
     let mut terminal = Terminal::new(TestBackend::new(70, 20)).expect("terminal");
-    terminal.draw(|frame| ui::draw(frame, &app)).expect("draw");
+    terminal
+        .draw(|frame| ui::draw(frame, &mut app))
+        .expect("draw");
 
     let text = screen_text(&terminal);
     assert!(text.contains("queued"), "queue header shown; got: {text}");
@@ -408,7 +428,9 @@ fn markdown_body_carries_palette_colors() {
     });
 
     let mut terminal = Terminal::new(TestBackend::new(70, 24)).expect("terminal");
-    terminal.draw(|frame| ui::draw(frame, &app)).expect("draw");
+    terminal
+        .draw(|frame| ui::draw(frame, &mut app))
+        .expect("draw");
 
     let cells = terminal.backend().buffer().content().to_vec();
     let p = &app.palette;
@@ -452,7 +474,9 @@ fn diff_rows_carry_diff_backgrounds() {
     });
 
     let mut terminal = Terminal::new(TestBackend::new(70, 24)).expect("terminal");
-    terminal.draw(|frame| ui::draw(frame, &app)).expect("draw");
+    terminal
+        .draw(|frame| ui::draw(frame, &mut app))
+        .expect("draw");
 
     let cells = terminal.backend().buffer().content().to_vec();
     let p = &app.palette;

@@ -176,13 +176,19 @@ async fn call_provider_with_retry(
     loop {
         // Always check cancel before initiating a provider call (biased
         // ensures the cancel arm wins when both are immediately ready).
+        //
+        // Bind the active provider to a local first: `provider()` clones the
+        // handle out of the `RwLock`, and `do_stream` borrows it across the
+        // `await`, so it must outlive the `select!` rather than be a temporary
+        // that drops at the end of the arm expression.
+        let provider = inner.provider();
         let stream_result = tokio::select! {
             biased;
             () = cancel.cancelled() => {
                 // Signal to the caller that we cancelled (None = cancel path).
                 return Err(None);
             }
-            r = inner.provider().do_stream(call_options.clone()) => r,
+            r = provider.do_stream(call_options.clone()) => r,
         };
 
         match stream_result {
@@ -458,11 +464,24 @@ async fn run_turn_inner(
         // Layer the turn's requested reasoning depth onto the request (no-op
         // when `reasoning` is `None`). Maps onto Anthropic `effort` + adaptive
         // thinking, or the portable `reasoning` enum for other providers.
+        // Bind the active provider once: `provider()` clones out of the lock,
+        // and we read its provider/model id for the reasoning mapping.
+        let active_provider = inner.provider();
         crate::engine::reasoning::apply_reasoning(
             &mut call_options,
             reasoning,
-            inner.provider().provider(),
-            inner.provider().model_id(),
+            active_provider.provider(),
+            active_provider.model_id(),
+        );
+        // Layer prompt caching onto the request: Anthropic `cache_control`
+        // breakpoints (system + last tool + latest user message), or the OpenAI
+        // `prompt_cache_key` (the session id). No-op for providers that cache
+        // implicitly. Runs after `apply_reasoning` so both share — rather than
+        // overwrite — the per-request provider-options bucket.
+        crate::engine::cache::apply_cache_control(
+            &mut call_options,
+            active_provider.provider(),
+            &thread_id.0,
         );
 
         // 2. Call the provider with retry/backoff for transient outer errors.
@@ -947,14 +966,21 @@ async fn run_turn_inner(
             super::compaction::estimate_tokens(&handle.items_snapshot().await)
         };
 
-        // Token budget: use the host-supplied explicit threshold when present
-        // (preserves backward compatibility — a host that already sets
-        // `compact_token_threshold: Some(n)` keeps its chosen value).
-        // When absent, use 75 % of the conservative default context budget
-        // (24 000 tokens). This ensures the engine compacts proactively
-        // rather than waiting for a provider 400.
+        // Token budget, in priority order:
+        //   1. host-supplied explicit threshold (backward compatibility — a host
+        //      that sets `compact_token_threshold: Some(n)` keeps its value),
+        //   2. 75 % of the active model's real context window when known (seeded
+        //      and updated by the host model catalogue / `engine/set_model`),
+        //   3. 75 % of the conservative 32 k default when both are absent.
+        // This compacts proactively rather than waiting for a provider 400, and
+        // scales the trigger to the model actually in use after a hot switch.
         let token_budget = inner
             .compact_token_threshold()
+            .or_else(|| {
+                inner
+                    .context_window()
+                    .map(super::compaction::threshold_for_context_window)
+            })
             .unwrap_or_else(super::compaction::default_compact_threshold);
 
         let token_threshold_hit = token_estimate >= token_budget;

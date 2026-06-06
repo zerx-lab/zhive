@@ -82,9 +82,14 @@ async fn user_turn_round_trips_into_conversation() {
 
     let thread = zhive_tui::id::new_thread_id();
     // Drive the real send path so `Item::UserMessage` serialization is covered.
-    zhive_tui::rpc::start_turn(&client, &thread, "hi")
-        .await
-        .expect("start_turn accepted");
+    zhive_tui::rpc::start_turn(
+        &client,
+        &thread,
+        "hi",
+        zhive_proto::domain::ThinkingEffort::Off,
+    )
+    .await
+    .expect("start_turn accepted");
 
     // Fold notifications into a conversation until the turn finishes.
     let mut conv = Conversation::new(thread.clone());

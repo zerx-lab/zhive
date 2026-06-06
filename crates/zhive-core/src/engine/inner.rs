@@ -35,7 +35,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Mutex, MutexGuard, RwLock};
 
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
@@ -107,7 +107,24 @@ pub(crate) struct EngineInner {
     /// (empty stream) is supplied by [`super::Engine::spawn`] for backward
     /// compatibility; real providers are injected via
     /// [`super::Engine::spawn_with_provider`].
-    provider: DynLanguageModel,
+    ///
+    /// Held behind a `RwLock` so a runtime model switch
+    /// ([`super::Engine::set_model`]) can swap it without restarting the
+    /// engine. Reads are short — each turn clones the inner `Arc` out and
+    /// drops the guard immediately (see [`Self::provider`]), so the lock is
+    /// never held across an `await`.
+    provider: RwLock<DynLanguageModel>,
+
+    /// Active model's context window (maximum input tokens), or `0` when unknown.
+    ///
+    /// Seeded post-spawn from the host's model catalogue
+    /// ([`super::Engine::with_context_window`]) and updated on every hot model
+    /// switch. Read during the post-turn auto-compaction check to derive a
+    /// token budget proportional to the model's window (see
+    /// [`super::compaction::threshold_for_context_window`]). `0` falls back to
+    /// the conservative default budget. Uses `Relaxed` ordering: the value is
+    /// advisory for a heuristic, never a synchronisation point.
+    context_window: AtomicU64,
     /// Hook host shared across all turn tasks spawned by this engine.
     pub(in crate::engine) hook_host: Arc<HookHost>,
     /// Tool registry shared across all turn tasks spawned by this engine.
@@ -231,7 +248,8 @@ impl EngineInner {
             turn_counter: AtomicU64::new(0),
             compaction_counter: AtomicU64::new(0),
             permission: PermissionReducer::new(),
-            provider,
+            provider: RwLock::new(provider),
+            context_window: AtomicU64::new(0),
             hook_host,
             tools,
             turn_limits,
@@ -259,10 +277,45 @@ impl EngineInner {
         &self.events_tx
     }
 
-    /// Returns the LLM provider for sibling modules within
-    /// the `engine` module (e.g. [`super::turn`]).
-    pub(in crate::engine) fn provider(&self) -> &DynLanguageModel {
-        &self.provider
+    /// Returns the active LLM provider for sibling modules (e.g. [`super::turn`]).
+    ///
+    /// Clones the provider handle out of the `RwLock` (a cheap `Arc` bump) and
+    /// drops the guard immediately, so callers never hold the lock across an
+    /// `await`. A poisoned lock is recovered rather than propagated: the
+    /// provider is read-mostly and a panic in an unrelated writer must not
+    /// wedge every future turn.
+    pub(in crate::engine) fn provider(&self) -> DynLanguageModel {
+        self.provider
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Swaps in a new provider, returning the previous one.
+    ///
+    /// Used by [`super::Engine::set_model`] to hot-swap the model bound to the
+    /// running engine. The change takes effect on the next provider call; a
+    /// turn already streaming keeps the provider it started with for that call.
+    pub(in crate::engine) fn swap_provider(&self, provider: DynLanguageModel) -> DynLanguageModel {
+        let mut guard = self
+            .provider
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::mem::replace(&mut guard, provider)
+    }
+
+    /// Returns the active model's context window, or `None` when unknown.
+    pub(in crate::engine) fn context_window(&self) -> Option<u64> {
+        match self.context_window.load(Ordering::Relaxed) {
+            0 => None,
+            n => Some(n),
+        }
+    }
+
+    /// Records the active model's context window (`None` clears it to unknown).
+    pub(in crate::engine) fn set_context_window(&self, window: Option<u64>) {
+        self.context_window
+            .store(window.unwrap_or(0), Ordering::Relaxed);
     }
 
     /// Returns the hook host for sibling modules.

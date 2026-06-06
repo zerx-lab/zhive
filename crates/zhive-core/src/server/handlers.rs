@@ -38,10 +38,10 @@ use zhive_proto::permission::{PermissionOutcome, ResumePermissionParams};
 use zhive_proto::rpc::{
     CancelTurnParams, CancelTurnResult, CompactParams, CompactResult, CompactStatus,
     DeleteThreadParams, DeleteThreadResult, ForkParams, ForkResult, GetItemsParams, GetItemsResult,
-    InjectionAck, InjectionParams, ListThreadsParams, ListThreadsResult, RenameThreadParams,
-    RenameThreadResult, ResumePermissionResult, ResumePermissionStatus, ResumeThreadParams,
-    ResumeThreadResult, SearchThreadsParams, SearchThreadsResult, SessionCancelParams,
-    StartTurnParams, StartTurnResult, ToolListResult,
+    InjectionAck, InjectionParams, ListModelsResult, ListThreadsParams, ListThreadsResult,
+    RenameThreadParams, RenameThreadResult, ResumePermissionResult, ResumePermissionStatus,
+    ResumeThreadParams, ResumeThreadResult, SearchThreadsParams, SearchThreadsResult,
+    SessionCancelParams, SetModelParams, StartTurnParams, StartTurnResult, ToolListResult,
 };
 
 use crate::engine::{
@@ -182,6 +182,22 @@ pub fn register_engine_handlers(router: &mut Router, engine: Engine) {
     router.register(
         methods::METHOD_TOOLS_LIST,
         Arc::new(ToolsListHandler {
+            engine: Arc::clone(&engine),
+        }),
+    );
+    // Model discovery + runtime switching. Both report
+    // `EngineError::ModelManagementUnavailable` when the engine was built
+    // without a host model catalogue, so registering them unconditionally is
+    // safe — a catalogue-less engine simply answers with that error.
+    router.register(
+        methods::METHOD_LIST_MODELS,
+        Arc::new(ListModelsHandler {
+            engine: Arc::clone(&engine),
+        }),
+    );
+    router.register(
+        methods::METHOD_SET_MODEL,
+        Arc::new(SetModelHandler {
             engine: Arc::clone(&engine),
         }),
     );
@@ -544,6 +560,44 @@ impl Handler for ToolsListHandler {
     }
 }
 
+/// Handler for `models/list` — no params, returns the provider's model list.
+struct ListModelsHandler {
+    engine: Arc<Engine>,
+}
+
+#[async_trait]
+impl Handler for ListModelsHandler {
+    async fn handle(&self, _params: Option<Value>) -> Result<Value, ErrorObject> {
+        match self.engine.list_models().await {
+            Ok(models) => {
+                Ok(serde_json::to_value(ListModelsResult::new(models)).unwrap_or(Value::Null))
+            }
+            Err(err) => Err(engine_error(&err)),
+        }
+    }
+}
+
+/// Handler for `engine/set_model` — hot-swaps the active model.
+struct SetModelHandler {
+    engine: Arc<Engine>,
+}
+
+#[async_trait]
+impl Handler for SetModelHandler {
+    async fn handle(&self, params: Option<Value>) -> Result<Value, ErrorObject> {
+        let params: SetModelParams = decode_params(params)?;
+        match self
+            .engine
+            .set_model(&params.model_id, params.context_window)
+        {
+            // A fully-typed struct cannot fail to serialise; fall back to Null
+            // rather than `.expect()` (CLAUDE.md no-expect rule).
+            Ok(result) => Ok(serde_json::to_value(result).unwrap_or(Value::Null)),
+            Err(err) => Err(engine_error(&err)),
+        }
+    }
+}
+
 // ============================================================
 // Injection-queue handlers (Pi `streamingBehavior` model)
 // ============================================================
@@ -652,6 +706,13 @@ fn engine_error(err: &EngineError) -> ErrorObject {
         })),
         EngineError::SubagentSpawnFailed(reason) => Some(serde_json::json!({
             "kind": "subagent_spawn_failed",
+            "reason": reason.to_string(),
+        })),
+        EngineError::ModelManagementUnavailable => Some(serde_json::json!({
+            "kind": "model_management_unavailable",
+        })),
+        EngineError::ModelCatalog(reason) => Some(serde_json::json!({
+            "kind": "model_catalog",
             "reason": reason.to_string(),
         })),
     };
