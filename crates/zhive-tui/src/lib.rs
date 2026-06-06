@@ -327,8 +327,7 @@ async fn event_loop(
                             perform(client, app, crate::app::Action::ReadClipboardImage, &cmd_tx);
                         } else if let Some(mime) = image_path_mime(trimmed) {
                             // Pasted text looks like an image file path; read it
-                            // and add as an attachment instead of inserting the
-                            // path verbatim into the input buffer.
+                            // and insert an [Image #N] placeholder at the cursor.
                             match std::fs::read(trimmed) {
                                 Ok(bytes) => {
                                     let label = trimmed
@@ -336,14 +335,13 @@ async fn event_loop(
                                         .next()
                                         .unwrap_or("image")
                                         .to_owned();
+                                    let n = app.attachments.len() + 1;
                                     app.attachments.push(crate::app::ImageAttachment {
                                         bytes,
                                         mime,
                                         label,
                                     });
-                                    let n = app.attachments.len();
-                                    app.flash =
-                                        Some(format!("📎 image attached ({n} total)"));
+                                    app.input.insert_str(&format!("[Image #{n}]"));
                                 }
                                 Err(_) => {
                                     // Not readable as a file; fall back to plain text.
@@ -551,24 +549,22 @@ fn perform(
         }
         Action::ReadClipboardImage => {
             // Shell out (blocking) to read a PNG from the system clipboard.
-            // This runs inline in the event loop rather than spawning a task
-            // because it is quick (shell tool startup ~10 ms) and the render
-            // loop is already paused on a key event.
+            // Runs inline (not spawned) because it is quick (~10 ms tool
+            // startup) and the render loop is paused on the key/paste event.
             match clipboard::read_image() {
                 Some(bytes) => {
+                    let n = app.attachments.len() + 1;
                     app.attachments.push(crate::app::ImageAttachment {
                         bytes,
                         mime: "image/png",
-                        label: "clipboard".to_owned(),
+                        label: format!("Image #{n}"),
                     });
-                    let n = app.attachments.len();
-                    app.flash = Some(format!(
-                        "📎 clipboard image added ({n} attachment{})",
-                        if n == 1 { "" } else { "s" }
-                    ));
+                    // Insert a visual placeholder at the cursor so the user
+                    // can see where each image sits relative to the text.
+                    app.input.insert_str(&format!("[Image #{n}]"));
                 }
                 None => {
-                    app.flash = Some("no image found in clipboard".to_owned());
+                    app.flash = Some("no image in clipboard".to_owned());
                 }
             }
         }

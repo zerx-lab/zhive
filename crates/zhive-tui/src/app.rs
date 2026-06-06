@@ -1678,8 +1678,12 @@ impl App {
                 } else if !self.attachments.is_empty() {
                     let n = self.attachments.len();
                     self.attachments.clear();
+                    // Remove the [Image #N] placeholder tokens so the input
+                    // buffer does not contain dangling references.
+                    let cleaned = strip_image_placeholders(self.input.value());
+                    self.input.set_text(cleaned);
                     self.flash = Some(format!(
-                        "cleared {n} attachment{}",
+                        "cleared {n} image{}",
                         if n == 1 { "" } else { "s" }
                     ));
                     Action::None
@@ -1894,16 +1898,6 @@ impl App {
             self.input.push_history(&text);
         }
         if let Some(cmd) = text.strip_prefix('/') {
-            // Slash commands do not consume attachments; discard them with a
-            // notice so the user knows they were dropped.
-            if has_attachments {
-                let n = self.attachments.len();
-                self.attachments.clear();
-                self.flash = Some(format!(
-                    "{n} attachment{} cleared (slash commands don't send images)",
-                    if n == 1 { "" } else { "s" }
-                ));
-            }
             return self.run_slash(cmd);
         }
         if self.conversation.busy {
@@ -3571,6 +3565,32 @@ mod tests {
         a.set_file_index(vec!["x.rs".to_owned()]);
         assert!(!a.needs_file_index());
     }
+}
+
+/// Removes all `[Image #N]` placeholder tokens from `text`, returning the
+/// remaining text.  Called when attachments are cleared via `Esc` to keep the
+/// input buffer consistent with the (now-empty) attachment store.
+pub(crate) fn strip_image_placeholders(text: &str) -> String {
+    let tag = "[Image #";
+    let mut result = String::with_capacity(text.len());
+    let mut rest = text;
+    loop {
+        if let Some(start) = rest.find(tag) {
+            result.push_str(&rest[..start]);
+            let after = &rest[start + tag.len()..];
+            if let Some(end) = after.find(']') {
+                rest = &after[end + 1..];
+            } else {
+                // Unterminated token — keep remainder verbatim.
+                result.push_str(&rest[start..]);
+                break;
+            }
+        } else {
+            result.push_str(rest);
+            break;
+        }
+    }
+    result
 }
 
 // Rust guideline compliant 2026-02-21

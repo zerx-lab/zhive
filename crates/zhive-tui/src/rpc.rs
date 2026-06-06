@@ -63,43 +63,77 @@ struct GetItemsReply {
     items: Vec<Item>,
 }
 
-/// Builds a multi-part user-message item from `text` and optional image attachments.
+/// Builds a multi-part user-message item by parsing `[Image #N]` placeholders
+/// in `text` and interleaving the corresponding attachment bytes.
 ///
-/// Text is the first content block (omitted when empty); each attachment is
-/// appended as an `ItemContent::Image` with base64-encoded bytes.  The
-/// resulting `Vec<ItemContent>` always contains at least one block: a
-/// plain-text block is added as a fallback when both `text` is empty and
-/// `attachments` is empty (which is a caller bug, but we stay well-defined).
+/// The resulting content preserves the order the user composed: text runs
+/// before the first image, between images, and after the last image are each
+/// emitted as separate `Text` blocks; each `[Image #N]` becomes an `Image`
+/// block with base64-encoded bytes.  References to out-of-range N are dropped.
+/// At least one block is always present (empty `Text` fallback).
 fn user_message(
     thread: &ThreadId,
     text: &str,
     attachments: &[crate::app::ImageAttachment],
 ) -> Item {
-    let mut content: Vec<ItemContent> = Vec::new();
-    if !text.is_empty() {
-        content.push(ItemContent::Text {
-            text: text.to_owned(),
-            annotations: None,
-        });
+    let content = parse_multipart(text, attachments);
+    Item::UserMessage {
+        id: new_user_item_id(thread),
+        content,
     }
-    for att in attachments {
-        content.push(ItemContent::Image {
-            data: crate::clipboard::base64_encode(&att.bytes),
-            mime_type: att.mime.to_owned(),
-            uri: None,
-        });
+}
+
+/// Splits `text` on `[Image #N]` tokens into an ordered `Vec<ItemContent>`.
+fn parse_multipart(text: &str, attachments: &[crate::app::ImageAttachment]) -> Vec<ItemContent> {
+    const TAG: &str = "[Image #";
+    let mut content: Vec<ItemContent> = Vec::new();
+    let mut rest = text;
+    loop {
+        if let Some(start) = rest.find(TAG) {
+            let chunk = &rest[..start];
+            if !chunk.is_empty() {
+                content.push(ItemContent::Text {
+                    text: chunk.to_owned(),
+                    annotations: None,
+                });
+            }
+            let after = &rest[start + TAG.len()..];
+            if let Some(end) = after.find(']') {
+                let n: usize = after[..end].trim().parse().unwrap_or(0);
+                if n >= 1 && n <= attachments.len() {
+                    let att = &attachments[n - 1];
+                    content.push(ItemContent::Image {
+                        data: crate::clipboard::base64_encode(&att.bytes),
+                        mime_type: att.mime.to_owned(),
+                        uri: None,
+                    });
+                }
+                rest = &after[end + 1..];
+            } else {
+                // Unterminated token — emit remainder as plain text.
+                content.push(ItemContent::Text {
+                    text: rest[start..].to_owned(),
+                    annotations: None,
+                });
+                break;
+            }
+        } else {
+            if !rest.is_empty() {
+                content.push(ItemContent::Text {
+                    text: rest.to_owned(),
+                    annotations: None,
+                });
+            }
+            break;
+        }
     }
     if content.is_empty() {
-        // Defensive fallback: keep the wire item well-formed even on empty input.
         content.push(ItemContent::Text {
             text: String::new(),
             annotations: None,
         });
     }
-    Item::UserMessage {
-        id: new_user_item_id(thread),
-        content,
-    }
+    content
 }
 
 /// Submits `text` (and any `attachments`) as a new turn on `thread`.

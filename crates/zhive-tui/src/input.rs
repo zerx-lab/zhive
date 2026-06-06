@@ -339,6 +339,17 @@ impl Input {
         self.draft.clear();
     }
 
+    /// Replaces the buffer contents with `text`, placing the cursor at the end.
+    ///
+    /// Used to rewrite the buffer in-place (e.g. stripping image placeholder
+    /// tokens when attachments are cleared) without going through history.
+    pub(crate) fn set_text(&mut self, text: String) {
+        self.cursor = text.chars().count();
+        self.value = text;
+        self.history_pos = None;
+        self.draft.clear();
+    }
+
     /// The cursor's display position as `(column, row)` in cells.
     ///
     /// The row counts hard newlines before the cursor; the column is the total

@@ -120,32 +120,16 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
 }
 
-/// Display width of the attachment chip prefix, in terminal columns.
-///
-/// `"📎N "` — the emoji is 2 wide, followed by the decimal digit count, then a
-/// space separator.  Returns 0 when there are no attachments so the layout is
-/// identical to an attachment-free session.
-fn chip_prefix_width(n: usize) -> u16 {
-    if n == 0 {
-        return 0;
-    }
-    // emoji(2) + digit count + trailing space
-    2 + u16::try_from(n.to_string().len()).unwrap_or(1) + 1
-}
-
 /// Computes the composer panel height (input rows + borders), clamped.
 ///
 /// `inner_width` is the wrappable text width (panel width minus its borders);
 /// the row count reflects soft-wrapped lines, not just hard newlines, so a long
-/// line that wraps grows the panel instead of being clipped.  When attachments
-/// are present the text area is narrowed by the chip prefix width, which may
-/// increase the wrap count.
+/// line that wraps grows the panel instead of being clipped.
 fn composer_height(app: &App, inner_width: u16) -> u16 {
-    let text_width = inner_width.saturating_sub(chip_prefix_width(app.attachments.len()));
-    let wrapped = app.input.wrap_rows(text_width).len();
+    let wrapped = app.input.wrap_rows(inner_width).len();
     // Grow to keep the caret's row in view (a row filled exactly to the edge
     // pushes the caret onto a phantom next row).
-    let (_, cursor_row) = app.input.cursor_visual_col_row(text_width);
+    let (_, cursor_row) = app.input.cursor_visual_col_row(inner_width);
     let rows = wrapped.max(usize::from(cursor_row) + 1);
     u16::try_from(rows).unwrap_or(1).clamp(1, 6) + 2
 }
@@ -1311,32 +1295,7 @@ fn render_composer(frame: &mut Frame, app: &App, area: Rect) -> (Rect, u16) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    // When attachments are pending, split the inner rect horizontally:
-    //   [chip_col | text_col]
-    // The chip shows "📎N" in accent colour; the cursor is positioned relative
-    // to text_col, so the existing placement code in the event loop is correct
-    // without any modification.
-    let chip_w = chip_prefix_width(app.attachments.len());
-    let (chip_col, text_col) = if chip_w > 0 && inner.width > chip_w {
-        let [left, right] =
-            Layout::horizontal([Constraint::Length(chip_w), Constraint::Fill(1)]).areas(inner);
-        (Some(left), right)
-    } else {
-        (None, inner)
-    };
-
-    if let Some(chip_area) = chip_col {
-        let chip_text = format!("📎{} ", app.attachments.len());
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                chip_text,
-                Style::new().fg(p.accent).add_modifier(Modifier::BOLD),
-            ))),
-            chip_area,
-        );
-    }
-
-    // Soft-wrap the draft to the text column width and scroll so the caret's
+    // Soft-wrap the draft to the inner width and scroll so the caret's
     // row stays visible once the draft grows past the panel's visible height.
     let (text, scroll) = if app.input.value().is_empty() && !busy {
         (
@@ -1349,16 +1308,51 @@ fn render_composer(frame: &mut Frame, app: &App, area: Rect) -> (Rect, u16) {
     } else {
         let lines: Vec<Line> = app
             .input
-            .wrap_rows(text_col.width)
+            .wrap_rows(inner.width)
             .into_iter()
-            .map(Line::from)
+            .map(|row| highlight_image_tokens(&row, p))
             .collect();
-        let (_, cursor_row) = app.input.cursor_visual_col_row(text_col.width);
-        let scroll = cursor_row.saturating_sub(text_col.height.saturating_sub(1));
+        let (_, cursor_row) = app.input.cursor_visual_col_row(inner.width);
+        let scroll = cursor_row.saturating_sub(inner.height.saturating_sub(1));
         (Text::from(lines).style(Style::new().fg(p.fg)), scroll)
     };
-    frame.render_widget(Paragraph::new(text).scroll((scroll, 0)), text_col);
-    (text_col, scroll)
+    frame.render_widget(Paragraph::new(text).scroll((scroll, 0)), inner);
+    (inner, scroll)
+}
+
+/// Splits a wrapped text row on `[Image #N]` tokens and styles them in accent.
+///
+/// Plain text segments keep the default foreground; each `[Image #N]` token is
+/// rendered bold in the accent colour so it stands out as a non-text placeholder.
+fn highlight_image_tokens<'a>(row: &str, p: &Palette) -> Line<'a> {
+    const TAG: &str = "[Image #";
+    let mut spans: Vec<Span<'a>> = Vec::new();
+    let mut rest = row.to_owned();
+    loop {
+        if let Some(start) = rest.find(TAG) {
+            if start > 0 {
+                spans.push(Span::raw(rest[..start].to_owned()));
+            }
+            let after = rest[start + TAG.len()..].to_owned();
+            if let Some(end) = after.find(']') {
+                let token = format!("{}{}]", TAG, &after[..end]);
+                spans.push(Span::styled(
+                    token,
+                    Style::new().fg(p.accent).add_modifier(Modifier::BOLD),
+                ));
+                after[end + 1..].clone_into(&mut rest);
+            } else {
+                spans.push(Span::raw(rest[start..].to_owned()));
+                break;
+            }
+        } else {
+            if !rest.is_empty() {
+                spans.push(Span::raw(rest));
+            }
+            break;
+        }
+    }
+    Line::from(spans)
 }
 
 /// A rotating composer placeholder, varied by the number of turns so far.

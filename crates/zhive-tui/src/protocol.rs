@@ -16,9 +16,9 @@ use zhive_proto::domain::{Item, ThreadId, TurnError, TurnId};
 use zhive_proto::events::{
     CompactionCompletedPayload, CompactionDeltaPayload, CompactionFailedPayload,
     CompactionStartedPayload, ItemAppendedPayload, ItemDeltaKind, ItemDeltaPayload,
-    PermissionRequestedPayload,
-    PhaseChangedPayload, SubagentCompletedPayload, SubagentStartedPayload, TurnCompletedPayload,
-    TurnFailedPayload, TurnStartedPayload, UsagePayload,
+    PermissionRequestedPayload, PhaseChangedPayload, SubagentCompletedPayload,
+    SubagentStartedPayload, TurnCompletedPayload, TurnFailedPayload, TurnStartedPayload,
+    UsagePayload,
 };
 use zhive_proto::hook::{CompactTrigger, EnginePhase};
 use zhive_proto::methods as m;
