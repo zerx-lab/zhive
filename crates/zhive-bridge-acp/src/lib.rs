@@ -238,8 +238,15 @@ fn build_agent(
 /// pickers are advertised per session via `config_options` on the `session/new`
 /// response (no capability flag is required for them), and refreshed through
 /// `session/set_config_option`.
+///
+/// `prompt_capabilities.image = true` tells the client (Zed, pi, …) that the
+/// agent accepts `ContentBlock::Image` in prompts; without this flag those
+/// clients silently drop image attachments before sending.
 fn advertise_capabilities() -> AgentCapabilities {
-    AgentCapabilities::new().load_session(false)
+    use agent_client_protocol::schema::PromptCapabilities;
+    AgentCapabilities::new()
+        .load_session(false)
+        .prompt_capabilities(PromptCapabilities::new().image(true))
 }
 
 /// Returns the session's current model + reasoning-depth config options.
@@ -513,20 +520,16 @@ async fn stream_turn(
                 // Tool calls: suppress the InProgress announcement (no output
                 // yet); send the Completed/Failed item as the sole ToolCall so
                 // the client sees a fully populated card on first render.
-                let update = if let zhive_proto::domain::Item::ToolCall { status, .. } =
-                    item.as_ref()
-                {
-                    if matches!(
-                        status,
-                        ToolCallStatus::InProgress | ToolCallStatus::Pending
-                    ) {
-                        None
+                let update =
+                    if let zhive_proto::domain::Item::ToolCall { status, .. } = item.as_ref() {
+                        if matches!(status, ToolCallStatus::InProgress | ToolCallStatus::Pending) {
+                            None
+                        } else {
+                            convert::tool_call_to_acp(&item).map(SessionUpdate::ToolCall)
+                        }
                     } else {
-                        convert::tool_call_to_acp(&item).map(SessionUpdate::ToolCall)
-                    }
-                } else {
-                    convert::item_to_session_update(&item)
-                };
+                        convert::item_to_session_update(&item)
+                    };
                 if let Some(update) = update {
                     notify(cx, session_id, update);
                 }
