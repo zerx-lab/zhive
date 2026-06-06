@@ -48,7 +48,8 @@ impl Host {
     /// for the engine's lifetime and shuts down in [`Host::stop`].
     ///
     /// `catalog` (when present) backs the `models/list` / `engine/set_model`
-    /// RPCs, and `context_window` seeds the auto-compaction budget for the
+    /// RPCs, `context_window` seeds the auto-compaction budget, and
+    /// `max_output_tokens` seeds the per-turn request cap for the
     /// initially-bound model.
     ///
     /// # Errors
@@ -61,6 +62,7 @@ impl Host {
         socket: PathBuf,
         catalog: Option<Arc<dyn ModelCatalog>>,
         context_window: Option<u64>,
+        max_output_tokens: Option<u64>,
     ) -> anyhow::Result<Self> {
         // A stale socket from a crashed run would block binding.
         let _ = std::fs::remove_file(&socket);
@@ -83,7 +85,8 @@ impl Host {
             compact_token_threshold: None,
             cwd: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
         })
-        .with_context_window(context_window);
+        .with_context_window(context_window)
+        .with_max_output_tokens(max_output_tokens);
         // Wire the host model catalogue when the provider kind supports one.
         let engine = match catalog {
             Some(cat) => engine.with_model_catalog(cat),

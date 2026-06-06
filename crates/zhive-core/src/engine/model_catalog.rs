@@ -32,10 +32,19 @@ pub struct SwitchedModel {
     pub provider: DynLanguageModel,
     /// Context window (maximum input tokens) the host resolved, if known.
     pub context_window: Option<u64>,
+    /// Maximum output tokens the host resolved for the model, if known.
+    ///
+    /// Applied to the engine's per-turn request budget so a deep reasoning pass
+    /// is not truncated by the provider's low fallback cap. `None` leaves the
+    /// engine on the provider default.
+    pub max_output_tokens: Option<u64>,
 }
 
 impl SwitchedModel {
     /// Constructs a switch outcome from a provider and resolved window.
+    ///
+    /// `max_output_tokens` starts unset; chain [`Self::with_max_output_tokens`]
+    /// to attach it.
     ///
     /// # Examples
     ///
@@ -44,13 +53,32 @@ impl SwitchedModel {
     /// use zhive_core::provider::ScriptedModel;
     /// let s = SwitchedModel::new(ScriptedModel::new("p", "m", vec![]).into_dyn(), Some(200_000));
     /// assert_eq!(s.context_window, Some(200_000));
+    /// assert_eq!(s.max_output_tokens, None);
     /// ```
     #[must_use]
     pub fn new(provider: DynLanguageModel, context_window: Option<u64>) -> Self {
         Self {
             provider,
             context_window,
+            max_output_tokens: None,
         }
+    }
+
+    /// Attaches the model's resolved maximum output tokens.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use zhive_core::engine::SwitchedModel;
+    /// use zhive_core::provider::ScriptedModel;
+    /// let s = SwitchedModel::new(ScriptedModel::new("p", "m", vec![]).into_dyn(), None)
+    ///     .with_max_output_tokens(Some(64_000));
+    /// assert_eq!(s.max_output_tokens, Some(64_000));
+    /// ```
+    #[must_use]
+    pub fn with_max_output_tokens(mut self, max_output_tokens: Option<u64>) -> Self {
+        self.max_output_tokens = max_output_tokens;
+        self
     }
 }
 

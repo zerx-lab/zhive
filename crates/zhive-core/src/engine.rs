@@ -587,6 +587,19 @@ impl Engine {
         self
     }
 
+    /// Seeds the active model's max output tokens for the per-turn request cap.
+    ///
+    /// `Some(max)` caps each request's output budget at the model's real
+    /// maximum instead of the provider's low fallback (which can truncate a deep
+    /// reasoning pass mid-thought); `None` clears it. Updated automatically on
+    /// every [`Self::set_model`]; hosts call this once at boot for the
+    /// initially-bound model.
+    #[must_use]
+    pub fn with_max_output_tokens(self, max_output_tokens: Option<u64>) -> Self {
+        self.inner.set_max_output_tokens(max_output_tokens);
+        self
+    }
+
     /// Lists the models the active provider exposes, via the host catalogue.
     ///
     /// # Errors
@@ -637,11 +650,14 @@ impl Engine {
             .ok_or(EngineError::ModelManagementUnavailable)?;
         let switched = catalog.switch(model_id, context_window_hint)?;
         let context_window = switched.context_window;
-        // Swap the provider and apply the new window for compaction. Both are
-        // interior-mutable, so no actor round-trip is needed; the running turn
-        // loop picks up the new provider on its next call.
+        let max_output_tokens = switched.max_output_tokens;
+        // Swap the provider and apply the new window for compaction plus the new
+        // output cap for the request budget. All are interior-mutable, so no
+        // actor round-trip is needed; the running turn loop picks up the new
+        // provider and caps on its next call.
         let _previous = self.inner.swap_provider(switched.provider);
         self.inner.set_context_window(context_window);
+        self.inner.set_max_output_tokens(max_output_tokens);
         tracing::info!(
             name: "zhive.engine.model_switched",
             model_id = %model_id,
@@ -6281,7 +6297,8 @@ mod model_management_tests {
             Ok(SwitchedModel::new(
                 ScriptedModel::new("stub", model_id, vec![]).into_dyn(),
                 window,
-            ))
+            )
+            .with_max_output_tokens(Some(64_000)))
         }
     }
 
@@ -6328,6 +6345,25 @@ mod model_management_tests {
         // Falls back to the catalogue's resolution when no hint is given.
         let result = engine.set_model("model-a", None).unwrap();
         assert_eq!(result.context_window, Some(123_456));
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn set_model_applies_max_output_tokens_to_request_budget() {
+        let engine = Engine::spawn().with_model_catalog(Arc::new(StubCatalog));
+        // The boot seed leaves it unset until a model is bound.
+        assert_eq!(engine.inner.max_output_tokens(), None);
+        engine.set_model("model-a", None).unwrap();
+        // The stub resolves 64_000 from its (would-be cached) descriptor; the
+        // engine stores it so each turn caps the request budget accordingly.
+        assert_eq!(engine.inner.max_output_tokens(), Some(64_000));
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn with_max_output_tokens_seeds_request_budget() {
+        let engine = Engine::spawn().with_max_output_tokens(Some(32_000));
+        assert_eq!(engine.inner.max_output_tokens(), Some(32_000));
         engine.shutdown().await.unwrap();
     }
 

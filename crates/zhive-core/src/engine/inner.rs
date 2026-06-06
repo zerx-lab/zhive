@@ -125,6 +125,15 @@ pub(crate) struct EngineInner {
     /// the conservative default budget. Uses `Relaxed` ordering: the value is
     /// advisory for a heuristic, never a synchronisation point.
     context_window: AtomicU64,
+    /// Active model's maximum output tokens, or `0` when unknown.
+    ///
+    /// Seeded post-spawn from the host's model catalogue
+    /// ([`super::Engine::with_max_output_tokens`]) and updated on every hot
+    /// model switch. Read when building each turn's request to cap the
+    /// provider's output budget; `0` leaves the provider on its own fallback
+    /// (which can be as low as 4096 and truncate a deep reasoning pass). Uses
+    /// `Relaxed` ordering for the same reason as [`Self::context_window`].
+    max_output_tokens: AtomicU64,
     /// Hook host shared across all turn tasks spawned by this engine.
     pub(in crate::engine) hook_host: Arc<HookHost>,
     /// Tool registry shared across all turn tasks spawned by this engine.
@@ -250,6 +259,7 @@ impl EngineInner {
             permission: PermissionReducer::new(),
             provider: RwLock::new(provider),
             context_window: AtomicU64::new(0),
+            max_output_tokens: AtomicU64::new(0),
             hook_host,
             tools,
             turn_limits,
@@ -316,6 +326,20 @@ impl EngineInner {
     pub(in crate::engine) fn set_context_window(&self, window: Option<u64>) {
         self.context_window
             .store(window.unwrap_or(0), Ordering::Relaxed);
+    }
+
+    /// Returns the active model's max output tokens, or `None` when unknown.
+    pub(in crate::engine) fn max_output_tokens(&self) -> Option<u64> {
+        match self.max_output_tokens.load(Ordering::Relaxed) {
+            0 => None,
+            n => Some(n),
+        }
+    }
+
+    /// Records the active model's max output tokens (`None` clears it).
+    pub(in crate::engine) fn set_max_output_tokens(&self, max: Option<u64>) {
+        self.max_output_tokens
+            .store(max.unwrap_or(0), Ordering::Relaxed);
     }
 
     /// Returns the hook host for sibling modules.

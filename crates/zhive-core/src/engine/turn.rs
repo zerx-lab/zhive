@@ -461,6 +461,14 @@ async fn run_turn_inner(
         //    (the single source of truth; see `build_call_options`).
         let mut call_options =
             build_call_options(&handle, inner.tools(), inner.system_prompt(), &scope).await;
+        // Cap the request's output budget at the active model's resolved maximum
+        // (seeded from the host catalogue). Without this the provider falls back
+        // to a low default — e.g. Anthropic's 4096 — which, with deep reasoning
+        // enabled, is consumed by the thinking pass and truncates the reply
+        // mid-thought. `None` leaves the provider on its own fallback.
+        call_options.max_output_tokens = inner
+            .max_output_tokens()
+            .map(|n| u32::try_from(n).unwrap_or(u32::MAX));
         // Layer the turn's requested reasoning depth onto the request (no-op
         // when `reasoning` is `None`). Maps onto Anthropic `effort` + adaptive
         // thinking, or the portable `reasoning` enum for other providers.

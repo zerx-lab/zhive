@@ -222,6 +222,16 @@ pub(crate) struct HttpModelCatalog {
     api_key: Option<String>,
     /// Shared HTTP client with a bounded timeout.
     http: reqwest::Client,
+    /// In-memory snapshot of the last successful listing, the single source of
+    /// truth after boot.
+    ///
+    /// `None` until the first [`list`](ModelCatalog::list) fetch warms it; once
+    /// `Some`, every later `list` and the synchronous
+    /// [`switch`](ModelCatalog::switch) read from it without a network round
+    /// trip. This is how a model hot-swap resolves the target's full metadata
+    /// (`context_window` **and** `max_output_tokens`) from the snapshot the
+    /// engine already fetched at startup, rather than re-deriving partial data.
+    cache: std::sync::RwLock<Option<Vec<ModelDescriptor>>>,
 }
 
 impl std::fmt::Debug for HttpModelCatalog {
@@ -236,9 +246,42 @@ impl std::fmt::Debug for HttpModelCatalog {
     }
 }
 
+impl HttpModelCatalog {
+    /// Returns the cached listing snapshot, if the boot fetch has warmed it.
+    fn cached_snapshot(&self) -> Option<Vec<ModelDescriptor>> {
+        self.cache
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Stores a fresh listing as the in-memory snapshot.
+    fn store_snapshot(&self, models: &[ModelDescriptor]) {
+        *self
+            .cache
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(models.to_vec());
+    }
+
+    /// Looks up one model's full descriptor in the cached snapshot by id.
+    fn cached_descriptor(&self, model_id: &str) -> Option<ModelDescriptor> {
+        self.cache
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .and_then(|models| models.iter().find(|m| m.id == model_id).cloned())
+    }
+}
+
 #[async_trait]
 impl ModelCatalog for HttpModelCatalog {
     async fn list(&self) -> Result<Vec<ModelDescriptor>, ModelCatalogError> {
+        // Cache-first: once the boot fetch has warmed the snapshot, serve every
+        // later listing from memory so model/depth switches and request
+        // construction all read the same startup data instead of re-fetching.
+        if let Some(cached) = self.cached_snapshot() {
+            return Ok(cached);
+        }
         let req = self.http.get(&self.models_url);
         let req = self.auth.apply(req, self.api_key.as_deref());
         let resp = req
@@ -256,7 +299,9 @@ impl ModelCatalog for HttpModelCatalog {
             .json()
             .await
             .map_err(|e| ModelCatalogError::List(e.to_string()))?;
-        Ok(body.data.into_iter().map(to_descriptor).collect())
+        let models: Vec<ModelDescriptor> = body.data.into_iter().map(to_descriptor).collect();
+        self.store_snapshot(&models);
+        Ok(models)
     }
 
     fn switch(
@@ -272,10 +317,17 @@ impl ModelCatalog for HttpModelCatalog {
                 model_id: model_id.to_owned(),
                 reason: e.to_string(),
             })?;
-        // Resolution priority: the host's manual override, then the caller's
-        // hint from a prior listing.
-        let context_window = self.entry.context_window.or(context_window_hint);
-        Ok(SwitchedModel::new(provider, context_window))
+        // Resolve the target's metadata from the cached startup snapshot.
+        let descriptor = self.cached_descriptor(model_id);
+        // Context window resolution priority: the host's manual override, then
+        // the cached snapshot, then the caller's hint from a prior listing.
+        let context_window = self
+            .entry
+            .context_window
+            .or_else(|| descriptor.as_ref().and_then(|d| d.context_window))
+            .or(context_window_hint);
+        let max_output_tokens = descriptor.and_then(|d| d.max_output_tokens);
+        Ok(SwitchedModel::new(provider, context_window).with_max_output_tokens(max_output_tokens))
     }
 }
 
@@ -303,28 +355,8 @@ pub(crate) fn build_catalog(cfg: &Config) -> Option<Arc<dyn ModelCatalog>> {
         models_url,
         auth,
         http,
+        cache: std::sync::RwLock::new(None),
     }))
-}
-
-/// Resolves the active model's context window to seed the compaction budget.
-///
-/// Prefers the config override (no network), otherwise asks the catalogue for
-/// the active model's `max_input_tokens`. Best-effort: any fetch failure yields
-/// `None`, leaving the engine on its conservative default budget.
-pub(crate) async fn resolve_initial_context_window(
-    cfg: &Config,
-    catalog: Option<&Arc<dyn ModelCatalog>>,
-) -> Option<u64> {
-    if let Some(window) = cfg.active_context_window() {
-        return Some(window);
-    }
-    let catalog = catalog?;
-    let active = cfg.active_model();
-    let models = catalog.list().await.ok()?;
-    models
-        .into_iter()
-        .find(|m| m.id == active)
-        .and_then(|m| m.context_window)
 }
 
 /// Boot-time `/models` snapshot for the active model: window plus depth cycle.
@@ -336,6 +368,13 @@ pub(crate) async fn resolve_initial_context_window(
 pub(crate) struct ActiveModelInfo {
     /// Context window (max input tokens) for the compaction budget, if known.
     pub context_window: Option<u64>,
+    /// Maximum output tokens for the per-turn request cap, if the endpoint
+    /// reports it.
+    ///
+    /// Seeds the engine so requests are not capped at the provider's low
+    /// fallback (which truncates deep reasoning). `None` leaves the provider on
+    /// its own default.
+    pub max_output_tokens: Option<u64>,
     /// The model's Off-first reasoning-depth cycle from the live endpoint.
     ///
     /// `None` when no catalogue exists, the fetch failed, or the active model is
@@ -356,6 +395,7 @@ pub(crate) async fn resolve_active_model_info(
     let Some(catalog) = catalog else {
         return ActiveModelInfo {
             context_window: override_window,
+            max_output_tokens: None,
             supported_efforts: None,
         };
     };
@@ -363,15 +403,18 @@ pub(crate) async fn resolve_active_model_info(
     let Ok(models) = catalog.list().await else {
         return ActiveModelInfo {
             context_window: override_window,
+            max_output_tokens: None,
             supported_efforts: None,
         };
     };
     let descriptor = models.into_iter().find(|m| m.id == active);
     let supported_efforts = descriptor.as_ref().map(|d| d.supported_efforts.clone());
+    let max_output_tokens = descriptor.as_ref().and_then(|d| d.max_output_tokens);
     let endpoint_window = descriptor.and_then(|d| d.context_window);
     ActiveModelInfo {
         // The manual override still wins; otherwise use the endpoint's value.
         context_window: override_window.or(endpoint_window),
+        max_output_tokens,
         supported_efforts,
     }
 }

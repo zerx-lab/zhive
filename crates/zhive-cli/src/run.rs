@@ -65,8 +65,16 @@ async fn run_tui(config_path: Option<std::path::PathBuf>, args: crate::cli::TuiA
     let catalog = crate::models::build_catalog(&cfg);
     let model_info = crate::models::resolve_active_model_info(&cfg, catalog.as_ref()).await;
     let context_window = model_info.context_window;
-    let host =
-        crate::engine_host::Host::start(provider, runtime, socket, catalog, context_window).await?;
+    let max_output_tokens = model_info.max_output_tokens;
+    let host = crate::engine_host::Host::start(
+        provider,
+        runtime,
+        socket,
+        catalog,
+        context_window,
+        max_output_tokens,
+    )
+    .await?;
 
     let mut tui_config = build_tui_config(&cfg);
     tui_config.effort_cycle = model_info.supported_efforts;
@@ -305,10 +313,16 @@ async fn run_exec(
     let runtime = crate::boot::build_runtime(&cfg).await?;
     let socket = crate::engine_host::tui_socket_path();
     let catalog = crate::models::build_catalog(&cfg);
-    let context_window =
-        crate::models::resolve_initial_context_window(&cfg, catalog.as_ref()).await;
-    let host =
-        crate::engine_host::Host::start(provider, runtime, socket, catalog, context_window).await?;
+    let model_info = crate::models::resolve_active_model_info(&cfg, catalog.as_ref()).await;
+    let host = crate::engine_host::Host::start(
+        provider,
+        runtime,
+        socket,
+        catalog,
+        model_info.context_window,
+        model_info.max_output_tokens,
+    )
+    .await?;
 
     // Generate a fresh thread id and subscribe to events before start_turn so
     // no event is missed between the call and subscription. Built locally (no
@@ -443,8 +457,7 @@ async fn run_serve(
     // mis-classify a running peer as "clean".
 
     let catalog = crate::models::build_catalog(&cfg);
-    let context_window =
-        crate::models::resolve_initial_context_window(&cfg, catalog.as_ref()).await;
+    let model_info = crate::models::resolve_active_model_info(&cfg, catalog.as_ref()).await;
     let engine = Engine::spawn_with_config(EngineConfig {
         provider,
         tools: Arc::clone(&runtime.registry),
@@ -456,7 +469,8 @@ async fn run_serve(
         compact_token_threshold: None,
         cwd: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
     })
-    .with_context_window(context_window);
+    .with_context_window(model_info.context_window)
+    .with_max_output_tokens(model_info.max_output_tokens);
     let engine = match catalog {
         Some(cat) => engine.with_model_catalog(cat),
         None => engine,
@@ -587,8 +601,7 @@ async fn run_acp(config_path: Option<std::path::PathBuf>) -> Result<()> {
     let runtime = crate::boot::build_runtime(&cfg).await?;
 
     let catalog = crate::models::build_catalog(&cfg);
-    let context_window =
-        crate::models::resolve_initial_context_window(&cfg, catalog.as_ref()).await;
+    let model_info = crate::models::resolve_active_model_info(&cfg, catalog.as_ref()).await;
     let engine = Engine::spawn_with_config(EngineConfig {
         provider,
         tools: Arc::clone(&runtime.registry),
@@ -600,7 +613,8 @@ async fn run_acp(config_path: Option<std::path::PathBuf>) -> Result<()> {
         compact_token_threshold: None,
         cwd: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
     })
-    .with_context_window(context_window);
+    .with_context_window(model_info.context_window)
+    .with_max_output_tokens(model_info.max_output_tokens);
     let engine = match catalog {
         Some(cat) => engine.with_model_catalog(cat),
         None => engine,
