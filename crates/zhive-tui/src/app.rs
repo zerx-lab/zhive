@@ -1619,11 +1619,20 @@ impl App {
     )]
     fn on_conversation_key(&mut self, key: KeyEvent) -> Action {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         let palette = self.palette_query().is_some();
         let mention = self.mention_query().is_some();
 
         match key.code {
+            // Ctrl+V / Ctrl+Shift+V: when the terminal's bracketed-paste
+            // mechanism sends an empty paste event (clipboard holds a binary
+            // image), the event loop handles it via ReadClipboardImage.
+            // These key-event guards are the fallback for terminals that let
+            // Ctrl+V through as a raw key when the clipboard has no text to
+            // bracket-paste (e.g. Wayland compositors that skip the sequence).
+            KeyCode::Char('v') if ctrl => Action::ReadClipboardImage,
+            KeyCode::Char('V') if ctrl && shift => Action::ReadClipboardImage,
             // Ctrl+C copies an active transcript selection (opencode parity).
             // With no selection it clears a non-empty composer, or does nothing
             // on an empty one — it never quits. Quitting is Ctrl+D's job, on a

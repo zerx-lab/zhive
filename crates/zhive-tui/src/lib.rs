@@ -318,10 +318,17 @@ async fn event_loop(
                     }
                     Some(Ok(Event::Paste(text))) => {
                         let trimmed = text.trim();
-                        if let Some(mime) = image_path_mime(trimmed) {
-                            // Pasted text looks like an image file path; try to
-                            // read it and add as an attachment instead of inserting
-                            // the path verbatim into the input buffer.
+                        if trimmed.is_empty() {
+                            // Empty bracketed paste — the terminal tried to paste
+                            // but had no text content (clipboard likely holds a
+                            // binary image).  Attempt a clipboard image read so
+                            // Ctrl+V / Ctrl+Shift+V work for image attachment
+                            // without requiring the Alt+I binding.
+                            perform(client, app, crate::app::Action::ReadClipboardImage, &cmd_tx);
+                        } else if let Some(mime) = image_path_mime(trimmed) {
+                            // Pasted text looks like an image file path; read it
+                            // and add as an attachment instead of inserting the
+                            // path verbatim into the input buffer.
                             match std::fs::read(trimmed) {
                                 Ok(bytes) => {
                                     let label = trimmed
@@ -335,9 +342,8 @@ async fn event_loop(
                                         label,
                                     });
                                     let n = app.attachments.len();
-                                    app.flash = Some(format!(
-                                        "📎 image attached ({n} total)"
-                                    ));
+                                    app.flash =
+                                        Some(format!("📎 image attached ({n} total)"));
                                 }
                                 Err(_) => {
                                     // Not readable as a file; fall back to plain text.
