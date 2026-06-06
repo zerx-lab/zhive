@@ -58,9 +58,9 @@ pub use slash::Skill as SlashSkill;
 use std::sync::Arc;
 
 use agent_client_protocol::schema::{
-    AgentCapabilities, CancelNotification, ContentBlock, InitializeRequest, InitializeResponse,
-    NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse, SessionId,
-    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
+    AgentCapabilities, AvailableCommand, AvailableCommandsUpdate, CancelNotification, ContentBlock,
+    InitializeRequest, InitializeResponse, NewSessionRequest, NewSessionResponse, PromptRequest,
+    PromptResponse, SessionId, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
     SetSessionConfigOptionResponse, StopReason, ToolCallId,
 };
 use agent_client_protocol::{Agent, ByteStreams, Client, ConnectionTo, Dispatch, Responder, Stdio};
@@ -152,6 +152,7 @@ fn discover_skills() -> Arc<[Skill]> {
             .into_iter()
             .map(|e| Skill {
                 name: Arc::from(e.name.as_str()),
+                description: e.description.as_deref().map(Arc::from),
                 invocation: Arc::from(e.invocation.as_str()),
             })
             .collect();
@@ -212,9 +213,10 @@ fn build_agent(
             {
                 let state = state.clone();
                 let engine = engine.clone();
+                let skills = Arc::clone(skills);
                 async move |req: NewSessionRequest,
                             responder: Responder<NewSessionResponse>,
-                            _cx| {
+                            cx: ConnectionTo<Client>| {
                     let session_id = state.new_session(req.cwd.clone());
                     tracing::info!(
                         name: "zhive.acp.session.new",
@@ -225,7 +227,31 @@ fn build_agent(
                     // model list needs a (possibly networked) catalog fetch, so
                     // session creation pays that latency once up front.
                     let options = current_config_options(&engine, &state, &session_id).await;
-                    responder.respond(NewSessionResponse::new(session_id).config_options(options))
+                    let result = responder.respond(
+                        NewSessionResponse::new(session_id.clone()).config_options(options),
+                    );
+                    // Advertise the slash-command catalogue. ACP clients (Zed,
+                    // opencode, …) populate their `/` menu solely from this
+                    // notification; without it the menu is empty and every slash
+                    // command appears unsupported.
+                    //
+                    // The notification is DEFERRED to a follow-up task rather than
+                    // sent inline: Zed drops a `session/update` for a session it has
+                    // not yet registered, and its session registration happens on a
+                    // separate (main-thread) hop after it reads the `session/new`
+                    // response. Sending inline races that hop across the process
+                    // boundary and the catalogue is silently discarded. opencode
+                    // sidesteps the same race with a `setTimeout(0)` deferral; the
+                    // short sleep here gives the client's registration time to land.
+                    let notify_cx = cx.clone();
+                    let notify_session = session_id.clone();
+                    let notify_skills = Arc::clone(&skills);
+                    let _ = cx.spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        notify_available_commands(&notify_cx, &notify_session, &notify_skills);
+                        Ok(())
+                    });
+                    result
                 }
             },
             agent_client_protocol::on_receive_request!(),
@@ -943,6 +969,54 @@ async fn wait_for_session_abort(thread_id: &ThreadId, abort_events: &mut Receive
             Err(RecvError::Closed) => return,
         }
     }
+}
+
+/// Builds the ACP `availableCommands` list from the discovered skills.
+///
+/// Only skills are advertised: the `/` menu lists skills alone, matching the
+/// TUI palette. The built-in commands (`/compact`, `/new`, `/clear`, `/skills`,
+/// `/help`) are intentionally omitted from the menu — they remain dispatchable
+/// when typed in full, since [`slash::parse_prompt`] still routes them, but they
+/// no longer clutter the picker.
+///
+/// Each skill becomes a command named after the skill, carrying its frontmatter
+/// description (a generic fallback when absent) and an unstructured input hint so
+/// clients forward any text typed after the command name as skill arguments.
+fn available_commands(skills: &[Skill]) -> Vec<AvailableCommand> {
+    use agent_client_protocol::schema::{AvailableCommandInput, UnstructuredCommandInput};
+
+    skills
+        .iter()
+        .map(|skill| {
+            let description = skill
+                .description
+                .as_deref()
+                .map_or_else(|| format!("Run the {} skill", skill.name), str::to_owned);
+            AvailableCommand::new(skill.name.as_ref(), description).input(
+                AvailableCommandInput::Unstructured(UnstructuredCommandInput::new("arguments")),
+            )
+        })
+        .collect()
+}
+
+/// Sends the `availableCommands` update so the client can render its `/` menu.
+///
+/// ACP clients populate their slash-command menu exclusively from this
+/// notification; emitting it once per `session/new` is what makes `/compact`,
+/// skills, and the rest selectable at all.
+fn notify_available_commands(cx: &ConnectionTo<Client>, session_id: &SessionId, skills: &[Skill]) {
+    let commands = available_commands(skills);
+    tracing::info!(
+        name: "zhive.acp.commands.advertised",
+        session = %session_id.0,
+        count = commands.len(),
+        "advertised slash-command catalogue"
+    );
+    notify(
+        cx,
+        session_id,
+        SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate::new(commands)),
+    );
 }
 
 /// Sends a `session/update` notification, logging (but not failing) on error.

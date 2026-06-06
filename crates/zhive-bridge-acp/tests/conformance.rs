@@ -1202,4 +1202,90 @@ async fn slash_command_with_extra_blocks_is_intercepted() {
     );
 }
 
+/// Client handler that records the names from any `AvailableCommandsUpdate`.
+///
+/// ACP clients build their `/` menu solely from this notification, so this
+/// collector lets the test assert the bridge advertises the catalogue at all.
+/// Records the names from an `AvailableCommandsUpdate`. `None` until one
+/// arrives, then `Some(names)` (possibly empty) — distinguishing "never sent"
+/// from "sent an empty catalogue".
+struct CommandsCollector {
+    sink: std::sync::Arc<std::sync::Mutex<Option<Vec<String>>>>,
+}
+
+impl agent_client_protocol::HandleDispatchFrom<agent_client_protocol::Agent> for CommandsCollector {
+    async fn handle_dispatch_from(
+        &mut self,
+        message: agent_client_protocol::Dispatch,
+        _cx: ConnectionTo<agent_client_protocol::Agent>,
+    ) -> Result<
+        agent_client_protocol::Handled<agent_client_protocol::Dispatch>,
+        agent_client_protocol::Error,
+    > {
+        use agent_client_protocol::schema::{SessionNotification, SessionUpdate};
+        match message.into_notification::<SessionNotification>()? {
+            Ok(notif) => {
+                if let SessionUpdate::AvailableCommandsUpdate(update) = notif.update {
+                    let names = update
+                        .available_commands
+                        .into_iter()
+                        .map(|c| c.name)
+                        .collect();
+                    *self.sink.lock().expect("sink lock") = Some(names);
+                }
+                Ok(agent_client_protocol::Handled::Yes)
+            }
+            Err(message) => Ok(agent_client_protocol::Handled::No {
+                message,
+                retry: false,
+            }),
+        }
+    }
+
+    fn describe_chain(&self) -> impl std::fmt::Debug {
+        "CommandsCollector"
+    }
+}
+
+/// `session/new` must emit an `AvailableCommandsUpdate` (or ACP clients render
+/// an empty `/` menu), and that menu must list skills only — never the built-in
+/// commands, which are dispatchable by name but hidden from the picker.
+#[tokio::test]
+async fn new_session_advertises_skills_only_commands() {
+    let engine = scripted_text_engine();
+    let names = with_agent_and_client(engine, async move |cx| {
+        let sink: Arc<std::sync::Mutex<Option<Vec<String>>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        // Register the collector before `session/new` so the catalogue update,
+        // emitted right after the response, is not missed.
+        cx.add_dynamic_handler(CommandsCollector {
+            sink: Arc::clone(&sink),
+        })?
+        .run_indefinitely();
+
+        init_and_new_session(&cx).await?;
+
+        // The notification trails the response; poll briefly until it arrives.
+        for _ in 0..50 {
+            if sink.lock().expect("sink lock").is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let names = sink.lock().expect("sink lock").clone();
+        Ok(names)
+    })
+    .await;
+
+    let names = names.expect("session/new must emit an AvailableCommandsUpdate notification");
+    // Skills are environment-dependent (discovered on disk), so we do not assert
+    // specific skill names — only that no built-in leaks into the menu.
+    for builtin in ["compact", "new", "clear", "skills", "help"] {
+        assert!(
+            !names.iter().any(|n| n == builtin),
+            "built-in /{builtin} must be hidden from the menu; got: {names:?}"
+        );
+    }
+}
+
 // Rust guideline compliant 2026-02-21

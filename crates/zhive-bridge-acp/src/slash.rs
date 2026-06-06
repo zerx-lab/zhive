@@ -33,6 +33,7 @@ use agent_client_protocol::schema::ContentBlock;
 ///
 /// let s = Skill {
 ///     name: Arc::from("commit"),
+///     description: Some(Arc::from("Create a git commit")),
 ///     invocation: Arc::from("<skill name=\"commit\" location=\"/x/SKILL.md\">\nbody\n</skill>"),
 /// };
 /// assert_eq!(&*s.name, "commit");
@@ -41,6 +42,11 @@ use agent_client_protocol::schema::ContentBlock;
 pub struct Skill {
     /// Slash-command name without the leading `/` (matches the SKILL.md `name`).
     pub name: Arc<str>,
+    /// Model-facing description from the SKILL.md frontmatter, if any.
+    ///
+    /// Surfaced to ACP clients in the `availableCommands` menu so users see what
+    /// each skill does, mirroring opencode. `None` when the skill declared none.
+    pub description: Option<Arc<str>>,
     /// Pre-rendered `<skill>…</skill>` invocation block; no trailing args.
     pub invocation: Arc<str>,
 }
@@ -125,7 +131,7 @@ pub enum SlashAction {
 ///
 /// // Skill by bare name
 /// use std::sync::Arc;
-/// let skill = Skill { name: Arc::from("commit"), invocation: Arc::from("<skill>body</skill>") };
+/// let skill = Skill { name: Arc::from("commit"), description: None, invocation: Arc::from("<skill>body</skill>") };
 /// let blocks = vec![ContentBlock::Text(TextContent::new("/commit"))];
 /// assert!(matches!(parse_prompt(&blocks, &[skill]), Some(SlashAction::RunSkill { .. })));
 ///

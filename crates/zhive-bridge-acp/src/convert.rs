@@ -161,6 +161,16 @@ pub fn prompt_blocks_to_user_item(blocks: Vec<ContentBlock>, item_id: impl Into<
 
 /// Maps a zhive [`ZToolKind`] to the ACP [`ToolKind`].
 ///
+/// `Execute` is **deliberately** downgraded to [`ToolKind::Other`]. Zed renders
+/// an ACP `execute` tool call as a "Run Command" terminal card whose body only
+/// shows a [`ToolCallContent::Terminal`] (a live `terminalId` obtained via the
+/// ACP terminal extension). zhive runs shell commands in-process and reports
+/// their output as a plain [`ToolCallContent::Content`] text block, which that
+/// terminal card ignores — so a completed `bash` call shows the command header
+/// but an empty body. Mapping to `Other` makes Zed use the generic tool card,
+/// which renders the text content we already attach. (Adopting `Execute` again
+/// would require implementing the ACP terminal extension end-to-end.)
+///
 /// # Examples
 ///
 /// ```
@@ -170,6 +180,8 @@ pub fn prompt_blocks_to_user_item(blocks: Vec<ContentBlock>, item_id: impl Into<
 ///
 /// assert_eq!(tool_kind_to_acp(ZToolKind::Read), ToolKind::Read);
 /// assert_eq!(tool_kind_to_acp(ZToolKind::Other), ToolKind::Other);
+/// // `Execute` is intentionally surfaced as `Other` (see docs above).
+/// assert_eq!(tool_kind_to_acp(ZToolKind::Execute), ToolKind::Other);
 /// ```
 #[must_use]
 pub fn tool_kind_to_acp(kind: ZToolKind) -> ToolKind {
@@ -179,7 +191,13 @@ pub fn tool_kind_to_acp(kind: ZToolKind) -> ToolKind {
         ZToolKind::Delete => ToolKind::Delete,
         ZToolKind::Move => ToolKind::Move,
         ZToolKind::Search => ToolKind::Search,
-        ZToolKind::Execute => ToolKind::Execute,
+        // See the function docs: `Execute` → `Other` so Zed renders our text
+        // content instead of an empty "Run Command" terminal card.
+        #[expect(
+            clippy::match_same_arms,
+            reason = "explicit arm documents the deliberate Execute→Other downgrade"
+        )]
+        ZToolKind::Execute => ToolKind::Other,
         ZToolKind::Think => ToolKind::Think,
         ZToolKind::Fetch => ToolKind::Fetch,
         ZToolKind::SwitchMode => ToolKind::SwitchMode,
@@ -376,26 +394,39 @@ pub fn tool_call_to_acp(item: &Item) -> Option<ToolCall> {
 /// Returns `None` for non-`ToolCall` items. Used for status / content changes
 /// after the first `ToolCall` notification.
 ///
+/// The `raw_output` payload is enriched with an `"output"` field containing
+/// the plain-text content summary. Clients such as Zed use a
+/// `markdown_for_raw_output` fallback that reads `rawOutput.output` when the
+/// structured `content` array cannot be rendered natively; without this field
+/// shell-execution results appear empty even though the model received them.
+///
 /// # Examples
 ///
 /// ```
 /// use zhive_bridge_acp::convert::tool_call_update_to_acp;
-/// use zhive_proto::domain::{Item, ItemId, ToolKind, ToolCallStatus};
+/// use zhive_proto::domain::{Item, ItemId, ItemToolCallContent, ItemContent, ToolKind, ToolCallStatus};
 ///
 /// let item = Item::ToolCall {
 ///     id: ItemId("item:t/0".into()),
-///     name: "read_file".into(),
-///     title: None,
-///     kind: ToolKind::Read,
+///     name: "bash".into(),
+///     title: Some("$ ls".into()),
+///     kind: ToolKind::Execute,
 ///     status: ToolCallStatus::Completed,
-///     content: vec![],
+///     content: vec![ItemToolCallContent::Content {
+///         content: ItemContent::Text { text: "Exit code: 0\nfoo\n".into(), annotations: None },
+///     }],
 ///     locations: vec![],
 ///     raw_input: None,
-///     raw_output: None,
+///     raw_output: Some(serde_json::json!({"exit_code": 0, "stdout": "foo\n"})),
 ///     provider_tool_call_id: Some("toolu_1".into()),
 /// };
 /// let upd = tool_call_update_to_acp(&item).unwrap();
 /// assert_eq!(upd.tool_call_id.0.as_ref(), "toolu_1");
+/// // `output` field is injected so Zed's raw_output fallback can render it.
+/// assert_eq!(
+///     upd.fields.raw_output.as_ref().and_then(|v| v.get("output")).and_then(|v| v.as_str()),
+///     Some("Exit code: 0\nfoo\n"),
+/// );
 /// ```
 #[must_use]
 pub fn tool_call_update_to_acp(item: &Item) -> Option<ToolCallUpdate> {
@@ -421,14 +452,65 @@ pub fn tool_call_update_to_acp(item: &Item) -> Option<ToolCallUpdate> {
     // Same title fallback as `tool_call_to_acp` so the headline stays stable
     // across the initial call and subsequent updates.
     let acp_title = title.clone().unwrap_or_else(|| name.clone());
+    // Inject `"output"` into raw_output so ACP clients whose fallback path
+    // reads `rawOutput.output` (e.g. Zed's `markdown_for_raw_output`) can
+    // display the tool result when the structured `content` array is not
+    // rendered natively. The field is only added when absent so it does not
+    // overwrite a value already set by a tool that produces it explicitly.
+    let acp_raw_output = enrich_raw_output_with_text(raw_output.as_ref(), content);
     let fields = ToolCallUpdateFields::new()
         .title(acp_title)
         .kind(tool_kind_to_acp(*kind))
         .status(tool_status_to_acp(*status))
         .content(acp_content)
         .raw_input(raw_input.clone())
-        .raw_output(raw_output.clone());
+        .raw_output(acp_raw_output);
     Some(ToolCallUpdate::new(tool_call_id, fields))
+}
+
+/// Returns the plain-text body of a tool's content blocks.
+///
+/// Concatenates every `ItemToolCallContent::Content { ItemContent::Text }` block with
+/// newlines. Returns an empty string when there are no text blocks.
+fn item_content_text(content: &[ItemToolCallContent]) -> String {
+    content
+        .iter()
+        .filter_map(|b| {
+            if let ItemToolCallContent::Content {
+                content: ItemContent::Text { text, .. },
+            } = b
+            {
+                Some(text.as_str())
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Ensures the ACP `raw_output` payload carries an `"output"` field.
+///
+/// Zed (and similar ACP clients) fall back to `rawOutput.output` when the
+/// structured `content` array cannot be rendered. This function injects the
+/// field from `content` when it is absent, so the fallback path always finds
+/// something to display.
+fn enrich_raw_output_with_text(
+    raw_output: Option<&serde_json::Value>,
+    content: &[ItemToolCallContent],
+) -> Option<serde_json::Value> {
+    let text = item_content_text(content);
+    if text.is_empty() {
+        return raw_output.cloned();
+    }
+    let mut base = raw_output
+        .cloned()
+        .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+    if let serde_json::Value::Object(ref mut map) = base {
+        map.entry("output")
+            .or_insert_with(|| serde_json::Value::String(text));
+    }
+    Some(base)
 }
 
 /// Maps a zhive [`Item`] (from `ItemAppended`) to a single ACP [`SessionUpdate`].
@@ -669,6 +751,45 @@ fn contents_to_acp_resource(c: ResourceContents) -> EmbeddedResourceResource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn execute_tool_update_carries_text_content_and_output() {
+        // Regression guard for the "bash card shows no output in Zed" bug.
+        // A completed `kind: Execute` tool call must serialize with BOTH the
+        // text content block AND a `rawOutput.output` field, matching what
+        // opencode sends (Zed renders the execute card body from `content`,
+        // and falls back to `rawOutput.output` when content is unavailable).
+        let item = Item::ToolCall {
+            id: zhive_proto::domain::ItemId("item:t/0".into()),
+            name: "bash".into(),
+            title: Some("$ ls".into()),
+            kind: ZToolKind::Execute,
+            status: ZToolStatus::Completed,
+            content: vec![ItemToolCallContent::Content {
+                content: ItemContent::Text {
+                    text: "Exit code: 0\nfoo\n".into(),
+                    annotations: None,
+                },
+            }],
+            locations: vec![],
+            raw_input: Some(serde_json::json!({ "command": "ls" })),
+            raw_output: Some(serde_json::json!({ "exit_code": 0, "stdout": "foo\n" })),
+            provider_tool_call_id: Some("tc-bash".into()),
+        };
+
+        let update = tool_call_update_to_acp(&item).expect("execute tool call → update");
+        // The text content block must survive into the ACP update.
+        let content = update.fields.content.as_ref().expect("content present");
+        assert_eq!(content.len(), 1, "one text content block");
+        // The raw_output fallback must carry the same text under `output`.
+        let output = update
+            .fields
+            .raw_output
+            .as_ref()
+            .and_then(|v| v.get("output"))
+            .and_then(serde_json::Value::as_str);
+        assert_eq!(output, Some("Exit code: 0\nfoo\n"));
+    }
 
     #[test]
     fn text_round_trips() {
