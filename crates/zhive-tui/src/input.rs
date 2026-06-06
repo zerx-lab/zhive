@@ -138,13 +138,30 @@ impl Input {
     }
 
     /// Deletes the character before the cursor, if any.
+    ///
+    /// When the cursor sits immediately after a `[Image #N]` token the entire
+    /// token is removed atomically, so the user experiences one backspace per
+    /// image rather than having to delete each character of the placeholder.
     pub fn backspace(&mut self) {
         if self.cursor == 0 {
             return;
         }
-        self.cursor -= 1;
-        let at = self.cursor_byte();
-        self.value.remove(at);
+        // Check whether the text before the cursor ends with an [Image #N] token.
+        let before: String = self.value.chars().take(self.cursor).collect();
+        if let Some(token_start) = image_token_end_before(&before) {
+            let token_chars = before.chars().count() - token_start;
+            let byte_start: usize = self
+                .value
+                .char_indices()
+                .nth(token_start)
+                .map_or(self.value.len(), |(b, _)| b);
+            self.value.drain(byte_start..self.cursor_byte());
+            self.cursor -= token_chars;
+        } else {
+            self.cursor -= 1;
+            let at = self.cursor_byte();
+            self.value.remove(at);
+        }
         self.history_pos = None;
     }
 
@@ -560,6 +577,32 @@ mod tests {
     }
 
     #[test]
+    fn backspace_deletes_image_token_atomically() {
+        let mut input = Input::new();
+        input.insert_str("hello[Image #1]");
+        // One backspace must remove the entire token, not just ']'.
+        input.backspace();
+        assert_eq!(input.value(), "hello");
+        // Backspace on plain text still removes one char.
+        input.backspace();
+        assert_eq!(input.value(), "hell");
+    }
+
+    #[test]
+    fn backspace_image_token_mid_text() {
+        let mut input = Input::new();
+        input.insert_str("[Image #1]世界");
+        // Move cursor just past the token (before '世').
+        input.move_home();
+        // advance past ']'
+        for _ in 0..10 {
+            input.move_right();
+        }
+        input.backspace();
+        assert_eq!(input.value(), "世界");
+    }
+
+    #[test]
     fn delete_word_removes_last_token() {
         let mut input = Input::new();
         input.insert_str("foo bar");
@@ -694,6 +737,24 @@ mod tests {
         input.insert_char('!');
         assert!(input.history_pos.is_none());
     }
+}
+
+/// Returns the character-index start of an `[Image #N]` token that ends exactly
+/// at the end of `text`, or `None` if no such token is present.
+///
+/// Used by [`Input::backspace`] to decide whether to delete a whole token.
+fn image_token_end_before(text: &str) -> Option<usize> {
+    let text = text.strip_suffix(']')?;
+    // Walk backwards over digits for N.
+    let digits_end = text.len();
+    let text = text.trim_end_matches(|c: char| c.is_ascii_digit());
+    if text.len() == digits_end {
+        // No digits found.
+        return None;
+    }
+    let text = text.strip_suffix(" #")?;
+    let text = text.strip_suffix("[Image")?;
+    Some(text.chars().count())
 }
 
 // Rust guideline compliant 2026-02-21

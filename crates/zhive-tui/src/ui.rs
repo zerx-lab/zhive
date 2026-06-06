@@ -1179,12 +1179,19 @@ fn item_kind_name(item: &Item) -> &'static str {
 }
 
 /// Joins the textual parts of a user message, noting non-text blocks.
+///
+/// Images are numbered in order of appearance so the user can correlate
+/// `[Image #1]` in the transcript with the image they pasted.
 fn user_text(content: &[ItemContent]) -> String {
     let mut parts = Vec::new();
+    let mut image_n = 0usize;
     for c in content {
         match c {
             ItemContent::Text { text, .. } => parts.push(text.clone()),
-            ItemContent::Image { .. } => parts.push("[image]".to_owned()),
+            ItemContent::Image { .. } => {
+                image_n += 1;
+                parts.push(format!("[Image #{image_n}]"));
+            }
             ItemContent::Audio { .. } => parts.push("[audio]".to_owned()),
             ItemContent::ResourceLink { name, uri, .. } => {
                 parts.push(format!("[{}]", name.clone().unwrap_or_else(|| uri.clone())));
