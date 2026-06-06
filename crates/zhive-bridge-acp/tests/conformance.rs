@@ -1165,4 +1165,41 @@ async fn slash_clear_then_prompt_completes() {
     );
 }
 
+/// A slash command is still intercepted when the prompt has extra trailing blocks.
+///
+/// ACP clients (e.g. Zed) may attach workspace context or file contents
+/// alongside the slash text. The bridge must route on the first block alone.
+#[tokio::test]
+async fn slash_command_with_extra_blocks_is_intercepted() {
+    let engine = scripted_text_engine();
+    let (stop, text) = with_agent_and_client(engine, async move |cx| {
+        let session_id = init_and_new_session(&cx).await?;
+        let buf = start_text_collector(&cx);
+        // Two-block prompt: slash command first, then some context text.
+        let resp = cx
+            .send_request(PromptRequest::new(
+                session_id,
+                vec![
+                    ContentBlock::Text(TextContent::new("/help")),
+                    ContentBlock::Text(TextContent::new("some attached context")),
+                ],
+            ))
+            .block_task()
+            .await?;
+        let text = buf.lock().expect("lock").clone();
+        Ok((resp.stop_reason, text))
+    })
+    .await;
+
+    assert_eq!(
+        stop,
+        StopReason::EndTurn,
+        "slash command with extra blocks must end with EndTurn"
+    );
+    assert!(
+        text.contains("compact") || text.contains("clear"),
+        "response must be the /help listing, not an LLM reply; got: {text:?}"
+    );
+}
+
 // Rust guideline compliant 2026-02-21

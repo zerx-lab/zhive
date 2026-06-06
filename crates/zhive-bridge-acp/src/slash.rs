@@ -83,10 +83,13 @@ pub enum SlashAction {
 
 /// Parses `blocks` as a slash command if the prompt qualifies.
 ///
-/// Returns `Some(action)` when `blocks` contains exactly one
+/// Returns `Some(action)` when the **first** [`ContentBlock`] is a
 /// [`ContentBlock::Text`] whose content starts with `/` (after trimming leading
-/// whitespace). Returns `None` for any other prompt shape — multi-block,
-/// non-text first block, or no leading `/` — which indicates a normal LLM turn.
+/// whitespace). Additional blocks after the slash text are ignored for command
+/// routing — ACP clients may attach workspace context or file attachments
+/// alongside the slash text, and those extra blocks must not suppress detection.
+/// Returns `None` when the first block is not a text block or its text does not
+/// start with `/`, indicating a normal LLM turn.
 ///
 /// `catalogue` is the set of skills available for slash dispatch. Pass an empty
 /// slice when the `skills` feature is disabled or no skills are installed.
@@ -125,11 +128,20 @@ pub enum SlashAction {
 /// let skill = Skill { name: Arc::from("commit"), invocation: Arc::from("<skill>body</skill>") };
 /// let blocks = vec![ContentBlock::Text(TextContent::new("/commit"))];
 /// assert!(matches!(parse_prompt(&blocks, &[skill]), Some(SlashAction::RunSkill { .. })));
+///
+/// // Extra blocks alongside a slash command are allowed (e.g. file attachments).
+/// let with_extra = vec![
+///     ContentBlock::Text(TextContent::new("/compact")),
+///     ContentBlock::Text(TextContent::new("some context")),
+/// ];
+/// assert_eq!(parse_prompt(&with_extra, &[]), Some(SlashAction::Compact));
 /// ```
 #[must_use]
 pub fn parse_prompt(blocks: &[ContentBlock], catalogue: &[Skill]) -> Option<SlashAction> {
-    // Only intercept a single text-only prompt starting with `/`.
-    let [ContentBlock::Text(text)] = blocks else {
+    // Intercept when the first block is a text block starting with `/`.
+    // Extra trailing blocks are permitted so clients that attach workspace
+    // context or file contents alongside a slash command still get routed.
+    let Some(ContentBlock::Text(text)) = blocks.first() else {
         return None;
     };
     let raw = text.text.trim_start();

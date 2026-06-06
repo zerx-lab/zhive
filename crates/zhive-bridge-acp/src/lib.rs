@@ -147,16 +147,30 @@ fn discover_skills() -> Arc<[Skill]> {
     {
         use zhive_core::skills::{SkillDiscoveryConfig, SkillSet};
         let set = SkillSet::discover_and_load(&SkillDiscoveryConfig::new());
-        set.catalogue()
+        let skills: Arc<[Skill]> = set
+            .catalogue()
             .into_iter()
             .map(|e| Skill {
                 name: Arc::from(e.name.as_str()),
                 invocation: Arc::from(e.invocation.as_str()),
             })
-            .collect()
+            .collect();
+        tracing::info!(
+            name: "zhive.acp.skills.discovered",
+            count = skills.len(),
+            names = ?skills.iter().map(|s| s.name.as_ref()).collect::<Vec<_>>(),
+            "ACP slash-skill catalogue ready"
+        );
+        skills
     }
     #[cfg(not(feature = "skills"))]
-    Arc::from([])
+    {
+        tracing::info!(
+            name: "zhive.acp.skills.disabled",
+            "skills feature not compiled in; slash-skill catalogue is empty"
+        );
+        Arc::from([])
+    }
 }
 
 /// Constructs the configured ACP agent builder with all callbacks registered.
@@ -377,7 +391,15 @@ fn on_prompt(
     let skills = Arc::clone(skills);
     let cx = cx.clone();
     cx.clone().spawn(async move {
-        match slash::parse_prompt(&req.prompt, &skills) {
+        let action = slash::parse_prompt(&req.prompt, &skills);
+        tracing::debug!(
+            name: "zhive.acp.slash.dispatch",
+            session = %req.session_id.0,
+            blocks = req.prompt.len(),
+            action = ?action,
+            "slash dispatch"
+        );
+        match action {
             Some(slash::SlashAction::Compact) => {
                 run_compact_slash(engine, cx, req.session_id, thread_id, responder).await;
             }
