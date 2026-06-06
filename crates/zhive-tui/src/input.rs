@@ -342,7 +342,9 @@ impl Input {
     /// The cursor's display position as `(column, row)` in cells.
     ///
     /// The row counts hard newlines before the cursor; the column is the total
-    /// display width (CJK-aware) of the characters since the last newline.
+    /// display width (CJK-aware) of the characters since the last newline. This
+    /// ignores soft wrapping — use [`Self::cursor_visual_col_row`] when the
+    /// composer wraps long lines to a finite width.
     #[must_use]
     pub fn cursor_col_row(&self) -> (u16, u16) {
         let mut col: usize = 0;
@@ -354,6 +356,92 @@ impl Input {
             } else {
                 col += UnicodeWidthChar::width(c).unwrap_or(0);
             }
+        }
+        (
+            u16::try_from(col).unwrap_or(u16::MAX),
+            u16::try_from(row).unwrap_or(u16::MAX),
+        )
+    }
+
+    /// Lays the buffer out into visual rows for a composer `width` cells wide.
+    ///
+    /// Rows break at hard newlines and—when a glyph would overflow the right
+    /// edge—at character boundaries, measuring with [`unicode_width`] so wide
+    /// CJK glyphs occupy two cells. Character-level wrapping (rather than word
+    /// wrapping) keeps cursor tracking exact in [`Self::cursor_visual_col_row`].
+    /// An empty buffer yields a single empty row; a `width` of `0` is treated
+    /// as `1` to avoid a zero-width division of the text.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use zhive_tui::input::Input;
+    /// let mut input = Input::new();
+    /// input.insert_str("abcdef");
+    /// assert_eq!(input.wrap_rows(4), vec!["abcd".to_owned(), "ef".to_owned()]);
+    /// ```
+    #[must_use]
+    pub fn wrap_rows(&self, width: u16) -> Vec<String> {
+        let width = usize::from(width.max(1));
+        let mut rows: Vec<String> = Vec::new();
+        let mut cur = String::new();
+        let mut col: usize = 0;
+        for c in self.value.chars() {
+            if c == '\n' {
+                rows.push(std::mem::take(&mut cur));
+                col = 0;
+                continue;
+            }
+            let w = UnicodeWidthChar::width(c).unwrap_or(0);
+            if col + w > width && !cur.is_empty() {
+                rows.push(std::mem::take(&mut cur));
+                col = 0;
+            }
+            cur.push(c);
+            col += w;
+        }
+        rows.push(cur);
+        rows
+    }
+
+    /// The cursor's visual `(column, row)` when wrapped to `width` cells.
+    ///
+    /// Applies the same character-level wrapping as [`Self::wrap_rows`] so the
+    /// caret aligns with the rendered text. A cursor that exactly fills a row is
+    /// reported at the start of the next row, since that is where the next typed
+    /// glyph lands. A `width` of `0` is treated as `1`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use zhive_tui::input::Input;
+    /// let mut input = Input::new();
+    /// input.insert_str("abcd");
+    /// // Four chars exactly fill width 4; the caret sits on the next row.
+    /// assert_eq!(input.cursor_visual_col_row(4), (0, 1));
+    /// ```
+    #[must_use]
+    pub fn cursor_visual_col_row(&self, width: u16) -> (u16, u16) {
+        let width = usize::from(width.max(1));
+        let mut col: usize = 0;
+        let mut row: usize = 0;
+        for c in self.value.chars().take(self.cursor) {
+            if c == '\n' {
+                row += 1;
+                col = 0;
+                continue;
+            }
+            let w = UnicodeWidthChar::width(c).unwrap_or(0);
+            if col + w > width && col > 0 {
+                row += 1;
+                col = 0;
+            }
+            col += w;
+        }
+        // A caret that fills the row exactly sits at the start of the next one.
+        if col >= width {
+            row += 1;
+            col = 0;
         }
         (
             u16::try_from(col).unwrap_or(u16::MAX),
@@ -405,6 +493,51 @@ mod tests {
         input.insert_newline();
         input.insert_char('b');
         assert_eq!(input.cursor_col_row(), (1, 1));
+    }
+
+    // ---- soft wrapping ----
+
+    #[test]
+    fn wrap_rows_breaks_at_width() {
+        let mut input = Input::new();
+        input.insert_str("abcdefgh");
+        assert_eq!(input.wrap_rows(3), vec!["abc", "def", "gh"]);
+    }
+
+    #[test]
+    fn wrap_rows_respects_hard_newlines() {
+        let mut input = Input::new();
+        input.insert_str("ab\ncd");
+        assert_eq!(input.wrap_rows(10), vec!["ab", "cd"]);
+    }
+
+    #[test]
+    fn wrap_rows_keeps_wide_glyph_whole_at_boundary() {
+        let mut input = Input::new();
+        // Width 2: "a" leaves one free cell, but the 2-cell 你 cannot split, so
+        // it wraps whole to the next row instead of spilling across the edge.
+        input.insert_str("a你");
+        assert_eq!(input.wrap_rows(2), vec!["a", "你"]);
+    }
+
+    #[test]
+    fn cursor_visual_wraps_to_next_row() {
+        let mut input = Input::new();
+        input.insert_str("abcdef");
+        input.move_home();
+        for _ in 0..4 {
+            input.move_right();
+        }
+        // Cursor after 4 chars at width 4 lands at the start of the next row.
+        assert_eq!(input.cursor_visual_col_row(4), (0, 1));
+    }
+
+    #[test]
+    fn cursor_visual_mid_wrapped_line() {
+        let mut input = Input::new();
+        input.insert_str("abcdef");
+        // Cursor at end: 6 chars over width 4 → row 1, column 2.
+        assert_eq!(input.cursor_visual_col_row(4), (2, 1));
     }
 
     #[test]

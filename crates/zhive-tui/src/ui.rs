@@ -70,7 +70,13 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     // Background fill.
     frame.render_widget(Paragraph::new("").style(Style::new().bg(p.bg)), area);
 
-    let composer_h = composer_height(app);
+    // The composer spans the full width; its wrappable text width is the panel
+    // width minus the left/right borders (2) and the panel's horizontal padding
+    // (1 each, see `widgets::panel`). This must match `block.inner(...).width` in
+    // `render_composer` exactly, or the height estimate and the rendered wrap
+    // disagree and a boundary-filling line can scroll itself out of view.
+    let composer_inner_width = area.width.saturating_sub(4);
+    let composer_h = composer_height(app, composer_inner_width);
     let queue_h = queue_height(app);
     let [top, body, queue, composer] = Layout::vertical([
         Constraint::Length(1),
@@ -83,13 +89,17 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     render_top_bar(frame, app, top);
     render_body(frame, app, body);
     render_queue(frame, app, queue);
-    let composer_inner = render_composer(frame, app, composer);
+    let (composer_inner, composer_scroll) = render_composer(frame, app, composer);
 
-    // Place the caret in the composer when no overlay is capturing input.
+    // Place the caret in the composer when no overlay is capturing input. The
+    // caret follows the same soft-wrap layout as the rendered text, offset by
+    // the composer's vertical scroll so it stays visible in a tall draft.
     if app.overlay.is_none() {
-        let (col, row) = app.input.cursor_col_row();
+        let (col, row) = app.input.cursor_visual_col_row(composer_inner.width);
         let cx = composer_inner.x.saturating_add(col);
-        let cy = composer_inner.y.saturating_add(row);
+        let cy = composer_inner
+            .y
+            .saturating_add(row.saturating_sub(composer_scroll));
         if cx < composer_inner.x.saturating_add(composer_inner.width)
             && cy < composer_inner.y.saturating_add(composer_inner.height)
         {
@@ -111,9 +121,17 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 }
 
 /// Computes the composer panel height (input rows + borders), clamped.
-fn composer_height(app: &App) -> u16 {
-    let rows = u16::try_from(app.input.value().split('\n').count()).unwrap_or(1);
-    rows.clamp(1, 6) + 2
+///
+/// `inner_width` is the wrappable text width (panel width minus its borders);
+/// the row count reflects soft-wrapped lines, not just hard newlines, so a long
+/// line that wraps grows the panel instead of being clipped.
+fn composer_height(app: &App, inner_width: u16) -> u16 {
+    let wrapped = app.input.wrap_rows(inner_width).len();
+    // Grow to keep the caret's row in view (a row filled exactly to the edge
+    // pushes the caret onto a phantom next row).
+    let (_, cursor_row) = app.input.cursor_visual_col_row(inner_width);
+    let rows = wrapped.max(usize::from(cursor_row) + 1);
+    u16::try_from(rows).unwrap_or(1).clamp(1, 6) + 2
 }
 
 /// Rows reserved for the queued-message preview (0 when the queue is empty).
@@ -1213,8 +1231,11 @@ fn render_welcome(frame: &mut Frame, app: &App, area: Rect) {
     );
 }
 
-/// Renders the composer panel and returns its inner rect (for the caret).
-fn render_composer(frame: &mut Frame, app: &App, area: Rect) -> Rect {
+/// Renders the composer panel and returns its inner rect and scroll offset.
+///
+/// The returned `u16` is the number of visual rows scrolled off the top so the
+/// caller can place the caret in the same coordinate space as the rendered text.
+fn render_composer(frame: &mut Frame, app: &App, area: Rect) -> (Rect, u16) {
     let p = &app.palette;
     let busy = app.conversation.busy;
     // Right-aligned status carries the most important signal: a persistent
@@ -1251,16 +1272,29 @@ fn render_composer(frame: &mut Frame, app: &App, area: Rect) -> Rect {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let text = if app.input.value().is_empty() && !busy {
-        Text::from(Line::styled(
-            composer_placeholder(app),
-            Style::new().fg(p.fg_mute),
-        ))
+    // Soft-wrap the draft to the inner width and scroll so the caret's row
+    // stays visible once the draft grows past the panel's visible height.
+    let (text, scroll) = if app.input.value().is_empty() && !busy {
+        (
+            Text::from(Line::styled(
+                composer_placeholder(app),
+                Style::new().fg(p.fg_mute),
+            )),
+            0,
+        )
     } else {
-        Text::from(app.input.value().to_owned()).style(Style::new().fg(p.fg))
+        let lines: Vec<Line> = app
+            .input
+            .wrap_rows(inner.width)
+            .into_iter()
+            .map(Line::from)
+            .collect();
+        let (_, cursor_row) = app.input.cursor_visual_col_row(inner.width);
+        let scroll = cursor_row.saturating_sub(inner.height.saturating_sub(1));
+        (Text::from(lines).style(Style::new().fg(p.fg)), scroll)
     };
-    frame.render_widget(Paragraph::new(text), inner);
-    inner
+    frame.render_widget(Paragraph::new(text).scroll((scroll, 0)), inner);
+    (inner, scroll)
 }
 
 /// A rotating composer placeholder, varied by the number of turns so far.
@@ -1494,6 +1528,41 @@ mod tests {
         assert!(
             !text.contains("tok"),
             "top bar must not show 'tok' without usage; got: {text:?}"
+        );
+    }
+
+    /// Renders the whole frame into a `width`×`height` backend and returns the
+    /// buffer as one joined string (used to detect a blank composer).
+    fn render_frame_text(app: &mut crate::app::App, width: u16, height: u16) -> String {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal.draw(|frame| draw(frame, app)).expect("draw");
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol().to_owned())
+            .collect::<String>()
+    }
+
+    #[test]
+    fn composer_keeps_text_when_line_fills_width_exactly() {
+        // Regression: a draft that exactly fills the composer's inner width must
+        // not scroll itself out of view. The inner width is `area.width - 4`
+        // (borders + horizontal padding); fill it precisely and assert the text
+        // is still rendered rather than a blank box.
+        let mut app = test_app_with_usage(None);
+        let width = 24u16;
+        let inner = usize::from(width) - 4;
+        let draft = "a".repeat(inner);
+        app.input.insert_str(&draft);
+        let text = render_frame_text(&mut app, width, 10);
+        assert!(
+            text.contains(&draft),
+            "boundary-filling draft must stay visible; got: {text:?}"
         );
     }
 
