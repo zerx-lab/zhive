@@ -40,7 +40,7 @@ bridge-stdio = ["dep:zhive-bridge-stdio"]
 # protocol. All three need the in-process engine, so they imply `engine`.
 mcp          = ["engine", "dep:zhive-mcp"]
 acp          = ["engine", "dep:zhive-bridge-acp"]
-skills       = ["engine", "zhive-core/skills"]
+skills       = ["engine", "zhive-core/skills", "zhive-bridge-acp?/skills"]
 full         = ["tui", "serve", "bridge-stdio", "mcp", "acp", "skills"]
 
 [dependencies]

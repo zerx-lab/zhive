@@ -47,16 +47,21 @@ pub mod config_option;
 pub mod convert;
 pub mod error;
 pub mod permission;
+pub mod slash;
 pub mod state;
 
 #[doc(inline)]
 pub use error::AcpError;
+#[doc(inline)]
+pub use slash::Skill as SlashSkill;
+
+use std::sync::Arc;
 
 use agent_client_protocol::schema::{
     AgentCapabilities, CancelNotification, ContentBlock, InitializeRequest, InitializeResponse,
     NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse, SessionId,
     SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
-    SetSessionConfigOptionResponse, StopReason,
+    SetSessionConfigOptionResponse, StopReason, ToolCallId,
 };
 use agent_client_protocol::{Agent, ByteStreams, Client, ConnectionTo, Dispatch, Responder, Stdio};
 use futures::{AsyncRead, AsyncWrite};
@@ -65,11 +70,12 @@ use tokio::sync::broadcast::error::RecvError;
 use zhive_core::engine::Engine;
 use zhive_core::engine::event::EngineEvent;
 use zhive_core::engine::submission::PermissionRequestId;
-use zhive_proto::domain::{ThinkingEffort, ThreadId, ToolCallStatus, TurnId};
+use zhive_proto::domain::{ThinkingEffort, ThreadId, TurnId};
 use zhive_proto::permission::{
     PermissionOutcome, RequestPermissionRequest as ZRequestPermissionRequest,
 };
 
+use slash::Skill;
 use state::AgentState;
 
 /// Serves zhive over ACP on stdio until the client disconnects.
@@ -94,7 +100,8 @@ use state::AgentState;
 /// # }
 /// ```
 pub async fn serve(engine: Engine) -> Result<(), AcpError> {
-    build_agent(&engine, &AgentState::new())
+    let skills = discover_skills();
+    build_agent(&engine, &AgentState::new(), &skills)
         .connect_to(Stdio::new())
         .await
         .map_err(AcpError::from)
@@ -125,10 +132,31 @@ where
     W: AsyncWrite + Send + 'static,
     R: AsyncRead + Send + 'static,
 {
-    build_agent(&engine, &AgentState::new())
+    let skills = discover_skills();
+    build_agent(&engine, &AgentState::new(), &skills)
         .connect_to(ByteStreams::new(write, read))
         .await
         .map_err(AcpError::from)
+}
+
+/// Discovers on-disk skills when the `skills` feature is enabled.
+///
+/// Returns an empty slice when the feature is off or no skills are installed.
+fn discover_skills() -> Arc<[Skill]> {
+    #[cfg(feature = "skills")]
+    {
+        use zhive_core::skills::{SkillDiscoveryConfig, SkillSet};
+        let set = SkillSet::discover_and_load(&SkillDiscoveryConfig::new());
+        set.catalogue()
+            .into_iter()
+            .map(|e| Skill {
+                name: Arc::from(e.name.as_str()),
+                invocation: Arc::from(e.invocation.as_str()),
+            })
+            .collect()
+    }
+    #[cfg(not(feature = "skills"))]
+    Arc::from([])
 }
 
 /// Constructs the configured ACP agent builder with all callbacks registered.
@@ -138,6 +166,7 @@ where
 fn build_agent(
     engine: &Engine,
     state: &AgentState,
+    skills: &Arc<[Skill]>,
 ) -> agent_client_protocol::Builder<
     Agent,
     impl agent_client_protocol::HandleDispatchFrom<Client>,
@@ -191,10 +220,11 @@ fn build_agent(
             {
                 let state = state.clone();
                 let engine = engine.clone();
+                let skills = Arc::clone(skills);
                 async move |req: PromptRequest,
                             responder: Responder<PromptResponse>,
                             cx: ConnectionTo<Client>| {
-                    on_prompt(&state, &engine, req, responder, &cx)
+                    on_prompt(&state, &engine, &skills, req, responder, &cx)
                 }
             },
             agent_client_protocol::on_receive_request!(),
@@ -323,13 +353,17 @@ async fn on_set_config_option(
 
 /// Handles a `session/prompt` request by spawning the turn task.
 ///
-/// The dispatch loop must not block, and the permission reverse request can
-/// only be awaited (`block_task`) outside a handler, so the turn is offloaded to
-/// [`ConnectionTo::spawn`]. Returns an error to the request when the session is
-/// unknown.
+/// If the prompt is a slash command (single text block starting with `/`), it
+/// is dispatched to the appropriate slash handler instead of the LLM. All work
+/// is offloaded to [`ConnectionTo::spawn`] so the dispatch loop never blocks:
+/// slash handlers that need engine I/O (e.g. `/compact`) and the permission
+/// reverse request both require `await` outside a handler context.
+///
+/// Returns an error to the request when the session is unknown.
 fn on_prompt(
     state: &AgentState,
     engine: &Engine,
+    skills: &Arc<[Skill]>,
     req: PromptRequest,
     responder: Responder<PromptResponse>,
     cx: &ConnectionTo<Client>,
@@ -340,20 +374,213 @@ fn on_prompt(
     };
     let engine = engine.clone();
     let state = state.clone();
+    let skills = Arc::clone(skills);
     let cx = cx.clone();
     cx.clone().spawn(async move {
-        run_prompt_turn(
-            state,
-            engine,
-            cx,
-            req.session_id,
-            thread_id,
-            req.prompt,
-            responder,
-        )
-        .await;
+        match slash::parse_prompt(&req.prompt, &skills) {
+            Some(slash::SlashAction::Compact) => {
+                run_compact_slash(engine, cx, req.session_id, thread_id, responder).await;
+            }
+            Some(slash::SlashAction::Clear) => {
+                run_clear_slash(&state, &cx, &req.session_id, responder);
+            }
+            Some(slash::SlashAction::ListSkills) => {
+                run_list_skills_slash(&skills, &cx, &req.session_id, responder);
+            }
+            Some(slash::SlashAction::Help) => {
+                run_help_slash(&cx, &req.session_id, responder);
+            }
+            Some(slash::SlashAction::RunSkill { invocation }) => {
+                // Substitute the skill invocation for the user's raw prompt.
+                use agent_client_protocol::schema::TextContent;
+                let skill_prompt = vec![ContentBlock::Text(TextContent::new(invocation))];
+                run_prompt_turn(
+                    state,
+                    engine,
+                    cx,
+                    req.session_id,
+                    thread_id,
+                    skill_prompt,
+                    responder,
+                )
+                .await;
+            }
+            Some(slash::SlashAction::Unknown { cmd }) => {
+                run_unknown_slash(&cmd, &cx, &req.session_id, responder);
+            }
+            None => {
+                // Normal LLM turn.
+                run_prompt_turn(
+                    state,
+                    engine,
+                    cx,
+                    req.session_id,
+                    thread_id,
+                    req.prompt,
+                    responder,
+                )
+                .await;
+            }
+        }
         Ok(())
     })
+}
+
+// ── Slash-command handlers ────────────────────────────────────────────────────
+
+/// Compacts the session's thread and streams progress as agent text chunks.
+///
+/// Subscribes to the engine event stream before calling `compact` (so no early
+/// event is missed), then either handles the synchronous reply directly or
+/// watches for the async `CompactionCompleted` / `CompactionFailed` events.
+async fn run_compact_slash(
+    engine: Engine,
+    cx: ConnectionTo<Client>,
+    session_id: SessionId,
+    thread_id: ThreadId,
+    responder: Responder<PromptResponse>,
+) {
+    use zhive_core::engine::submission::{CompactError, CompactReply};
+    use zhive_proto::hook::CompactTrigger;
+
+    let mut events = engine.subscribe();
+
+    let compact_result = engine
+        .compact(thread_id.clone(), CompactTrigger::Manual)
+        .await;
+
+    match compact_result {
+        Err(err) => {
+            notify_text(&cx, &session_id, &format!("compact failed: {err}"));
+        }
+        Ok(Err(CompactError::EngineBusy { .. })) => {
+            notify_text(&cx, &session_id, "compact failed: engine is busy");
+        }
+        Ok(Err(err)) => {
+            notify_text(&cx, &session_id, &format!("compact failed: {err}"));
+        }
+        Ok(Ok(CompactReply::NothingToCompact)) => {
+            notify_text(&cx, &session_id, "nothing to compact");
+        }
+        Ok(Ok(CompactReply::Compacted { entries_compacted })) => {
+            notify_text(
+                &cx,
+                &session_id,
+                &format!("compacted {entries_compacted} entries"),
+            );
+        }
+        Ok(Ok(CompactReply::Started)) => {
+            // The summarise phase is async; stream its output via events.
+            loop {
+                match events.recv().await {
+                    Ok(EngineEvent::CompactionDelta {
+                        thread_id: ev_thread,
+                        delta,
+                    }) if ev_thread == thread_id => {
+                        notify_text(&cx, &session_id, &delta);
+                    }
+                    Ok(EngineEvent::CompactionCompleted {
+                        thread_id: ev_thread,
+                        entries_compacted,
+                    }) if ev_thread == thread_id => {
+                        notify_text(
+                            &cx,
+                            &session_id,
+                            &format!("\n\nCompacted {entries_compacted} entries."),
+                        );
+                        break;
+                    }
+                    Ok(EngineEvent::CompactionFailed {
+                        thread_id: ev_thread,
+                        reason,
+                    }) if ev_thread == thread_id => {
+                        notify_text(&cx, &session_id, &format!("compaction failed: {reason}"));
+                        break;
+                    }
+                    Err(RecvError::Closed) => break,
+                    Ok(_) | Err(RecvError::Lagged(_)) => {}
+                }
+            }
+        }
+        // `CompactReply` is `#[non_exhaustive]`; unknown future variants are treated
+        // as a successful synchronous compaction with no detail to report.
+        Ok(Ok(_)) => {}
+    }
+    respond_stop(responder, StopReason::EndTurn);
+}
+
+/// Rebinds the session to a fresh thread (clears history) and notifies the client.
+fn run_clear_slash(
+    state: &AgentState,
+    cx: &ConnectionTo<Client>,
+    session_id: &SessionId,
+    responder: Responder<PromptResponse>,
+) {
+    if state.rebind_session(session_id).is_some() {
+        notify_text(
+            cx,
+            session_id,
+            "Session cleared. Starting a fresh conversation.",
+        );
+        tracing::info!(
+            name: "zhive.acp.slash.clear",
+            session = %session_id.0,
+            "slash.clear: session rebound to a fresh thread"
+        );
+    } else {
+        notify_text(cx, session_id, "No session to clear.");
+    }
+    respond_stop(responder, StopReason::EndTurn);
+}
+
+/// Lists all available skills as an agent text notification.
+fn run_list_skills_slash(
+    skills: &[Skill],
+    cx: &ConnectionTo<Client>,
+    session_id: &SessionId,
+    responder: Responder<PromptResponse>,
+) {
+    let text = if skills.is_empty() {
+        "No skills installed.".to_owned()
+    } else {
+        use std::fmt::Write as _;
+        let mut out = String::from("Available skills:\n");
+        for skill in skills {
+            let _ = writeln!(out, "  /{}", skill.name);
+        }
+        out
+    };
+    notify_text(cx, session_id, &text);
+    respond_stop(responder, StopReason::EndTurn);
+}
+
+/// Sends the list of supported slash commands as an agent text notification.
+fn run_help_slash(
+    cx: &ConnectionTo<Client>,
+    session_id: &SessionId,
+    responder: Responder<PromptResponse>,
+) {
+    let text = "Available slash commands:\n\
+        /compact    — compress conversation history\n\
+        /new        — start a fresh conversation\n\
+        /clear      — alias for /new\n\
+        /skills     — list installed skills\n\
+        /help       — show this message\n\
+        /<name>     — run a skill by name (e.g. /commit)\n\
+        /skill:<name> — same, explicit prefix\n";
+    notify_text(cx, session_id, text);
+    respond_stop(responder, StopReason::EndTurn);
+}
+
+/// Notifies the client that a slash command is unknown.
+fn run_unknown_slash(
+    cmd: &str,
+    cx: &ConnectionTo<Client>,
+    session_id: &SessionId,
+    responder: Responder<PromptResponse>,
+) {
+    notify_text(cx, session_id, &format!("unknown command: /{cmd}"));
+    respond_stop(responder, StopReason::EndTurn);
 }
 
 /// Handles a `session/cancel` notification by cancelling the bound thread.
@@ -458,18 +685,11 @@ fn respond_stop(responder: Responder<PromptResponse>, stop: StopReason) {
 /// thread is gone and the session can never receive another turn. This is the
 /// primary lifecycle-event cleanup path described in [`crate::state`].
 ///
-/// Tool-call events: the engine broadcasts an `InProgress` announcement (no
-/// output) and later a `Completed`/`Failed` item with `raw_output`/`content`.
-/// ACP clients (pi, Zed, …) render tool output from the *initial* `ToolCall`
-/// message; they do not update it from `ToolCallUpdate`.  The bridge therefore
-/// suppresses the `InProgress` event and sends only the final complete item as
-/// `SessionUpdate::ToolCall` — matching the behaviour of pi and opencode.
-#[expect(
-    clippy::too_many_lines,
-    reason = "stream_turn is the turn event-loop: one match arm per EngineEvent variant; \
-              extracting sub-functions would scatter closely-coupled lifecycle logic \
-              without reducing real complexity"
-)]
+/// Tool-call events follow the canonical ACP two-event lifecycle (matching pi
+/// and opencode): the `InProgress` broadcast becomes `SessionUpdate::ToolCall`
+/// (establishes the card, empty content), and the `Completed`/`Failed` item
+/// becomes `SessionUpdate::ToolCallUpdate` (carries `content` + `raw_output`).
+/// Clients (Zed, pi, …) render tool output from the update's `content` field.
 async fn stream_turn(
     state: &AgentState,
     engine: &Engine,
@@ -479,6 +699,8 @@ async fn stream_turn(
     turn_id: &TurnId,
     events: &mut Receiver<EngineEvent>,
 ) -> StopReason {
+    let mut seen_tool_calls: std::collections::HashSet<ToolCallId> =
+        std::collections::HashSet::new();
     loop {
         let event = match events.recv().await {
             Ok(event) => event,
@@ -517,19 +739,16 @@ async fn stream_turn(
                 turn_id: ev_turn,
                 item,
             } if &ev_thread == thread_id && &ev_turn == turn_id => {
-                // Tool calls: suppress the InProgress announcement (no output
-                // yet); send the Completed/Failed item as the sole ToolCall so
-                // the client sees a fully populated card on first render.
-                let update =
-                    if let zhive_proto::domain::Item::ToolCall { status, .. } = item.as_ref() {
-                        if matches!(status, ToolCallStatus::InProgress | ToolCallStatus::Pending) {
-                            None
-                        } else {
-                            convert::tool_call_to_acp(&item).map(SessionUpdate::ToolCall)
-                        }
-                    } else {
-                        convert::item_to_session_update(&item)
-                    };
+                // Tool calls: two-event lifecycle via seen_tool_calls.
+                // First sighting (InProgress) → ToolCall (card header, empty content).
+                // Second sighting (Completed/Failed) → ToolCallUpdate (content + raw_output).
+                // All other items are routed through item_to_session_update.
+                let update = if matches!(item.as_ref(), zhive_proto::domain::Item::ToolCall { .. })
+                {
+                    convert::tool_call_session_update(item.as_ref(), &mut seen_tool_calls)
+                } else {
+                    convert::item_to_session_update(item.as_ref())
+                };
                 if let Some(update) = update {
                     notify(cx, session_id, update);
                 }
@@ -716,6 +935,18 @@ fn notify(cx: &ConnectionTo<Client>, session_id: &SessionId, update: SessionUpda
             "failed to send session/update"
         );
     }
+}
+
+/// Sends a plain-text agent message chunk as a `session/update` notification.
+fn notify_text(cx: &ConnectionTo<Client>, session_id: &SessionId, text: &str) {
+    use agent_client_protocol::schema::{ContentChunk, TextContent};
+    notify(
+        cx,
+        session_id,
+        SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(TextContent::new(
+            text.to_owned(),
+        )))),
+    );
 }
 
 // Rust guideline compliant 2026-02-21

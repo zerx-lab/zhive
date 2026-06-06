@@ -256,6 +256,41 @@ impl AgentState {
     pub fn session_effort(&self, session: &SessionId) -> Option<ThinkingEffort> {
         self.lock().sessions.get(session).and_then(|e| e.effort)
     }
+
+    /// Replaces the thread bound to `session` with a brand-new one.
+    ///
+    /// Used by the `/new` and `/clear` slash commands: the session keeps its
+    /// ACP id but all subsequent prompts go to a fresh engine thread, effectively
+    /// clearing the conversation history. The old thread persists in engine
+    /// storage but the bridge drops its reference.
+    ///
+    /// The per-session reasoning depth is also reset so the new thread starts
+    /// with the engine default.
+    ///
+    /// Returns the new [`ThreadId`], or `None` when `session_id` is not known.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use zhive_bridge_acp::state::AgentState;
+    ///
+    /// let state = AgentState::new();
+    /// let session = state.new_session("/work");
+    /// let old_thread = state.thread_for_session(&session).unwrap();
+    /// let new_thread = state.rebind_session(&session).unwrap();
+    /// assert_ne!(old_thread, new_thread, "rebind must produce a distinct thread");
+    /// assert_eq!(state.thread_for_session(&session), Some(new_thread));
+    /// ```
+    #[must_use]
+    pub fn rebind_session(&self, session_id: &SessionId) -> Option<ThreadId> {
+        let mut inner = self.lock();
+        let entry = inner.sessions.get_mut(session_id)?;
+        let unique = next_id();
+        let new_thread = ThreadId(Arc::from(format!("thread:acp/{unique}").as_str()));
+        entry.thread_id = new_thread.clone();
+        entry.effort = None;
+        Some(new_thread)
+    }
 }
 
 impl AgentState {

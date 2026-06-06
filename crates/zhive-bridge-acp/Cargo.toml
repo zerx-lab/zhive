@@ -12,6 +12,11 @@ authors.workspace      = true
 [lints]
 workspace = true
 
+[features]
+# Enables on-disk Agent-Skills discovery so ACP clients can use `/skill:<name>`
+# and `/<name>` slash commands. Requires the `skills` feature of zhive-core.
+skills = ["zhive-core/skills"]
+
 [dependencies]
 agent-client-protocol = "0.13"
 async-trait.workspace = true

@@ -748,20 +748,20 @@ impl agent_client_protocol::HandleDispatchFrom<agent_client_protocol::Agent> for
 }
 
 #[tokio::test]
-async fn tool_call_sends_complete_result_after_permission() {
+async fn tool_call_announces_then_updates_with_matching_id() {
     use std::sync::{Arc, Mutex};
 
-    // The bridge must send the tool card ONCE — after execution — with the full
-    // output already populated.  ACP clients (pi, Zed, …) render tool output
-    // from the initial `ToolCall` message's `raw_output` / `content` fields.
-    // Sending an InProgress announcement first (with no output) followed by a
-    // `ToolCallUpdate` causes those clients to show an empty card permanently
-    // because they do not update the output section from `ToolCallUpdate`.
+    // The bridge must follow the canonical ACP two-event tool-call lifecycle
+    // (matching pi / opencode):
+    //   1. `SessionUpdate::ToolCall` with status=InProgress — establishes the
+    //      card in the client UI (empty content, no output yet).
+    //   2. `session/request_permission` — the hook returns `Ask`, so the bridge
+    //      sends the reverse request before executing the tool.
+    //   3. `SessionUpdate::ToolCallUpdate` with status=Completed and
+    //      content_len=1 — carries the tool output after execution.
     //
-    // Expected sequence:
-    //   1. `session/request_permission` (before execution)
-    //   2. `SessionUpdate::ToolCall` with status=Completed and content_len=1
-    //   No InProgress announcement; no ToolCallUpdate.
+    // Both events must share the same tool_call_id ("tc-0" from the script),
+    // so the client can correlate the update with the initial card.
     let engine = scripted_tool_call_engine(PermissionDecision::Ask);
     let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let sink = Arc::clone(&captured);
@@ -779,40 +779,39 @@ async fn tool_call_sends_complete_result_after_permission() {
 
     let lines = captured.lock().expect("lock").clone();
 
-    // No InProgress announcement must reach the client.
-    assert!(
-        !lines
-            .iter()
-            .any(|l| l.starts_with("ToolCall ") && l.contains("InProgress")),
-        "InProgress announcement must be suppressed; got: {lines:?}"
-    );
-
-    // No ToolCallUpdate must reach the client (output is inlined in the ToolCall).
-    assert!(
-        !lines.iter().any(|l| l.starts_with("ToolCallUpdate ")),
-        "ToolCallUpdate must not be emitted; got: {lines:?}"
-    );
-
-    // A single complete ToolCall with the output must be sent.
-    let complete = lines
+    // 1. InProgress ToolCall must be sent first (establishes the card).
+    let announce = lines
         .iter()
-        .find(|l| l.starts_with("ToolCall "))
-        .expect("a complete ToolCall with output");
+        .find(|l| l.starts_with("ToolCall ") && l.contains("InProgress"))
+        .unwrap_or_else(|| panic!("expected InProgress ToolCall announcement; got: {lines:?}"));
     assert!(
-        complete.contains("content_len=1"),
-        "ToolCall must carry the tool output inline, got: {complete}"
+        announce.contains("id=tc-0"),
+        "InProgress ToolCall id must match; got: {announce}"
     );
 
-    // Permission request and ToolCall must share the same provider id ("tc-0").
+    // 2. ToolCallUpdate with the tool output must follow.
+    let update = lines
+        .iter()
+        .find(|l| l.starts_with("ToolCallUpdate ") && l.contains("id=tc-0"))
+        .unwrap_or_else(|| panic!("expected ToolCallUpdate for tc-0; got: {lines:?}"));
+    assert!(
+        update.contains("content_len=1"),
+        "ToolCallUpdate must carry the tool output; got: {update}"
+    );
+    assert!(
+        update.contains("id=tc-0"),
+        "ToolCallUpdate id must match announcement; got: {update}"
+    );
+
+    // 3. Permission request must use the same provider id.
     let permission = lines
         .iter()
         .find(|l| l.starts_with("RequestPermission "))
-        .expect("a permission request");
+        .unwrap_or_else(|| panic!("expected RequestPermission; got: {lines:?}"));
     assert!(
         permission.contains("tool_call_id=tc-0"),
-        "permission id: {permission}"
+        "permission must reference the same tool call; got: {permission}"
     );
-    assert!(complete.contains("id=tc-0"), "complete ToolCall id: {complete}");
 }
 
 /// A deterministic in-memory model catalogue for the config-option tests.
@@ -944,6 +943,225 @@ async fn set_config_option_switches_effort_and_model() {
         config_current_value(&after_model, "model").as_deref(),
         Some("model-b"),
         "the model switch must be reflected as the new active model"
+    );
+}
+
+// ── Slash-command conformance tests ─────────────────────────────────────────
+
+/// Returns an `Arc<Mutex<String>>` collector and registers an `AgentTextCollector`
+/// handler that funnels every `AgentMessageChunk` into it.
+fn start_text_collector(
+    cx: &ConnectionTo<agent_client_protocol::Agent>,
+) -> Arc<std::sync::Mutex<String>> {
+    let buf: Arc<std::sync::Mutex<String>> = Arc::new(std::sync::Mutex::new(String::new()));
+    cx.add_dynamic_handler(AgentTextCollector {
+        sink: Arc::clone(&buf),
+    })
+    .expect("add handler")
+    .run_indefinitely();
+    buf
+}
+
+/// `/compact` on an empty thread → "nothing to compact".
+#[tokio::test]
+async fn slash_compact_nothing_to_compact() {
+    let engine = scripted_text_engine();
+    let (stop, text) = with_agent_and_client(engine, async move |cx| {
+        let session_id = init_and_new_session(&cx).await?;
+        let buf = start_text_collector(&cx);
+        let resp = cx
+            .send_request(PromptRequest::new(session_id, text_prompt("/compact")))
+            .block_task()
+            .await?;
+        let text = buf.lock().expect("lock").clone();
+        Ok((resp.stop_reason, text))
+    })
+    .await;
+
+    assert_eq!(stop, StopReason::EndTurn, "/compact must end with EndTurn");
+    assert!(
+        text.contains("nothing to compact") || text.contains("compact"),
+        "compact response must mention compaction; got: {text:?}"
+    );
+}
+
+/// `/clear` rebinds the session and returns a confirmation.
+#[tokio::test]
+async fn slash_clear_returns_confirmation() {
+    let engine = scripted_text_engine();
+    let (stop, text) = with_agent_and_client(engine, async move |cx| {
+        let session_id = init_and_new_session(&cx).await?;
+        let buf = start_text_collector(&cx);
+        let resp = cx
+            .send_request(PromptRequest::new(session_id, text_prompt("/clear")))
+            .block_task()
+            .await?;
+        let text = buf.lock().expect("lock").clone();
+        Ok((resp.stop_reason, text))
+    })
+    .await;
+
+    assert_eq!(stop, StopReason::EndTurn, "/clear must end with EndTurn");
+    assert!(
+        text.to_lowercase().contains("cleared") || text.to_lowercase().contains("fresh"),
+        "/clear must confirm the reset; got: {text:?}"
+    );
+}
+
+/// `/new` is an alias for `/clear` and also returns a confirmation.
+#[tokio::test]
+async fn slash_new_returns_confirmation() {
+    let engine = scripted_text_engine();
+    let (stop, text) = with_agent_and_client(engine, async move |cx| {
+        let session_id = init_and_new_session(&cx).await?;
+        let buf = start_text_collector(&cx);
+        let resp = cx
+            .send_request(PromptRequest::new(session_id, text_prompt("/new")))
+            .block_task()
+            .await?;
+        let text = buf.lock().expect("lock").clone();
+        Ok((resp.stop_reason, text))
+    })
+    .await;
+
+    assert_eq!(stop, StopReason::EndTurn, "/new must end with EndTurn");
+    assert!(
+        !text.is_empty(),
+        "/new must send a response notification; got empty text"
+    );
+}
+
+/// `/help` returns a list of available commands.
+#[tokio::test]
+async fn slash_help_lists_commands() {
+    let engine = scripted_text_engine();
+    let (stop, text) = with_agent_and_client(engine, async move |cx| {
+        let session_id = init_and_new_session(&cx).await?;
+        let buf = start_text_collector(&cx);
+        let resp = cx
+            .send_request(PromptRequest::new(session_id, text_prompt("/help")))
+            .block_task()
+            .await?;
+        let text = buf.lock().expect("lock").clone();
+        Ok((resp.stop_reason, text))
+    })
+    .await;
+
+    assert_eq!(stop, StopReason::EndTurn, "/help must end with EndTurn");
+    assert!(
+        text.contains("/compact"),
+        "/help output must mention /compact; got: {text:?}"
+    );
+    assert!(
+        text.contains("/clear") || text.contains("/new"),
+        "/help output must mention /clear or /new; got: {text:?}"
+    );
+}
+
+/// `/?` is an alias for `/help`.
+#[tokio::test]
+async fn slash_question_mark_is_help_alias() {
+    let engine = scripted_text_engine();
+    let (stop, text) = with_agent_and_client(engine, async move |cx| {
+        let session_id = init_and_new_session(&cx).await?;
+        let buf = start_text_collector(&cx);
+        let resp = cx
+            .send_request(PromptRequest::new(session_id, text_prompt("/?")))
+            .block_task()
+            .await?;
+        let text = buf.lock().expect("lock").clone();
+        Ok((resp.stop_reason, text))
+    })
+    .await;
+
+    assert_eq!(stop, StopReason::EndTurn);
+    assert!(
+        !text.is_empty(),
+        "/? must produce help text; got empty text"
+    );
+}
+
+/// `/skills` returns the skill list (empty when no skills are installed).
+#[tokio::test]
+async fn slash_skills_returns_list() {
+    let engine = scripted_text_engine();
+    let (stop, text) = with_agent_and_client(engine, async move |cx| {
+        let session_id = init_and_new_session(&cx).await?;
+        let buf = start_text_collector(&cx);
+        let resp = cx
+            .send_request(PromptRequest::new(session_id, text_prompt("/skills")))
+            .block_task()
+            .await?;
+        let text = buf.lock().expect("lock").clone();
+        Ok((resp.stop_reason, text))
+    })
+    .await;
+
+    assert_eq!(stop, StopReason::EndTurn, "/skills must end with EndTurn");
+    assert!(
+        text.to_lowercase().contains("skill") || text.to_lowercase().contains("no skills"),
+        "/skills must mention skills; got: {text:?}"
+    );
+}
+
+/// An unrecognised command sends an error notification instead of hanging.
+#[tokio::test]
+async fn slash_unknown_command_returns_error() {
+    let engine = scripted_text_engine();
+    let (stop, text) = with_agent_and_client(engine, async move |cx| {
+        let session_id = init_and_new_session(&cx).await?;
+        let buf = start_text_collector(&cx);
+        let resp = cx
+            .send_request(PromptRequest::new(
+                session_id,
+                text_prompt("/xyzzy_no_such_command"),
+            ))
+            .block_task()
+            .await?;
+        let text = buf.lock().expect("lock").clone();
+        Ok((resp.stop_reason, text))
+    })
+    .await;
+
+    assert_eq!(
+        stop,
+        StopReason::EndTurn,
+        "unknown slash command must end with EndTurn"
+    );
+    assert!(
+        text.contains("unknown"),
+        "response must mention unknown command; got: {text:?}"
+    );
+}
+
+/// After `/clear`, the next prompt starts a fresh LLM turn (no leftover history).
+#[tokio::test]
+async fn slash_clear_then_prompt_completes() {
+    let engine = scripted_text_engine();
+    let stop = with_agent_and_client(engine, async move |cx| {
+        let session_id = init_and_new_session(&cx).await?;
+        // First, clear the session.
+        let clear = cx
+            .send_request(PromptRequest::new(
+                session_id.clone(),
+                text_prompt("/clear"),
+            ))
+            .block_task()
+            .await?;
+        assert_eq!(clear.stop_reason, StopReason::EndTurn);
+        // Then, send a normal prompt to the fresh thread — must complete.
+        let resp = cx
+            .send_request(PromptRequest::new(session_id, text_prompt("hello")))
+            .block_task()
+            .await?;
+        Ok(resp.stop_reason)
+    })
+    .await;
+
+    assert_eq!(
+        stop,
+        StopReason::EndTurn,
+        "prompt after /clear must complete normally"
     );
 }
 
