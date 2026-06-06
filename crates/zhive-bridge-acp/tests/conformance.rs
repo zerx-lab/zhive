@@ -748,13 +748,20 @@ impl agent_client_protocol::HandleDispatchFrom<agent_client_protocol::Agent> for
 }
 
 #[tokio::test]
-async fn tool_call_announces_then_updates_with_matching_id() {
+async fn tool_call_sends_complete_result_after_permission() {
     use std::sync::{Arc, Mutex};
 
-    // A tool call must reach the client as the canonical ACP lifecycle:
-    // a first-sighting `tool_call` (announcement), a `request_permission`
-    // referencing the SAME id, then a `tool_call_update` carrying the output —
-    // all sharing one tool-call id so the client correlates them to one card.
+    // The bridge must send the tool card ONCE — after execution — with the full
+    // output already populated.  ACP clients (pi, Zed, …) render tool output
+    // from the initial `ToolCall` message's `raw_output` / `content` fields.
+    // Sending an InProgress announcement first (with no output) followed by a
+    // `ToolCallUpdate` causes those clients to show an empty card permanently
+    // because they do not update the output section from `ToolCallUpdate`.
+    //
+    // Expected sequence:
+    //   1. `session/request_permission` (before execution)
+    //   2. `SessionUpdate::ToolCall` with status=Completed and content_len=1
+    //   No InProgress announcement; no ToolCallUpdate.
     let engine = scripted_tool_call_engine(PermissionDecision::Ask);
     let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let sink = Arc::clone(&captured);
@@ -772,36 +779,40 @@ async fn tool_call_announces_then_updates_with_matching_id() {
 
     let lines = captured.lock().expect("lock").clone();
 
-    let announce = lines
-        .iter()
-        .find(|l| l.starts_with("ToolCall "))
-        .expect("a first-sighting ToolCall announcement");
+    // No InProgress announcement must reach the client.
     assert!(
-        announce.contains("status=InProgress"),
-        "announcement must be in-progress, got: {announce}"
+        !lines
+            .iter()
+            .any(|l| l.starts_with("ToolCall ") && l.contains("InProgress")),
+        "InProgress announcement must be suppressed; got: {lines:?}"
     );
 
+    // No ToolCallUpdate must reach the client (output is inlined in the ToolCall).
+    assert!(
+        !lines.iter().any(|l| l.starts_with("ToolCallUpdate ")),
+        "ToolCallUpdate must not be emitted; got: {lines:?}"
+    );
+
+    // A single complete ToolCall with the output must be sent.
+    let complete = lines
+        .iter()
+        .find(|l| l.starts_with("ToolCall "))
+        .expect("a complete ToolCall with output");
+    assert!(
+        complete.contains("content_len=1"),
+        "ToolCall must carry the tool output inline, got: {complete}"
+    );
+
+    // Permission request and ToolCall must share the same provider id ("tc-0").
     let permission = lines
         .iter()
         .find(|l| l.starts_with("RequestPermission "))
         .expect("a permission request");
-
-    let update = lines
-        .iter()
-        .find(|l| l.starts_with("ToolCallUpdate "))
-        .expect("a ToolCallUpdate carrying the result");
-    assert!(
-        update.contains("content_len=1"),
-        "the update must carry the tool output, got: {update}"
-    );
-
-    // All three must reference the same provider tool-call id ("tc-0").
-    assert!(announce.contains("id=tc-0"), "announce id: {announce}");
     assert!(
         permission.contains("tool_call_id=tc-0"),
         "permission id: {permission}"
     );
-    assert!(update.contains("id=tc-0"), "update id: {update}");
+    assert!(complete.contains("id=tc-0"), "complete ToolCall id: {complete}");
 }
 
 /// A deterministic in-memory model catalogue for the config-option tests.

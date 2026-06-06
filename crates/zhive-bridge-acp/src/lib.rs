@@ -56,7 +56,7 @@ use agent_client_protocol::schema::{
     AgentCapabilities, CancelNotification, ContentBlock, InitializeRequest, InitializeResponse,
     NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse, SessionId,
     SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
-    SetSessionConfigOptionResponse, StopReason, ToolCallId,
+    SetSessionConfigOptionResponse, StopReason,
 };
 use agent_client_protocol::{Agent, ByteStreams, Client, ConnectionTo, Dispatch, Responder, Stdio};
 use futures::{AsyncRead, AsyncWrite};
@@ -65,7 +65,7 @@ use tokio::sync::broadcast::error::RecvError;
 use zhive_core::engine::Engine;
 use zhive_core::engine::event::EngineEvent;
 use zhive_core::engine::submission::PermissionRequestId;
-use zhive_proto::domain::{ThinkingEffort, ThreadId, TurnId};
+use zhive_proto::domain::{ThinkingEffort, ThreadId, ToolCallStatus, TurnId};
 use zhive_proto::permission::{
     PermissionOutcome, RequestPermissionRequest as ZRequestPermissionRequest,
 };
@@ -450,6 +450,19 @@ fn respond_stop(responder: Responder<PromptResponse>, stop: StopReason) {
 /// On `SessionAborted` the session is removed from `state` because the engine
 /// thread is gone and the session can never receive another turn. This is the
 /// primary lifecycle-event cleanup path described in [`crate::state`].
+///
+/// Tool-call events: the engine broadcasts an `InProgress` announcement (no
+/// output) and later a `Completed`/`Failed` item with `raw_output`/`content`.
+/// ACP clients (pi, Zed, …) render tool output from the *initial* `ToolCall`
+/// message; they do not update it from `ToolCallUpdate`.  The bridge therefore
+/// suppresses the `InProgress` event and sends only the final complete item as
+/// `SessionUpdate::ToolCall` — matching the behaviour of pi and opencode.
+#[expect(
+    clippy::too_many_lines,
+    reason = "stream_turn is the turn event-loop: one match arm per EngineEvent variant; \
+              extracting sub-functions would scatter closely-coupled lifecycle logic \
+              without reducing real complexity"
+)]
 async fn stream_turn(
     state: &AgentState,
     engine: &Engine,
@@ -459,12 +472,6 @@ async fn stream_turn(
     turn_id: &TurnId,
     events: &mut Receiver<EngineEvent>,
 ) -> StopReason {
-    // Tracks which tool-call ids have already been announced this turn so the
-    // first event for an id maps to a `tool_call` and later events map to a
-    // `tool_call_update` (the canonical ACP lifecycle; see
-    // [`convert::tool_call_session_update`]).
-    let mut seen_tool_calls: std::collections::HashSet<ToolCallId> =
-        std::collections::HashSet::new();
     loop {
         let event = match events.recv().await {
             Ok(event) => event,
@@ -503,10 +510,20 @@ async fn stream_turn(
                 turn_id: ev_turn,
                 item,
             } if &ev_thread == thread_id && &ev_turn == turn_id => {
-                // Tool calls follow the announce -> update lifecycle (keyed by
-                // the per-turn `seen` set); every other item maps directly.
-                let update = if matches!(*item, zhive_proto::domain::Item::ToolCall { .. }) {
-                    convert::tool_call_session_update(&item, &mut seen_tool_calls)
+                // Tool calls: suppress the InProgress announcement (no output
+                // yet); send the Completed/Failed item as the sole ToolCall so
+                // the client sees a fully populated card on first render.
+                let update = if let zhive_proto::domain::Item::ToolCall { status, .. } =
+                    item.as_ref()
+                {
+                    if matches!(
+                        status,
+                        ToolCallStatus::InProgress | ToolCallStatus::Pending
+                    ) {
+                        None
+                    } else {
+                        convert::tool_call_to_acp(&item).map(SessionUpdate::ToolCall)
+                    }
                 } else {
                     convert::item_to_session_update(&item)
                 };
