@@ -51,10 +51,15 @@ pub fn build_request(
     session_id: &SessionId,
     request: &ZRequestPermissionRequest,
 ) -> RequestPermissionRequest {
-    // The zhive request names a resource (a tool) but carries no ACP tool-call
-    // id, so synthesise a stable id from the resource name and surface the
-    // reason in the title for the editor's permission prompt.
-    let tool_call_id = ToolCallId::new(std::sync::Arc::<str>::from(request.name.as_str()));
+    // Prefer the request's tool-call id so the permission prompt correlates with
+    // the `tool_call` card already announced for this call; fall back to the
+    // resource name for older callers that carry no id. The reason is surfaced
+    // in the title for the editor's permission prompt.
+    let raw_id = request
+        .tool_call_id
+        .as_deref()
+        .unwrap_or(request.name.as_str());
+    let tool_call_id = ToolCallId::new(std::sync::Arc::<str>::from(raw_id));
     let title = format!("{}: {}", request.name, request.reason);
     let fields = ToolCallUpdateFields::new().title(title);
     let tool_call = ToolCallUpdate::new(tool_call_id, fields);

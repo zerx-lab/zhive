@@ -377,6 +377,9 @@ impl StreamFold {
                     vec![Item::ToolCall {
                         id: buf.item_id,
                         name: buf.tool_name.unwrap_or_default(),
+                        // Title is supplied at dispatch time by the resolved
+                        // tool; the streaming accumulator item carries none.
+                        title: None,
                         kind: ToolKind::Other,
                         status: ToolCallStatus::InProgress,
                         content: vec![],
@@ -418,6 +421,8 @@ impl StreamFold {
                 vec![Item::ToolCall {
                     id: item_id,
                     name: call_part.tool_name,
+                    // Title is supplied at dispatch time by the resolved tool.
+                    title: None,
                     kind: ToolKind::Other,
                     status: ToolCallStatus::InProgress,
                     content: vec![],
@@ -544,6 +549,8 @@ impl StreamFold {
             items.push(Item::ToolCall {
                 id: buf.item_id,
                 name: buf.tool_name.unwrap_or_default(),
+                // Title is supplied at dispatch time by the resolved tool.
+                title: None,
                 kind: ToolKind::Other,
                 status: ToolCallStatus::InProgress,
                 content: vec![],

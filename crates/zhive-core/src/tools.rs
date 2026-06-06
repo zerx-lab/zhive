@@ -274,6 +274,26 @@ pub trait Tool: Send + Sync {
         None
     }
 
+    /// Human-readable, one-line title summarizing a call with these `args`.
+    ///
+    /// Surfaced as the ACP `ToolCall.title` so clients show a meaningful
+    /// headline (e.g. `$ cargo check` for a shell call) instead of the bare
+    /// tool name. The default `None` lets consumers fall back to [`Tool::name`].
+    ///
+    /// Implementors should keep the result short and single-line; long values
+    /// are the implementor's responsibility to truncate.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use zhive_core::tools::{EchoTool, Tool};
+    /// assert!(EchoTool.title(&serde_json::json!({})).is_none());
+    /// ```
+    fn title(&self, args: &serde_json::Value) -> Option<String> {
+        let _ = args;
+        None
+    }
+
     /// JSON Schema (an object schema) describing this tool's input arguments.
     ///
     /// Advertised to the model so it emits well-formed arguments, and used as

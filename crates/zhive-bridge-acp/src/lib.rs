@@ -43,6 +43,7 @@
 //! # }
 //! ```
 
+pub mod config_option;
 pub mod convert;
 pub mod error;
 pub mod permission;
@@ -54,7 +55,8 @@ pub use error::AcpError;
 use agent_client_protocol::schema::{
     AgentCapabilities, CancelNotification, ContentBlock, InitializeRequest, InitializeResponse,
     NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse, SessionId,
-    SessionNotification, SessionUpdate, StopReason,
+    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
+    SetSessionConfigOptionResponse, StopReason, ToolCallId,
 };
 use agent_client_protocol::{Agent, ByteStreams, Client, ConnectionTo, Dispatch, Responder, Stdio};
 use futures::{AsyncRead, AsyncWrite};
@@ -63,7 +65,7 @@ use tokio::sync::broadcast::error::RecvError;
 use zhive_core::engine::Engine;
 use zhive_core::engine::event::EngineEvent;
 use zhive_core::engine::submission::PermissionRequestId;
-use zhive_proto::domain::{ThreadId, TurnId};
+use zhive_proto::domain::{ThinkingEffort, ThreadId, TurnId};
 use zhive_proto::permission::{
     PermissionOutcome, RequestPermissionRequest as ZRequestPermissionRequest,
 };
@@ -166,6 +168,7 @@ fn build_agent(
         .on_receive_request(
             {
                 let state = state.clone();
+                let engine = engine.clone();
                 async move |req: NewSessionRequest,
                             responder: Responder<NewSessionResponse>,
                             _cx| {
@@ -175,7 +178,11 @@ fn build_agent(
                         session = %session_id.0,
                         "session/new bound to fresh thread"
                     );
-                    responder.respond(NewSessionResponse::new(session_id))
+                    // Surface model + reasoning-depth pickers to the client. The
+                    // model list needs a (possibly networked) catalog fetch, so
+                    // session creation pays that latency once up front.
+                    let options = current_config_options(&engine, &state, &session_id).await;
+                    responder.respond(NewSessionResponse::new(session_id).config_options(options))
                 }
             },
             agent_client_protocol::on_receive_request!(),
@@ -188,6 +195,18 @@ fn build_agent(
                             responder: Responder<PromptResponse>,
                             cx: ConnectionTo<Client>| {
                     on_prompt(&state, &engine, req, responder, &cx)
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let state = state.clone();
+                let engine = engine.clone();
+                async move |req: SetSessionConfigOptionRequest,
+                            responder: Responder<SetSessionConfigOptionResponse>,
+                            _cx| {
+                    on_set_config_option(&state, &engine, req, responder).await
                 }
             },
             agent_client_protocol::on_receive_request!(),
@@ -215,10 +234,84 @@ fn build_agent(
 
 /// Advertises the agent capabilities zhive supports in v1.
 ///
-/// `load_session` is off (no storage replay yet) and no session modes are
-/// exposed, so conforming clients will not call the deferred methods.
+/// `load_session` is off (no storage replay yet). Model and reasoning-depth
+/// pickers are advertised per session via `config_options` on the `session/new`
+/// response (no capability flag is required for them), and refreshed through
+/// `session/set_config_option`.
 fn advertise_capabilities() -> AgentCapabilities {
     AgentCapabilities::new().load_session(false)
+}
+
+/// Returns the session's current model + reasoning-depth config options.
+///
+/// Fetches the model catalog via `engine.list_models()` (degrading to an empty
+/// list, i.e. no model selector, when the catalog is unavailable) and combines
+/// it with the session's chosen reasoning depth. Shared by `session/new` and
+/// `session/set_config_option` so both return a consistent, current view.
+async fn current_config_options(
+    engine: &Engine,
+    state: &AgentState,
+    session: &SessionId,
+) -> Vec<agent_client_protocol::schema::SessionConfigOption> {
+    let models = engine.list_models().await.unwrap_or_else(|err| {
+        tracing::warn!(
+            name: "zhive.acp.models.list_failed",
+            error = %err,
+            "list_models failed; omitting the model selector"
+        );
+        Vec::new()
+    });
+    config_option::build_config_options(&models, state.session_effort(session))
+}
+
+/// Handles `session/set_config_option`: switches model or reasoning depth.
+///
+/// `model` swaps the engine's active model (engine-global); `effort` records the
+/// per-session reasoning depth applied to subsequent prompts. Either way the
+/// response carries the full, refreshed option set (a model switch can change
+/// the available depths), so the client re-renders both dropdowns.
+async fn on_set_config_option(
+    state: &AgentState,
+    engine: &Engine,
+    req: SetSessionConfigOptionRequest,
+    responder: Responder<SetSessionConfigOptionResponse>,
+) -> Result<(), agent_client_protocol::Error> {
+    if state.thread_for_session(&req.session_id).is_none() {
+        return responder
+            .respond_with_internal_error(format!("unknown session: {}", req.session_id.0));
+    }
+
+    let value = req.value.0.as_ref();
+    match req.config_id.0.as_ref() {
+        config_option::CONFIG_MODEL_ID => {
+            // The catalog resolves the context window itself, so no hint is
+            // passed. A model switch affects the whole engine, not just this
+            // session (the engine holds one active provider).
+            if let Err(err) = engine.set_model(value, None) {
+                tracing::warn!(
+                    name: "zhive.acp.set_model.failed",
+                    model = value,
+                    error = %err,
+                    "set_model failed"
+                );
+                return responder.respond_with_internal_error(format!("set_model failed: {err}"));
+            }
+        }
+        config_option::CONFIG_EFFORT_ID => match ThinkingEffort::from_label(value) {
+            Some(effort) => state.set_session_effort(&req.session_id, effort),
+            None => {
+                return responder
+                    .respond_with_internal_error(format!("unknown reasoning depth: {value}"));
+            }
+        },
+        other => {
+            return responder
+                .respond_with_internal_error(format!("unknown config option: {other}"));
+        }
+    }
+
+    let options = current_config_options(engine, state, &req.session_id).await;
+    responder.respond(SetSessionConfigOptionResponse::new(options))
 }
 
 /// Handles a `session/prompt` request by spawning the turn task.
@@ -304,8 +397,11 @@ async fn run_prompt_turn(
     let mut events = engine.subscribe();
     let user_item = convert::prompt_blocks_to_user_item(prompt, format!("item:{}/0", thread_id.0));
 
+    // Apply the session's chosen reasoning depth (set via
+    // `session/set_config_option`); `None` keeps the engine default.
+    let reasoning = state.session_effort(&session_id);
     let turn_id = match engine
-        .start_turn(thread_id.clone(), vec![user_item], None)
+        .start_turn_with_reasoning(thread_id.clone(), vec![user_item], None, reasoning)
         .await
     {
         Ok(turn_id) => turn_id,
@@ -363,6 +459,12 @@ async fn stream_turn(
     turn_id: &TurnId,
     events: &mut Receiver<EngineEvent>,
 ) -> StopReason {
+    // Tracks which tool-call ids have already been announced this turn so the
+    // first event for an id maps to a `tool_call` and later events map to a
+    // `tool_call_update` (the canonical ACP lifecycle; see
+    // [`convert::tool_call_session_update`]).
+    let mut seen_tool_calls: std::collections::HashSet<ToolCallId> =
+        std::collections::HashSet::new();
     loop {
         let event = match events.recv().await {
             Ok(event) => event,
@@ -388,15 +490,27 @@ async fn stream_turn(
                 thread_id: ev_thread,
                 turn_id: ev_turn,
                 delta,
+                kind,
             } if &ev_thread == thread_id && &ev_turn == turn_id => {
-                notify(cx, session_id, convert::delta_to_session_update(delta));
+                notify(
+                    cx,
+                    session_id,
+                    convert::delta_to_session_update(delta, kind),
+                );
             }
             EngineEvent::ItemAppended {
                 thread_id: ev_thread,
                 turn_id: ev_turn,
                 item,
             } if &ev_thread == thread_id && &ev_turn == turn_id => {
-                if let Some(update) = convert::item_to_session_update(&item) {
+                // Tool calls follow the announce -> update lifecycle (keyed by
+                // the per-turn `seen` set); every other item maps directly.
+                let update = if matches!(*item, zhive_proto::domain::Item::ToolCall { .. }) {
+                    convert::tool_call_session_update(&item, &mut seen_tool_calls)
+                } else {
+                    convert::item_to_session_update(&item)
+                };
+                if let Some(update) = update {
                     notify(cx, session_id, update);
                 }
             }
@@ -443,7 +557,10 @@ async fn stream_turn(
                 notify(
                     cx,
                     session_id,
-                    convert::delta_to_session_update(format!("turn failed: {}", error.message)),
+                    convert::delta_to_session_update(
+                        format!("turn failed: {}", error.message),
+                        zhive_proto::events::ItemDeltaKind::Text,
+                    ),
                 );
                 return StopReason::EndTurn;
             }

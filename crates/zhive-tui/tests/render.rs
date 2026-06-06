@@ -203,6 +203,7 @@ fn tool_call_header_is_compact_with_inline_arg() {
         item: Box::new(Item::ToolCall {
             id: ItemId(Arc::from("item:turn:render/0/0")),
             name: "bash".to_owned(),
+            title: None,
             kind: ToolKind::default(),
             status: ToolCallStatus::Completed,
             content: Vec::new(),
@@ -257,6 +258,7 @@ fn tool_call_persists_in_view_after_turn_completes_with_agent_reply() {
         item: Box::new(Item::ToolCall {
             id: ItemId(Arc::from("item:turn:render/0/1")),
             name: "bash".to_owned(),
+            title: None,
             kind: ToolKind::default(),
             status: ToolCallStatus::Completed,
             content: Vec::new(),
@@ -270,6 +272,7 @@ fn tool_call_persists_in_view_after_turn_completes_with_agent_reply() {
         thread_id: thread(),
         turn_id: turn(),
         delta: "the listing".to_owned(),
+        kind: zhive_proto::events::ItemDeltaKind::Text,
     });
     app.on_engine(&EngineNotification::ItemAppended {
         thread_id: thread(),
@@ -310,6 +313,7 @@ fn renders_subagent_summary_under_agent_tool_call() {
         item: Box::new(Item::ToolCall {
             id: ItemId(Arc::from("item:turn:render/0/0")),
             name: "agent".to_owned(),
+            title: None,
             kind: ToolKind::default(),
             status: ToolCallStatus::InProgress,
             content: Vec::new(),
@@ -333,6 +337,7 @@ fn renders_subagent_summary_under_agent_tool_call() {
         item: Box::new(Item::ToolCall {
             id: ItemId(Arc::from("item:turn:subagent/render/1/0/0")),
             name: "grep".to_owned(),
+            title: None,
             kind: ToolKind::default(),
             status: ToolCallStatus::InProgress,
             content: Vec::new(),

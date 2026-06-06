@@ -422,6 +422,14 @@ pub struct RequestPermissionRequest {
     pub reason: String,
     /// Available option set; order matters for UI rendering.
     pub options: Vec<PermissionOption>,
+    /// ACP tool-call id this permission applies to.
+    ///
+    /// The provider-assigned tool-use id (or its synthetic fallback) of the
+    /// call awaiting authorization, so a client can correlate the permission
+    /// prompt with the tool-call card it already announced. `None` for callers
+    /// that pre-date this field (e.g. resource-scoped requests with no call id).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
 }
 
 /// One choice surfaced by [`RequestPermissionRequest`].
@@ -966,6 +974,37 @@ pub enum HookSpecificOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn request_permission_tool_call_id_round_trips_and_is_optional() {
+        // Present: serializes as camelCase `toolCallId` and round-trips.
+        let req: RequestPermissionRequest = serde_json::from_value(serde_json::json!({
+            "threadId": "thread:native/t",
+            "resourceType": "tool",
+            "name": "bash",
+            "toolCallId": "toolu_1",
+            "reason": "run a command",
+            "options": []
+        }))
+        .expect("with id");
+        assert_eq!(req.tool_call_id.as_deref(), Some("toolu_1"));
+        let v = serde_json::to_value(&req).expect("serialize");
+        assert_eq!(v["toolCallId"], "toolu_1");
+
+        // Absent: old callers omit the key; it defaults to None and is skipped
+        // on the wire so the form stays backward compatible.
+        let legacy: RequestPermissionRequest = serde_json::from_value(serde_json::json!({
+            "threadId": "thread:native/t",
+            "resourceType": "tool",
+            "name": "bash",
+            "reason": "run a command",
+            "options": []
+        }))
+        .expect("without id");
+        assert_eq!(legacy.tool_call_id, None);
+        let v = serde_json::to_value(&legacy).expect("serialize");
+        assert!(v.get("toolCallId").is_none(), "None must be omitted");
+    }
 
     #[test]
     fn reduce_priority_order() {

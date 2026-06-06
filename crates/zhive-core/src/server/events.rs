@@ -259,13 +259,13 @@ pub fn engine_event_to_notification(event: &EngineEvent) -> Option<Notification>
             thread_id,
             turn_id,
             delta,
+            kind,
         } => (
             methods::EVENT_ITEM_DELTA,
-            serde_json::to_value(ItemDeltaPayload::new(
-                thread_id.clone(),
-                turn_id.clone(),
-                delta.clone(),
-            ))
+            serde_json::to_value(
+                ItemDeltaPayload::new(thread_id.clone(), turn_id.clone(), delta.clone())
+                    .with_kind(*kind),
+            )
             .ok()?,
         ),
         EngineEvent::PhaseChanged {

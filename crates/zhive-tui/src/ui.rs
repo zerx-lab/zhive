@@ -436,16 +436,29 @@ fn transcript_lines(app: &App, inner_width: u16) -> Vec<Line<'static>> {
     }
 
     if app.conversation.busy {
-        let body = if app.conversation.revealed_streaming().is_empty() {
-            vec![Line::styled(
-                format!("{} thinking…", widgets::spinner(app.spinner_tick)),
-                Style::new().fg(p.fg_dim),
-            )]
-        } else {
+        let reasoning = app.conversation.revealed_reasoning();
+        let answer = app.conversation.revealed_streaming();
+        // Live reasoning trace (dim italic), streamed above the answer. A trailing
+        // cursor marks it as in-flight only until the answer body starts. It is
+        // superseded by the finalised `Item::Reasoning` once the block closes.
+        if !reasoning.is_empty() {
+            let mut rlines = wrap_plain(
+                reasoning,
+                Style::new().fg(p.fg_dim).add_modifier(Modifier::ITALIC),
+                content_width,
+            );
+            if answer.is_empty()
+                && let Some(last) = rlines.last_mut()
+            {
+                last.push_span(Span::styled("▌", Style::new().fg(p.accent)));
+            }
+            push_message(&mut out, "", p.role_zap, rlines);
+        }
+        if !answer.is_empty() {
             // Render the live partial text as markdown with a trailing cursor.
             // Heal the tail first so an unclosed marker mid-stream renders in its
             // eventual style instead of flashing a literal `**` / `` ` `` / `[`.
-            let healed = crate::heal::heal_tail(app.conversation.revealed_streaming());
+            let healed = crate::heal::heal_tail(answer);
             let mut lines = Vec::new();
             for line in markdown::render(&healed, p) {
                 lines.extend(wrap::wrap_line(&line, content_width));
@@ -453,9 +466,19 @@ fn transcript_lines(app: &App, inner_width: u16) -> Vec<Line<'static>> {
             if let Some(last) = lines.last_mut() {
                 last.push_span(Span::styled("▌", Style::new().fg(p.accent)));
             }
-            lines
-        };
-        push_message(&mut out, "", p.role_zap, body);
+            push_message(&mut out, "", p.role_zap, lines);
+        } else if reasoning.is_empty() {
+            // Nothing revealed yet — show the generic working placeholder.
+            push_message(
+                &mut out,
+                "",
+                p.role_zap,
+                vec![Line::styled(
+                    format!("{} thinking…", widgets::spinner(app.spinner_tick)),
+                    Style::new().fg(p.fg_dim),
+                )],
+            );
+        }
     }
 
     // Live compaction progress / failure panel at the transcript tail.

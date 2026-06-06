@@ -138,6 +138,10 @@ impl Tool for BashTool {
         )
     }
 
+    fn title(&self, args: &Value) -> Option<String> {
+        args["command"].as_str().map(summarize_command)
+    }
+
     fn input_schema(&self) -> Value {
         serde_json::json!({
             "type": "object",
@@ -310,6 +314,31 @@ fn build_tool_output(output: &std::process::Output, timed_out: bool) -> ToolOutp
     ToolOutput::with_value(text, value)
 }
 
+/// Maximum number of characters in a [`BashTool::title`] before truncation.
+///
+/// Kept short because the title renders as a single-line headline (e.g. the
+/// ACP `ToolCall.title`); long commands would otherwise wrap or be clipped by
+/// the client. The value is a display budget only and has no functional
+/// effect on command execution.
+const BASH_TITLE_MAX_CHARS: usize = 80;
+
+/// Builds a one-line `$ <command>` title summary from a raw shell command.
+///
+/// Collapses every run of whitespace (including newlines in multi-line
+/// commands) into a single space and truncates to [`BASH_TITLE_MAX_CHARS`]
+/// characters, appending `…` when shortened, so the result stays on one line.
+fn summarize_command(command: &str) -> String {
+    let collapsed = command.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut title = String::from("$ ");
+    if collapsed.chars().count() > BASH_TITLE_MAX_CHARS {
+        title.extend(collapsed.chars().take(BASH_TITLE_MAX_CHARS - 1));
+        title.push('…');
+    } else {
+        title.push_str(&collapsed);
+    }
+    title
+}
+
 // ============================================================
 // Tests
 // ============================================================
@@ -337,6 +366,39 @@ mod tests {
             cancel,
             spawner: None,
         }
+    }
+
+    #[test]
+    fn bash_title_summarizes_command() {
+        let tool = BashTool::new();
+        let args = serde_json::json!({ "command": "cargo check -p zhive-core" });
+        assert_eq!(
+            tool.title(&args).as_deref(),
+            Some("$ cargo check -p zhive-core")
+        );
+    }
+
+    #[test]
+    fn bash_title_collapses_whitespace_and_truncates() {
+        let tool = BashTool::new();
+        let args = serde_json::json!({ "command": "echo   a\n    b\tc" });
+        assert_eq!(tool.title(&args).as_deref(), Some("$ echo a b c"));
+
+        let long = "x".repeat(200);
+        let args = serde_json::json!({ "command": long });
+        let title = tool.title(&args).unwrap();
+        // `$ ` prefix (2) + clamped body (BASH_TITLE_MAX_CHARS, last char `…`).
+        assert_eq!(title.chars().count(), 2 + BASH_TITLE_MAX_CHARS);
+        assert!(title.ends_with('\u{2026}'));
+    }
+
+    #[test]
+    fn bash_title_none_without_command() {
+        let tool = BashTool::new();
+        assert!(
+            tool.title(&serde_json::json!({ "timeout_ms": 10 }))
+                .is_none()
+        );
     }
 
     #[tokio::test]

@@ -31,7 +31,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use agent_client_protocol::schema::{ClientCapabilities, SessionId};
-use zhive_proto::domain::ThreadId;
+use zhive_proto::domain::{ThinkingEffort, ThreadId};
 
 /// Maximum number of concurrent ACP sessions tracked in the bridge.
 ///
@@ -54,6 +54,12 @@ struct SessionEntry {
     thread_id: ThreadId,
     #[expect(dead_code, reason = "retained for future fs/terminal routing (v1.1)")]
     cwd: PathBuf,
+    /// Reasoning depth chosen for this session via `session/set_config_option`.
+    ///
+    /// `None` means the client never picked one, so the turn runs without an
+    /// explicit reasoning override (the engine default). Per-session because the
+    /// effort is a per-turn parameter, unlike the model, which is engine-global.
+    effort: Option<ThinkingEffort>,
 }
 
 /// Inner, lock-guarded state.
@@ -173,6 +179,7 @@ impl AgentState {
             SessionEntry {
                 thread_id,
                 cwd: cwd.into(),
+                effort: None,
             },
         );
         inner.eviction_queue.push_back(session_id.clone());
@@ -217,6 +224,37 @@ impl AgentState {
             .sessions
             .get(session)
             .map(|e| e.thread_id.clone())
+    }
+
+    /// Records the reasoning depth chosen for `session`.
+    ///
+    /// Set from a `session/set_config_option` request; read back per prompt to
+    /// drive `engine.start_turn_with_reasoning`. A no-op for an unknown session.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use zhive_bridge_acp::state::AgentState;
+    /// use zhive_proto::domain::ThinkingEffort;
+    /// let state = AgentState::new();
+    /// let s = state.new_session("/work");
+    /// state.set_session_effort(&s, ThinkingEffort::High);
+    /// assert_eq!(state.session_effort(&s), Some(ThinkingEffort::High));
+    /// ```
+    pub fn set_session_effort(&self, session: &SessionId, effort: ThinkingEffort) {
+        let mut inner = self.lock();
+        if let Some(entry) = inner.sessions.get_mut(session) {
+            entry.effort = Some(effort);
+        }
+    }
+
+    /// Returns the reasoning depth chosen for `session`, if any.
+    ///
+    /// `None` means the client never picked one, so the turn runs with the
+    /// engine's default reasoning.
+    #[must_use]
+    pub fn session_effort(&self, session: &SessionId) -> Option<ThinkingEffort> {
+        self.lock().sessions.get(session).and_then(|e| e.effort)
     }
 }
 

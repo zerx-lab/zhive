@@ -559,6 +559,17 @@ pub enum Item {
         id: ItemId,
         /// Tool name (e.g. `read_file`, `bash`).
         name: String,
+        /// Human-readable title describing what the call does.
+        ///
+        /// Tool-supplied summary (e.g. `$ cargo check` for a shell call) used
+        /// as the headline in surfaces that show one line per call, such as the
+        /// ACP `ToolCall.title`. Consumers fall back to the `name` field when
+        /// this is `None`.
+        ///
+        /// `None` for tools that supply no title and for items that pre-date
+        /// this field.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
         /// Coarse classification, useful for UI grouping.
         #[serde(default)]
         kind: ToolKind,

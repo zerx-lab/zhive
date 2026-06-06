@@ -39,6 +39,9 @@ pub(super) fn blocked_outcome(
     let item = Item::ToolCall {
         id: item_id,
         name: tool_name.to_owned(),
+        // Blocked before the tool resolved, so no tool-supplied title is
+        // available; consumers fall back to `name`.
+        title: None,
         kind: zhive_proto::domain::ToolKind::Other,
         status: ToolCallStatus::Failed,
         content,
@@ -104,6 +107,7 @@ pub(super) const OPT_REJECT_ALWAYS: &str = "reject-always";
 pub(super) fn build_permission_request(
     thread_id_str: &str,
     tool_name: &str,
+    tool_call_id: &str,
 ) -> Result<RequestPermissionRequest, serde_json::Error> {
     // RequestPermissionRequest and PermissionOption are #[non_exhaustive];
     // use JSON construction to stay future-safe. `PermissionOptionKind`
@@ -113,6 +117,9 @@ pub(super) fn build_permission_request(
         "threadId": thread_id_str,
         "resourceType": "tool",
         "name": tool_name,
+        // The provider tool-use id (or synthetic fallback) so a client can
+        // correlate this prompt with the tool-call card already announced.
+        "toolCallId": tool_call_id,
         "reason": format!("agent wants to call tool: {tool_name}"),
         "options": [
             {
@@ -263,9 +270,16 @@ mod tests {
     use super::*;
 
     fn options() -> Vec<PermissionOption> {
-        build_permission_request("thread:native/t", "read_file")
+        build_permission_request("thread:native/t", "read_file", "toolu_test")
             .expect("request fixture")
             .options
+    }
+
+    #[test]
+    fn build_request_carries_tool_call_id() {
+        let request = build_permission_request("thread:native/t", "read_file", "toolu_test")
+            .expect("request fixture");
+        assert_eq!(request.tool_call_id.as_deref(), Some("toolu_test"));
     }
 
     #[test]

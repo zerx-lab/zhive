@@ -464,6 +464,32 @@ impl ItemAppendedPayload {
 // events/item_delta
 // ============================================================
 
+/// Which streaming channel an [`ItemDeltaPayload`] fragment belongs to.
+///
+/// A turn interleaves the model's reasoning trace and its visible answer; the
+/// delta channel carries both, tagged so a client can render them as separate
+/// blocks (a dim thinking stream vs. the answer body).
+///
+/// # Examples
+///
+/// ```
+/// use zhive_proto::events::ItemDeltaKind;
+/// assert_eq!(ItemDeltaKind::default(), ItemDeltaKind::Text);
+/// let v = serde_json::to_value(ItemDeltaKind::Reasoning).unwrap();
+/// assert_eq!(v, "reasoning");
+/// ```
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ItemDeltaKind {
+    /// A fragment of the visible answer (finalises as `Item::AgentMessage`).
+    #[default]
+    Text,
+    /// A fragment of the reasoning trace (finalises as `Item::Reasoning`).
+    Reasoning,
+}
+
 /// Payload of the `events/item_delta` notification.
 ///
 /// # Examples
@@ -471,7 +497,7 @@ impl ItemAppendedPayload {
 /// ```
 /// use std::sync::Arc;
 /// use zhive_proto::domain::{ThreadId, TurnId};
-/// use zhive_proto::events::ItemDeltaPayload;
+/// use zhive_proto::events::{ItemDeltaKind, ItemDeltaPayload};
 /// let p = ItemDeltaPayload::new(
 ///     ThreadId(Arc::from("thread:native/t")),
 ///     TurnId(Arc::from("turn:thread:native/t/0")),
@@ -479,6 +505,8 @@ impl ItemAppendedPayload {
 /// );
 /// let v = serde_json::to_value(&p).unwrap();
 /// assert_eq!(v["delta"], "Hello");
+/// // The default channel is the visible answer.
+/// assert_eq!(p.kind, ItemDeltaKind::Text);
 /// let back: ItemDeltaPayload = serde_json::from_value(v).unwrap();
 /// assert_eq!(back, p);
 /// ```
@@ -491,8 +519,14 @@ pub struct ItemDeltaPayload {
     pub thread_id: ThreadId,
     /// Turn the delta belongs to.
     pub turn_id: TurnId,
-    /// Streaming text fragment.
+    /// Streaming fragment.
     pub delta: String,
+    /// Which channel the fragment belongs to (answer vs. reasoning).
+    ///
+    /// Defaults to [`ItemDeltaKind::Text`] when absent, so a payload from an
+    /// older engine that only streamed answer text decodes unchanged.
+    #[serde(default)]
+    pub kind: ItemDeltaKind,
 }
 
 impl ItemDeltaPayload {
@@ -515,7 +549,28 @@ impl ItemDeltaPayload {
             thread_id,
             turn_id,
             delta,
+            kind: ItemDeltaKind::Text,
         }
+    }
+
+    /// Sets the channel the fragment belongs to, returning the updated payload.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use zhive_proto::domain::{ThreadId, TurnId};
+    /// use zhive_proto::events::{ItemDeltaKind, ItemDeltaPayload};
+    /// let p = ItemDeltaPayload::new(
+    ///     ThreadId(Arc::from("t")), TurnId(Arc::from("t/0")), "thinking".into(),
+    /// )
+    /// .with_kind(ItemDeltaKind::Reasoning);
+    /// assert_eq!(p.kind, ItemDeltaKind::Reasoning);
+    /// ```
+    #[must_use]
+    pub fn with_kind(mut self, kind: ItemDeltaKind) -> Self {
+        self.kind = kind;
+        self
     }
 }
 

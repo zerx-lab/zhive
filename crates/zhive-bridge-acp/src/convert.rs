@@ -27,6 +27,7 @@ use zhive_proto::domain::{
     Item, ItemContent, ItemToolCallContent, PlanStep, PlanStepStatus, ResourceContents,
     ToolCallStatus as ZToolStatus, ToolKind as ZToolKind,
 };
+use zhive_proto::events::ItemDeltaKind;
 
 /// Converts an ACP [`ContentBlock`] into a zhive [`ItemContent`].
 ///
@@ -324,6 +325,7 @@ fn tool_call_id_for(item: &Item) -> ToolCallId {
 /// let item = Item::ToolCall {
 ///     id: ItemId("item:t/0".into()),
 ///     name: "read_file".into(),
+///     title: None,
 ///     kind: ToolKind::Read,
 ///     status: ToolCallStatus::InProgress,
 ///     content: vec![],
@@ -340,6 +342,7 @@ fn tool_call_id_for(item: &Item) -> ToolCallId {
 pub fn tool_call_to_acp(item: &Item) -> Option<ToolCall> {
     let Item::ToolCall {
         name,
+        title,
         kind,
         status,
         content,
@@ -356,7 +359,10 @@ pub fn tool_call_to_acp(item: &Item) -> Option<ToolCall> {
         .cloned()
         .map(tool_call_content_to_acp)
         .collect();
-    let mut call = ToolCall::new(tool_call_id, name.clone())
+    // Prefer the tool-supplied title (e.g. `$ cargo check`); fall back to the
+    // bare tool name when none was provided.
+    let acp_title = title.clone().unwrap_or_else(|| name.clone());
+    let mut call = ToolCall::new(tool_call_id, acp_title)
         .kind(tool_kind_to_acp(*kind))
         .status(tool_status_to_acp(*status))
         .content(acp_content);
@@ -379,6 +385,7 @@ pub fn tool_call_to_acp(item: &Item) -> Option<ToolCall> {
 /// let item = Item::ToolCall {
 ///     id: ItemId("item:t/0".into()),
 ///     name: "read_file".into(),
+///     title: None,
 ///     kind: ToolKind::Read,
 ///     status: ToolCallStatus::Completed,
 ///     content: vec![],
@@ -394,6 +401,7 @@ pub fn tool_call_to_acp(item: &Item) -> Option<ToolCall> {
 pub fn tool_call_update_to_acp(item: &Item) -> Option<ToolCallUpdate> {
     let Item::ToolCall {
         name,
+        title,
         kind,
         status,
         content,
@@ -410,8 +418,11 @@ pub fn tool_call_update_to_acp(item: &Item) -> Option<ToolCallUpdate> {
         .cloned()
         .map(tool_call_content_to_acp)
         .collect();
+    // Same title fallback as `tool_call_to_acp` so the headline stays stable
+    // across the initial call and subsequent updates.
+    let acp_title = title.clone().unwrap_or_else(|| name.clone());
     let fields = ToolCallUpdateFields::new()
-        .title(name.clone())
+        .title(acp_title)
         .kind(tool_kind_to_acp(*kind))
         .status(tool_status_to_acp(*status))
         .content(acp_content)
@@ -434,13 +445,16 @@ pub fn tool_call_update_to_acp(item: &Item) -> Option<ToolCallUpdate> {
 /// the client render the agent's text a second time. `AgentMessageChunk` is
 /// therefore produced only on the delta path ([`delta_to_session_update`]).
 ///
-/// Thought/reasoning text, by contrast, has *no* delta path — it finalises as a
-/// single item — so `AgentThought` / `Reasoning` are forwarded here unchanged.
+/// Native reasoning also has a delta path now (`ItemDelta` with
+/// [`ItemDeltaKind::Reasoning`]), so [`Item::Reasoning`] is suppressed here for
+/// the same dedup reason. `Item::AgentThought` (codex-only, no delta stream) is
+/// still forwarded whole.
 ///
 /// [`EngineEvent::ItemDelta`]: zhive_core::engine::event::EngineEvent::ItemDelta
 ///
-/// * `AgentMessage` → `None` (already streamed live as deltas)
-/// * `AgentThought` / `Reasoning` → `AgentThoughtChunk`
+/// * `AgentMessage` → `None` (already streamed live as text deltas)
+/// * `Reasoning` → `None` (already streamed live as reasoning deltas)
+/// * `AgentThought` → `AgentThoughtChunk` (codex-only, no delta path)
 /// * `ToolCall` → `ToolCall`
 /// * `Plan` → `Plan`
 ///
@@ -470,9 +484,15 @@ pub fn item_to_session_update(item: &Item) -> Option<SessionUpdate> {
         Item::AgentThought { text, .. } => Some(SessionUpdate::AgentThoughtChunk(
             ContentChunk::new(ContentBlock::Text(TextContent::new(text.clone()))),
         )),
-        Item::Reasoning { summary, .. } => Some(SessionUpdate::AgentThoughtChunk(
-            ContentChunk::new(ContentBlock::Text(TextContent::new(summary.join("\n")))),
-        )),
+        // Suppressed: native reasoning streams live via ItemDelta
+        // (`ItemDeltaKind::Reasoning`) → `delta_to_session_update`. Re-emitting
+        // the finalised block would duplicate the thought in the client, exactly
+        // as with `AgentMessage` above.
+        #[expect(
+            clippy::match_same_arms,
+            reason = "explicit arm documents the deliberate Reasoning dedup"
+        )]
+        Item::Reasoning { .. } => None,
         Item::ToolCall { .. } => tool_call_to_acp(item).map(SessionUpdate::ToolCall),
         Item::Plan { steps, .. } => Some(SessionUpdate::Plan(plan_steps_to_acp(steps.clone()))),
         Item::SystemNotice { message, .. } => Some(SessionUpdate::AgentMessageChunk(
@@ -485,21 +505,102 @@ pub fn item_to_session_update(item: &Item) -> Option<SessionUpdate> {
     }
 }
 
-/// Maps a streamed text delta to an `AgentMessageChunk` `session/update`.
+/// Maps a [`Item::ToolCall`] to its `session/update`, tracking lifecycle state.
+///
+/// Follows the canonical ACP tool-call lifecycle: the first time a tool-call id
+/// is seen it becomes a `tool_call` (first sighting, establishing the card);
+/// every later event for that id becomes a `tool_call_update` (carrying the new
+/// status, content, and raw output). Clients render tool output from the
+/// *update*, so a single first-sighting `tool_call` with inlined content shows
+/// only the header — this split is what makes the result appear.
+///
+/// The decision keys purely on `seen`, never on status: if the in-progress
+/// announcement is dropped (e.g. a broadcast lag), the finalized item still
+/// arrives as a first-sighting `tool_call` and renders in full.
+///
+/// Returns `None` for non-`ToolCall` items; route those through
+/// [`item_to_session_update`] instead.
+///
+/// # Examples
+///
+/// ```
+/// use std::collections::HashSet;
+/// use agent_client_protocol::schema::SessionUpdate;
+/// use zhive_bridge_acp::convert::tool_call_session_update;
+/// use zhive_proto::domain::{Item, ItemId, ToolKind, ToolCallStatus};
+///
+/// let item = Item::ToolCall {
+///     id: ItemId("item:t/0".into()),
+///     name: "bash".into(),
+///     title: None,
+///     kind: ToolKind::Execute,
+///     status: ToolCallStatus::InProgress,
+///     content: vec![],
+///     locations: vec![],
+///     raw_input: None,
+///     raw_output: None,
+///     provider_tool_call_id: Some("toolu_1".into()),
+/// };
+/// let mut seen = HashSet::new();
+/// // First sighting announces the call.
+/// assert!(matches!(
+///     tool_call_session_update(&item, &mut seen),
+///     Some(SessionUpdate::ToolCall(_))
+/// ));
+/// // The same id again delivers an update (e.g. completion + output).
+/// assert!(matches!(
+///     tool_call_session_update(&item, &mut seen),
+///     Some(SessionUpdate::ToolCallUpdate(_))
+/// ));
+/// ```
+#[must_use]
+pub fn tool_call_session_update<S: std::hash::BuildHasher>(
+    item: &Item,
+    seen: &mut std::collections::HashSet<ToolCallId, S>,
+) -> Option<SessionUpdate> {
+    if !matches!(item, Item::ToolCall { .. }) {
+        return None;
+    }
+    let id = tool_call_id_for(item);
+    if seen.insert(id) {
+        tool_call_to_acp(item).map(SessionUpdate::ToolCall)
+    } else {
+        tool_call_update_to_acp(item).map(SessionUpdate::ToolCallUpdate)
+    }
+}
+
+/// Maps a streamed delta to a `session/update`, keyed by its channel.
+///
+/// A [`ItemDeltaKind::Text`] fragment becomes an `AgentMessageChunk`; a
+/// [`ItemDeltaKind::Reasoning`] fragment becomes an `AgentThoughtChunk`. Both
+/// channels stream live, so the finalised whole blocks
+/// ([`Item::AgentMessage`] / [`Item::Reasoning`]) are suppressed in
+/// [`item_to_session_update`] to avoid double-rendering.
 ///
 /// # Examples
 ///
 /// ```
 /// use agent_client_protocol::schema::SessionUpdate;
+/// use zhive_proto::events::ItemDeltaKind;
 /// use zhive_bridge_acp::convert::delta_to_session_update;
 ///
-/// assert!(matches!(delta_to_session_update("hi"), SessionUpdate::AgentMessageChunk(_)));
+/// assert!(matches!(
+///     delta_to_session_update("hi", ItemDeltaKind::Text),
+///     SessionUpdate::AgentMessageChunk(_)
+/// ));
+/// assert!(matches!(
+///     delta_to_session_update("hmm", ItemDeltaKind::Reasoning),
+///     SessionUpdate::AgentThoughtChunk(_)
+/// ));
 /// ```
 #[must_use]
-pub fn delta_to_session_update(delta: impl Into<String>) -> SessionUpdate {
-    SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(TextContent::new(
-        delta.into(),
-    ))))
+pub fn delta_to_session_update(delta: impl Into<String>, kind: ItemDeltaKind) -> SessionUpdate {
+    let chunk = ContentChunk::new(ContentBlock::Text(TextContent::new(delta.into())));
+    match kind {
+        ItemDeltaKind::Reasoning => SessionUpdate::AgentThoughtChunk(chunk),
+        // Text and any future channel default to a visible message chunk.
+        _ => SessionUpdate::AgentMessageChunk(chunk),
+    }
 }
 
 // ------------------------------------------------------------------
@@ -644,6 +745,7 @@ mod tests {
         let item = Item::ToolCall {
             id: zhive_proto::domain::ItemId("item:t/0".into()),
             name: "bash".into(),
+            title: None,
             kind: ZToolKind::Execute,
             status: ZToolStatus::InProgress,
             content: vec![],
@@ -663,6 +765,7 @@ mod tests {
         let item = Item::ToolCall {
             id: zhive_proto::domain::ItemId("item:t/9".into()),
             name: "bash".into(),
+            title: None,
             kind: ZToolKind::Execute,
             status: ZToolStatus::Completed,
             content: vec![],
@@ -673,6 +776,53 @@ mod tests {
         };
         let id = tool_call_to_acp(&item).unwrap().tool_call_id;
         assert_eq!(id.0.as_ref(), "item:t/9");
+    }
+
+    #[test]
+    fn tool_call_title_prefers_supplied_title_else_name() {
+        // Supplied title wins over the bare tool name on both ACP paths.
+        let with_title = Item::ToolCall {
+            id: zhive_proto::domain::ItemId("item:t/0".into()),
+            name: "bash".into(),
+            title: Some("$ cargo check".into()),
+            kind: ZToolKind::Execute,
+            status: ZToolStatus::Completed,
+            content: vec![],
+            locations: vec![],
+            raw_input: None,
+            raw_output: None,
+            provider_tool_call_id: Some("toolu_t".into()),
+        };
+        assert_eq!(
+            tool_call_to_acp(&with_title).unwrap().title,
+            "$ cargo check"
+        );
+        assert_eq!(
+            tool_call_update_to_acp(&with_title).unwrap().fields.title,
+            Some("$ cargo check".into())
+        );
+
+        // No title falls back to the tool name.
+        let without_title = Item::ToolCall {
+            id: zhive_proto::domain::ItemId("item:t/1".into()),
+            name: "bash".into(),
+            title: None,
+            kind: ZToolKind::Execute,
+            status: ZToolStatus::Completed,
+            content: vec![],
+            locations: vec![],
+            raw_input: None,
+            raw_output: None,
+            provider_tool_call_id: Some("toolu_u".into()),
+        };
+        assert_eq!(tool_call_to_acp(&without_title).unwrap().title, "bash");
+        assert_eq!(
+            tool_call_update_to_acp(&without_title)
+                .unwrap()
+                .fields
+                .title,
+            Some("bash".into())
+        );
     }
 
     #[test]

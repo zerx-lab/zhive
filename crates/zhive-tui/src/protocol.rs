@@ -15,7 +15,8 @@ use serde_json::Value;
 use zhive_proto::domain::{Item, ThreadId, TurnError, TurnId};
 use zhive_proto::events::{
     CompactionCompletedPayload, CompactionDeltaPayload, CompactionFailedPayload,
-    CompactionStartedPayload, ItemAppendedPayload, ItemDeltaPayload, PermissionRequestedPayload,
+    CompactionStartedPayload, ItemAppendedPayload, ItemDeltaKind, ItemDeltaPayload,
+    PermissionRequestedPayload,
     PhaseChangedPayload, SubagentCompletedPayload, SubagentStartedPayload, TurnCompletedPayload,
     TurnFailedPayload, TurnStartedPayload, UsagePayload,
 };
@@ -64,14 +65,16 @@ pub enum EngineNotification {
         /// The appended item (boxed: `Item` is a large enum).
         item: Box<Item>,
     },
-    /// A streamed text fragment for the active turn (token-by-token output).
+    /// A streamed fragment for the active turn (answer text or reasoning).
     ItemDelta {
         /// Owning thread.
         thread_id: ThreadId,
         /// Owning turn.
         turn_id: TurnId,
-        /// The incremental text fragment.
+        /// The incremental fragment.
         delta: String,
+        /// Which channel the fragment belongs to (answer vs. reasoning).
+        kind: ItemDeltaKind,
     },
     /// The engine phase machine transitioned.
     PhaseChanged {
@@ -217,6 +220,7 @@ pub fn decode(method: &str, params: Option<Value>) -> EngineNotification {
                 thread_id: p.thread_id,
                 turn_id: p.turn_id,
                 delta: p.delta,
+                kind: p.kind,
             },
             Err(_) => unhandled(),
         };

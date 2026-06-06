@@ -40,7 +40,8 @@ use futures::StreamExt as _;
 use llmsdk::language_model::{BoxStream, StreamPart};
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
-use zhive_proto::domain::{Item, ItemId, NoticeLevel, ThreadId, TurnError, TurnId};
+use zhive_proto::domain::{Item, ItemId, NoticeLevel, ThreadId, ToolCallStatus, TurnError, TurnId};
+use zhive_proto::events::ItemDeltaKind;
 use zhive_proto::hook::{CompactTrigger, EnginePhase};
 use zhive_proto::permission::PermissionScope;
 
@@ -543,16 +544,26 @@ async fn run_turn_inner(
                     match maybe_part {
                         None => break,
                         Some(Ok(part)) => {
-                            // Stream text fragments live so clients can render
-                            // token-by-token; the block still finalises as one
-                            // AgentMessage via fold below.
-                            if let StreamPart::TextDelta { delta, .. } = &part
-                                && !delta.is_empty()
-                            {
+                            // Stream answer text AND reasoning fragments live so
+                            // clients can render both token-by-token, tagged by
+                            // channel; each block still finalises via fold below
+                            // (AgentMessage / Reasoning), so delta-ignoring
+                            // clients lose nothing.
+                            let live_delta = match &part {
+                                StreamPart::TextDelta { delta, .. } if !delta.is_empty() => {
+                                    Some((delta.clone(), ItemDeltaKind::Text))
+                                }
+                                StreamPart::ReasoningDelta { delta, .. } if !delta.is_empty() => {
+                                    Some((delta.clone(), ItemDeltaKind::Reasoning))
+                                }
+                                _ => None,
+                            };
+                            if let Some((delta, kind)) = live_delta {
                                 let _ = inner.events_tx().send(EngineEvent::ItemDelta {
                                     thread_id: thread_id.clone(),
                                     turn_id: turn_id.clone(),
-                                    delta: delta.clone(),
+                                    delta,
+                                    kind,
                                 });
                             }
                             for item in fold.fold(part) {
@@ -778,6 +789,37 @@ async fn run_turn_inner(
                     format!("tc-fallback-{fallback_id_counter}")
                 }
             };
+
+            // Announce the in-progress tool call BEFORE resolving permission so
+            // ACP clients render a "running" card and the permission prompt can
+            // correlate to it by id (the canonical ACP `tool_call` →
+            // `tool_call_update` lifecycle). This is broadcast only: it is NOT
+            // pushed to the thread tail and NOT persisted, so prompt rebuild and
+            // the rollout still see exactly the one finalized item committed in
+            // PHASE 3. The TUI upserts by `ItemId`, so the later Completed item
+            // replaces this card rather than duplicating it.
+            //
+            // `provider_tool_call_id` is forced to the resolved `tool_use_id`
+            // (not the fold's raw field, which is `None` for non-conformant
+            // streams) so the announcement and the finalized item — which also
+            // sets `Some(tool_use_id)` — map to the same ACP tool-call id.
+            {
+                let mut announce = tool_item.clone();
+                if let Item::ToolCall {
+                    status,
+                    provider_tool_call_id,
+                    ..
+                } = &mut announce
+                {
+                    *status = ToolCallStatus::InProgress;
+                    *provider_tool_call_id = Some(tool_use_id.clone());
+                }
+                let _ = inner.events_tx().send(EngineEvent::ItemAppended {
+                    thread_id: thread_id.clone(),
+                    turn_id: turn_id.clone(),
+                    item: Box::new(announce),
+                });
+            }
 
             let resolution = resolve_tool_permission(
                 inner,

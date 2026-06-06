@@ -682,4 +682,258 @@ impl llmsdk::LanguageModel for MultiScriptedModel {
     }
 }
 
+/// Captures a one-line summary of every `session/update` and answers any
+/// `request_permission` with allow-once, so a test can assert the exact
+/// notification sequence the bridge emits for a tool-call turn.
+struct UpdateCapture {
+    sink: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl agent_client_protocol::HandleDispatchFrom<agent_client_protocol::Agent> for UpdateCapture {
+    async fn handle_dispatch_from(
+        &mut self,
+        message: agent_client_protocol::Dispatch,
+        _cx: ConnectionTo<agent_client_protocol::Agent>,
+    ) -> Result<
+        agent_client_protocol::Handled<agent_client_protocol::Dispatch>,
+        agent_client_protocol::Error,
+    > {
+        use agent_client_protocol::schema::{SessionNotification, SessionUpdate};
+        let message = match message.into_notification::<SessionNotification>()? {
+            Ok(notif) => {
+                let summary = match &notif.update {
+                    SessionUpdate::ToolCall(tc) => format!(
+                        "ToolCall id={} status={:?} content_len={}",
+                        tc.tool_call_id.0,
+                        tc.status,
+                        tc.content.len()
+                    ),
+                    SessionUpdate::ToolCallUpdate(tu) => format!(
+                        "ToolCallUpdate id={} status={:?} content_len={}",
+                        tu.tool_call_id.0,
+                        tu.fields.status,
+                        tu.fields.content.as_ref().map_or(0, Vec::len)
+                    ),
+                    SessionUpdate::AgentMessageChunk(_) => "AgentMessageChunk".to_string(),
+                    other => format!("{other:?}"),
+                };
+                self.sink.lock().expect("sink").push(summary);
+                return Ok(agent_client_protocol::Handled::Yes);
+            }
+            Err(message) => message,
+        };
+        match message.into_request::<RequestPermissionRequest>()? {
+            Ok((req, responder)) => {
+                self.sink.lock().expect("sink").push(format!(
+                    "RequestPermission tool_call_id={}",
+                    req.tool_call.tool_call_id.0
+                ));
+                responder.respond(RequestPermissionResponse::new(
+                    RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(
+                        "allow-once",
+                    )),
+                ))?;
+                Ok(agent_client_protocol::Handled::Yes)
+            }
+            Err(message) => Ok(agent_client_protocol::Handled::No {
+                message,
+                retry: false,
+            }),
+        }
+    }
+
+    fn describe_chain(&self) -> impl std::fmt::Debug {
+        "UpdateCapture"
+    }
+}
+
+#[tokio::test]
+async fn tool_call_announces_then_updates_with_matching_id() {
+    use std::sync::{Arc, Mutex};
+
+    // A tool call must reach the client as the canonical ACP lifecycle:
+    // a first-sighting `tool_call` (announcement), a `request_permission`
+    // referencing the SAME id, then a `tool_call_update` carrying the output —
+    // all sharing one tool-call id so the client correlates them to one card.
+    let engine = scripted_tool_call_engine(PermissionDecision::Ask);
+    let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&captured);
+
+    with_agent_and_client(engine, async move |cx| {
+        let session_id = init_and_new_session(&cx).await?;
+        cx.add_dynamic_handler(UpdateCapture { sink })?
+            .run_indefinitely();
+        cx.send_request(PromptRequest::new(session_id, text_prompt("run echo")))
+            .block_task()
+            .await?;
+        Ok(())
+    })
+    .await;
+
+    let lines = captured.lock().expect("lock").clone();
+
+    let announce = lines
+        .iter()
+        .find(|l| l.starts_with("ToolCall "))
+        .expect("a first-sighting ToolCall announcement");
+    assert!(
+        announce.contains("status=InProgress"),
+        "announcement must be in-progress, got: {announce}"
+    );
+
+    let permission = lines
+        .iter()
+        .find(|l| l.starts_with("RequestPermission "))
+        .expect("a permission request");
+
+    let update = lines
+        .iter()
+        .find(|l| l.starts_with("ToolCallUpdate "))
+        .expect("a ToolCallUpdate carrying the result");
+    assert!(
+        update.contains("content_len=1"),
+        "the update must carry the tool output, got: {update}"
+    );
+
+    // All three must reference the same provider tool-call id ("tc-0").
+    assert!(announce.contains("id=tc-0"), "announce id: {announce}");
+    assert!(
+        permission.contains("tool_call_id=tc-0"),
+        "permission id: {permission}"
+    );
+    assert!(update.contains("id=tc-0"), "update id: {update}");
+}
+
+/// A deterministic in-memory model catalogue for the config-option tests.
+#[derive(Debug)]
+struct TestCatalog;
+
+#[async_trait::async_trait]
+impl zhive_core::engine::ModelCatalog for TestCatalog {
+    async fn list(
+        &self,
+    ) -> Result<Vec<zhive_proto::rpc::ModelDescriptor>, zhive_core::engine::ModelCatalogError> {
+        use zhive_proto::domain::ThinkingEffort;
+        use zhive_proto::rpc::ModelDescriptor;
+        Ok(vec![
+            ModelDescriptor::new("model-a".to_owned())
+                .with_context_window(Some(200_000))
+                .with_supported_efforts(vec![ThinkingEffort::Off, ThinkingEffort::High])
+                .with_active(true),
+            ModelDescriptor::new("model-b".to_owned()).with_context_window(Some(1_000_000)),
+        ])
+    }
+
+    fn switch(
+        &self,
+        model_id: &str,
+        context_window_hint: Option<u64>,
+    ) -> Result<zhive_core::engine::SwitchedModel, zhive_core::engine::ModelCatalogError> {
+        let window = context_window_hint.or(Some(123_456));
+        Ok(zhive_core::engine::SwitchedModel::new(
+            ScriptedModel::new("stub", model_id, vec![]).into_dyn(),
+            window,
+        ))
+    }
+}
+
+/// Returns the `select` current value for the config option with `id`, if any.
+fn config_current_value(
+    options: &[agent_client_protocol::schema::SessionConfigOption],
+    id: &str,
+) -> Option<String> {
+    use agent_client_protocol::schema::SessionConfigKind;
+    let option = options.iter().find(|o| o.id.0.as_ref() == id)?;
+    match &option.kind {
+        SessionConfigKind::Select(sel) => Some(sel.current_value.0.to_string()),
+        _ => None,
+    }
+}
+
+#[tokio::test]
+async fn new_session_advertises_model_and_effort_config_options() {
+    use agent_client_protocol::schema::{NewSessionRequest, ProtocolVersion};
+
+    // With a catalogue injected, `session/new` must surface a model selector and
+    // a reasoning-depth selector so the editor renders both dropdowns.
+    let engine = scripted_text_engine().with_model_catalog(std::sync::Arc::new(TestCatalog));
+
+    let options = with_agent_and_client(engine, async move |cx| {
+        cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
+            .block_task()
+            .await?;
+        let resp = cx
+            .send_request(NewSessionRequest::new("/tmp"))
+            .block_task()
+            .await?;
+        Ok(resp.config_options.unwrap_or_default())
+    })
+    .await;
+
+    assert_eq!(
+        config_current_value(&options, "model").as_deref(),
+        Some("model-a"),
+        "model selector defaults to the active model"
+    );
+    assert_eq!(
+        config_current_value(&options, "effort").as_deref(),
+        Some("off"),
+        "reasoning selector defaults to the model's first depth"
+    );
+}
+
+#[tokio::test]
+async fn set_config_option_switches_effort_and_model() {
+    use agent_client_protocol::schema::{
+        NewSessionRequest, ProtocolVersion, SetSessionConfigOptionRequest,
+    };
+
+    let engine = scripted_text_engine().with_model_catalog(std::sync::Arc::new(TestCatalog));
+
+    let (after_effort, after_model) = with_agent_and_client(engine, async move |cx| {
+        cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
+            .block_task()
+            .await?;
+        let session = cx
+            .send_request(NewSessionRequest::new("/tmp"))
+            .block_task()
+            .await?
+            .session_id;
+
+        // Pick the High reasoning depth; the response echoes the new value.
+        let effort_resp = cx
+            .send_request(SetSessionConfigOptionRequest::new(
+                session.clone(),
+                "effort",
+                "high",
+            ))
+            .block_task()
+            .await?;
+
+        // Switch the active model; the response reflects the new selection.
+        let model_resp = cx
+            .send_request(SetSessionConfigOptionRequest::new(
+                session.clone(),
+                "model",
+                "model-b",
+            ))
+            .block_task()
+            .await?;
+
+        Ok((effort_resp.config_options, model_resp.config_options))
+    })
+    .await;
+
+    assert_eq!(
+        config_current_value(&after_effort, "effort").as_deref(),
+        Some("high"),
+        "the effort selection must round-trip in the response"
+    );
+    assert_eq!(
+        config_current_value(&after_model, "model").as_deref(),
+        Some("model-b"),
+        "the model switch must be reflected as the new active model"
+    );
+}
+
 // Rust guideline compliant 2026-02-21

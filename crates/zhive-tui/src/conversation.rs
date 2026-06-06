@@ -8,6 +8,7 @@
 //! inherent race between an RPC reply and the broadcast events it triggers.
 
 use zhive_proto::domain::{Item, ThreadId, ToolCallStatus, TurnId};
+use zhive_proto::events::ItemDeltaKind;
 
 use crate::protocol::EngineNotification;
 
@@ -218,14 +219,23 @@ pub struct Conversation {
     pub busy: bool,
     /// Live partial text for the in-flight agent message (token streaming).
     ///
-    /// Accumulated from `ItemDelta` events and shown as a provisional message;
-    /// cleared the moment the finalised `Item::AgentMessage` is appended, so
-    /// the real item supersedes it without duplication.
+    /// Accumulated from `ItemDelta` events with [`ItemDeltaKind::Text`] and
+    /// shown as a provisional message; cleared the moment the finalised
+    /// `Item::AgentMessage` is appended, so the real item supersedes it without
+    /// duplication.
     pub streaming: String,
     /// Byte offset into `streaming` up to which text has been revealed to the
     /// renderer (the smooth-reveal cursor). Always a char boundary; reset to 0
     /// whenever the buffer is cleared via [`Conversation::clear_streaming`].
     revealed: usize,
+    /// Live partial reasoning trace for the in-flight turn (token streaming).
+    ///
+    /// Accumulated from `ItemDelta` events with [`ItemDeltaKind::Reasoning`] and
+    /// shown as a provisional thinking block; cleared alongside [`Self::streaming`]
+    /// when the turn's items finalise.
+    pub streaming_reasoning: String,
+    /// Smooth-reveal cursor into [`Self::streaming_reasoning`] (see [`Self::revealed`]).
+    revealed_reasoning: usize,
     /// Last transient error (rejected turn, transport hiccup) for the status bar.
     pub last_error: Option<String>,
     /// Subagents spawned within this conversation, in spawn order.
@@ -240,6 +250,50 @@ const REVEAL_FLOOR: usize = 3;
 /// Fraction of the remaining backlog revealed per tick (geometric drain).
 const REVEAL_RATIO: f64 = 0.20;
 
+/// Returns the already-revealed prefix of a streaming buffer.
+///
+/// Clamps defensively so a `revealed` cursor left past the buffer end — or
+/// mid-multibyte — can never cause a slice panic.
+fn revealed_prefix(buf: &str, revealed: usize) -> &str {
+    let mut end = revealed.min(buf.len());
+    while end > 0 && !buf.is_char_boundary(end) {
+        end -= 1;
+    }
+    &buf[..end]
+}
+
+/// Advances a smooth-reveal cursor over `buf` by one adaptive step.
+///
+/// Reveals `max(REVEAL_FLOOR, ceil(backlog * REVEAL_RATIO))` chars so the
+/// backlog drains geometrically. Returns the new cursor (a char boundary);
+/// a no-op once caught up.
+fn advance_cursor(buf: &str, revealed: usize) -> usize {
+    // Defensive clamp first: a stale cursor must never index past the end or
+    // land mid-multibyte.
+    let mut revealed = revealed.min(buf.len());
+    while revealed > 0 && !buf.is_char_boundary(revealed) {
+        revealed -= 1;
+    }
+    if revealed >= buf.len() {
+        return revealed;
+    }
+    let tail = &buf[revealed..];
+    let backlog_chars = tail.chars().count();
+    #[expect(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "reveal step is a small count; f64 round-trip is exact at these sizes"
+    )]
+    let step = ((backlog_chars as f64) * REVEAL_RATIO).ceil() as usize;
+    let step = step.max(REVEAL_FLOOR).min(backlog_chars);
+    let advance_bytes = tail
+        .char_indices()
+        .nth(step)
+        .map_or(tail.len(), |(byte_off, _)| byte_off);
+    revealed + advance_bytes
+}
+
 impl Conversation {
     /// Creates an empty conversation bound to `thread_id`.
     #[must_use]
@@ -250,67 +304,49 @@ impl Conversation {
             busy: false,
             streaming: String::new(),
             revealed: 0,
+            streaming_reasoning: String::new(),
+            revealed_reasoning: 0,
             last_error: None,
             subagents: Vec::new(),
         }
     }
 
-    /// Clears the streaming buffer and resets the reveal cursor together.
+    /// Clears both streaming buffers (answer and reasoning) and their cursors.
     ///
-    /// The single clear site keeps `revealed` from ever stranding past a now
+    /// The single clear site keeps each cursor from ever stranding past a now
     /// shorter (or empty) buffer.
     pub(crate) fn clear_streaming(&mut self) {
         self.streaming = String::new();
         self.revealed = 0;
+        self.streaming_reasoning = String::new();
+        self.revealed_reasoning = 0;
     }
 
-    /// Returns the already-revealed prefix of the live streaming buffer.
-    ///
-    /// Clamps defensively so an external mutation that left `revealed` past the
-    /// buffer end — or mid-multibyte — can never cause a slice panic.
+    /// Returns the already-revealed prefix of the live answer buffer.
     pub(crate) fn revealed_streaming(&self) -> &str {
-        let mut end = self.revealed.min(self.streaming.len());
-        while end > 0 && !self.streaming.is_char_boundary(end) {
-            end -= 1;
-        }
-        &self.streaming[..end]
+        revealed_prefix(&self.streaming, self.revealed)
     }
 
-    /// Advances the reveal cursor by an adaptive step (called once per tick).
+    /// Returns the already-revealed prefix of the live reasoning buffer.
+    pub(crate) fn revealed_reasoning(&self) -> &str {
+        revealed_prefix(&self.streaming_reasoning, self.revealed_reasoning)
+    }
+
+    /// Advances both reveal cursors by an adaptive step (called once per tick).
     ///
-    /// Reveals `max(REVEAL_FLOOR, ceil(backlog * REVEAL_RATIO))` chars so the
-    /// backlog drains geometrically — long replies finish fast, slow streams
-    /// still progress. A no-op once caught up.
+    /// Reveals `max(REVEAL_FLOOR, ceil(backlog * REVEAL_RATIO))` chars per
+    /// channel so each backlog drains geometrically — long replies finish fast,
+    /// slow streams still progress. A no-op for a channel once caught up.
     pub(crate) fn advance_reveal(&mut self) {
-        // Defensive clamp first: a stale cursor (e.g. after an external reset)
-        // must never index past the end or land mid-multibyte.
-        self.revealed = self.revealed.min(self.streaming.len());
-        while self.revealed > 0 && !self.streaming.is_char_boundary(self.revealed) {
-            self.revealed -= 1;
-        }
-        if self.revealed >= self.streaming.len() {
-            return;
-        }
-        let tail = &self.streaming[self.revealed..];
-        let backlog_chars = tail.chars().count();
-        #[expect(
-            clippy::cast_precision_loss,
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss,
-            reason = "reveal step is a small count; f64 round-trip is exact at these sizes"
-        )]
-        let step = ((backlog_chars as f64) * REVEAL_RATIO).ceil() as usize;
-        let step = step.max(REVEAL_FLOOR).min(backlog_chars);
-        let advance_bytes = tail
-            .char_indices()
-            .nth(step)
-            .map_or(tail.len(), |(byte_off, _)| byte_off);
-        self.revealed += advance_bytes;
+        self.revealed = advance_cursor(&self.streaming, self.revealed);
+        self.revealed_reasoning =
+            advance_cursor(&self.streaming_reasoning, self.revealed_reasoning);
     }
 
-    /// `true` when every received byte has been revealed (or the buffer empty).
+    /// `true` when every received byte (both channels) has been revealed.
     pub(crate) fn reveal_caught_up(&self) -> bool {
         self.revealed >= self.streaming.len()
+            && self.revealed_reasoning >= self.streaming_reasoning.len()
     }
 
     /// `true` when buffered text remains to be revealed (keeps ticks firing).
@@ -356,7 +392,7 @@ impl Conversation {
     pub fn load_history(&mut self, items: Vec<Item>) {
         self.turns.clear();
         self.subagents.clear();
-        self.streaming.clear();
+        self.clear_streaming();
         self.busy = false;
         for item in items {
             let turn_id = history_turn_id(&item)
@@ -451,8 +487,12 @@ impl Conversation {
                 self.clear_streaming();
                 self.turn_mut(turn_id).upsert((**item).clone());
             }
-            EngineNotification::ItemDelta { delta, .. } => {
-                self.streaming.push_str(delta);
+            EngineNotification::ItemDelta { delta, kind, .. } => {
+                match kind {
+                    ItemDeltaKind::Reasoning => self.streaming_reasoning.push_str(delta),
+                    // Text and any future channel default to the answer body.
+                    _ => self.streaming.push_str(delta),
+                }
                 self.busy = true;
             }
             EngineNotification::TurnCompleted { turn_id, .. } => {
@@ -695,11 +735,13 @@ mod tests {
             thread_id: tid(),
             turn_id: turn("turn:1/0"),
             delta: "hel".to_owned(),
+            kind: ItemDeltaKind::Text,
         });
         conv.apply(&EngineNotification::ItemDelta {
             thread_id: tid(),
             turn_id: turn("turn:1/0"),
             delta: "lo".to_owned(),
+            kind: ItemDeltaKind::Text,
         });
         assert_eq!(conv.streaming, "hello");
         assert!(conv.busy);
@@ -713,6 +755,55 @@ mod tests {
         assert_eq!(conv.item_count(), 1, "no duplicate from the stream");
     }
 
+    #[test]
+    fn reasoning_deltas_stream_separately_from_answer() {
+        let mut conv = Conversation::new(tid());
+        conv.apply(&EngineNotification::TurnStarted {
+            thread_id: tid(),
+            turn_id: turn("turn:1/0"),
+        });
+        // Reasoning and answer fragments interleave on the same notification but
+        // accumulate into separate buffers, keyed by `kind`.
+        conv.apply(&EngineNotification::ItemDelta {
+            thread_id: tid(),
+            turn_id: turn("turn:1/0"),
+            delta: "let me think".to_owned(),
+            kind: ItemDeltaKind::Reasoning,
+        });
+        conv.apply(&EngineNotification::ItemDelta {
+            thread_id: tid(),
+            turn_id: turn("turn:1/0"),
+            delta: "the answer".to_owned(),
+            kind: ItemDeltaKind::Text,
+        });
+        assert_eq!(conv.streaming_reasoning, "let me think");
+        assert_eq!(conv.streaming, "the answer");
+
+        // Finalising the turn clears both provisional buffers.
+        conv.apply(&EngineNotification::ItemAppended {
+            thread_id: tid(),
+            turn_id: turn("turn:1/0"),
+            item: Box::new(agent_item("item:a", "the answer")),
+        });
+        assert!(conv.streaming.is_empty());
+        assert!(conv.streaming_reasoning.is_empty());
+    }
+
+    #[test]
+    fn reveal_advances_both_channels() {
+        let mut conv = Conversation::new(tid());
+        conv.streaming = "answer body here".to_owned();
+        conv.streaming_reasoning = "reasoning trace here".to_owned();
+        assert!(conv.is_revealing());
+        // Drain both backlogs; neither reveal may panic on multibyte clamps.
+        for _ in 0..40 {
+            conv.advance_reveal();
+        }
+        assert!(conv.reveal_caught_up());
+        assert_eq!(conv.revealed_streaming(), conv.streaming);
+        assert_eq!(conv.revealed_reasoning(), conv.streaming_reasoning);
+    }
+
     fn child_tid() -> ThreadId {
         ThreadId(Arc::from("thread:subagent/test/1"))
     }
@@ -721,6 +812,7 @@ mod tests {
         Item::ToolCall {
             id: ItemId(Arc::from(id)),
             name: name.to_owned(),
+            title: None,
             kind: ToolKind::default(),
             status,
             content: Vec::new(),

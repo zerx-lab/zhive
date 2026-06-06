@@ -1163,6 +1163,7 @@ mod tests {
         let in_progress = Item::ToolCall {
             id: ItemId(Arc::from("item:tc/0")),
             name: "echo".into(),
+            title: None,
             kind: zhive_proto::domain::ToolKind::Other,
             status: zhive_proto::domain::ToolCallStatus::InProgress,
             content: vec![],
@@ -1177,6 +1178,7 @@ mod tests {
         let completed = Item::ToolCall {
             id: ItemId(Arc::from("item:tc/0")),
             name: "echo".into(),
+            title: None,
             kind: zhive_proto::domain::ToolKind::Other,
             status: zhive_proto::domain::ToolCallStatus::Completed,
             content: vec![],

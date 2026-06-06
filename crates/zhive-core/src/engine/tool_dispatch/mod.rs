@@ -597,7 +597,8 @@ async fn resolve_tool_permission_inner(
             );
 
             // Build reverse-RPC request inside the span context (sync).
-            let request = perm_span.in_scope(|| build_permission_request(thread_id_str, tool_name));
+            let request = perm_span
+                .in_scope(|| build_permission_request(thread_id_str, tool_name, tool_use_id));
             let request = match request {
                 Ok(r) => r,
                 Err(err) => {
@@ -1178,6 +1179,10 @@ async fn execute_resolved_tool_inner(
     let item = Item::ToolCall {
         id: item_id,
         name: tool_name.to_owned(),
+        // Tool-supplied one-line headline (e.g. `$ cargo check` for bash) so
+        // ACP clients show the command rather than the bare tool name.
+        // Computed before `args` is moved into `raw_input` below.
+        title: tool.title(&args),
         // Propagate the tool's self-declared kind (Read / Edit / Execute) so
         // UI grouping and permission policy can distinguish, e.g., a read from
         // a shell execution. `tool` is the resolved registry entry above.

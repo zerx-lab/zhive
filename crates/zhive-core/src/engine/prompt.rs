@@ -430,6 +430,7 @@ mod tests {
         Item::ToolCall {
             id: ItemId(Arc::from(id)),
             name: name.to_owned(),
+            title: None,
             kind: ToolKind::Other,
             status: ToolCallStatus::Completed,
             content: vec![ItemToolCallContent::Content {
@@ -529,6 +530,7 @@ mod tests {
             .push_item(Item::ToolCall {
                 id: ItemId(Arc::from("item:fallback-0")),
                 name: "echo".to_owned(),
+                title: None,
                 kind: ToolKind::Other,
                 status: ToolCallStatus::Completed,
                 content: vec![ItemToolCallContent::Content {
@@ -582,6 +584,7 @@ mod tests {
             .push_item(Item::ToolCall {
                 id: ItemId(Arc::from("item:denied-0")),
                 name: "echo".to_owned(),
+                title: None,
                 kind: ToolKind::Other,
                 status: ToolCallStatus::Failed,
                 content: vec![ItemToolCallContent::Content {
@@ -633,6 +636,7 @@ mod tests {
             .push_item(Item::ToolCall {
                 id: ItemId(Arc::from("item:inprog-0")),
                 name: "echo".to_owned(),
+                title: None,
                 kind: ToolKind::Other,
                 status: ToolCallStatus::InProgress,
                 content: vec![],
@@ -878,6 +882,7 @@ mod tests {
             .push_item(Item::ToolCall {
                 id: ItemId(Arc::from("item:trunc-0")),
                 name: "read_file".to_owned(),
+                title: None,
                 kind: ToolKind::Other,
                 status: ToolCallStatus::Completed,
                 content: vec![ItemToolCallContent::Content {
