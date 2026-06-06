@@ -364,8 +364,9 @@ async fn event_loop(
                             // A left click on the welcome logo sends a ripple from
                             // the click point. The hit-rect is only honored while
                             // the welcome screen is live, so a stale rect cannot
-                            // fire a phantom ripple. Off the welcome screen, a
-                            // left press begins a transcript text selection.
+                            // fire a phantom ripple. Otherwise a left press begins
+                            // a composer or transcript text selection (routed by
+                            // `pointer_down`).
                             MouseEventKind::Down(MouseButton::Left) => {
                                 let hit = app.logo_hit.get();
                                 if app.welcome_active()
@@ -379,14 +380,14 @@ async fn event_loop(
                                         mouse.column.saturating_sub(rect.x),
                                         mouse.row.saturating_sub(rect.y),
                                     );
-                                } else if !app.welcome_active() {
-                                    app.selection_start(mouse.column, mouse.row);
+                                } else {
+                                    app.pointer_down(mouse.column, mouse.row);
                                 }
                             }
                             // Drag extends the selection; release ends the drag
                             // (the selection persists for a subsequent Ctrl+C).
                             MouseEventKind::Drag(MouseButton::Left) => {
-                                app.selection_update(mouse.column, mouse.row);
+                                app.pointer_drag(mouse.column, mouse.row);
                             }
                             // A release ends the drag; a plain click (no drag)
                             // toggles the collapsible block under the pointer.

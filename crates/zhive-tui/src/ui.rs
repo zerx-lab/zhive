@@ -1324,7 +1324,58 @@ fn render_composer(frame: &mut Frame, app: &App, area: Rect) -> (Rect, u16) {
         (Text::from(lines).style(Style::new().fg(p.fg)), scroll)
     };
     frame.render_widget(Paragraph::new(text).scroll((scroll, 0)), inner);
+
+    // Capture geometry (+ wrapped rows while a selection is live) so a mouse
+    // drag can map onto the composer text, then overpaint the highlight. The
+    // row clone is gated on an active selection, so an idle composer pays
+    // nothing. The rows must be wrapped to `inner.width` to match the rendered
+    // layout exactly, so the hit-test and highlight stay aligned.
+    app.composer_geom
+        .set(crate::app::SelGeom::new(inner, scroll));
+    if let Some(sel) = app.composer_sel {
+        let mut rows = app.composer_lines.borrow_mut();
+        rows.clear();
+        rows.extend(app.input.wrap_rows(inner.width));
+        drop(rows); // release before `paint_composer_selection` re-borrows
+        paint_composer_selection(frame, app, inner, scroll, sel);
+    }
     (inner, scroll)
+}
+
+/// Overpaints the composer selection background onto the visible input rows.
+///
+/// Mirrors [`paint_selection`] but with no role gutter (the composer text
+/// starts at the inner rect's left edge) and using the composer's own scroll
+/// offset and wrapped-row cache.
+fn paint_composer_selection(
+    frame: &mut Frame,
+    app: &App,
+    inner: Rect,
+    scroll: u16,
+    sel: crate::app::Selection,
+) {
+    let sel_bg = app.palette.sel_bg;
+    let rows = app.composer_lines.borrow();
+    let right = inner.x.saturating_add(inner.width);
+    let buf = frame.buffer_mut();
+    for row in 0..inner.height {
+        let row_idx = usize::from(scroll) + usize::from(row);
+        let Some(text) = rows.get(row_idx) else {
+            break;
+        };
+        let row_width = u16::try_from(UnicodeWidthStr::width(text.as_str())).unwrap_or(u16::MAX);
+        let Some((from, to)) = crate::app::cell_range_for_line(sel, row_idx, row_width) else {
+            continue;
+        };
+        let y = inner.y.saturating_add(row);
+        let start = inner.x.saturating_add(from);
+        let end = inner.x.saturating_add(to).min(right);
+        for x in start..end {
+            if let Some(cell) = buf.cell_mut((x, y)) {
+                cell.set_bg(sel_bg);
+            }
+        }
+    }
 }
 
 /// Splits a wrapped text row on `[Image #N]` tokens and styles them in accent.

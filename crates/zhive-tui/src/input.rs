@@ -478,6 +478,24 @@ impl Input {
     }
 }
 
+/// Returns the character-index start of an `[Image #N]` token that ends exactly
+/// at the end of `text`, or `None` if no such token is present.
+///
+/// Used by [`Input::backspace`] to decide whether to delete a whole token.
+fn image_token_end_before(text: &str) -> Option<usize> {
+    let text = text.strip_suffix(']')?;
+    // Walk backwards over digits for N.
+    let digits_end = text.len();
+    let text = text.trim_end_matches(|c: char| c.is_ascii_digit());
+    if text.len() == digits_end {
+        // No digits found.
+        return None;
+    }
+    let text = text.strip_suffix(" #")?;
+    let text = text.strip_suffix("[Image")?;
+    Some(text.chars().count())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -737,24 +755,6 @@ mod tests {
         input.insert_char('!');
         assert!(input.history_pos.is_none());
     }
-}
-
-/// Returns the character-index start of an `[Image #N]` token that ends exactly
-/// at the end of `text`, or `None` if no such token is present.
-///
-/// Used by [`Input::backspace`] to decide whether to delete a whole token.
-fn image_token_end_before(text: &str) -> Option<usize> {
-    let text = text.strip_suffix(']')?;
-    // Walk backwards over digits for N.
-    let digits_end = text.len();
-    let text = text.trim_end_matches(|c: char| c.is_ascii_digit());
-    if text.len() == digits_end {
-        // No digits found.
-        return None;
-    }
-    let text = text.strip_suffix(" #")?;
-    let text = text.strip_suffix("[Image")?;
-    Some(text.chars().count())
 }
 
 // Rust guideline compliant 2026-02-21

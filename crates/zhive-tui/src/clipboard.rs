@@ -119,9 +119,9 @@ fn run_native(argv: &[&str], text: &str) -> bool {
 ///
 /// # Examples
 ///
-/// ```no_run
-/// # use zhive_tui::clipboard;
-/// if let Some(bytes) = zhive_tui::clipboard::read_image() {
+/// ```ignore
+/// // `read_image` is crate-internal; callers live inside this crate.
+/// if let Some(bytes) = clipboard::read_image() {
 ///     println!("got {} bytes of PNG", bytes.len());
 /// }
 /// ```

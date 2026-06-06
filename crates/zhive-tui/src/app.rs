@@ -241,6 +241,43 @@ fn hit_to_content_clamped(geom: SelGeom, col: u16, row: u16) -> Option<(usize, u
     hit_to_content(geom, col, row)
 }
 
+/// Maps a mouse cell to a composer `(row_idx, cell_x)`, if inside the composer.
+///
+/// Unlike [`hit_to_content`] there is no gutter, so the column is measured from
+/// the inner rect's left edge. `row_idx` is the wrapped-row index (the composer
+/// scroll plus the cell's row within the inner rect). Returns `None` when the
+/// position falls outside the composer's inner rect.
+fn composer_hit(geom: SelGeom, col: u16, row: u16) -> Option<(usize, u16)> {
+    let r = geom.body;
+    if r.width == 0 || r.height == 0 {
+        return None;
+    }
+    let inside = col >= r.x
+        && col < r.x.saturating_add(r.width)
+        && row >= r.y
+        && row < r.y.saturating_add(r.height);
+    if !inside {
+        return None;
+    }
+    let row_idx = usize::from(geom.scroll_y) + usize::from(row - r.y);
+    let cell_x = col.saturating_sub(r.x);
+    Some((row_idx, cell_x))
+}
+
+/// Like [`composer_hit`] but clamps the position into the composer rect first.
+///
+/// Used while dragging so the selection keeps tracking when the pointer strays
+/// just past the composer's edges.
+fn composer_hit_clamped(geom: SelGeom, col: u16, row: u16) -> Option<(usize, u16)> {
+    let r = geom.body;
+    if r.width == 0 || r.height == 0 {
+        return None;
+    }
+    let col = col.clamp(r.x, r.x.saturating_add(r.width).saturating_sub(1));
+    let row = row.clamp(r.y, r.y.saturating_add(r.height).saturating_sub(1));
+    composer_hit(geom, col, row)
+}
+
 /// Returns the content-cell range `[from, to)` selected on `line_idx`, if any.
 ///
 /// `line_width` bounds full-line rows (interior lines of a multi-line
@@ -618,6 +655,23 @@ pub struct App {
     /// Populated only while a [`Self::selection`] exists (there is always a
     /// redraw between mouse-down and copy), so an idle TUI pays nothing.
     pub(crate) sel_lines: RefCell<Vec<String>>,
+    /// Active composer (input area) text selection, if the user is dragging or
+    /// has selected. Coordinates are wrapped-row + display-column, like
+    /// [`Self::selection`] but anchored to the composer rather than the
+    /// transcript. The two are mutually exclusive: starting a drag in one clears
+    /// the other. `None` at rest.
+    pub(crate) composer_sel: Option<Selection>,
+    /// Composer geometry from the last frame, for mouse→row mapping.
+    ///
+    /// `body` is the composer's inner rect (no gutter) and `scroll_y` is its
+    /// vertical scroll offset, so `scroll_y + (row - body.y)` is the wrapped-row
+    /// index under the pointer.
+    pub(crate) composer_geom: Cell<SelGeom>,
+    /// Wrapped composer rows from the last frame, for text extraction.
+    ///
+    /// Populated only while a [`Self::composer_sel`] exists, mirroring the
+    /// [`Self::sel_lines`] hand-off, so an idle composer pays nothing.
+    pub(crate) composer_lines: RefCell<Vec<String>>,
     /// Live context-compaction progress, shown as a streaming panel.
     ///
     /// `Some` from `CompactionStarted` until `CompactionCompleted`; on failure
@@ -719,6 +773,9 @@ impl App {
             selection: None,
             sel_geom: Cell::new(SelGeom::default()),
             sel_lines: RefCell::new(Vec::new()),
+            composer_sel: None,
+            composer_geom: Cell::new(SelGeom::default()),
+            composer_lines: RefCell::new(Vec::new()),
             compaction: None,
             attachments: Vec::new(),
             config,
@@ -860,18 +917,21 @@ impl App {
         }
     }
 
-    /// Commands whose name prefixes the current palette query.
+    /// Skill commands whose name prefixes the current palette query.
     ///
-    /// Built-in commands are listed first, followed by extra runtime commands.
+    /// Only runtime-injected skill commands ([`App::extra_commands`]) populate
+    /// the `/` palette. Built-in commands (`/compact`, `/clear`, `/model`, …)
+    /// remain dispatchable by name through [`Self::run_slash`] but are
+    /// intentionally hidden from the menu, so it lists skills alone.
     #[must_use]
     pub fn palette_matches(&self) -> Vec<SlashCommand> {
         let Some(query) = self.palette_query() else {
             return Vec::new();
         };
-        builtin_commands()
-            .into_iter()
-            .chain(self.extra_commands.iter().cloned())
+        self.extra_commands
+            .iter()
             .filter(|c| c.name.starts_with(query))
+            .cloned()
             .collect()
     }
 
@@ -1091,6 +1151,58 @@ impl App {
         self.logo.spawn(col, row);
     }
 
+    /// Routes a left-button press to the composer or the transcript.
+    ///
+    /// A press inside the composer's inner rect begins a composer text
+    /// selection; otherwise it begins a transcript selection (suppressed on the
+    /// welcome screen, where the body shows the clickable logo, not text).
+    /// Starting one surface's selection clears the other's so only one highlight
+    /// is ever live.
+    pub(crate) fn pointer_down(&mut self, col: u16, row: u16) {
+        if let Some(hit) = composer_hit(self.composer_geom.get(), col, row) {
+            self.selection = None;
+            self.composer_sel = Some(Selection {
+                anchor: hit,
+                cursor: hit,
+                dragging: true,
+            });
+        } else if !self.welcome_active() {
+            self.composer_sel = None;
+            self.selection_start(col, row);
+        }
+    }
+
+    /// Extends whichever selection is mid-drag to the pointer cell.
+    pub(crate) fn pointer_drag(&mut self, col: u16, row: u16) {
+        if self.composer_sel.is_some() {
+            self.composer_selection_update(col, row);
+        } else {
+            self.selection_update(col, row);
+        }
+    }
+
+    /// Extends the in-progress composer selection while dragging.
+    fn composer_selection_update(&mut self, col: u16, row: u16) {
+        let geom = self.composer_geom.get();
+        let Some(sel) = self.composer_sel.as_mut() else {
+            return;
+        };
+        if sel.dragging
+            && let Some(hit) = composer_hit_clamped(geom, col, row)
+        {
+            sel.cursor = hit;
+        }
+    }
+
+    /// Takes the selected composer text and clears the composer selection.
+    ///
+    /// Returns `None` when there is no composer selection or it is empty.
+    pub(crate) fn take_composer_selection_text(&mut self) -> Option<String> {
+        let sel = self.composer_sel.take()?;
+        let text = extract_selection(sel, &self.composer_lines.borrow());
+        (!text.is_empty()).then_some(text)
+    }
+
     /// Begins a transcript selection at a mouse cell, if it hit the body.
     ///
     /// Replaces any prior selection. A no-op when the click lands outside the
@@ -1133,14 +1245,15 @@ impl App {
         }
     }
 
-    /// Whether a transcript selection is currently active.
+    /// Whether a transcript or composer selection is currently active.
     pub(crate) fn has_selection(&self) -> bool {
-        self.selection.is_some()
+        self.selection.is_some() || self.composer_sel.is_some()
     }
 
     /// Drops any active selection (called when the transcript layout shifts).
     pub(crate) fn clear_selection(&mut self) {
         self.selection = None;
+        self.composer_sel = None;
     }
 
     /// Effective expansion of a collapsible block: its override, else baseline.
@@ -1160,6 +1273,16 @@ impl App {
     /// did not move and landed on a collapsible block flips just that block's
     /// expansion instead.
     pub(crate) fn pointer_release(&mut self, col: u16, row: u16) {
+        // A composer drag finalizes in place; a zero-width composer click drops
+        // the selection so it neither lingers nor blocks a later Ctrl+C.
+        if let Some(sel) = self.composer_sel.as_mut() {
+            if sel.anchor == sel.cursor {
+                self.composer_sel = None;
+            } else {
+                sel.dragging = false;
+            }
+            return;
+        }
         let was_click = matches!(self.selection, Some(sel) if sel.anchor == sel.cursor);
         self.selection_finish();
         if was_click {
@@ -1624,6 +1747,17 @@ impl App {
         let palette = self.palette_query().is_some();
         let mention = self.mention_query().is_some();
 
+        // A composer selection is a transient mouse gesture whose row/column
+        // indices go stale the moment the buffer changes. Drop it on the next
+        // key, except Ctrl+C (which copies it) and Esc (the `has_selection` arm
+        // clears it explicitly with selection-cleared semantics).
+        if self.composer_sel.is_some()
+            && !matches!(key.code, KeyCode::Esc)
+            && !(ctrl && matches!(key.code, KeyCode::Char('c')))
+        {
+            self.composer_sel = None;
+        }
+
         match key.code {
             // Ctrl+V / Ctrl+Shift+V: when the terminal's bracketed-paste
             // mechanism sends an empty paste event (clipboard holds a binary
@@ -1639,7 +1773,10 @@ impl App {
             // blank composer, so an unfinished message is never lost to a stray
             // Ctrl+C.
             KeyCode::Char('c') if ctrl => {
-                if let Some(text) = self.take_selection_text() {
+                if let Some(text) = self
+                    .take_selection_text()
+                    .or_else(|| self.take_composer_selection_text())
+                {
                     self.flash = Some("copied selection".to_owned());
                     Action::Copy(text)
                 } else if !self.input.is_blank() {
@@ -1764,6 +1901,16 @@ impl App {
             }
             KeyCode::Char('x') if ctrl => {
                 self.unqueue();
+                Action::None
+            }
+            // Emacs-style line motion: Ctrl+A to the start, Ctrl+E to the end of
+            // the composer buffer (mirrors the bare Home/End cursor moves).
+            KeyCode::Char('a') if ctrl => {
+                self.input.move_home();
+                Action::None
+            }
+            KeyCode::Char('e') if ctrl => {
+                self.input.move_end();
                 Action::None
             }
             // Flip the expansion baseline for every collapsible block at once,
@@ -2223,6 +2370,32 @@ pub fn filter_models<'a>(
                     .is_some_and(|d| d.to_lowercase().contains(&needle))
         })
         .collect()
+}
+
+/// Removes all `[Image #N]` placeholder tokens from `text`, returning the
+/// remaining text.  Called when attachments are cleared via `Esc` to keep the
+/// input buffer consistent with the (now-empty) attachment store.
+pub(crate) fn strip_image_placeholders(text: &str) -> String {
+    let tag = "[Image #";
+    let mut result = String::with_capacity(text.len());
+    let mut rest = text;
+    loop {
+        if let Some(start) = rest.find(tag) {
+            result.push_str(&rest[..start]);
+            let after = &rest[start + tag.len()..];
+            if let Some(end) = after.find(']') {
+                rest = &after[end + 1..];
+            } else {
+                // Unterminated token — keep remainder verbatim.
+                result.push_str(&rest[start..]);
+                break;
+            }
+        } else {
+            result.push_str(rest);
+            break;
+        }
+    }
+    result
 }
 
 #[cfg(test)]
@@ -2824,29 +2997,48 @@ mod tests {
 
     #[test]
     fn palette_enter_executes_highlighted_command() {
-        let mut app = app();
-        type_text(&mut app, "/he");
-        // Single Enter dispatches the highlighted no-arg command (opens Help).
-        assert_eq!(app.on_key(key(KeyCode::Enter)), Action::None);
-        assert!(matches!(app.overlay, Some(Overlay::Help)));
+        let mut app = app_with_skills();
+        app.on_key(key(KeyCode::Char('/')));
+        // Move the highlight off the first entry; a single Enter then dispatches
+        // the *highlighted* skill, not merely the first match.
+        app.on_key(ctrl(KeyCode::Char('n')));
+        let highlighted = app.palette_matches()[app.palette_index].name.clone();
+        match app.on_key(key(KeyCode::Enter)) {
+            Action::Submit(text) => {
+                assert!(text.contains(&format!("name=\"{highlighted}\"")));
+            }
+            other => panic!("expected Submit of the highlighted skill, got {other:?}"),
+        }
     }
 
     #[test]
     fn palette_enter_on_arg_command_completes_without_dispatch() {
         let mut app = app();
-        type_text(&mut app, "/th");
-        // /theme takes an arg → Enter completes to "/theme " and waits.
+        // An arg-taking palette command completes to "/name " and waits for the
+        // argument. Built-ins are hidden from the palette, so use a skill-style
+        // extra command to exercise the arg-completion path.
+        app.set_extra_commands(vec![SlashCommand::from_static(
+            "deploy",
+            "deploy to an environment",
+            true,
+        )]);
+        type_text(&mut app, "/de");
         assert_eq!(app.on_key(key(KeyCode::Enter)), Action::None);
-        assert_eq!(app.input.value(), "/theme ");
+        assert_eq!(app.input.value(), "/deploy ");
         assert!(app.overlay.is_none());
     }
 
     #[test]
     fn ctrl_n_p_wrap_palette_selection() {
         let mut app = app();
+        app.set_extra_commands(vec![
+            SlashCommand::from_static("alpha", "a", false),
+            SlashCommand::from_static("beta", "b", false),
+            SlashCommand::from_static("gamma", "c", false),
+        ]);
         app.on_key(key(KeyCode::Char('/')));
         let n = app.palette_matches().len();
-        assert!(n > 1, "several builtins match an empty query");
+        assert!(n > 1, "several skill commands match an empty query");
         // Ctrl+P from the top wraps to the bottom.
         app.on_key(ctrl(KeyCode::Char('p')));
         assert_eq!(app.palette_index, n - 1);
@@ -2973,17 +3165,20 @@ mod tests {
 
     #[test]
     fn palette_activates_on_slash_and_filters() {
-        let mut app = app();
+        let mut app = app_with_skills();
         assert!(app.palette_query().is_none());
         app.on_key(key(KeyCode::Char('/')));
         assert_eq!(app.palette_query(), Some(""));
-        for c in "mo".chars() {
+        for c in "com".chars() {
             app.on_key(key(KeyCode::Char(c)));
         }
-        assert_eq!(app.palette_query(), Some("mo"));
+        assert_eq!(app.palette_query(), Some("com"));
         let matches = app.palette_matches();
-        assert!(matches.iter().any(|c| c.name == "model"));
-        assert!(!matches.iter().any(|c| c.name == "help"));
+        assert!(matches.iter().any(|c| c.name == "commit"));
+        // Built-in commands are intentionally hidden from the palette, even when
+        // their name would otherwise prefix-match the query.
+        assert!(!matches.iter().any(|c| c.name == "compact"));
+        assert!(!matches.iter().any(|c| c.name == "model"));
         // A space ends command composition and closes the palette.
         app.on_key(key(KeyCode::Char(' ')));
         assert!(app.palette_query().is_none());
@@ -3010,12 +3205,14 @@ mod tests {
 
     #[test]
     fn tab_autocompletes_unique_command() {
-        let mut app = app();
-        for c in "/co".chars() {
+        // Tab completes the highlighted palette match. Built-ins are hidden, so
+        // the palette is populated from skills; "/com" uniquely prefixes commit.
+        let mut app = app_with_skills();
+        for c in "/com".chars() {
             app.on_key(key(KeyCode::Char(c)));
         }
         app.on_key(key(KeyCode::Tab));
-        assert_eq!(app.input.value(), "/compact ");
+        assert_eq!(app.input.value(), "/commit ");
     }
 
     // ---- token usage ----
@@ -3119,25 +3316,24 @@ mod tests {
     }
 
     #[test]
-    fn extra_command_does_not_shadow_builtin() {
+    fn builtins_are_hidden_from_palette_but_still_dispatch() {
         let mut app = app();
-        // An extra command with a matching prefix must not hide the builtin.
-        app.set_extra_commands(vec![SlashCommand::from_static(
-            "helpx",
-            "extended help",
-            false,
-        )]);
+        // A skill command coexists, but built-ins never populate the palette.
+        app.set_extra_commands(vec![SlashCommand::from_static("deploy", "deploy", false)]);
         for c in "/help".chars() {
             app.on_key(key(KeyCode::Char(c)));
         }
         let matches = app.palette_matches();
         assert!(
-            matches.iter().any(|c| c.name == "help"),
-            "builtin help must still appear"
+            matches.is_empty(),
+            "no skill prefixes /help, and built-ins are hidden, so the palette is empty"
         );
+        // With nothing highlighted, Enter falls back to name dispatch: the
+        // built-in /help still works even though it is absent from the menu.
+        assert_eq!(app.on_key(key(KeyCode::Enter)), Action::None);
         assert!(
-            matches.iter().any(|c| c.name == "helpx"),
-            "extra command must also appear"
+            matches!(app.overlay, Some(Overlay::Help)),
+            "built-in /help must still open the Help overlay"
         );
     }
 
@@ -3476,6 +3672,104 @@ mod tests {
         assert!(!a.has_selection());
     }
 
+    // --- composer (input area) selection ---
+
+    #[test]
+    fn composer_hit_inside_and_outside() {
+        let geom = SelGeom::new(Rect::new(0, 20, 40, 3), 5);
+        // row 0 of the composer → wrapped row 5 (the scroll); col 3 → cell 3
+        // (no gutter, unlike the transcript).
+        assert_eq!(composer_hit(geom, 3, 20), Some((5, 3)));
+        assert_eq!(composer_hit(geom, 3, 23), None); // below the rect
+        assert_eq!(composer_hit(geom, 50, 20), None); // right of the rect
+    }
+
+    #[test]
+    fn composer_drag_then_copy() {
+        let mut a = app();
+        a.composer_geom
+            .set(SelGeom::new(Rect::new(0, 20, 40, 3), 0));
+        *a.composer_lines.borrow_mut() = vec!["hello world".to_owned()];
+        a.pointer_down(0, 20); // composer row 0, cell 0
+        a.pointer_drag(5, 20); // drag to cell 5
+        a.pointer_release(5, 20);
+        assert!(a.has_selection());
+        assert_eq!(a.take_composer_selection_text().as_deref(), Some("hello"));
+        assert!(!a.has_selection()); // taken
+    }
+
+    #[test]
+    fn composer_plain_click_selects_nothing() {
+        let mut a = app();
+        a.composer_geom
+            .set(SelGeom::new(Rect::new(0, 20, 40, 3), 0));
+        a.pointer_down(5, 20);
+        a.pointer_release(5, 20); // no drag → dropped
+        assert!(!a.has_selection());
+    }
+
+    #[test]
+    fn composer_selection_clears_transcript_selection() {
+        let mut a = app();
+        // An active transcript selection...
+        a.sel_geom.set(SelGeom::new(Rect::new(0, 0, 40, 10), 0));
+        *a.sel_lines.borrow_mut() = vec!["transcript".to_owned()];
+        a.selection_start(2, 0);
+        a.selection_update(8, 0);
+        a.selection_finish();
+        assert!(a.has_selection());
+        // ...is dropped when a composer drag begins, so only one highlight lives.
+        a.composer_geom
+            .set(SelGeom::new(Rect::new(0, 20, 40, 3), 0));
+        a.pointer_down(0, 20);
+        assert!(a.selection.is_none());
+        assert!(a.composer_sel.is_some());
+    }
+
+    #[test]
+    fn ctrl_c_copies_composer_selection() {
+        let mut a = app();
+        a.composer_geom
+            .set(SelGeom::new(Rect::new(0, 20, 40, 3), 0));
+        *a.composer_lines.borrow_mut() = vec!["copy me".to_owned()];
+        a.pointer_down(0, 20);
+        a.pointer_drag(7, 20);
+        a.pointer_release(7, 20);
+        assert_eq!(
+            a.on_key(ctrl(KeyCode::Char('c'))),
+            Action::Copy("copy me".to_owned())
+        );
+        assert!(!a.has_selection());
+    }
+
+    #[test]
+    fn typing_clears_stale_composer_selection() {
+        let mut a = app();
+        a.composer_geom
+            .set(SelGeom::new(Rect::new(0, 20, 40, 3), 0));
+        *a.composer_lines.borrow_mut() = vec!["hello".to_owned()];
+        a.pointer_down(0, 20);
+        a.pointer_drag(5, 20);
+        a.pointer_release(5, 20);
+        assert!(a.has_selection());
+        // The next edit invalidates the selection's row/column indices.
+        a.on_key(key(KeyCode::Char('x')));
+        assert!(!a.has_selection());
+    }
+
+    #[test]
+    fn ctrl_a_e_move_cursor_to_buffer_ends() {
+        let mut a = app();
+        for c in "hello".chars() {
+            a.on_key(key(KeyCode::Char(c)));
+        }
+        assert_eq!(a.input.cursor_col_row(), (5, 0));
+        a.on_key(ctrl(KeyCode::Char('a')));
+        assert_eq!(a.input.cursor_col_row(), (0, 0));
+        a.on_key(ctrl(KeyCode::Char('e')));
+        assert_eq!(a.input.cursor_col_row(), (5, 0));
+    }
+
     #[test]
     fn copy_last_message_command() {
         let mut a = app();
@@ -3565,32 +3859,6 @@ mod tests {
         a.set_file_index(vec!["x.rs".to_owned()]);
         assert!(!a.needs_file_index());
     }
-}
-
-/// Removes all `[Image #N]` placeholder tokens from `text`, returning the
-/// remaining text.  Called when attachments are cleared via `Esc` to keep the
-/// input buffer consistent with the (now-empty) attachment store.
-pub(crate) fn strip_image_placeholders(text: &str) -> String {
-    let tag = "[Image #";
-    let mut result = String::with_capacity(text.len());
-    let mut rest = text;
-    loop {
-        if let Some(start) = rest.find(tag) {
-            result.push_str(&rest[..start]);
-            let after = &rest[start + tag.len()..];
-            if let Some(end) = after.find(']') {
-                rest = &after[end + 1..];
-            } else {
-                // Unterminated token — keep remainder verbatim.
-                result.push_str(&rest[start..]);
-                break;
-            }
-        } else {
-            result.push_str(rest);
-            break;
-        }
-    }
-    result
 }
 
 // Rust guideline compliant 2026-02-21

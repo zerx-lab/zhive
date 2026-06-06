@@ -134,6 +134,35 @@ fn renders_skill_invocation_as_collapsible_chip() {
 }
 
 #[test]
+fn slash_palette_lists_registered_skill_commands() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use zhive_tui::app::SlashCommand;
+
+    let mut app = App::new(TuiConfig::default(), thread());
+    // Mirror `lib::run`'s skill registration: discovered skills become palette
+    // commands. With built-ins hidden from the palette, these are all the menu
+    // should show.
+    app.set_extra_commands(vec![
+        SlashCommand::from_static("commit", "create a git commit", false),
+        SlashCommand::from_static("issue", "drive an issue", false),
+    ]);
+    // Typing `/` opens the palette over the composer.
+    app.on_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+
+    let mut terminal = Terminal::new(TestBackend::new(70, 20)).expect("terminal");
+    terminal
+        .draw(|frame| ui::draw(frame, &mut app))
+        .expect("draw");
+
+    let text = screen_text(&terminal);
+    assert!(
+        text.contains("commit"),
+        "skill command must appear in the `/` palette; got: {text}"
+    );
+    assert!(text.contains("issue"), "second skill must also appear");
+}
+
+#[test]
 fn command_output_collapses_by_default_and_expands_on_ctrl_o() {
     let mut app = App::new(TuiConfig::default(), thread());
     app.on_engine(&EngineNotification::TurnStarted {
