@@ -63,18 +63,46 @@ struct GetItemsReply {
     items: Vec<Item>,
 }
 
-/// Builds a single-text user-message item addressed to `thread`.
-fn user_message(thread: &ThreadId, text: &str) -> Item {
-    Item::UserMessage {
-        id: new_user_item_id(thread),
-        content: vec![ItemContent::Text {
+/// Builds a multi-part user-message item from `text` and optional image attachments.
+///
+/// Text is the first content block (omitted when empty); each attachment is
+/// appended as an `ItemContent::Image` with base64-encoded bytes.  The
+/// resulting `Vec<ItemContent>` always contains at least one block: a
+/// plain-text block is added as a fallback when both `text` is empty and
+/// `attachments` is empty (which is a caller bug, but we stay well-defined).
+fn user_message(
+    thread: &ThreadId,
+    text: &str,
+    attachments: &[crate::app::ImageAttachment],
+) -> Item {
+    let mut content: Vec<ItemContent> = Vec::new();
+    if !text.is_empty() {
+        content.push(ItemContent::Text {
             text: text.to_owned(),
             annotations: None,
-        }],
+        });
+    }
+    for att in attachments {
+        content.push(ItemContent::Image {
+            data: crate::clipboard::base64_encode(&att.bytes),
+            mime_type: att.mime.to_owned(),
+            uri: None,
+        });
+    }
+    if content.is_empty() {
+        // Defensive fallback: keep the wire item well-formed even on empty input.
+        content.push(ItemContent::Text {
+            text: String::new(),
+            annotations: None,
+        });
+    }
+    Item::UserMessage {
+        id: new_user_item_id(thread),
+        content,
     }
 }
 
-/// Submits `text` as a new turn on `thread`.
+/// Submits `text` (and any `attachments`) as a new turn on `thread`.
 ///
 /// Returns once the engine has accepted the turn. The user message and all
 /// agent output arrive afterwards as `events/item_appended` notifications, so
@@ -88,9 +116,10 @@ pub async fn start_turn(
     client: &Client,
     thread: &ThreadId,
     text: &str,
+    attachments: &[crate::app::ImageAttachment],
     reasoning: zhive_proto::domain::ThinkingEffort,
 ) -> Result<()> {
-    let item = user_message(thread, text);
+    let item = user_message(thread, text, attachments);
     // `reasoning` is always sent explicitly (including `Off`) so the turn's
     // depth is exactly what the UI shows rather than an engine default.
     let params = json!({

@@ -110,11 +110,66 @@ fn run_native(argv: &[&str], text: &str) -> bool {
     true
 }
 
+/// Reads PNG image bytes from the system clipboard, best-effort.
+///
+/// Shells out to `wl-paste` (Wayland) or `xclip` (X11) and captures their
+/// stdout.  Returns `None` when no image is in the clipboard, when no
+/// clipboard tool is available, or on non-Linux hosts.  The call blocks while
+/// the tool runs, so callers must invoke this off the render thread.
+///
+/// # Examples
+///
+/// ```no_run
+/// # use zhive_tui::clipboard;
+/// if let Some(bytes) = zhive_tui::clipboard::read_image() {
+///     println!("got {} bytes of PNG", bytes.len());
+/// }
+/// ```
+pub(crate) fn read_image() -> Option<Vec<u8>> {
+    if cfg!(target_os = "linux") {
+        read_image_linux()
+    } else {
+        None
+    }
+}
+
+/// Linux-specific image clipboard read: tries Wayland first, then X11.
+fn read_image_linux() -> Option<Vec<u8>> {
+    // Args for each clipboard tool that can emit PNG to stdout.
+    const WL_PASTE_PNG: &[&str] = &["wl-paste", "--type", "image/png", "--no-newline"];
+    const XCLIP_PNG: &[&str] = &["xclip", "-selection", "clipboard", "-t", "image/png", "-o"];
+
+    let order: [&[&str]; 2] = if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        [WL_PASTE_PNG, XCLIP_PNG]
+    } else {
+        [XCLIP_PNG, WL_PASTE_PNG]
+    };
+    order.into_iter().find_map(run_image_read)
+}
+
+/// Runs one clipboard read tool and returns its stdout when the exit is clean.
+///
+/// Returns `None` when the tool is absent, exits non-zero (= no image in
+/// clipboard), or returns empty output.
+fn run_image_read(argv: &[&str]) -> Option<Vec<u8>> {
+    let (cmd, rest) = argv.split_first()?;
+    let output = std::process::Command::new(cmd)
+        .args(rest)
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if output.status.success() && !output.stdout.is_empty() {
+        Some(output.stdout)
+    } else {
+        None
+    }
+}
+
 /// Encodes `input` as standard (RFC 4648) base64 with `=` padding.
 ///
 /// Hand-rolled to keep the crate dependency-free; OSC 52 requires the standard
 /// alphabet. Verified against the RFC 4648 §10 test vectors.
-fn base64_encode(input: &[u8]) -> String {
+pub(crate) fn base64_encode(input: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
     for chunk in input.chunks(3) {

@@ -19,6 +19,30 @@ use crate::conversation::Conversation;
 use crate::protocol::EngineNotification;
 use crate::theme::{Accent, Palette, Theme};
 
+/// An image file attached to the pending composer message.
+///
+/// Bytes are kept in memory until the message is sent; they are base64-encoded
+/// at dispatch time so the wire format stays a plain JSON string.
+#[derive(Clone)]
+pub struct ImageAttachment {
+    /// Raw image bytes (PNG / JPEG / WebP / GIF).
+    pub bytes: Vec<u8>,
+    /// IANA media type, e.g. `"image/png"`.
+    pub mime: &'static str,
+    /// Short display label shown in the composer chip (filename or `"clipboard"`).
+    pub label: String,
+}
+
+impl std::fmt::Debug for ImageAttachment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ImageAttachment")
+            .field("mime", &self.mime)
+            .field("label", &self.label)
+            .field("bytes_len", &self.bytes.len())
+            .finish()
+    }
+}
+
 /// A side-effecting command the event loop should perform over the client.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -29,6 +53,8 @@ pub enum Action {
     Quit,
     /// Submit the given text as a new turn.
     Submit(String),
+    /// Read a PNG image from the system clipboard and add it as an attachment.
+    ReadClipboardImage,
     /// Cancel the active turn.
     Cancel,
     /// Manually compact the current thread.
@@ -598,6 +624,12 @@ pub struct App {
     /// it stays `Some` with `error` set so the reason persists until the next
     /// turn or compaction. `None` at rest.
     pub compaction: Option<CompactionView>,
+    /// Images attached to the pending composer message, in insertion order.
+    ///
+    /// Populated by pasting an image file path or pressing `Alt+I` to grab the
+    /// clipboard.  Drained and sent alongside the text on `Enter`; cleared by
+    /// `Esc` when idle, and discarded (with a flash) when a slash command runs.
+    pub attachments: Vec<ImageAttachment>,
 }
 
 /// Live state of an in-progress (or just-failed) context compaction.
@@ -688,6 +720,7 @@ impl App {
             sel_geom: Cell::new(SelGeom::default()),
             sel_lines: RefCell::new(Vec::new()),
             compaction: None,
+            attachments: Vec::new(),
             config,
         }
     }
@@ -1199,6 +1232,8 @@ impl App {
         // Token usage belongs to the old thread; a fresh thread has none yet, so
         // the top bar must not keep showing the previous thread's counts.
         self.last_usage = None;
+        // Stale attachments from the old thread must not leak into the new one.
+        self.attachments.clear();
     }
 
     /// Records that the engine connection was lost.
@@ -1211,10 +1246,11 @@ impl App {
         // Reset the partial stream + reveal cursor like every other busy->false
         // transition, so a mid-stream disconnect cannot strand them.
         self.conversation.clear_streaming();
-        // Drop the queue so a reconnect cannot silently fire stale input. The
-        // persistent footer banner supersedes any flash, so none is set here.
+        // Drop the queue and attachments so a reconnect cannot silently fire
+        // stale input.  The persistent footer banner supersedes any flash.
         self.message_queue.clear();
         self.queue_halted = false;
+        self.attachments.clear();
     }
 
     /// Folds an engine notification into state, opening overlays as needed.
@@ -1630,6 +1666,14 @@ impl App {
                     self.queue_halted = false;
                     self.flash = Some(format!("cleared {n} queued"));
                     Action::None
+                } else if !self.attachments.is_empty() {
+                    let n = self.attachments.len();
+                    self.attachments.clear();
+                    self.flash = Some(format!(
+                        "cleared {n} attachment{}",
+                        if n == 1 { "" } else { "s" }
+                    ));
+                    Action::None
                 } else {
                     Action::None
                 }
@@ -1691,6 +1735,10 @@ impl App {
                 Action::None
             }
             KeyCode::Enter => self.submit(),
+            // Alt+I reads a PNG from the system clipboard and adds it as an
+            // attachment; the event loop performs the actual OS call and pushes
+            // the result onto `self.attachments`.
+            KeyCode::Char('i') if alt => Action::ReadClipboardImage,
             KeyCode::Char('u') if ctrl => {
                 self.input.clear();
                 self.palette_index = 0;
@@ -1817,7 +1865,9 @@ impl App {
     /// run immediately; a plain message typed while the engine is busy is
     /// enqueued instead of racing the in-flight turn.
     fn submit(&mut self) -> Action {
-        if self.input.is_blank() {
+        let has_attachments = !self.attachments.is_empty();
+
+        if self.input.is_blank() && !has_attachments {
             // Empty Enter resumes a stalled queue (e.g. after a failed turn).
             if !self.conversation.busy
                 && let Some(next) = self.message_queue.pop_front()
@@ -1830,12 +1880,33 @@ impl App {
             return Action::None;
         }
         let text = self.input.take();
-        // Push to history before routing, so every submitted text is captured.
-        self.input.push_history(&text);
+        // Push to history before routing (only non-empty text is useful).
+        if !text.is_empty() {
+            self.input.push_history(&text);
+        }
         if let Some(cmd) = text.strip_prefix('/') {
+            // Slash commands do not consume attachments; discard them with a
+            // notice so the user knows they were dropped.
+            if has_attachments {
+                let n = self.attachments.len();
+                self.attachments.clear();
+                self.flash = Some(format!(
+                    "{n} attachment{} cleared (slash commands don't send images)",
+                    if n == 1 { "" } else { "s" }
+                ));
+            }
             return self.run_slash(cmd);
         }
         if self.conversation.busy {
+            if has_attachments {
+                // Attachments cannot survive the FIFO queue as plain strings;
+                // block the submit so they are not silently dropped.
+                self.flash =
+                    Some("busy – wait for the turn to finish before sending images".to_owned());
+                // Put the text back so the user does not lose their draft.
+                self.input.insert_str(&text);
+                return Action::None;
+            }
             // Queue rather than race the in-flight turn; flushed one-per-turn.
             self.message_queue.push_back(text);
             self.flash = Some(format!("queued · {} pending", self.message_queue.len()));

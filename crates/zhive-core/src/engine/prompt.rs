@@ -97,19 +97,46 @@ pub(in crate::engine) async fn build_call_options(
     for item in &tail {
         match item {
             Item::UserMessage { content, .. } => {
-                let text: String = content
-                    .iter()
-                    .filter_map(|c| match c {
-                        zhive_proto::domain::ItemContent::Text { text, .. } => Some(text.as_str()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join("");
-                prompt.push(Message::User {
-                    content: vec![UserPart::Text(TextPart {
-                        text,
+                use llmsdk::language_model::{FilePart, UserPart as UP};
+                use llmsdk::shared::{FileBytes, FileData};
+                use zhive_proto::domain::ItemContent;
+
+                let mut parts: Vec<UserPart> = Vec::new();
+                for block in content {
+                    match block {
+                        ItemContent::Text { text, .. } if !text.is_empty() => {
+                            parts.push(UP::Text(TextPart {
+                                text: text.clone(),
+                                provider_options: None,
+                            }));
+                        }
+                        ItemContent::Image {
+                            data, mime_type, ..
+                        } => {
+                            parts.push(UP::File(FilePart {
+                                filename: None,
+                                data: FileData::Data {
+                                    data: FileBytes::Base64(data.clone()),
+                                },
+                                media_type: mime_type.clone(),
+                                provider_options: None,
+                            }));
+                        }
+                        _ => {}
+                    }
+                }
+                if parts.is_empty() {
+                    // Preserve the existing behaviour of sending an empty text
+                    // block rather than dropping the message entirely, so a
+                    // pure-attachment turn that arrives with no text still
+                    // produces a well-formed message pair.
+                    parts.push(UP::Text(TextPart {
+                        text: String::new(),
                         provider_options: None,
-                    })],
+                    }));
+                }
+                prompt.push(Message::User {
+                    content: parts,
                     provider_options: None,
                 });
             }

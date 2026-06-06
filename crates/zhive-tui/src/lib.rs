@@ -275,6 +275,10 @@ fn install_mouse_panic_guard() {
 }
 
 /// The core select loop, factored out so the terminal is always restored.
+#[expect(
+    clippy::too_many_lines,
+    reason = "single cohesive select loop; splitting arms into helpers would scatter the flow"
+)]
 async fn event_loop(
     terminal: &mut ratatui::DefaultTerminal,
     client: &Client,
@@ -312,7 +316,38 @@ async fn event_loop(
                         let action = app.on_key(key);
                         perform(client, app, action, &cmd_tx);
                     }
-                    Some(Ok(Event::Paste(text))) => app.input.insert_str(&text),
+                    Some(Ok(Event::Paste(text))) => {
+                        let trimmed = text.trim();
+                        if let Some(mime) = image_path_mime(trimmed) {
+                            // Pasted text looks like an image file path; try to
+                            // read it and add as an attachment instead of inserting
+                            // the path verbatim into the input buffer.
+                            match std::fs::read(trimmed) {
+                                Ok(bytes) => {
+                                    let label = trimmed
+                                        .rsplit(['/', '\\'])
+                                        .next()
+                                        .unwrap_or("image")
+                                        .to_owned();
+                                    app.attachments.push(crate::app::ImageAttachment {
+                                        bytes,
+                                        mime,
+                                        label,
+                                    });
+                                    let n = app.attachments.len();
+                                    app.flash = Some(format!(
+                                        "📎 image attached ({n} total)"
+                                    ));
+                                }
+                                Err(_) => {
+                                    // Not readable as a file; fall back to plain text.
+                                    app.input.insert_str(&text);
+                                }
+                            }
+                        } else {
+                            app.input.insert_str(&text);
+                        }
+                    }
                     Some(Ok(Event::Mouse(mouse))) => {
                         // Scroll wheel adjusts the transcript scrollback.
                         match mouse.kind {
@@ -485,6 +520,9 @@ fn perform(
             // Optimistically mark busy so the queue drainer won't re-fire on the
             // next tick before `TurnStarted` arrives; reset by `SubmitFailed`.
             app.conversation.busy = true;
+            // Drain attachments now — the closure below is `move`, so we must
+            // extract them before the move captures `app`.
+            let attachments = std::mem::take(&mut app.attachments);
             // Capture the current depth (Copy) so the moved closure sends the
             // level the UI shows at submit time.
             let reasoning = app.thinking_effort;
@@ -496,7 +534,7 @@ fn perform(
             spawn_rpc(client, cmd_tx, move |client, _tx| async move {
                 let failed = text.clone();
                 let expanded = files::expand_mentions(&text, &cwd);
-                rpc::start_turn(&client, &thread, &expanded, reasoning)
+                rpc::start_turn(&client, &thread, &expanded, &attachments, reasoning)
                     .await
                     .err()
                     .map(|e| LoopMsg::SubmitFailed {
@@ -504,6 +542,29 @@ fn perform(
                         text: failed,
                     })
             });
+        }
+        Action::ReadClipboardImage => {
+            // Shell out (blocking) to read a PNG from the system clipboard.
+            // This runs inline in the event loop rather than spawning a task
+            // because it is quick (shell tool startup ~10 ms) and the render
+            // loop is already paused on a key event.
+            match clipboard::read_image() {
+                Some(bytes) => {
+                    app.attachments.push(crate::app::ImageAttachment {
+                        bytes,
+                        mime: "image/png",
+                        label: "clipboard".to_owned(),
+                    });
+                    let n = app.attachments.len();
+                    app.flash = Some(format!(
+                        "📎 clipboard image added ({n} attachment{})",
+                        if n == 1 { "" } else { "s" }
+                    ));
+                }
+                None => {
+                    app.flash = Some("no image found in clipboard".to_owned());
+                }
+            }
         }
         Action::Cancel => spawn_rpc(client, cmd_tx, move |client, _tx| async move {
             rpc::cancel_turn(&client, &thread)
@@ -717,6 +778,25 @@ where
             let _ = tx.send(message).await;
         }
     });
+}
+
+/// Returns the IANA image media type for a path whose extension identifies it
+/// as a supported image format, or `None` for any other string.
+///
+/// Only the extension is examined — no filesystem probe happens here.
+/// Extension matching is case-insensitive (`PNG`, `png`, `Png` all work).
+fn image_path_mime(path: &str) -> Option<&'static str> {
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase);
+    match ext.as_deref() {
+        Some("png") => Some("image/png"),
+        Some("jpg" | "jpeg") => Some("image/jpeg"),
+        Some("gif") => Some("image/gif"),
+        Some("webp") => Some("image/webp"),
+        _ => None,
+    }
 }
 
 // Rust guideline compliant 2026-02-21
