@@ -31,3 +31,6 @@
 
 若**命中任一项**，必须先读 `ms-rust` skills。
 若仅是改变量名、调格式、加日志等局部改动，可跳过。
+
+## 参考项目
+- 参考项目路径：/home/zero/Desktop/code/github
