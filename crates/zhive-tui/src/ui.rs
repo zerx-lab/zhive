@@ -986,6 +986,25 @@ fn tool_call_lines(
         ));
     }
 
+    // Tool-supplied diff blocks (e.g. from `edit` / `write`) render as a folded
+    // diff view beneath the call, flush-left like a standalone diff item so the
+    // per-line background stripes stay intact. The chip header already shows the
+    // path, so `render_diff_body` omits the per-file header.
+    for block in content {
+        if let ItemToolCallContent::Diff {
+            old_text, new_text, ..
+        } = block
+        {
+            out.extend(crate::diff::render_diff_body(
+                old_text.as_deref(),
+                Some(new_text.as_str()),
+                expanded,
+                p,
+                width,
+            ));
+        }
+    }
+
     out
 }
 

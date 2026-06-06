@@ -1029,13 +1029,13 @@ async fn execute_resolved_tool_inner(
     // but we still dispatch `PostToolUseFailure` so audit hooks see every
     // non-success outcome. `ToolError::Execution` maps to `ExecutionError`;
     // `ToolError::Cancelled` maps to `Cancelled`.
-    let (raw_output, succeeded, mut result_text, exec_error) = match exec_result {
+    let (raw_output, succeeded, mut result_text, exec_error, tool_diffs) = match exec_result {
         Ok(out) => {
             let json_out = out
                 .value
                 .clone()
                 .unwrap_or_else(|| serde_json::Value::String(out.text.clone()));
-            (json_out, true, out.text, None)
+            (json_out, true, out.text, None, out.diffs)
         }
         Err(err) => {
             let msg = err.to_string();
@@ -1044,6 +1044,7 @@ async fn execute_resolved_tool_inner(
                 false,
                 msg,
                 Some(err),
+                Vec::new(),
             )
         }
     };
@@ -1169,12 +1170,23 @@ async fn execute_resolved_tool_inner(
         ToolCallStatus::Failed
     };
 
-    let content = vec![ItemToolCallContent::Content {
+    // The text block carries the model-facing result; any tool-supplied diffs
+    // become sibling Diff blocks the TUI and ACP bridge render as a diff view.
+    // Diff blocks never reach the provider prompt (prompt reconstruction reads
+    // only text blocks), so they enrich the UI without enlarging the context.
+    let mut content = vec![ItemToolCallContent::Content {
         content: ItemContent::Text {
             text: result_text.clone(),
             annotations: None,
         },
     }];
+    for diff in tool_diffs {
+        content.push(ItemToolCallContent::Diff {
+            path: diff.path,
+            old_text: diff.old_text,
+            new_text: diff.new_text,
+        });
+    }
 
     let item = Item::ToolCall {
         id: item_id,
@@ -1199,6 +1211,100 @@ async fn execute_resolved_tool_inner(
     };
 
     DispatchOutcome::Executed { item, stop_loop }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tools::{FileDiff, Tool, ToolError, ToolKind, ToolOutput};
+
+    /// Minimal tool that returns a single file diff, to exercise the promotion
+    /// of [`FileDiff`] into [`ItemToolCallContent::Diff`] content blocks.
+    #[derive(Debug)]
+    struct DiffStubTool;
+
+    #[async_trait::async_trait]
+    impl Tool for DiffStubTool {
+        fn name(&self) -> &'static str {
+            "diff_stub"
+        }
+
+        fn kind(&self) -> ToolKind {
+            ToolKind::Edit
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+            _ctx: &ToolContext,
+        ) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput::text("done").with_diffs(vec![FileDiff {
+                path: std::path::PathBuf::from("src/lib.rs"),
+                old_text: Some("a\n".to_owned()),
+                new_text: "b\n".to_owned(),
+            }]))
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_diffs_become_tool_call_diff_content_blocks() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(DiffStubTool));
+        let tools = Arc::new(registry);
+        let hook_host = Arc::new(HookHost::new());
+        let turn_id = TurnId(Arc::from("turn:native/0"));
+        let item_id = ItemId(Arc::from("item:turn:native/0/0"));
+        let cancel = CancellationToken::new();
+
+        let outcome = execute_resolved_tool(
+            &tools,
+            &hook_host,
+            "thread:native/test",
+            &turn_id,
+            item_id,
+            "diff_stub",
+            serde_json::json!({}),
+            "toolu_test",
+            &cancel,
+            false,
+            None,
+        )
+        .await;
+
+        let DispatchOutcome::Executed { item, .. } = outcome else {
+            panic!("expected an executed tool call");
+        };
+        let Item::ToolCall {
+            content, status, ..
+        } = item
+        else {
+            panic!("expected a ToolCall item");
+        };
+        assert_eq!(status, ToolCallStatus::Completed);
+
+        // The text result block survives; a Diff block is appended alongside it.
+        assert!(
+            content.iter().any(|c| matches!(
+                c,
+                ItemToolCallContent::Content {
+                    content: ItemContent::Text { .. }
+                }
+            )),
+            "the text result block must be preserved"
+        );
+        let diff = content.iter().find_map(|c| match c {
+            ItemToolCallContent::Diff {
+                path,
+                old_text,
+                new_text,
+            } => Some((path, old_text, new_text)),
+            _ => None,
+        });
+        let (path, old_text, new_text) = diff.expect("a Diff content block must be present");
+        assert_eq!(path, &std::path::PathBuf::from("src/lib.rs"));
+        assert_eq!(old_text.as_deref(), Some("a\n"));
+        assert_eq!(new_text, "b\n");
+    }
 }
 
 // Rust guideline compliant 2026-02-21

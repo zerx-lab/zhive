@@ -10,11 +10,7 @@
 zhive 现状：内置 7 工具（`read` `write` `edit` `grep` `glob` `bash` `agent`）+ skills 折叠进 system prompt。
 工具**数量**已属精简合理（与 pi 同级）；本轮已直接打磨工具**质量**（grep 路径 glob、tmp 命名、SkillTool 递归、描述扩写、config 漂移守卫）。下列为净新增能力。
 
-> 标注：优先级 P0(高)/P1(中)/P2(低)；工作量 S/M/L；来源=哪些参照已具备。
-
----
-
-## 一、工具（新工具，非已有工具的打磨）
+## 一、工具集合（净新增能力，非已有工具的打磨与优化）
 
 ### 1. todo / plan 工具 — P0 / M
 - **现状**：无。`grep -ri "TodoTool|PlanTool"` 全空。

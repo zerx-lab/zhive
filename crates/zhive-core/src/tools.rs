@@ -25,6 +25,7 @@
 //! returned, no revalidation runs and the call proceeds.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -70,6 +71,37 @@ impl From<ToolKind> for zhive_proto::domain::ToolKind {
 // ToolOutput / ToolError
 // ============================================================
 
+/// Whole-file before/after text for a diff produced by a tool call.
+///
+/// A tool that edits a file (e.g. `edit`, `write`) attaches one `FileDiff` per
+/// touched file so clients can render a diff view. The engine promotes each
+/// `FileDiff` into an [`zhive_proto::domain::ItemToolCallContent::Diff`] block
+/// on the tool call's content, where the TUI and ACP bridge already know how to
+/// surface it. The provider-facing tool result is left untouched — only the
+/// human-readable [`ToolOutput::text`] reaches the model.
+///
+/// # Examples
+///
+/// ```
+/// use std::path::PathBuf;
+/// use zhive_core::tools::FileDiff;
+/// let diff = FileDiff {
+///     path: PathBuf::from("src/lib.rs"),
+///     old_text: Some("a\n".to_owned()),
+///     new_text: "b\n".to_owned(),
+/// };
+/// assert_eq!(diff.old_text.as_deref(), Some("a\n"));
+/// ```
+#[derive(Debug, Clone, PartialEq)]
+pub struct FileDiff {
+    /// Affected file path.
+    pub path: PathBuf,
+    /// Pre-edit text; `None` for a newly created file.
+    pub old_text: Option<String>,
+    /// Post-edit text.
+    pub new_text: String,
+}
+
 /// Successful output of a tool execution.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToolOutput {
@@ -77,6 +109,12 @@ pub struct ToolOutput {
     pub text: String,
     /// Optional structured JSON value for richer clients.
     pub value: Option<serde_json::Value>,
+    /// File diffs to surface as diff content blocks on the tool call.
+    ///
+    /// Empty for tools that touch no files. The engine maps each entry to an
+    /// [`zhive_proto::domain::ItemToolCallContent::Diff`] block; it never
+    /// affects the provider-facing result text.
+    pub diffs: Vec<FileDiff>,
 }
 
 impl ToolOutput {
@@ -89,12 +127,14 @@ impl ToolOutput {
     /// let out = ToolOutput::text("hello");
     /// assert_eq!(out.text, "hello");
     /// assert!(out.value.is_none());
+    /// assert!(out.diffs.is_empty());
     /// ```
     #[must_use]
     pub fn text(text: impl Into<String>) -> Self {
         Self {
             text: text.into(),
             value: None,
+            diffs: Vec::new(),
         }
     }
 
@@ -113,7 +153,32 @@ impl ToolOutput {
         Self {
             text: text.into(),
             value: Some(value),
+            diffs: Vec::new(),
         }
+    }
+
+    /// Attaches file diffs, returning the updated output.
+    ///
+    /// Each diff becomes a diff content block on the resulting tool call. The
+    /// model still sees only [`ToolOutput::text`], so attaching a diff never
+    /// enlarges the provider prompt.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::path::PathBuf;
+    /// use zhive_core::tools::{FileDiff, ToolOutput};
+    /// let out = ToolOutput::text("replaced 1 occurrence(s)").with_diffs(vec![FileDiff {
+    ///     path: PathBuf::from("src/lib.rs"),
+    ///     old_text: Some("a\n".to_owned()),
+    ///     new_text: "b\n".to_owned(),
+    /// }]);
+    /// assert_eq!(out.diffs.len(), 1);
+    /// ```
+    #[must_use]
+    pub fn with_diffs(mut self, diffs: Vec<FileDiff>) -> Self {
+        self.diffs = diffs;
+        self
     }
 }
 

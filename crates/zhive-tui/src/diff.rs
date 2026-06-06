@@ -89,10 +89,25 @@ pub(crate) fn render_file_diff(
             Style::new().fg(p.info).add_modifier(Modifier::BOLD),
         ),
     ]);
-    let body = build_diff_lines(old_text.unwrap_or(""), new_text.unwrap_or(""), p, width);
     let mut out = vec![header];
-    out.extend(truncate_styled_lines(body, DIFF_PREVIEW, expanded, p));
+    out.extend(render_diff_body(old_text, new_text, expanded, p, width));
     out
+}
+
+/// Renders just the folded diff body (no path header) for `old` vs `new`.
+///
+/// Used when the surrounding UI already labels the file — e.g. a diff nested
+/// under a tool call whose header shows the path. Returns an empty vec when the
+/// two sides are identical.
+pub(crate) fn render_diff_body(
+    old_text: Option<&str>,
+    new_text: Option<&str>,
+    expanded: bool,
+    p: &Palette,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let body = build_diff_lines(old_text.unwrap_or(""), new_text.unwrap_or(""), p, width);
+    truncate_styled_lines(body, DIFF_PREVIEW, expanded, p)
 }
 
 /// Diffs `old` vs `new_str` line-by-line into styled hunk lines.

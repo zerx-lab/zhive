@@ -1,10 +1,21 @@
 //! [`WriteFileTool`] and [`EditFileTool`]: atomic file write and in-place edit.
 
+use std::path::Path;
+
 use async_trait::async_trait;
 use serde_json::Value;
 
 use crate::tools::builtin::resolve_path;
-use crate::tools::{Tool, ToolContext, ToolError, ToolKind, ToolOutput};
+use crate::tools::{FileDiff, Tool, ToolContext, ToolError, ToolKind, ToolOutput};
+
+/// Per-side byte ceiling above which a captured diff is dropped.
+///
+/// Both `edit` and `write` attach whole-file before/after text so clients can
+/// render a diff. This matches the TUI renderer's own per-side ceiling
+/// (`MAX_DIFF_BYTES` in `zhive-tui/src/diff.rs`): past this size the renderer
+/// suppresses the diff, so capturing it would only bloat the persisted rollout
+/// without any rendering benefit. The plain-text result is always kept.
+const MAX_DIFF_CAPTURE_BYTES: usize = 200_000;
 
 // ============================================================
 // WriteFileTool
@@ -81,6 +92,11 @@ impl Tool for WriteFileTool {
 
         let dest = resolve_path(path_str);
 
+        // Build the diff before overwriting so the tool call can surface it.
+        // Computed up front to distinguish a brand-new file (creation diff) from
+        // an existing file we cannot faithfully diff.
+        let pending_diff = build_write_diff(&dest, content).await;
+
         // Ensure parent directory exists.
         if let Some(parent) = dest.parent() {
             tokio::fs::create_dir_all(parent).await.map_err(|e| {
@@ -111,11 +127,15 @@ impl Tool for WriteFileTool {
             ))
         })?;
 
-        Ok(ToolOutput::text(format!(
+        let out = ToolOutput::text(format!(
             "wrote {} bytes to `{}`",
             content.len(),
             dest.display()
-        )))
+        ));
+        Ok(match pending_diff {
+            Some(diff) => out.with_diffs(vec![diff]),
+            None => out,
+        })
     }
 }
 
@@ -264,16 +284,70 @@ impl Tool for EditFileTool {
         // Atomic write back.
         atomic_write(&dest, new_content.as_bytes()).await?;
 
-        Ok(ToolOutput::text(format!(
+        let out = ToolOutput::text(format!(
             "replaced {replacements} occurrence(s) in `{}`",
             dest.display()
-        )))
+        ));
+        // `content` is the whole file before the edit; `new_content` after. Both
+        // are already in scope and UTF-8, so the diff is free of extra I/O.
+        Ok(attach_diff(out, &dest, Some(content), &new_content))
     }
 }
 
 // ============================================================
 // Helpers
 // ============================================================
+
+/// Attaches a whole-file diff to `out` when both sides fit the size cap.
+///
+/// Oversized diffs are dropped (see [`MAX_DIFF_CAPTURE_BYTES`]); the returned
+/// output is otherwise `out` enriched with a single [`FileDiff`]. `old_text` is
+/// `None` for a freshly created file.
+fn attach_diff(out: ToolOutput, path: &Path, old_text: Option<&str>, new_text: &str) -> ToolOutput {
+    let old_len = old_text.map_or(0, str::len);
+    if old_len > MAX_DIFF_CAPTURE_BYTES || new_text.len() > MAX_DIFF_CAPTURE_BYTES {
+        return out;
+    }
+    out.with_diffs(vec![FileDiff {
+        path: path.to_path_buf(),
+        old_text: old_text.map(str::to_owned),
+        new_text: new_text.to_owned(),
+    }])
+}
+
+/// Builds the diff to attach to a `write`, or `None` to attach none.
+///
+/// Returns a creation diff (`old_text == None`) when `dest` does not exist, an
+/// update diff carrying the prior content when it can be read, and `None` when
+/// either side is too large or the existing file is non-UTF-8 (binary). In the
+/// last case a partial diff would misrepresent the change — e.g. rendering an
+/// overwrite of large or binary content as a pure creation — so none is shown.
+///
+/// `new_content` duplicates the tool's `raw_input.content` in the persisted
+/// item; the duplication is bounded by [`MAX_DIFF_CAPTURE_BYTES`] and accepted
+/// as the cost of an ACP-renderable diff block.
+async fn build_write_diff(dest: &Path, new_content: &str) -> Option<FileDiff> {
+    if new_content.len() > MAX_DIFF_CAPTURE_BYTES {
+        return None;
+    }
+    let old_text = match tokio::fs::read(dest).await {
+        // Missing file → genuine creation diff (all additions).
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Ok(bytes) if bytes.len() <= MAX_DIFF_CAPTURE_BYTES => match String::from_utf8(bytes) {
+            Ok(text) => Some(text),
+            // Binary prior content: cannot diff faithfully → show nothing.
+            Err(_) => return None,
+        },
+        // Existing file too large or otherwise unreadable → show no diff rather
+        // than pass off the overwrite as a creation.
+        _ => return None,
+    };
+    Some(FileDiff {
+        path: dest.to_path_buf(),
+        old_text,
+        new_text: new_content.to_owned(),
+    })
+}
 
 /// Trims trailing whitespace from every line of `s`.
 fn trim_line_endings(s: &str) -> String {
@@ -584,6 +658,97 @@ mod tests {
             content, "A\nB\n",
             "final newline must survive trim fallback"
         );
+    }
+
+    // ---- diff capture tests ----
+
+    #[tokio::test]
+    async fn edit_emits_diff_with_old_and_new() {
+        let mut f = NamedTempFile::new().unwrap();
+        writeln!(f, "hello world").unwrap();
+        let args = serde_json::json!({
+            "path": f.path().to_str().unwrap(),
+            "old_string": "world",
+            "new_string": "Rust"
+        });
+        let out = EditFileTool.execute(args, &ctx()).await.unwrap();
+        assert_eq!(out.diffs.len(), 1, "edit must attach exactly one diff");
+        let diff = &out.diffs[0];
+        assert_eq!(diff.old_text.as_deref(), Some("hello world\n"));
+        assert_eq!(diff.new_text, "hello Rust\n");
+        assert_eq!(diff.path.as_path(), f.path());
+    }
+
+    #[tokio::test]
+    async fn write_emits_diff_for_overwrite() {
+        let mut f = NamedTempFile::new().unwrap();
+        writeln!(f, "old content").unwrap();
+        let args = serde_json::json!({
+            "path": f.path().to_str().unwrap(),
+            "content": "new content"
+        });
+        let out = WriteFileTool.execute(args, &ctx()).await.unwrap();
+        assert_eq!(out.diffs.len(), 1);
+        assert_eq!(out.diffs[0].old_text.as_deref(), Some("old content\n"));
+        assert_eq!(out.diffs[0].new_text, "new content");
+    }
+
+    #[tokio::test]
+    async fn write_emits_create_diff_for_new_file() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("fresh.txt");
+        let args = serde_json::json!({
+            "path": path.to_str().unwrap(),
+            "content": "brand new\n"
+        });
+        let out = WriteFileTool.execute(args, &ctx()).await.unwrap();
+        assert_eq!(out.diffs.len(), 1);
+        assert!(
+            out.diffs[0].old_text.is_none(),
+            "a freshly created file has no old text"
+        );
+        assert_eq!(out.diffs[0].new_text, "brand new\n");
+    }
+
+    #[tokio::test]
+    async fn write_skips_diff_when_overwriting_binary_file() {
+        // Overwriting a non-UTF-8 (binary) file must NOT render as a creation
+        // diff (which would hide that prior content was destroyed); show none.
+        let f = NamedTempFile::new().unwrap();
+        std::fs::write(f.path(), [0x00u8, 0x9f, 0x92, 0x96]).unwrap();
+        let args = serde_json::json!({
+            "path": f.path().to_str().unwrap(),
+            "content": "now plain text\n"
+        });
+        let out = WriteFileTool.execute(args, &ctx()).await.unwrap();
+        assert!(
+            out.diffs.is_empty(),
+            "binary overwrite shows no (misleading) diff"
+        );
+        assert!(out.text.contains("wrote"), "text result still present");
+    }
+
+    #[test]
+    fn attach_diff_drops_oversized() {
+        let big = "x".repeat(MAX_DIFF_CAPTURE_BYTES + 1);
+        let out = attach_diff(ToolOutput::text("ok"), Path::new("/tmp/a"), Some("a"), &big);
+        assert!(out.diffs.is_empty(), "oversized diff must be dropped");
+        assert_eq!(
+            out.text, "ok",
+            "text result is preserved when diff is dropped"
+        );
+    }
+
+    #[test]
+    fn attach_diff_keeps_small() {
+        let out = attach_diff(
+            ToolOutput::text("ok"),
+            Path::new("/tmp/a"),
+            Some("a\n"),
+            "b\n",
+        );
+        assert_eq!(out.diffs.len(), 1);
+        assert_eq!(out.diffs[0].old_text.as_deref(), Some("a\n"));
     }
 }
 

@@ -9,7 +9,9 @@ use std::sync::Arc;
 
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
-use zhive_proto::domain::{Item, ItemContent, ItemId, ThreadId, ToolCallStatus, ToolKind, TurnId};
+use zhive_proto::domain::{
+    Item, ItemContent, ItemId, ItemToolCallContent, ThreadId, ToolCallStatus, ToolKind, TurnId,
+};
 use zhive_tui::app::App;
 use zhive_tui::config::TuiConfig;
 use zhive_tui::protocol::EngineNotification;
@@ -518,4 +520,76 @@ fn diff_rows_carry_diff_backgrounds() {
 
     assert!(has_bg(p.diff_add_bg), "added line carries diff_add_bg");
     assert!(has_bg(p.diff_del_bg), "deleted line carries diff_del_bg");
+}
+
+/// An `edit` / `write` tool call surfaces its diff inline beneath the chip.
+#[test]
+fn tool_call_diff_content_renders_diff_view() {
+    let mut app = App::new(TuiConfig::default(), thread());
+    app.on_engine(&EngineNotification::TurnStarted {
+        thread_id: thread(),
+        turn_id: turn(),
+    });
+    app.on_engine(&EngineNotification::ItemAppended {
+        thread_id: thread(),
+        turn_id: turn(),
+        item: Box::new(Item::ToolCall {
+            id: ItemId(Arc::from("item:turn:render/0/0")),
+            name: "edit".to_owned(),
+            title: None,
+            kind: ToolKind::Edit,
+            status: ToolCallStatus::Completed,
+            content: vec![
+                ItemToolCallContent::Content {
+                    content: ItemContent::Text {
+                        text: "replaced 1 occurrence(s) in `src/x.rs`".to_owned(),
+                        annotations: None,
+                    },
+                },
+                ItemToolCallContent::Diff {
+                    path: std::path::PathBuf::from("src/x.rs"),
+                    old_text: Some("alpha\n".to_owned()),
+                    new_text: "bravo\n".to_owned(),
+                },
+            ],
+            locations: Vec::new(),
+            raw_input: Some(serde_json::json!({
+                "path": "src/x.rs",
+                "old_string": "alpha",
+                "new_string": "bravo"
+            })),
+            raw_output: None,
+            provider_tool_call_id: None,
+        }),
+    });
+    app.on_engine(&EngineNotification::TurnCompleted {
+        thread_id: thread(),
+        turn_id: turn(),
+    });
+
+    let mut terminal = Terminal::new(TestBackend::new(70, 24)).expect("terminal");
+    terminal
+        .draw(|frame| ui::draw(frame, &mut app))
+        .expect("draw");
+
+    let cells = terminal.backend().buffer().content().to_vec();
+    let p = &app.palette;
+    let has_bg = |want| cells.iter().any(|c| c.bg == want);
+    assert!(has_bg(p.diff_add_bg), "edit diff shows an added line bg");
+    assert!(has_bg(p.diff_del_bg), "edit diff shows a deleted line bg");
+
+    let text = screen_text(&terminal);
+    assert!(
+        text.contains("edit"),
+        "tool chip shows the tool name; got: {text}"
+    );
+    assert!(
+        text.contains("replaced 1 occurrence"),
+        "the text summary survives alongside the diff; got: {text}"
+    );
+    assert!(
+        text.contains("alpha"),
+        "removed content visible; got: {text}"
+    );
+    assert!(text.contains("bravo"), "added content visible; got: {text}");
 }

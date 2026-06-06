@@ -281,38 +281,38 @@ mod tests {
     }
 
     /// Reads `provider_options["anthropic"]["cacheControl"]`, if present.
-    fn cache_control(slot: &Option<ProviderOptions>) -> Option<&serde_json::Value> {
-        slot.as_ref()?.get("anthropic")?.get("cacheControl")
+    fn cache_control(slot: Option<&ProviderOptions>) -> Option<&serde_json::Value> {
+        slot?.get("anthropic")?.get("cacheControl")
     }
 
     /// Reads a `Message::User`'s first text part's provider options.
-    fn user_text_options(message: &Message) -> &Option<ProviderOptions> {
+    fn user_text_options(message: &Message) -> Option<&ProviderOptions> {
         let Message::User { content, .. } = message else {
             panic!("expected a user message");
         };
         let UserPart::Text(part) = &content[0] else {
             panic!("expected a text part");
         };
-        &part.provider_options
+        part.provider_options.as_ref()
     }
 
     /// Reads a `Message::System`'s provider options.
-    fn system_options(message: &Message) -> &Option<ProviderOptions> {
+    fn system_options(message: &Message) -> Option<&ProviderOptions> {
         let Message::System {
             provider_options, ..
         } = message
         else {
             panic!("expected a system message");
         };
-        provider_options
+        provider_options.as_ref()
     }
 
     /// Reads a `Tool::Function`'s provider options.
-    fn tool_options(tool: &Tool) -> &Option<ProviderOptions> {
+    fn tool_options(tool: &Tool) -> Option<&ProviderOptions> {
         let Tool::Function(function) = tool else {
             panic!("expected a function tool");
         };
-        &function.provider_options
+        function.provider_options.as_ref()
     }
 
     /// Builds an assistant message that only requests a tool call.
@@ -347,7 +347,7 @@ mod tests {
     }
 
     /// Reads a message's message-level provider options.
-    fn message_options(message: &Message) -> &Option<ProviderOptions> {
+    fn message_options(message: &Message) -> Option<&ProviderOptions> {
         match message {
             Message::Assistant {
                 provider_options, ..
@@ -357,7 +357,7 @@ mod tests {
             }
             | Message::System {
                 provider_options, ..
-            } => provider_options,
+            } => provider_options.as_ref(),
             Message::User { .. } => panic!("expected a non-user message"),
         }
     }
@@ -410,7 +410,7 @@ mod tests {
         for message in &opts.prompt {
             if let Message::User { content, .. } = message
                 && let UserPart::Text(part) = &content[0]
-                && cache_control(&part.provider_options).is_some()
+                && cache_control(part.provider_options.as_ref()).is_some()
             {
                 count += 1;
             }
@@ -481,7 +481,7 @@ mod tests {
     }
 
     /// A pre-existing `anthropic` bucket (e.g. a thinking block) survives the
-    /// cache_control merge.
+    /// `cache_control` merge.
     #[test]
     fn anthropic_merge_preserves_sibling_keys() {
         let mut anthropic = serde_json::Map::new();
@@ -503,7 +503,6 @@ mod tests {
         apply_cache_control(&mut opts, "anthropic", "session-1");
 
         let bucket = system_options(&opts.prompt[0])
-            .as_ref()
             .expect("provider options present")
             .get("anthropic")
             .expect("anthropic bucket present");

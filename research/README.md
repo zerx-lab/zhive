@@ -6,6 +6,7 @@
 
 | 编号 | 主题 | 状态 |
 |---|---|---|
+| [20](./20-file-revert-design/) | **文件编辑回退机制（调研 + 设计）** | ✅ active — 影子 git 主干 + 5 处经核实硬伤修正；设计完成未实现 |
 | [91](./91-architecture-review-2026-05-27/) | **架构 review（2026-05-27）** | ✅ active — 7 轮 21 subagent 交叉验证 |
 | [92](./92-reference-mapping/) | **外部参考项目对应关系** | ✅ active — 每个 zhive 模块→参考的外部文件/字段/PR |
 | [99](./99-decisions/) | **决策汇总（R3+R4 终版）** | ✅ active — D-001~D-015 |

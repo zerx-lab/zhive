@@ -302,6 +302,24 @@ pub(crate) fn cell_range_for_line(
     Some((from, to))
 }
 
+/// Whether `event` rebuilds the transcript body, invalidating a selection.
+///
+/// A transcript selection stores absolute line indices into the rendered body,
+/// so any event that appends or streams items shifts those rows out from under
+/// it. Expressed as an exclusion list of the purely-informational events (top
+/// bar, footer phase, overlay, unhandled) so a future notification variant
+/// defaults to the safe side — clearing a still-valid selection at worst, never
+/// leaving a stale highlight painted on the wrong rows.
+fn transcript_shifted(event: &EngineNotification) -> bool {
+    !matches!(
+        event,
+        EngineNotification::Usage { .. }
+            | EngineNotification::PhaseChanged { .. }
+            | EngineNotification::PermissionRequested { .. }
+            | EngineNotification::Unhandled { .. }
+    )
+}
+
 /// Extracts the selected text from the per-line body texts.
 ///
 /// Joins the sliced lines with `\n`. Line indices are clamped to `lines` as a
@@ -1450,6 +1468,13 @@ impl App {
             _ => {}
         }
         self.conversation.apply(event);
+        // Appending or streaming items rebuilds the transcript, so a transcript
+        // selection's absolute line indices now point at shifted rows — drop it,
+        // mirroring the ctrl+o / click-toggle / resync paths. The composer
+        // selection tracks composer text, not the transcript, so leave it.
+        if self.selection.is_some() && transcript_shifted(event) {
+            self.selection = None;
+        }
         // New output does NOT yank the view to the tail. When the user is at the
         // bottom (`scrollback == 0`) the renderer keeps following it; when they
         // have scrolled up to read history, the renderer anchors their position
@@ -3724,6 +3749,62 @@ mod tests {
         a.pointer_down(0, 20);
         assert!(a.selection.is_none());
         assert!(a.composer_sel.is_some());
+    }
+
+    #[test]
+    fn streaming_event_clears_stale_transcript_selection() {
+        use crate::protocol::ItemDeltaKind;
+        use zhive_proto::domain::TurnId;
+
+        let mut a = app();
+        a.sel_geom.set(SelGeom::new(Rect::new(0, 0, 40, 10), 0));
+        *a.sel_lines.borrow_mut() = vec!["selected line".to_owned()];
+        a.selection_start(2, 0);
+        a.selection_update(9, 0);
+        a.selection_finish();
+        assert!(a.selection.is_some());
+
+        // An informational event (top-bar only) leaves the selection intact.
+        a.on_engine(&EngineNotification::Usage {
+            input_tokens: 1,
+            output_tokens: 1,
+        });
+        assert!(a.selection.is_some(), "usage must not drop the selection");
+
+        // Streamed content rebuilds the transcript, so the now-stale selection
+        // is dropped rather than painted on shifted rows (the phantom block).
+        a.on_engine(&EngineNotification::ItemDelta {
+            thread_id: ThreadId(Arc::from("thread:native/t")),
+            turn_id: TurnId(Arc::from("turn:1/0")),
+            delta: "more output".to_owned(),
+            kind: ItemDeltaKind::Text,
+        });
+        assert!(a.selection.is_none(), "streamed delta clears the selection");
+    }
+
+    #[test]
+    fn streaming_event_leaves_composer_selection_intact() {
+        use crate::protocol::ItemDeltaKind;
+        use zhive_proto::domain::TurnId;
+
+        let mut a = app();
+        a.composer_geom
+            .set(SelGeom::new(Rect::new(0, 20, 40, 3), 0));
+        *a.composer_lines.borrow_mut() = vec!["draft text".to_owned()];
+        a.pointer_down(0, 20);
+        a.pointer_drag(5, 20);
+        a.pointer_release(5, 20);
+        assert!(a.composer_sel.is_some());
+
+        // The composer selection tracks composer text, not the transcript, so a
+        // transcript-shifting engine event must not disturb it.
+        a.on_engine(&EngineNotification::ItemDelta {
+            thread_id: ThreadId(Arc::from("thread:native/t")),
+            turn_id: TurnId(Arc::from("turn:1/0")),
+            delta: "x".to_owned(),
+            kind: ItemDeltaKind::Text,
+        });
+        assert!(a.composer_sel.is_some(), "composer selection survives");
     }
 
     #[test]
