@@ -140,28 +140,53 @@ fn slash_palette_lists_registered_skill_commands() {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use zhive_tui::app::SlashCommand;
 
+    let type_str = |app: &mut App, s: &str| {
+        for ch in s.chars() {
+            app.on_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+    };
+    let render = |app: &mut App| {
+        let mut terminal = Terminal::new(TestBackend::new(70, 20)).expect("terminal");
+        terminal.draw(|frame| ui::draw(frame, app)).expect("draw");
+        screen_text(&terminal)
+    };
+
     let mut app = App::new(TuiConfig::default(), thread());
     // Mirror `lib::run`'s skill registration: discovered skills become palette
-    // commands. With built-ins hidden from the palette, these are all the menu
-    // should show.
+    // commands, appended after the built-ins (which lead the menu so they are
+    // discoverable too). The palette caps the visible window, so a skill is
+    // reached by filtering rather than always being on the first page.
     app.set_extra_commands(vec![
         SlashCommand::from_static("commit", "create a git commit", false),
         SlashCommand::from_static("issue", "drive an issue", false),
     ]);
-    // Typing `/` opens the palette over the composer.
-    app.on_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
 
-    let mut terminal = Terminal::new(TestBackend::new(70, 20)).expect("terminal");
-    terminal
-        .draw(|frame| ui::draw(frame, &mut app))
-        .expect("draw");
-
-    let text = screen_text(&terminal);
+    // Bare `/` leads with the built-ins.
+    type_str(&mut app, "/");
     assert!(
-        text.contains("commit"),
-        "skill command must appear in the `/` palette; got: {text}"
+        render(&mut app).contains("help"),
+        "built-in commands lead the `/` palette"
     );
-    assert!(text.contains("issue"), "second skill must also appear");
+
+    // Filtering by a skill name surfaces the registered skill command.
+    type_str(&mut app, "commit");
+    assert!(
+        render(&mut app).contains("create a git commit"),
+        "skill command is reachable in the palette by name"
+    );
+
+    // A second skill is likewise registered and filterable.
+    let mut app2 = App::new(TuiConfig::default(), thread());
+    app2.set_extra_commands(vec![SlashCommand::from_static(
+        "issue",
+        "drive an issue",
+        false,
+    )]);
+    type_str(&mut app2, "/issue");
+    assert!(
+        render(&mut app2).contains("drive an issue"),
+        "second skill also appears when filtered"
+    );
 }
 
 #[test]
