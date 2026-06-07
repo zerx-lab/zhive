@@ -75,8 +75,13 @@ use zhive_client_native::{Client, ClientEvent};
 
 use crate::app::{Action, App};
 
-/// How often the UI ticks to animate the spinner and repaint.
-const TICK: Duration = Duration::from_millis(90);
+/// How often the UI ticks to animate the spinner and drain the reveal cursor.
+///
+/// ~20fps while streaming: fine-grained enough that the smooth-reveal drip reads
+/// as continuous motion rather than the chunky 11fps steps an older, coarser
+/// tick produced. The arm is gated off while idle (see the event loop), so this
+/// cadence costs nothing once a turn settles.
+const TICK: Duration = Duration::from_millis(50);
 
 /// A message from a detached RPC task back into the render loop.
 ///
@@ -324,10 +329,11 @@ async fn event_loop(
     // never freezes input or rendering; their user-facing outcome flows back
     // here as a [`LoopMsg`]. The loop keeps a sender so `recv()` never ends.
     let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel::<LoopMsg>(16);
-    // Repaint only when state changed. Streaming `ItemDelta`s deliberately do
-    // NOT mark dirty: the reveal cursor surfaces buffered text on the next tick,
-    // so per-delta repaints coalesce to the 90ms tick instead of one draw per
-    // token. `dirty` starts true so the first frame always paints.
+    // Repaint only when state changed. A streaming `ItemDelta` marks dirty only
+    // when it starts a fresh burst (reveal cursor caught up) — that paints the
+    // first token at once; while a backlog is draining, deltas coalesce to the
+    // 90ms reveal tick instead of one draw per token. `dirty` starts true so the
+    // first frame always paints.
     let mut dirty = true;
     // Last rendered scroll offset, to detect scrolling (which shifts every row).
     let mut last_scrollback = app.scrollback;
@@ -514,9 +520,10 @@ async fn event_loop(
 /// Applies one engine stream item, returning `(engine_alive, dirty)`.
 ///
 /// `engine_alive` is `false` once the stream has ended. `dirty` is `false` only
-/// for an `ItemDelta` — whose repaint is coalesced to the next reveal tick — and
-/// `true` for every other event, so finalized items and lifecycle changes paint
-/// immediately.
+/// for an `ItemDelta` that lands on an existing backlog — whose repaint is
+/// coalesced to the next reveal tick. A delta that starts a fresh burst, and
+/// every other event, returns `true` so the first token, finalized items, and
+/// lifecycle changes all paint immediately.
 fn handle_engine(
     app: &mut App,
     event: Option<ClientEvent>,
@@ -526,10 +533,28 @@ fn handle_engine(
     match event {
         Some(ClientEvent::Notification(notif)) => {
             let decoded = protocol::decode(&notif.method, notif.params);
-            // Delta repaints are deferred to the reveal tick (see event loop).
-            let redraw = !matches!(decoded, protocol::EngineNotification::ItemDelta { .. });
-            app.on_engine(&decoded);
-            (true, redraw)
+            if matches!(decoded, protocol::EngineNotification::ItemDelta { .. }) {
+                // A streaming delta normally coalesces to the next reveal tick so
+                // a fast token burst repaints at most once per `TICK` instead of
+                // once per token. But when the reveal cursor is already caught up
+                // there is no backlog ahead of this delta: deferring it would
+                // freeze the line for up to `TICK` before the next token shows —
+                // the "first char then pause" stutter, most visible with CJK text
+                // where the first token is a single glyph. So when a delta begins
+                // a fresh visible burst, surface a slice and paint immediately;
+                // only coalesce while a backlog is genuinely draining.
+                let starts_burst = app.conversation.reveal_caught_up();
+                app.on_engine(&decoded);
+                if starts_burst {
+                    app.conversation.advance_reveal();
+                    (true, true)
+                } else {
+                    (true, false)
+                }
+            } else {
+                app.on_engine(&decoded);
+                (true, true)
+            }
         }
         Some(ClientEvent::Disconnected { reason }) => {
             app.on_disconnected();

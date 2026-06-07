@@ -246,9 +246,18 @@ pub struct Conversation {
 }
 
 /// Minimum chars revealed per tick (keeps slow streams visibly progressing).
-const REVEAL_FLOOR: usize = 3;
+///
+/// Sized so the very start of a reply — when the backlog is still tiny and the
+/// geometric term below rounds down to almost nothing — keeps pace with the
+/// provider's token rate instead of crawling a few chars per tick (the "first
+/// appearance" stutter). At the 50ms tick this is a ~200 chars/s floor.
+const REVEAL_FLOOR: usize = 10;
 /// Fraction of the remaining backlog revealed per tick (geometric drain).
-const REVEAL_RATIO: f64 = 0.20;
+///
+/// Higher than a token-smoothing minimum so a burst that arrives mid-reply
+/// (e.g. after a tool call) catches up within a few ticks rather than lagging
+/// visibly behind the real stream.
+const REVEAL_RATIO: f64 = 0.30;
 
 /// Returns the already-revealed prefix of a streaming buffer.
 ///
