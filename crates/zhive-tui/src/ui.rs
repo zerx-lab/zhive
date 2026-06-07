@@ -10,6 +10,7 @@
 //! overlays ([`Overlay`]) draw over a [`Clear`]ed centered rect.
 
 use ratatui::Frame;
+use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
@@ -117,6 +118,42 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     if let Some(overlay) = &app.overlay {
         crate::overlays::render_overlay(frame, app, overlay, area);
+    }
+
+    // Run last, after every widget (and the selection overpaint) has written its
+    // cells, so each wide glyph's trailing column inherits the final background.
+    heal_wide_char_trailing(frame.buffer_mut(), area);
+}
+
+/// Backfills the background of every double-width cell's trailing column.
+///
+/// A terminal paints a wide (CJK / full-width / emoji) glyph's background across
+/// *both* columns it occupies, but ratatui's widgets write only the lead cell
+/// (see `Paragraph::render_line`), leaving the trailing column at the base
+/// background in the back buffer. ratatui's incremental diff then never clears
+/// that trailing cell when the wide char moves or disappears — it compares the
+/// trailing column `base == base` and emits nothing — so the terminal keeps the
+/// background it painted there: a colored "ghost" block left behind departed
+/// CJK, most visible behind streaming diff highlights.
+///
+/// Copying the lead cell's background into its trailing cell makes the back
+/// buffer match what is actually on screen, so the diff clears the trailing cell
+/// the moment the wide char goes away. While the wide char is still present
+/// ratatui skips the trailing index (`pos += width - 1`), so the trailing cell
+/// is never emitted then and this can never overwrite the glyph's right half.
+fn heal_wide_char_trailing(buf: &mut Buffer, area: Rect) {
+    for y in area.top()..area.bottom() {
+        // Stop one short of the right edge: a lead at the last column has no
+        // in-bounds trailing (and ratatui would not place a wide char there).
+        for x in area.left()..area.right().saturating_sub(1) {
+            let lead_bg = match buf.cell((x, y)) {
+                Some(cell) if UnicodeWidthStr::width(cell.symbol()) >= 2 => cell.bg,
+                _ => continue,
+            };
+            if let Some(trailing) = buf.cell_mut((x + 1, y)) {
+                trailing.bg = lead_bg;
+            }
+        }
     }
 }
 
@@ -1497,6 +1534,101 @@ fn truncate_one_line(text: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::style::Color;
+    use ratatui::widgets::Widget;
+
+    // ---- wide-char trailing ghost heal ----
+
+    const TEST_BG: Color = Color::Rgb(0x10, 0x10, 0x12); // app background
+    const TEST_ADD_BG: Color = Color::Rgb(0x0f, 0x3a, 0x30); // diff_add_bg (green)
+
+    /// Renders one frame exactly like the transcript: bg-fill, then a Paragraph
+    /// with no `.style()` / no `.wrap()` (mirrors `draw` + `render_body`).
+    fn render_transcript(area: Rect, lines: Vec<Line<'static>>) -> Buffer {
+        let mut buf = Buffer::empty(area);
+        buf.set_style(area, Style::new().bg(TEST_BG));
+        Paragraph::new(Text::from(lines)).render(area, &mut buf);
+        buf
+    }
+
+    fn emitted(prev: &Buffer, next: &Buffer) -> Vec<(u16, u16)> {
+        prev.diff(next)
+            .into_iter()
+            .map(|(x, y, _)| (x, y))
+            .collect()
+    }
+
+    #[test]
+    fn heal_makes_diff_clear_wide_char_trailing_cells() {
+        let area = Rect::new(0, 0, 12, 1);
+        // "+你好": col0 '+', col1/2 你 (lead/trailing), col3/4 好 (lead/trailing).
+        let diff_line = Line::from(vec![Span::styled(
+            "+你好",
+            Style::new().fg(Color::White).bg(TEST_ADD_BG),
+        )]);
+        let blank = render_transcript(area, vec![Line::from("")]);
+
+        // Without the heal, the trailing columns stay at the base bg in the
+        // buffer, so when the wide chars disappear the diff never clears them —
+        // this is the ghost-block bug.
+        let unhealed = render_transcript(area, vec![diff_line.clone()]);
+        assert_eq!(unhealed[(2, 0)].bg, TEST_BG, "trailing untouched by render");
+        let before = emitted(&unhealed, &blank);
+        assert!(before.contains(&(1, 0)), "lead 你 is cleared");
+        assert!(
+            !before.contains(&(2, 0)) && !before.contains(&(4, 0)),
+            "BUG: wide-char trailing cells are NOT in the diff (ghost residue)"
+        );
+
+        // With the heal, the trailing columns carry the lead bg, so the diff
+        // clears them the moment the wide chars are gone.
+        let mut healed = render_transcript(area, vec![diff_line]);
+        heal_wide_char_trailing(&mut healed, area);
+        assert_eq!(healed[(2, 0)].bg, TEST_ADD_BG, "trailing now mirrors lead");
+        assert_eq!(healed[(4, 0)].bg, TEST_ADD_BG, "trailing now mirrors lead");
+        let after = emitted(&healed, &blank);
+        assert!(
+            after.contains(&(2, 0)) && after.contains(&(4, 0)),
+            "FIXED: trailing cells are now cleared by the diff"
+        );
+    }
+
+    #[test]
+    fn heal_never_emits_trailing_while_wide_char_present() {
+        // Safety: rendering INTO a frame that still has the wide char must not
+        // emit the trailing index, or the backend would print a space over the
+        // glyph's right half. ratatui's `pos += width - 1` skip guarantees this
+        // even after the heal sets the trailing bg.
+        let area = Rect::new(0, 0, 12, 1);
+        let blank = render_transcript(area, vec![Line::from("")]);
+        let mut widechar = render_transcript(
+            area,
+            vec![Line::from(vec![Span::styled(
+                "+你好",
+                Style::new().fg(Color::White).bg(TEST_ADD_BG),
+            )])],
+        );
+        heal_wide_char_trailing(&mut widechar, area);
+
+        let into_widechar = emitted(&blank, &widechar);
+        assert!(
+            into_widechar.contains(&(1, 0)) && into_widechar.contains(&(3, 0)),
+            "the wide leads are emitted (terminal paints both columns)"
+        );
+        assert!(
+            !into_widechar.contains(&(2, 0)) && !into_widechar.contains(&(4, 0)),
+            "SAFETY: trailing cells are skipped while the wide char is present"
+        );
+    }
+
+    #[test]
+    fn heal_is_a_noop_without_wide_chars() {
+        let area = Rect::new(0, 0, 12, 1);
+        let plain = render_transcript(area, vec![Line::from("plain text!!")]);
+        let mut healed = plain.clone();
+        heal_wide_char_trailing(&mut healed, area);
+        assert_eq!(plain, healed, "ASCII content is left untouched");
+    }
 
     // ---- scrollback clamping ----
 

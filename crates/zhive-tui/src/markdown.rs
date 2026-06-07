@@ -13,6 +13,10 @@
 //! disabled) emits fence sentinel lines (```` ```lang ```` / ```` ``` ````) and
 //! plain code body lines, which this module detects and re-highlights.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::sync::OnceLock;
 
 use ratatui::style::{Color, Modifier, Style};
@@ -58,50 +62,71 @@ pub fn render(source: &str, palette: &Palette) -> Vec<Line<'static>> {
     out
 }
 
+/// State for the fenced code block currently being collected.
+struct OpenFence {
+    /// Language token from the opening fence (empty for a bare ```` ``` ````).
+    lang: String,
+    /// Raw body lines gathered until the closing fence (or buffer EOF).
+    body: Vec<String>,
+}
+
 /// Renders one non-table Markdown block via tui-markdown + syntect highlighting.
+///
+/// A fenced code block's body is buffered and highlighted as a unit when its
+/// closing fence arrives, so the block is memoized by content (see
+/// [`render_code_body`]): a code block that sits above the in-flight tail of a
+/// streaming reply is highlighted once instead of re-highlighted on every
+/// frame. (`pulldown-cmark` synthesizes a closing fence at EOF, so a still-open
+/// block is closed here too; its body changes each token and simply misses the
+/// cache until it settles.)
 fn render_block(source: &str, palette: &Palette) -> Vec<Line<'static>> {
     let sheet = PaletteSheet::from_palette(palette);
     let text = from_str_with_options(source, &Options::new(sheet));
 
     let mut out: Vec<Line<'static>> = Vec::with_capacity(text.lines.len());
-    let mut in_fence = false;
-    // Highlighter state is rebuilt at each opening fence; `'static` because the
-    // syntax + theme references come from the process-global `Highlighter`.
-    let mut highlighter: Option<HighlightLines<'static>> = None;
+    let mut fence: Option<OpenFence> = None;
 
     for line in text.lines {
         let raw = line_raw_text(&line);
         if raw.trim_start().starts_with("```") {
-            in_fence = !in_fence;
-            if in_fence {
+            if let Some(open) = fence.take() {
+                // Closing fence: the block is complete, so render it through the
+                // content cache, then draw the bottom divider.
+                out.extend(render_code_body(&open.lang, &open.body, palette));
+                out.push(Line::styled(
+                    "─────────────",
+                    Style::new().fg(palette.fg_mute),
+                ));
+            } else {
+                // Opening fence: emit the header marker and start collecting.
                 let lang = fence_lang(&raw);
-                highlighter = Some(new_highlighter(&lang));
                 let marker = if lang.is_empty() {
                     "─── code ───".to_owned()
                 } else {
                     format!("─── {lang} ───")
                 };
                 out.push(Line::styled(marker, Style::new().fg(palette.fg_mute)));
-            } else {
-                out.push(Line::styled(
-                    "─────────────",
-                    Style::new().fg(palette.fg_mute),
-                ));
-                highlighter = None;
+                fence = Some(OpenFence {
+                    lang,
+                    body: Vec::new(),
+                });
             }
             continue;
         }
 
-        if in_fence {
-            out.push(Line::from(highlight_code_line(
-                &raw,
-                highlighter.as_mut(),
-                palette,
-            )));
+        if let Some(open) = fence.as_mut() {
+            open.body.push(raw);
             continue;
         }
 
         out.push(inject_palette_line(line, palette));
+    }
+
+    // Fallback: a fence left unclosed in tui-markdown's output (no synthesized
+    // close) flushes its body without a bottom divider, preserving prior
+    // behavior for any such edge case.
+    if let Some(open) = fence {
+        out.extend(render_code_body(&open.lang, &open.body, palette));
     }
 
     out
@@ -113,6 +138,72 @@ fn render_block(source: &str, palette: &Palette) -> Vec<Line<'static>> {
 /// one-time `two-face` asset deserialization on the render path.
 pub(crate) fn prewarm() {
     let _ = get_highlighter();
+}
+
+/// Hard cap on the closed-code-block highlight cache (see [`render_code_body`]).
+///
+/// Highlighted blocks are small `Vec<Line>`s and a session accrues few of them;
+/// the cap is a runaway guard, cleared wholesale on overflow rather than evicted
+/// per entry (a palette change invalidates every entry anyway, so precision here
+/// buys nothing).
+const CODE_BLOCK_CACHE_CAP: usize = 512;
+
+thread_local! {
+    /// Per-thread memo of highlighted *closed* code blocks, keyed by language +
+    /// body + the palette colors that affect the output. The TUI renders on one
+    /// thread, so a `thread_local` avoids locking; tests on other threads each
+    /// get their own (correct, independent) map.
+    static CODE_BLOCK_CACHE: RefCell<HashMap<u64, Vec<Line<'static>>>> =
+        RefCell::new(HashMap::new());
+}
+
+/// Highlights a fenced code block's `body`, memoizing the result by content.
+///
+/// The highlight (the costly `syntect` pass) is computed once per distinct
+/// block content and cloned on later frames — the key to smooth streaming when
+/// completed code blocks sit above the in-flight tail. The tail block changes
+/// each token, so it simply misses the cache until its content settles; those
+/// transient entries are bounded by [`CODE_BLOCK_CACHE_CAP`].
+fn render_code_body(lang: &str, body: &[String], palette: &Palette) -> Vec<Line<'static>> {
+    let key = code_block_key(lang, body, palette);
+    if let Some(hit) = CODE_BLOCK_CACHE.with(|c| c.borrow().get(&key).cloned()) {
+        return hit;
+    }
+    let lines = highlight_body(lang, body, palette);
+    CODE_BLOCK_CACHE.with(|c| {
+        let mut map = c.borrow_mut();
+        if map.len() >= CODE_BLOCK_CACHE_CAP {
+            map.clear();
+        }
+        map.insert(key, lines.clone());
+    });
+    lines
+}
+
+/// Highlights `body` line-by-line with a single fence-scoped highlighter.
+fn highlight_body(lang: &str, body: &[String], palette: &Palette) -> Vec<Line<'static>> {
+    // Highlighter state is rebuilt per block; `'static` because the syntax +
+    // theme references come from the process-global `Highlighter`.
+    let mut highlighter: HighlightLines<'static> = new_highlighter(lang);
+    body.iter()
+        .map(|raw| Line::from(highlight_code_line(raw, Some(&mut highlighter), palette)))
+        .collect()
+}
+
+/// Content hash keying the closed-block cache: language, body, and the palette
+/// colors [`highlight_code_line`] reads (so a `/theme` switch can't serve a
+/// stale-colored block).
+fn code_block_key(lang: &str, body: &[String], palette: &Palette) -> u64 {
+    let mut h = DefaultHasher::new();
+    lang.hash(&mut h);
+    for line in body {
+        line.hash(&mut h);
+        // Separator so ["ab"] and ["a","b"] cannot collide.
+        0xffu8.hash(&mut h);
+    }
+    palette.bg_overlay.hash(&mut h);
+    palette.fg.hash(&mut h);
+    h.finish()
 }
 
 /// Concatenates the text content of a line's spans (markup-free).
@@ -375,6 +466,52 @@ mod tests {
     }
 
     #[test]
+    fn closed_code_block_cache_hit_matches_cold_render() {
+        // Second render of the same closed block must come from the cache and be
+        // byte-for-byte identical to the first (cold) render.
+        let src = "intro\n\n```rust\nfn main() { let x = 1; }\n```\n\ntail";
+        let p = palette();
+        let first = render(src, &p);
+        let second = render(src, &p);
+        assert_eq!(first, second, "cached closed-block render must match cold");
+    }
+
+    #[test]
+    fn unclosed_fence_renders_body_without_panic() {
+        // An in-flight (unclosed) fence — pulldown-cmark synthesizes a close at
+        // EOF — must still render its body. Two renders match (cache-consistent).
+        let src = "```rust\nfn main() {";
+        let p = palette();
+        let a = render(src, &p);
+        let b = render(src, &p);
+        assert_eq!(a, b, "repeated render of an in-flight block must be stable");
+        let joined: String = a
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(joined.contains("fn main"), "in-flight body must render");
+    }
+
+    #[test]
+    fn distinct_closed_blocks_do_not_cross_contaminate() {
+        // Two different blocks must cache and render independently — a content
+        // key collision would leak one block's highlight into the other.
+        let p = palette();
+        let body_of = |ls: &[Line<'_>]| -> String {
+            ls.iter()
+                .flat_map(|l| l.spans.iter())
+                .map(|s| s.content.as_ref().to_owned())
+                .collect()
+        };
+        let a = render("```rust\nlet a = 1;\n```", &p);
+        let b = render("```rust\nlet b = 2;\n```", &p);
+        assert!(body_of(&a).contains("let a = 1;"));
+        assert!(body_of(&b).contains("let b = 2;"));
+        assert!(!body_of(&b).contains("let a = 1;"));
+    }
+
+    #[test]
     fn heading_marker_detector() {
         assert!(is_heading_marker("# "));
         assert!(is_heading_marker("###### "));
@@ -382,6 +519,37 @@ mod tests {
         assert!(!is_heading_marker("####### "));
         assert!(!is_heading_marker("#x "));
         assert!(!is_heading_marker(""));
+    }
+
+    /// Perf gate: while a reply streams, a completed code block above the
+    /// in-flight tail must be served from the content cache, not re-highlighted
+    /// every frame — keeping each streaming repaint well under the reveal tick.
+    #[test]
+    #[ignore = "perf gate; run manually with --ignored --nocapture"]
+    fn closed_block_above_streaming_tail_is_cheap() {
+        use std::fmt::Write as _;
+        use std::time::Instant;
+
+        let mut prefix = String::from("Here is the implementation:\n\n```rust\n");
+        for i in 0..200 {
+            let _ = writeln!(prefix, "fn function_{i}(x: u64) -> u64 {{ x * 2 + {i} }}");
+        }
+        prefix.push_str("```\n\n");
+        let p = palette();
+        let _ = render(&prefix, &p); // warm the highlighter + cache the closed block
+
+        let t0 = Instant::now();
+        for frame in 0..30 {
+            let mut buf = prefix.clone();
+            let _ = write!(buf, "Now streaming an explanation, token {frame} ...");
+            let _ = render(&buf, &p);
+        }
+        let per_frame = t0.elapsed() / 30;
+        println!("[stream-perf] per-frame with cached closed block = {per_frame:?}");
+        assert!(
+            per_frame.as_millis() < 9,
+            "streaming frame with a cached closed block must be <9ms, got {per_frame:?}"
+        );
     }
 }
 
