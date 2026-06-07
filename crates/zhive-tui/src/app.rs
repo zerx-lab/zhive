@@ -494,8 +494,9 @@ pub struct SkillCommand {
 
 /// The built-in slash commands the conversation screen always understands.
 ///
-/// Extra runtime commands (e.g. skill slash-commands discovered at startup) are
-/// stored in [`App::extra_commands`] and merged at palette-match time.
+/// These lead the `/` palette; extra runtime commands (e.g. skill
+/// slash-commands discovered at startup) are stored in [`App::extra_commands`]
+/// and appended at palette-match time.
 #[must_use]
 pub fn builtin_commands() -> Vec<SlashCommand> {
     [
@@ -567,6 +568,14 @@ pub struct App {
     /// Anchoring is skipped when the width changed: a resize reflows every line,
     /// so a line-count delta then is not newly streamed output.
     pub(crate) last_width: u16,
+    /// Request a full terminal clear before the next draw.
+    ///
+    /// ratatui's incremental diff leaves stale physical cells behind a wide
+    /// (CJK) glyph after a re-layout: the buffer is correct, but the terminal
+    /// keeps last frame's wider background where a now-shorter line used to be.
+    /// Set on the discrete layout-shifting actions (fold toggle, resize) so the
+    /// event loop forces a full repaint that wipes the artifact.
+    pub(crate) force_clear: bool,
     /// Baseline expansion of collapsible detail blocks, toggled by ctrl+o.
     ///
     /// Covers `/skill:<name>` chips, tool-call output, command output, and
@@ -769,6 +778,7 @@ impl App {
             viewport_max_scroll: Cell::new(0),
             last_total: 0,
             last_width: 0,
+            force_clear: false,
             details_expanded: false,
             item_expanded: std::collections::HashMap::new(),
             toggle_zones: RefCell::new(Vec::new()),
@@ -935,21 +945,23 @@ impl App {
         }
     }
 
-    /// Skill commands whose name prefixes the current palette query.
+    /// Commands whose name prefixes the current palette query.
     ///
-    /// Only runtime-injected skill commands ([`App::extra_commands`]) populate
-    /// the `/` palette. Built-in commands (`/compact`, `/clear`, `/model`, …)
-    /// remain dispatchable by name through [`Self::run_slash`] but are
-    /// intentionally hidden from the menu, so it lists skills alone.
+    /// Built-in commands ([`builtin_commands`]) lead the menu, followed by the
+    /// runtime-injected skill commands ([`App::extra_commands`]). The skill list
+    /// already excludes names that clash with a built-in (the built-in wins), so
+    /// chaining the two stays duplicate-free. Both kinds dispatch through
+    /// [`Self::run_slash`]; the menu now surfaces both so `/settings`, `/model`,
+    /// and friends are discoverable, not just blind-typed.
     #[must_use]
     pub fn palette_matches(&self) -> Vec<SlashCommand> {
         let Some(query) = self.palette_query() else {
             return Vec::new();
         };
-        self.extra_commands
-            .iter()
+        builtin_commands()
+            .into_iter()
+            .chain(self.extra_commands.iter().cloned())
             .filter(|c| c.name.starts_with(query))
-            .cloned()
             .collect()
     }
 
@@ -1274,6 +1286,16 @@ impl App {
         self.composer_sel = None;
     }
 
+    /// Requests a full terminal clear before the next draw (see [`Self::force_clear`]).
+    pub(crate) fn request_clear(&mut self) {
+        self.force_clear = true;
+    }
+
+    /// Consumes the pending full-clear request, returning whether one was set.
+    pub(crate) fn take_clear(&mut self) -> bool {
+        std::mem::take(&mut self.force_clear)
+    }
+
     /// Effective expansion of a collapsible block: its override, else baseline.
     ///
     /// A click records a per-item override in [`Self::item_expanded`]; absent
@@ -1328,6 +1350,8 @@ impl App {
         let next = !self.item_is_expanded(&id);
         self.item_expanded.insert(id, next);
         self.clear_selection();
+        // A single-block fold also shifts the lines below; force a full repaint.
+        self.force_clear = true;
     }
 
     /// Takes the selected text and clears the selection.
@@ -1946,6 +1970,9 @@ impl App {
                 // Expanding/collapsing shifts every line below, so a selection's
                 // absolute line indices would point at the wrong rows.
                 self.clear_selection();
+                // The re-layout moves wide glyphs; force a full repaint so no
+                // stale background lingers behind their old positions.
+                self.force_clear = true;
                 Action::None
             }
             // Cycle reasoning depth: Off → Low → Medium → High → Xhigh → Off.
@@ -2633,6 +2660,18 @@ mod tests {
         assert!(!a.details_expanded);
     }
 
+    #[test]
+    fn fold_toggle_requests_full_clear() {
+        let mut a = app();
+        assert!(!a.force_clear, "idle app has no pending clear");
+        // ctrl+o re-layouts the transcript → the loop must repaint from scratch.
+        a.on_key(ctrl(KeyCode::Char('o')));
+        assert!(a.force_clear, "ctrl+o requests a full clear");
+        // take_clear consumes the request exactly once.
+        assert!(a.take_clear(), "take_clear returns the pending request");
+        assert!(!a.take_clear(), "request is consumed, not sticky");
+    }
+
     /// Two sample models for the picker tests: an active Opus and a Haiku.
     fn sample_models() -> Vec<zhive_proto::rpc::ModelDescriptor> {
         use zhive_proto::domain::ThinkingEffort::{High, Low, Medium, Off};
@@ -3024,13 +3063,19 @@ mod tests {
     fn palette_enter_executes_highlighted_command() {
         let mut app = app_with_skills();
         app.on_key(key(KeyCode::Char('/')));
-        // Move the highlight off the first entry; a single Enter then dispatches
-        // the *highlighted* skill, not merely the first match.
-        app.on_key(ctrl(KeyCode::Char('n')));
-        let highlighted = app.palette_matches()[app.palette_index].name.clone();
+        // Built-ins lead the palette, so the first match is a built-in, not a
+        // skill. Highlight a skill entry explicitly and confirm a single Enter
+        // dispatches the *highlighted* command, not merely the first match.
+        let matches = app.palette_matches();
+        let skill_idx = matches
+            .iter()
+            .position(|c| c.name == "commit")
+            .expect("the commit skill is registered");
+        assert_ne!(skill_idx, 0, "a built-in leads ahead of the commit skill");
+        app.palette_index = skill_idx;
         match app.on_key(key(KeyCode::Enter)) {
             Action::Submit(text) => {
-                assert!(text.contains(&format!("name=\"{highlighted}\"")));
+                assert!(text.contains("name=\"commit\""));
             }
             other => panic!("expected Submit of the highlighted skill, got {other:?}"),
         }
@@ -3040,8 +3085,8 @@ mod tests {
     fn palette_enter_on_arg_command_completes_without_dispatch() {
         let mut app = app();
         // An arg-taking palette command completes to "/name " and waits for the
-        // argument. Built-ins are hidden from the palette, so use a skill-style
-        // extra command to exercise the arg-completion path.
+        // argument. Use a skill-style extra command with a prefix no built-in
+        // shares ("/de") to isolate the arg-completion path to a single match.
         app.set_extra_commands(vec![SlashCommand::from_static(
             "deploy",
             "deploy to an environment",
@@ -3199,10 +3244,11 @@ mod tests {
         }
         assert_eq!(app.palette_query(), Some("com"));
         let matches = app.palette_matches();
+        // Both the built-in `/compact` and the `commit` skill prefix-match "com"
+        // and are surfaced together in the palette.
         assert!(matches.iter().any(|c| c.name == "commit"));
-        // Built-in commands are intentionally hidden from the palette, even when
-        // their name would otherwise prefix-match the query.
-        assert!(!matches.iter().any(|c| c.name == "compact"));
+        assert!(matches.iter().any(|c| c.name == "compact"));
+        // A non-matching built-in stays out of this filtered view.
         assert!(!matches.iter().any(|c| c.name == "model"));
         // A space ends command composition and closes the palette.
         app.on_key(key(KeyCode::Char(' ')));
@@ -3230,10 +3276,10 @@ mod tests {
 
     #[test]
     fn tab_autocompletes_unique_command() {
-        // Tab completes the highlighted palette match. Built-ins are hidden, so
-        // the palette is populated from skills; "/com" uniquely prefixes commit.
+        // Tab completes the highlighted palette match. "/comm" is a prefix no
+        // built-in shares, so it uniquely selects the commit skill.
         let mut app = app_with_skills();
-        for c in "/com".chars() {
+        for c in "/comm".chars() {
             app.on_key(key(KeyCode::Char(c)));
         }
         app.on_key(key(KeyCode::Tab));
@@ -3341,24 +3387,54 @@ mod tests {
     }
 
     #[test]
-    fn builtins_are_hidden_from_palette_but_still_dispatch() {
+    fn builtins_appear_in_palette_and_dispatch() {
         let mut app = app();
-        // A skill command coexists, but built-ins never populate the palette.
+        // A skill command coexists with the built-ins in the palette.
         app.set_extra_commands(vec![SlashCommand::from_static("deploy", "deploy", false)]);
-        for c in "/help".chars() {
+        for c in "/se".chars() {
             app.on_key(key(KeyCode::Char(c)));
         }
         let matches = app.palette_matches();
         assert!(
-            matches.is_empty(),
-            "no skill prefixes /help, and built-ins are hidden, so the palette is empty"
+            matches.iter().any(|c| c.name == "settings"),
+            "the built-in /settings must be discoverable in the palette"
         );
-        // With nothing highlighted, Enter falls back to name dispatch: the
-        // built-in /help still works even though it is absent from the menu.
+        assert!(
+            matches.iter().any(|c| c.name == "session"),
+            "all built-ins matching the prefix are listed, not just the first"
+        );
+        // The highlighted built-in dispatches on Enter.
+        app.palette_index = matches
+            .iter()
+            .position(|c| c.name == "settings")
+            .expect("settings is present");
         assert_eq!(app.on_key(key(KeyCode::Enter)), Action::None);
         assert!(
-            matches!(app.overlay, Some(Overlay::Help)),
-            "built-in /help must still open the Help overlay"
+            matches!(app.overlay, Some(Overlay::Settings)),
+            "selecting the built-in /settings must open the Settings overlay"
+        );
+    }
+
+    #[test]
+    fn builtins_lead_skills_in_palette_order() {
+        let mut app = app();
+        // A skill whose name shares the `s` prefix with several built-ins.
+        app.set_extra_commands(vec![SlashCommand::from_static("ship", "ship it", false)]);
+        for c in "/s".chars() {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+        let matches = app.palette_matches();
+        let settings = matches
+            .iter()
+            .position(|c| c.name == "settings")
+            .expect("built-in present");
+        let ship = matches
+            .iter()
+            .position(|c| c.name == "ship")
+            .expect("skill present");
+        assert!(
+            settings < ship,
+            "built-ins lead the palette ahead of skills"
         );
     }
 
@@ -3753,8 +3829,8 @@ mod tests {
 
     #[test]
     fn streaming_event_clears_stale_transcript_selection() {
-        use crate::protocol::ItemDeltaKind;
         use zhive_proto::domain::TurnId;
+        use zhive_proto::events::ItemDeltaKind;
 
         let mut a = app();
         a.sel_geom.set(SelGeom::new(Rect::new(0, 0, 40, 10), 0));
@@ -3784,8 +3860,8 @@ mod tests {
 
     #[test]
     fn streaming_event_leaves_composer_selection_intact() {
-        use crate::protocol::ItemDeltaKind;
         use zhive_proto::domain::TurnId;
+        use zhive_proto::events::ItemDeltaKind;
 
         let mut a = app();
         a.composer_geom

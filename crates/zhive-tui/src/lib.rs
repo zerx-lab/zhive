@@ -274,6 +274,35 @@ fn install_mouse_panic_guard() {
     }));
 }
 
+/// Clears the screen and repaints in full inside one synchronized update.
+///
+/// ratatui's incremental diff leaves stale physical cells behind wide (CJK)
+/// glyphs once content reflows; a clear-and-repaint is the only way to wipe them
+/// with stock ratatui (a bare buffer-invalidate would re-skip the same trailing
+/// cells).
+///
+/// We force the wipe via [`Terminal::resize`] to the current size rather than
+/// [`Terminal::clear`]: for a fullscreen viewport `resize` does the same work
+/// (clear the screen + reset the back buffer so the next draw repaints in full)
+/// but, crucially, does NOT snapshot the cursor with a DSR query — `clear()`
+/// does, and that query races the async input `EventStream` (which drains the
+/// reply), timing out with "cursor position could not be read".
+///
+/// The clear and the draw are two terminal writes, so they are wrapped in a
+/// synchronized update (CSI ?2026) — the terminal swaps the frame atomically and
+/// never shows the momentary blank between them (no flicker).
+fn full_repaint(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {
+    use crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
+    use ratatui::layout::Rect;
+
+    let size = terminal.size()?;
+    crossterm::execute!(std::io::stdout(), BeginSynchronizedUpdate)?;
+    terminal.resize(Rect::new(0, 0, size.width, size.height))?;
+    terminal.draw(|frame| ui::draw(frame, app))?;
+    crossterm::execute!(std::io::stdout(), EndSynchronizedUpdate)?;
+    Ok(())
+}
+
 /// The core select loop, factored out so the terminal is always restored.
 #[expect(
     clippy::too_many_lines,
@@ -300,11 +329,30 @@ async fn event_loop(
     // so per-delta repaints coalesce to the 90ms tick instead of one draw per
     // token. `dirty` starts true so the first frame always paints.
     let mut dirty = true;
+    // Last rendered scroll offset, to detect scrolling (which shifts every row).
+    let mut last_scrollback = app.scrollback;
+    // When set, the deadline at which to wipe wide-glyph residue with one full
+    // repaint after scrolling has settled. Scrolling itself paints incrementally
+    // (smooth, no per-tick clear); only this debounced wipe pays a full repaint,
+    // so a fast scroll is never throttled by clearing on every wheel event.
+    let mut scroll_settle: Option<tokio::time::Instant> = None;
     loop {
         if dirty {
-            terminal.draw(|frame| ui::draw(frame, app))?;
+            // Fold/resize force an immediate full repaint (rare). Scrolling does
+            // not: it draws incrementally and defers the residue wipe below.
+            if app.take_clear() {
+                full_repaint(terminal, app)?;
+            } else {
+                terminal.draw(|frame| ui::draw(frame, app))?;
+            }
+            if app.scrollback != last_scrollback {
+                scroll_settle = Some(tokio::time::Instant::now() + Duration::from_millis(80));
+            }
+            last_scrollback = app.scrollback;
             dirty = false;
         }
+        // Future that fires once scrolling settles (or never, when idle).
+        let settle = scroll_settle;
         if app.should_quit {
             return Ok(());
         }
@@ -397,7 +445,12 @@ async fn event_loop(
                             _ => {} // other clicks / moves
                         }
                     }
-                    Some(Ok(_)) => {}            // resize / focus
+                    Some(Ok(Event::Resize(..))) => {
+                        // A resize reflows every line; force a full repaint so
+                        // ratatui's diff cannot leave stale wide-glyph cells.
+                        app.request_clear();
+                    }
+                    Some(Ok(_)) => {}            // focus / other
                     Some(Err(err)) => {
                         app.flash = Some(format!("input error: {err}"));
                     }
@@ -434,6 +487,17 @@ async fn event_loop(
             {
                 app.tick();
                 dirty = true;
+            }
+            // Scrolling has settled: wipe any wide-glyph residue the incremental
+            // scroll frames left behind with one synchronized full repaint.
+            () = async move {
+                match settle {
+                    Some(at) => tokio::time::sleep_until(at).await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
+                scroll_settle = None;
+                full_repaint(terminal, app)?;
             }
         }
 
