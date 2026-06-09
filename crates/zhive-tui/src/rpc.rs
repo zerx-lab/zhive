@@ -230,7 +230,7 @@ pub async fn list_checkpoints(client: &Client, thread: &ThreadId) -> Result<Vec<
         .call(zhive_proto::methods::METHOD_LIST_CHECKPOINTS, Some(params))
         .await?;
     let reply: zhive_proto::rpc::ListCheckpointsResult = serde_json::from_value(result)
-        .unwrap_or_else(|_| zhive_proto::rpc::ListCheckpointsResult::new(Vec::new()));
+        .map_err(|e| zhive_client_native::ClientError::Decode(e.to_string()))?;
     Ok(reply.checkpoints)
 }
 

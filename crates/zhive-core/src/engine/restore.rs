@@ -124,6 +124,47 @@ impl EngineInner {
         Ok(checkpoints)
     }
 
+    /// Copies a source thread's in-boundary checkpoints onto a freshly forked
+    /// branch so the branch stays rewindable (chained rewind).
+    ///
+    /// Keeps only the checkpoints for turns that survive the rewind — those
+    /// strictly before `target_turn` in the source rollout — and re-records each
+    /// under the new thread keyed by its original turn id. The fork preserves
+    /// every item's original turn-encoded id, so these copied checkpoints align
+    /// with the branch's items and resolve on a subsequent rewind.
+    ///
+    /// Best-effort: a read failure leaves the branch with no checkpoints rather
+    /// than failing the restore (the rewind itself already succeeded).
+    async fn copy_checkpoints_to_fork(
+        &self,
+        storage: &crate::persistence::Storage,
+        source_thread_id: &ThreadId,
+        new_thread_id: &ThreadId,
+        target_turn: &TurnId,
+    ) {
+        // Turns kept on the branch are those appearing before the target turn.
+        let kept = kept_turns_before(storage, source_thread_id, target_turn).await;
+        if kept.is_empty() {
+            return;
+        }
+        let Ok(checkpoints) = storage.state.list_checkpoints(source_thread_id).await else {
+            return;
+        };
+        let now = super::lifecycle::unix_now_pub();
+        for cp in checkpoints {
+            if !kept.contains(cp.turn_id.0.as_ref()) {
+                continue;
+            }
+            self.enqueue_storage_op(StorageWriteOp::Snapshot {
+                thread_id: new_thread_id.clone(),
+                turn_id: cp.turn_id.clone(),
+                timestamp: now,
+                tree: cp.tree.clone(),
+                preview: cp.preview.clone(),
+            });
+        }
+    }
+
     /// Reverts the workspace to a checkpoint and rewinds the conversation.
     ///
     /// See the [module docs](self) for the full flow. Returns the new branch
@@ -208,21 +249,46 @@ impl EngineInner {
             "workspace files reverted to checkpoint"
         );
 
-        // Fork the conversation to the checkpoint. Reuses the verified fork path
-        // (its own BranchSummary phase claim + durable replay). `boundary` is the
-        // last item to keep; `None` keeps the full prior history (only when the
-        // target turn has no preceding item, i.e. the earliest checkpoint).
-        let fork = self
-            .fork_thread(thread_id.clone(), boundary, false)
-            .await
-            .map_err(|e| RestoreError::ReplayFailed {
-                message: e.to_string(),
-            })?;
+        // Fork the conversation to the checkpoint. Reuses the verified fork
+        // path (its own BranchSummary phase claim + durable replay).
+        //
+        // * `UpTo(id)` keeps history up to and including `id`.
+        // * `ToStart` rewinds to before the first turn — an empty branch.
+        // * `All` (target turn not found) conservatively keeps everything.
+        let fork = match boundary {
+            RewindBound::UpTo(id) => self.fork_thread(thread_id.clone(), Some(id), false).await,
+            RewindBound::ToStart => self.fork_thread_to_start(thread_id.clone()).await,
+            RewindBound::All => self.fork_thread(thread_id.clone(), None, false).await,
+        }
+        .map_err(|e| RestoreError::ReplayFailed {
+            message: e.to_string(),
+        })?;
         let ForkReply::Forked {
             new_thread_id,
             items_replayed,
             ..
         } = fork;
+
+        // Carry the kept turns' checkpoints onto the new branch so a rewound
+        // thread stays rewindable (chained rewind). The fork preserves each
+        // item's original turn-encoded id, so copying the source checkpoints
+        // under their original turn ids keeps `boundary_before_turn` able to
+        // resolve them on the branch.
+        self.copy_checkpoints_to_fork(&storage, &thread_id, &new_thread_id, &target_turn_id)
+            .await;
+
+        // Wait for the forked thread's rollout to be durable before returning.
+        // `fork_thread` enqueues the branch's writes (header + items + flush)
+        // asynchronously and does not block on them; the TUI reads the new
+        // thread's history (`thread/get_items` → rollout replay) the instant
+        // restore returns. Without this ack the read can race ahead of the
+        // writer and see an empty rollout, leaving the rewound view blank.
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        self.enqueue_storage_op(StorageWriteOp::Flush {
+            thread_id: new_thread_id.clone(),
+            ack: Some(ack_tx),
+        });
+        let _ = tokio::time::timeout(RESTORE_FLUSH_ACK_TIMEOUT, ack_rx).await;
 
         let _ = self.events_tx().send(EngineEvent::Restored {
             source_thread_id: thread_id,
@@ -240,30 +306,94 @@ impl EngineInner {
     }
 }
 
-/// Finds the id of the last item that precedes `target_turn`'s first item.
+/// How far back a rewind cuts the conversation, derived from the target turn's
+/// position in the rollout.
+enum RewindBound {
+    /// Keep every item up to and including this one (target has a preceding
+    /// item); the fork truncates there.
+    UpTo(ItemId),
+    /// The target is the first turn — rewind to before it, leaving an empty
+    /// conversation.
+    ToStart,
+    /// The target turn was not found in the rollout; fall back to keeping the
+    /// full history (conservative: never silently drops data).
+    All,
+}
+
+/// Classifies a rewind target's truncation boundary from the rollout.
 ///
-/// This is the inclusive truncation boundary handed to
-/// [`EngineInner::fork_thread`]: keep every item up to and including it, drop
-/// the target turn and everything after. Returns `None` when the target turn is
-/// the first turn (no preceding item) — the fork then keeps the full history,
-/// which the earliest-checkpoint case documents as a known limitation.
+/// Walks the rollout in order: returns [`RewindBound::UpTo`] with the last item
+/// before the target turn's first item, [`RewindBound::ToStart`] when the target
+/// is the first turn (nothing precedes it), or [`RewindBound::All`] when the
+/// target turn never appears (treat as a full-history branch).
+///
+/// The turn each item belongs to is read from its **id** (`item:<turn>/<seq>`),
+/// not the rollout's `turn_id` field. On a forked thread every replayed item is
+/// re-homed under one synthetic `::forked` turn, but its id still encodes the
+/// original turn — so deriving the turn from the id lets a rewind chain through
+/// successive forks.
 async fn boundary_before_turn(
     storage: &crate::persistence::Storage,
     thread_id: &ThreadId,
     target_turn: &TurnId,
-) -> Option<ItemId> {
+) -> RewindBound {
     let path = storage.rollout_path(&thread_id.0);
-    let entries = read_all_tolerant(&path).await.ok()?;
+    let Ok(entries) = read_all_tolerant(&path).await else {
+        return RewindBound::All;
+    };
     let mut last_before: Option<ItemId> = None;
     for entry in entries {
-        if let RolloutEntry::Item { turn_id, item, .. } = entry {
-            if turn_id == target_turn.0.as_ref() {
-                return last_before;
+        if let RolloutEntry::Item { item, .. } = entry {
+            let item_turn = turn_of_item(item.id());
+            if item_turn.as_deref() == Some(target_turn.0.as_ref()) {
+                // Reached the target turn: keep everything before it, or start
+                // empty when it is the very first turn.
+                return match last_before {
+                    Some(id) => RewindBound::UpTo(id),
+                    None => RewindBound::ToStart,
+                };
             }
             last_before = Some(item.id().clone());
         }
     }
-    last_before
+    RewindBound::All
+}
+
+/// Recovers the owning turn id from an `item:<turn>/<seq>` item id.
+///
+/// Returns `None` for ids that do not encode a turn (legacy client-minted ids).
+/// Mirrors the TUI's `history_turn_id`: strip the `item:` prefix, then drop the
+/// trailing `/<seq>` segment.
+fn turn_of_item(id: &ItemId) -> Option<String> {
+    let body = id.0.as_ref().strip_prefix("item:")?;
+    let (turn, _seq) = body.rsplit_once('/')?;
+    (!turn.is_empty()).then(|| turn.to_owned())
+}
+
+/// Collects the (item-id-encoded) turn ids that appear strictly before
+/// `target_turn` in `thread_id`'s rollout — the turns a rewind to `target_turn`
+/// keeps. Returns an empty set when the target is the first turn or unknown.
+async fn kept_turns_before(
+    storage: &crate::persistence::Storage,
+    thread_id: &ThreadId,
+    target_turn: &TurnId,
+) -> std::collections::HashSet<String> {
+    let mut kept = std::collections::HashSet::new();
+    let path = storage.rollout_path(&thread_id.0);
+    let Ok(entries) = read_all_tolerant(&path).await else {
+        return kept;
+    };
+    for entry in entries {
+        if let RolloutEntry::Item { item, .. } = entry
+            && let Some(turn) = turn_of_item(item.id())
+        {
+            if turn == target_turn.0.as_ref() {
+                break;
+            }
+            kept.insert(turn);
+        }
+    }
+    kept
 }
 
 /// Restores `Idle` from `Restore` on drop, even across a panic.
@@ -391,8 +521,14 @@ mod tests {
         .await
         .expect("header");
         for (turn, item) in [
-            (&turn0, user_item("item:u0", "first")),
-            (&turn1, user_item("item:u1", "second")),
+            (
+                &turn0,
+                user_item("item:turn:thread:native/restore-it/0/0", "first"),
+            ),
+            (
+                &turn1,
+                user_item("item:turn:thread:native/restore-it/1/0", "second"),
+            ),
         ] {
             w.append(&RolloutEntry::Item {
                 thread_id: thread.0.to_string(),
@@ -433,7 +569,10 @@ mod tests {
             .await
             .expect("restore ok");
         let RestoreReply::Restored {
-            reverted, deleted, ..
+            reverted,
+            deleted,
+            new_thread_id,
+            ..
         } = reply;
         assert!(reverted >= 1, "a.txt should be reverted");
         assert!(deleted >= 1, "b.txt should be deleted");
@@ -444,6 +583,218 @@ mod tests {
             "v1"
         );
         assert!(!file_b.exists(), "b.txt should be gone");
+
+        // The forked thread's history must be readable IMMEDIATELY after restore
+        // returns — restore waits for the branch rollout to be durable, so the
+        // TUI's follow-up `get_items` cannot race ahead of the writer and see an
+        // empty thread (the "rewound → blank screen" bug). Rewinding to turn 1
+        // keeps turn 0's single user item.
+        let forked = inner
+            .get_items(new_thread_id, None, None, None)
+            .await
+            .expect("forked history readable right after restore");
+        assert_eq!(
+            forked.len(),
+            1,
+            "forked thread keeps turn 0's history, got {forked:?}"
+        );
+    }
+
+    /// Rewinding to the EARLIEST checkpoint (the first turn) yields an empty
+    /// branch — there is nothing before the first message to keep.
+    #[tokio::test]
+    async fn restore_to_first_turn_forks_empty_branch() {
+        let work = tempfile::tempdir().expect("work tempdir");
+        let file_a = work.path().join("a.txt");
+        tokio::fs::write(&file_a, b"v1").await.expect("seed a");
+
+        let (inner, _data) = inner_for_workspace(work.path()).await;
+        if inner.shadow_repo().await.is_none() {
+            eprintln!("skipping: shadow repo unavailable (no git)");
+            return;
+        }
+
+        let thread = ThreadId(Arc::from("thread:native/restore-first"));
+        let turn0 = TurnId(Arc::from("turn:thread:native/restore-first/0"));
+        let turn1 = TurnId(Arc::from("turn:thread:native/restore-first/1"));
+
+        let mut w = RolloutWriter::open(inner.storage().unwrap().rollout_path(&thread.0))
+            .await
+            .expect("open rollout");
+        w.append(&RolloutEntry::Session {
+            version: 4,
+            id: thread.0.to_string(),
+            timestamp: 0,
+            cwd: work.path().to_string_lossy().into_owned(),
+            parent_session: None,
+            subagent_parent: None,
+            source: None,
+        })
+        .await
+        .expect("header");
+        for (turn, item) in [
+            (
+                &turn0,
+                user_item("item:turn:thread:native/restore-first/0/0", "first"),
+            ),
+            (
+                &turn1,
+                user_item("item:turn:thread:native/restore-first/1/0", "second"),
+            ),
+        ] {
+            w.append(&RolloutEntry::Item {
+                thread_id: thread.0.to_string(),
+                turn_id: turn.0.to_string(),
+                timestamp: 0,
+                item: Box::new(item),
+            })
+            .await
+            .expect("item");
+        }
+        w.sync_all().await.expect("sync");
+        drop(w);
+
+        // Capture a checkpoint for the FIRST turn against the v1 workspace.
+        inner
+            .capture_turn_snapshot(&thread, &turn0, "first".to_owned())
+            .await;
+        drain(&inner, &thread).await;
+
+        // Mutate the workspace so the revert has something to undo.
+        tokio::fs::write(&file_a, b"v2-modified")
+            .await
+            .expect("modify a");
+
+        let reply = inner
+            .restore_to_checkpoint(thread.clone(), turn0.clone())
+            .await
+            .expect("restore ok");
+        let RestoreReply::Restored {
+            new_thread_id,
+            items_replayed,
+            ..
+        } = reply;
+
+        // The branch starts empty: rewinding to before the first message keeps
+        // no conversation items.
+        assert_eq!(items_replayed, 0, "earliest rewind replays nothing");
+        let forked = inner
+            .get_items(new_thread_id, None, None, None)
+            .await
+            .expect("forked history readable");
+        assert!(
+            forked.is_empty(),
+            "rewind to first turn must yield an empty branch, got {forked:?}"
+        );
+        // The file revert still happened.
+        assert_eq!(
+            tokio::fs::read_to_string(&file_a).await.expect("read a"),
+            "v1"
+        );
+    }
+
+    /// A rewound branch stays rewindable: its kept turns' checkpoints are
+    /// carried over, so the user can keep rewinding back toward the start.
+    #[tokio::test]
+    async fn rewound_branch_is_rewindable_again() {
+        let work = tempfile::tempdir().expect("work tempdir");
+        let file_a = work.path().join("a.txt");
+        tokio::fs::write(&file_a, b"v0").await.expect("seed a");
+
+        let (inner, _data) = inner_for_workspace(work.path()).await;
+        if inner.shadow_repo().await.is_none() {
+            eprintln!("skipping: shadow repo unavailable (no git)");
+            return;
+        }
+
+        let thread = ThreadId(Arc::from("thread:native/chain"));
+        let turn0 = TurnId(Arc::from("turn:thread:native/chain/0"));
+        let turn1 = TurnId(Arc::from("turn:thread:native/chain/1"));
+
+        let mut w = RolloutWriter::open(inner.storage().unwrap().rollout_path(&thread.0))
+            .await
+            .expect("open rollout");
+        w.append(&RolloutEntry::Session {
+            version: 4,
+            id: thread.0.to_string(),
+            timestamp: 0,
+            cwd: work.path().to_string_lossy().into_owned(),
+            parent_session: None,
+            subagent_parent: None,
+            source: None,
+        })
+        .await
+        .expect("header");
+        for (turn, item) in [
+            (
+                &turn0,
+                user_item("item:turn:thread:native/chain/0/0", "first"),
+            ),
+            (
+                &turn1,
+                user_item("item:turn:thread:native/chain/1/0", "second"),
+            ),
+        ] {
+            w.append(&RolloutEntry::Item {
+                thread_id: thread.0.to_string(),
+                turn_id: turn.0.to_string(),
+                timestamp: 0,
+                item: Box::new(item),
+            })
+            .await
+            .expect("item");
+        }
+        w.sync_all().await.expect("sync");
+        drop(w);
+
+        // Capture a checkpoint for turn 0 (against v0), then mutate and capture
+        // turn 1 — two distinct rewind points.
+        inner
+            .capture_turn_snapshot(&thread, &turn0, "first".to_owned())
+            .await;
+        tokio::fs::write(&file_a, b"v1").await.expect("v1");
+        inner
+            .capture_turn_snapshot(&thread, &turn1, "second".to_owned())
+            .await;
+        drain(&inner, &thread).await;
+        tokio::fs::write(&file_a, b"v2").await.expect("v2");
+
+        // First rewind: to turn 1 → branch keeps turn 0.
+        let RestoreReply::Restored {
+            new_thread_id: branch,
+            ..
+        } = inner
+            .restore_to_checkpoint(thread.clone(), turn1.clone())
+            .await
+            .expect("first rewind");
+
+        // The branch must surface turn 0's checkpoint so it can be rewound again.
+        let branch_cps = inner
+            .list_checkpoints(&branch)
+            .await
+            .expect("list branch checkpoints");
+        assert_eq!(
+            branch_cps.len(),
+            1,
+            "branch must carry turn 0's checkpoint, got {branch_cps:?}"
+        );
+        assert_eq!(branch_cps[0].turn_id, turn0);
+
+        // Second rewind: rewind the branch to turn 0 → empty conversation.
+        let RestoreReply::Restored {
+            new_thread_id: branch2,
+            items_replayed,
+            ..
+        } = inner
+            .restore_to_checkpoint(branch.clone(), turn0.clone())
+            .await
+            .expect("second rewind");
+        assert_eq!(items_replayed, 0, "rewinding to the first turn empties it");
+        let items = inner
+            .get_items(branch2, None, None, None)
+            .await
+            .expect("branch2 readable");
+        assert!(items.is_empty(), "chained rewind reaches an empty start");
     }
 
     /// Restoring a turn with no recorded checkpoint fails cleanly.

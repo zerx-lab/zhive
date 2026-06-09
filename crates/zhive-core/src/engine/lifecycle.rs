@@ -143,7 +143,17 @@ impl EngineInner {
         // Push the combined input items (next-turn seeds + user_input) and
         // emit ItemAppended for each one. The thread-scoped
         // `ThreadEvent::ItemAppended` is fanned out inside `push_item`.
-        for item in full_input {
+        //
+        // Rewrite each input item's id to the canonical `item:<turn_id>/<seq>`
+        // form before it is pushed/broadcast/persisted. Client-minted input ids
+        // (e.g. the TUI's `item:<thread>/u<n>`) do not encode the owning turn,
+        // so a resume/restore that groups history by turn could not place them
+        // in their turn. Rewriting here keeps the seq origin aligned with the
+        // persistence seq (see `turn.rs`: input items take seq `0..N-1`).
+        for (seq, mut item) in full_input.into_iter().enumerate() {
+            item.set_id(zhive_proto::domain::ItemId(std::sync::Arc::from(
+                format!("item:{}/{seq}", turn_id.0).as_str(),
+            )));
             handle.push_item(item.clone()).await;
             let _ = self.events_tx().send(EngineEvent::ItemAppended {
                 thread_id: thread_id.clone(),

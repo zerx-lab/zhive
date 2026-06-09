@@ -74,6 +74,21 @@ const FORK_TURN_SUFFIX: &str = "::forked";
 /// on-disk state, preserving the prior best-effort semantics.
 const FORK_FLUSH_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// How much of a source thread's history a fork carries into the new branch.
+///
+/// Resolved by the caller from its own boundary logic so [`EngineInner::fork_inner`]
+/// can branch on intent rather than overloading `Option<ItemId>` (where `None`
+/// ambiguously meant "keep everything").
+enum HistoryCut {
+    /// Replay the full source history (a plain branch of the whole thread).
+    All,
+    /// Replay up to and including this item; drop everything after it.
+    UpTo(ItemId),
+    /// Replay nothing — the branch starts empty (rewind to before the first
+    /// turn).
+    Nothing,
+}
+
 impl EngineInner {
     /// Forks a new thread from `source_thread_id`'s history.
     ///
@@ -92,6 +107,48 @@ impl EngineInner {
         self: &Arc<Self>,
         source_thread_id: ThreadId,
         up_to_item: Option<ItemId>,
+        summarize: bool,
+    ) -> Result<ForkReply, ForkError> {
+        // `None` keeps the whole history; `Some(id)` truncates at that item.
+        let cut = match up_to_item.clone() {
+            Some(id) => HistoryCut::UpTo(id),
+            None => HistoryCut::All,
+        };
+        self.fork_with_cut(source_thread_id, up_to_item, cut, summarize)
+            .await
+    }
+
+    /// Forks an **empty** branch off `source_thread_id` (rewind to before its
+    /// first turn).
+    ///
+    /// The new thread carries no history — used by restore when the rewind
+    /// target is the earliest checkpoint, where keeping any prior item would be
+    /// wrong (there is nothing before the first message). Reuses the same
+    /// durable fork machinery as [`Self::fork_thread`].
+    ///
+    /// # Errors
+    ///
+    /// Mirrors [`Self::fork_thread`]: [`ForkError::SourceNotFound`] (no storage),
+    /// [`ForkError::EngineBusy`] (engine not `Idle`), or [`ForkError::ReplayFailed`].
+    pub(in crate::engine) async fn fork_thread_to_start(
+        self: &Arc<Self>,
+        source_thread_id: ThreadId,
+    ) -> Result<ForkReply, ForkError> {
+        self.fork_with_cut(source_thread_id, None, HistoryCut::Nothing, false)
+            .await
+    }
+
+    /// Shared fork driver: claims the phase, runs [`Self::fork_inner`] with the
+    /// resolved [`HistoryCut`], rolls the phase back, and broadcasts the outcome.
+    ///
+    /// `forked_from_item` is the `Option<ItemId>` reported on the `ThreadForked`
+    /// event (the public boundary the UI sees); it is independent of the
+    /// internal `cut` that decides how much history is replayed.
+    async fn fork_with_cut(
+        self: &Arc<Self>,
+        source_thread_id: ThreadId,
+        forked_from_item: Option<ItemId>,
+        cut: HistoryCut,
         summarize: bool,
     ) -> Result<ForkReply, ForkError> {
         // 1. Cross-thread fork reads the source rollout; without storage there
@@ -137,7 +194,7 @@ impl EngineInner {
                 &storage,
                 source_thread_id.clone(),
                 new_thread_id.clone(),
-                up_to_item.clone(),
+                cut,
                 summarize,
             )
             .instrument(span)
@@ -156,7 +213,7 @@ impl EngineInner {
         let _ = self.events_tx().send(EngineEvent::ThreadForked {
             source_thread_id,
             new_thread_id,
-            forked_from_item: up_to_item,
+            forked_from_item,
         });
 
         Ok(reply)
@@ -170,7 +227,7 @@ impl EngineInner {
         storage: &Arc<crate::persistence::Storage>,
         source_thread_id: ThreadId,
         new_thread_id: ThreadId,
-        up_to_item: Option<ItemId>,
+        cut: HistoryCut,
         summarize: bool,
     ) -> Result<ForkReply, ForkError> {
         // Flush the source thread's buffered rollout writes before reading its
@@ -205,15 +262,30 @@ impl EngineInner {
         // Read the source history from the rollout (source of truth). This
         // returns the FULL history, not just the in-memory window — the ability
         // that makes cross-thread fork possible (compaction only sees the tail).
-        let replayed = storage
-            .replay_thread_items(&source_thread_id, up_to_item.as_ref())
-            .await
-            .map_err(|e| ForkError::ReplayFailed {
-                message: e.to_string(),
-            })?;
+        // A `Nothing` cut skips the read entirely: the branch starts empty.
+        let replayed = match cut {
+            HistoryCut::Nothing => Vec::new(),
+            HistoryCut::All => storage
+                .replay_thread_items(&source_thread_id, None)
+                .await
+                .map_err(|e| ForkError::ReplayFailed {
+                    message: e.to_string(),
+                })?,
+            HistoryCut::UpTo(ref id) => storage
+                .replay_thread_items(&source_thread_id, Some(id))
+                .await
+                .map_err(|e| ForkError::ReplayFailed {
+                    message: e.to_string(),
+                })?,
+        };
 
         // No rollout history AND no resident thread → nothing to fork from.
-        if replayed.is_empty() && self.threads().get(&source_thread_id).await.is_none() {
+        // An intentional empty cut on a resident thread is allowed (it is the
+        // rewind-to-start branch, which legitimately has no items).
+        if !matches!(cut, HistoryCut::Nothing)
+            && replayed.is_empty()
+            && self.threads().get(&source_thread_id).await.is_none()
+        {
             return Err(ForkError::SourceNotFound);
         }
 

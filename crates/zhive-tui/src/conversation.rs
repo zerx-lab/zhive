@@ -599,6 +599,16 @@ mod tests {
         }
     }
 
+    fn user_item(id: &str, text: &str) -> Item {
+        Item::UserMessage {
+            id: ItemId(Arc::from(id)),
+            content: vec![zhive_proto::domain::ItemContent::Text {
+                text: text.to_owned(),
+                annotations: None,
+            }],
+        }
+    }
+
     // ---- smooth-reveal cursor (Plan C) ----
 
     #[test]
@@ -910,6 +920,28 @@ mod tests {
             "restored turns render as completed"
         );
         assert!(!conv.busy, "resumed view is not busy");
+    }
+
+    #[test]
+    fn load_history_keeps_user_messages_in_their_own_turn() {
+        // Regression: a two-turn history where each turn's user message carries
+        // a turn-encoded id (as the engine now persists). The user messages must
+        // stay with their turn's reply, in order — not collapse to the front.
+        let mut conv = Conversation::new(tid());
+        let items = vec![
+            user_item("item:turn:test/0/0", "delete first line"),
+            agent_item("item:turn:test/0/1", "done with line 1"),
+            user_item("item:turn:test/1/0", "delete second line"),
+            agent_item("item:turn:test/1/1", "done with line 2"),
+        ];
+        conv.load_history(items);
+        assert_eq!(conv.turns.len(), 2, "two distinct turns");
+        // Turn 0 leads with its user message, then the reply.
+        assert!(matches!(conv.turns[0].items[0], Item::UserMessage { .. }));
+        assert!(matches!(conv.turns[0].items[1], Item::AgentMessage { .. }));
+        // Turn 1 likewise — the second user message did NOT jump to the front.
+        assert!(matches!(conv.turns[1].items[0], Item::UserMessage { .. }));
+        assert!(matches!(conv.turns[1].items[1], Item::AgentMessage { .. }));
     }
 
     #[test]

@@ -419,7 +419,12 @@ async fn run_turn_inner(
     // 1's reply would reuse iteration 0's tool-call id (`item:<turn>/0`) and
     // overwrite it on every id-keyed store — the tool record would vanish once
     // the reply arrives.
-    let mut item_id_seq: u64 = 0;
+    //
+    // Starts at `item_seq` (the count of input items persisted above), not 0:
+    // `start_turn` now embeds the input items' ids as `item:<turn>/0..N-1`, so
+    // agent/tool ids must continue from N to avoid colliding with — and
+    // overwriting — the user message in the id-keyed item store.
+    let mut item_id_seq: u64 = u64::try_from(item_seq).unwrap_or(0);
 
     // Once-per-turn guard for the workspace snapshot checkpoint. Captured
     // lazily just before the first tool dispatch (see PHASE 1 below) so a
@@ -1372,6 +1377,49 @@ mod tests {
             replayed_user.as_deref(),
             Some("hello world"),
             "resume (get_items) must return the persisted user message; got {replayed:?}"
+        );
+    }
+
+    /// The persisted user-message id encodes its owning turn so a resumed
+    /// client can group history by turn (the rewind/resume ordering fix).
+    ///
+    /// Before the fix the input item kept its client-minted `item:<thread>/uN`
+    /// id, which carries no turn, so every turn's user message collapsed into
+    /// one synthetic turn on reload. The engine now rewrites the id to
+    /// `item:<turn_id>/<seq>`.
+    #[tokio::test]
+    async fn input_item_id_encodes_owning_turn() {
+        let (inner, _dir, _storage) = inner_with_storage(text_provider()).await;
+        let thread_id = tid("thread:native/id-encodes-turn");
+        let mut events_rx = inner.events_tx().subscribe();
+
+        let reply = inner
+            .start_turn(
+                thread_id.clone(),
+                // A deliberately turn-less client id, like the TUI mints.
+                vec![user_message("item:thread:native/id-encodes-turn/u0", "hi")],
+                None,
+                None,
+            )
+            .await
+            .expect("start_turn");
+        let turn_id = reply.turn_id;
+        await_turn_completed(&mut events_rx, &turn_id).await;
+        drain_writer(&inner, &thread_id).await;
+
+        let replayed = inner
+            .get_items(thread_id.clone(), None, None, None)
+            .await
+            .expect("get_items");
+        let user = replayed
+            .iter()
+            .find(|i| matches!(i, Item::UserMessage { .. }))
+            .expect("user message present");
+        // The id is rewritten to the canonical `item:<turn_id>/<seq>` form.
+        assert_eq!(
+            user.id().0.as_ref(),
+            format!("item:{}/0", turn_id.0),
+            "input item id must encode its owning turn"
         );
     }
 

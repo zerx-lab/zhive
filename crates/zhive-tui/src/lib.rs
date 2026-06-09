@@ -717,6 +717,8 @@ fn perform(
                     Some(app.config.cwd.to_string_lossy().into_owned())
                 }
             };
+            // Guard the fetch window: keys are swallowed until the overlay opens.
+            app.pending_overlay = true;
             spawn_rpc(client, cmd_tx, move |client, _tx| async move {
                 match rpc::list_threads(&client, cwd.as_deref()).await {
                     Ok(entries) => Some(LoopMsg::ShowSessions { entries, filter }),
@@ -754,6 +756,8 @@ fn perform(
             });
         }
         Action::OpenModelList => {
+            // Guard the fetch window: keys are swallowed until the overlay opens.
+            app.pending_overlay = true;
             spawn_rpc(client, cmd_tx, move |client, _tx| async move {
                 match rpc::list_models(&client).await {
                     Ok(models) if models.is_empty() => Some(LoopMsg::Flash(
@@ -779,6 +783,8 @@ fn perform(
             });
         }
         Action::OpenCheckpointList => {
+            // Guard the fetch window: keys are swallowed until the overlay opens.
+            app.pending_overlay = true;
             spawn_rpc(client, cmd_tx, move |client, _tx| async move {
                 match rpc::list_checkpoints(&client, &thread).await {
                     Ok(entries) => Some(LoopMsg::ShowCheckpoints { entries }),
@@ -815,7 +821,12 @@ fn perform(
 /// Applies a [`LoopMsg`] from a detached RPC task to the live [`App`] state.
 fn apply_loop_msg(app: &mut App, msg: LoopMsg) {
     match msg {
-        LoopMsg::Flash(text) => app.flash = Some(text),
+        LoopMsg::Flash(text) => {
+            // Any async result clears a pending picker fetch (covers errors and
+            // empty-result flashes like "no models available").
+            app.pending_overlay = false;
+            app.flash = Some(text);
+        }
         LoopMsg::SubmitFailed { error, text } => {
             // The optimistic busy flag never got a real turn. Reset it, put the
             // un-sent message back at the front, and halt draining so a
@@ -829,6 +840,7 @@ fn apply_loop_msg(app: &mut App, msg: LoopMsg) {
             ));
         }
         LoopMsg::ShowSessions { entries, filter } => {
+            app.pending_overlay = false;
             let count = entries.len();
             app.overlay = Some(crate::app::Overlay::SessionList {
                 entries,
@@ -839,6 +851,7 @@ fn apply_loop_msg(app: &mut App, msg: LoopMsg) {
             app.flash = Some(format!("{count} session(s) · {}", filter.label()));
         }
         LoopMsg::ShowModels { models } => {
+            app.pending_overlay = false;
             let count = models.len();
             app.overlay = Some(crate::app::Overlay::ModelList {
                 models,
@@ -882,6 +895,7 @@ fn apply_loop_msg(app: &mut App, msg: LoopMsg) {
             app.clear_selection();
         }
         LoopMsg::ShowCheckpoints { entries } => {
+            app.pending_overlay = false;
             app.open_checkpoint_list(entries);
         }
         LoopMsg::Restored {

@@ -4453,12 +4453,19 @@ mod inc4_tests {
             b2.wait().await;
         });
 
-        let mut item_ids_in_order: Vec<String> = Vec::new();
+        // Correlate by user-message text content (not id): the engine now
+        // rewrites input-item ids to the canonical `item:<turn>/<seq>` form, so
+        // the marker survives only in the message text.
+        let mut item_texts_in_order: Vec<String> = Vec::new();
         let saw_completed = collect_until(&mut events2, 64, |ev| {
             if let EngineEvent::ItemAppended { item, .. } = ev
-                && let zhive_proto::domain::Item::UserMessage { id, .. } = item.as_ref()
+                && let zhive_proto::domain::Item::UserMessage { content, .. } = item.as_ref()
             {
-                item_ids_in_order.push(id.0.to_string());
+                for part in content {
+                    if let zhive_proto::domain::ItemContent::Text { text, .. } = part {
+                        item_texts_in_order.push(text.clone());
+                    }
+                }
             }
             matches!(ev, EngineEvent::TurnCompleted { .. })
         })
@@ -4466,15 +4473,19 @@ mod inc4_tests {
 
         assert!(saw_completed, "second turn must complete");
         // The NextTurn item ("next-turn-item") must appear before "new-user-input".
-        let pos_next = item_ids_in_order.iter().position(|s| s == "next-turn-item");
-        let pos_new = item_ids_in_order.iter().position(|s| s == "new-user-input");
+        let pos_next = item_texts_in_order
+            .iter()
+            .position(|s| s == "next-turn-item");
+        let pos_new = item_texts_in_order
+            .iter()
+            .position(|s| s == "new-user-input");
         assert!(
             pos_next.is_some(),
-            "next-turn-item must appear in second turn items; got {item_ids_in_order:?}"
+            "next-turn-item must appear in second turn items; got {item_texts_in_order:?}"
         );
         assert!(
             pos_new.is_some(),
-            "new-user-input must appear in second turn items; got {item_ids_in_order:?}"
+            "new-user-input must appear in second turn items; got {item_texts_in_order:?}"
         );
         assert!(
             pos_next.unwrap() < pos_new.unwrap(),

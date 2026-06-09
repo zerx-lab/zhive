@@ -565,6 +565,14 @@ pub struct App {
     pub input: crate::input::Input,
     /// Active modal overlay, if any.
     pub overlay: Option<Overlay>,
+    /// An async overlay (checkpoint/session/model list) is being fetched.
+    ///
+    /// Set the instant a list-opening action is dispatched, before its RPC
+    /// returns; cleared when the overlay opens or the fetch reports an error.
+    /// While set, conversation-screen keys are swallowed so a stray Enter
+    /// during the fetch window cannot leak into the composer (e.g. submit a
+    /// queued message) — the gesture is "open a picker", not "send".
+    pub(crate) pending_overlay: bool,
     /// A transient one-line status message (command feedback, errors).
     pub flash: Option<String>,
     /// Whether a single Esc has primed the double-Esc rewind gesture.
@@ -800,6 +808,7 @@ impl App {
             conversation: Conversation::new(thread),
             input: crate::input::Input::new(),
             overlay: None,
+            pending_overlay: false,
             flash: None,
             esc_primed: false,
             spinner_tick: 0,
@@ -1569,6 +1578,16 @@ impl App {
         if self.overlay.is_some() {
             return self.on_overlay_key(key);
         }
+        // A picker fetch is in flight: the overlay has not opened yet. Swallow
+        // keys so a stray Enter cannot leak into the composer (and submit a
+        // queued message) during the fetch window. Esc cancels the wait.
+        if self.pending_overlay {
+            if matches!(key.code, KeyCode::Esc) {
+                self.pending_overlay = false;
+                self.flash = Some("cancelled".to_owned());
+            }
+            return Action::None;
+        }
         self.on_conversation_key(key)
     }
 
@@ -1749,14 +1768,24 @@ impl App {
                     return Action::None;
                 }
             }
-            KeyCode::Up | KeyCode::Char('k') if !confirm => {
+            KeyCode::Up | KeyCode::Char('k') => {
+                // A nav key in the confirm state backs out to navigation rather
+                // than being silently swallowed.
+                confirm = false;
                 selected = selected.saturating_sub(1);
             }
-            KeyCode::Down | KeyCode::Char('j') if !confirm => {
+            KeyCode::Down | KeyCode::Char('j') => {
+                confirm = false;
                 selected = (selected + 1).min(max);
             }
-            KeyCode::Char('p') if ctrl && !confirm => selected = selected.saturating_sub(1),
-            KeyCode::Char('n') if ctrl && !confirm => selected = (selected + 1).min(max),
+            KeyCode::Char('p') if ctrl => {
+                confirm = false;
+                selected = selected.saturating_sub(1);
+            }
+            KeyCode::Char('n') if ctrl => {
+                confirm = false;
+                selected = (selected + 1).min(max);
+            }
             KeyCode::Enter => {
                 if confirm {
                     // Confirmed: revert to the highlighted checkpoint.
@@ -4137,6 +4166,106 @@ mod tests {
         assert!(a.needs_file_index());
         a.set_file_index(vec!["x.rs".to_owned()]);
         assert!(!a.needs_file_index());
+    }
+
+    fn checkpoint(turn: &str, preview: &str, files: u32) -> zhive_proto::domain::Checkpoint {
+        zhive_proto::domain::Checkpoint {
+            turn_id: zhive_proto::domain::TurnId(Arc::from(turn)),
+            tree: String::new(),
+            preview: preview.to_owned(),
+            created_at: 0,
+            files_changed: files,
+        }
+    }
+
+    #[test]
+    fn double_esc_opens_checkpoint_picker() {
+        let mut a = app();
+        // First Esc primes the gesture (no overlay yet).
+        assert_eq!(a.on_key(key(KeyCode::Esc)), Action::None);
+        assert!(a.esc_primed);
+        // Second Esc requests the picker.
+        assert_eq!(a.on_key(key(KeyCode::Esc)), Action::OpenCheckpointList);
+    }
+
+    #[test]
+    fn pending_overlay_swallows_enter_during_fetch() {
+        let mut a = app();
+        // Simulate the fetch window: the picker action fired, RPC in flight.
+        a.pending_overlay = true;
+        // A stray Enter must not leak into the composer / submit anything.
+        assert_eq!(a.on_key(key(KeyCode::Enter)), Action::None);
+        assert!(a.pending_overlay, "Enter must not cancel the pending fetch");
+    }
+
+    #[test]
+    fn pending_overlay_esc_cancels_fetch() {
+        let mut a = app();
+        a.pending_overlay = true;
+        assert_eq!(a.on_key(key(KeyCode::Esc)), Action::None);
+        assert!(!a.pending_overlay, "Esc cancels the pending fetch");
+    }
+
+    #[test]
+    fn checkpoint_picker_enter_confirms_then_restores() {
+        let mut a = app();
+        a.open_checkpoint_list(vec![checkpoint("turn:1", "hello", 2)]);
+        // First Enter arms the destructive-revert confirmation, no restore yet.
+        assert_eq!(a.on_overlay_key(key(KeyCode::Enter)), Action::None);
+        assert!(matches!(
+            a.overlay,
+            Some(Overlay::CheckpointList { confirm: true, .. })
+        ));
+        // Second Enter confirms and reverts to the highlighted checkpoint.
+        match a.on_overlay_key(key(KeyCode::Enter)) {
+            Action::Restore { target_turn_id } => {
+                assert_eq!(target_turn_id.0.as_ref(), "turn:1");
+            }
+            other => panic!("expected Restore, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn checkpoint_picker_nav_key_backs_out_of_confirm() {
+        let mut a = app();
+        a.open_checkpoint_list(vec![
+            checkpoint("turn:1", "first", 0),
+            checkpoint("turn:2", "second", 0),
+        ]);
+        // Highlight defaults to the most recent (last) row; Enter arms confirm.
+        a.on_overlay_key(key(KeyCode::Enter));
+        assert!(matches!(
+            a.overlay,
+            Some(Overlay::CheckpointList { confirm: true, .. })
+        ));
+        // Up backs out of the confirmation and moves the highlight instead of
+        // being silently swallowed.
+        assert_eq!(a.on_overlay_key(key(KeyCode::Up)), Action::None);
+        match &a.overlay {
+            Some(Overlay::CheckpointList {
+                confirm, selected, ..
+            }) => {
+                assert!(!confirm, "a nav key must exit the confirm state");
+                assert_eq!(*selected, 0);
+            }
+            other => panic!("expected CheckpointList, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn checkpoint_picker_esc_backs_out_then_closes() {
+        let mut a = app();
+        a.open_checkpoint_list(vec![checkpoint("turn:1", "x", 0)]);
+        a.on_overlay_key(key(KeyCode::Enter)); // arm confirm
+        // Esc in confirm state backs out, keeping the picker open.
+        assert_eq!(a.on_overlay_key(key(KeyCode::Esc)), Action::None);
+        assert!(matches!(
+            a.overlay,
+            Some(Overlay::CheckpointList { confirm: false, .. })
+        ));
+        // Esc again closes the picker (overlay taken, not re-installed).
+        assert_eq!(a.on_overlay_key(key(KeyCode::Esc)), Action::None);
+        assert!(a.overlay.is_none());
     }
 }
 

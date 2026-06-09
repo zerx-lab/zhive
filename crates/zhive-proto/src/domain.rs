@@ -756,6 +756,43 @@ impl Item {
             | Self::SystemNotice { id, .. } => id,
         }
     }
+
+    /// Overwrites this item's [`ItemId`].
+    ///
+    /// Used when an item's id must be re-scoped after the fact — e.g. the
+    /// engine rewrites a client-minted input-item id to the canonical
+    /// `item:<turn_id>/<seq>` form once the owning turn is allocated, so the
+    /// persisted id encodes the turn it belongs to.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use zhive_proto::domain::{Item, ItemId};
+    /// let mut item = Item::AgentMessage {
+    ///     id: ItemId(std::sync::Arc::from("item:old")),
+    ///     text: "hi".into(),
+    /// };
+    /// item.set_id(ItemId(std::sync::Arc::from("item:turn:foo/0/0")));
+    /// assert_eq!(item.id().0.as_ref(), "item:turn:foo/0/0");
+    /// ```
+    pub fn set_id(&mut self, new_id: ItemId) {
+        match self {
+            Self::UserMessage { id, .. }
+            | Self::AgentMessage { id, .. }
+            | Self::AgentThought { id, .. }
+            | Self::Reasoning { id, .. }
+            | Self::ToolCall { id, .. }
+            | Self::CommandExecution { id, .. }
+            | Self::FileEdit { id, .. }
+            | Self::Diff { id, .. }
+            | Self::Terminal { id, .. }
+            | Self::Plan { id, .. }
+            | Self::AvailableCommands { id, .. }
+            | Self::ModeChange { id, .. }
+            | Self::ContextCompaction { id }
+            | Self::SystemNotice { id, .. } => *id = new_id,
+        }
+    }
 }
 
 // ============================================================
