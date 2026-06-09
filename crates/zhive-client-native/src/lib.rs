@@ -64,10 +64,11 @@ use zhive_proto::initialize::{Capabilities, Implementation, ProtocolVersion};
 use zhive_proto::permission::ResumePermissionParams;
 use zhive_proto::rpc::{
     CompactParams, CompactResult, DeleteThreadParams, DeleteThreadResult, ForkParams, ForkResult,
-    GetItemsParams, GetItemsResult, InjectionAck, InjectionParams, ListThreadsParams,
-    ListThreadsResult, RenameThreadParams, RenameThreadResult, ResumePermissionResult,
-    ResumeThreadParams, ResumeThreadResult, SearchThreadsParams, SearchThreadsResult,
-    StartTurnParams, StartTurnResult, ToolListResult,
+    GetItemsParams, GetItemsResult, InjectionAck, InjectionParams, ListCheckpointsParams,
+    ListCheckpointsResult, ListThreadsParams, ListThreadsResult, RenameThreadParams,
+    RenameThreadResult, RestoreParams, RestoreResult, ResumePermissionResult, ResumeThreadParams,
+    ResumeThreadResult, SearchThreadsParams, SearchThreadsResult, StartTurnParams, StartTurnResult,
+    ToolListResult,
 };
 use zhive_proto::{
     ErrorObject, Id, Message, Notification, Request, Response, ResponseOutcome, methods,
@@ -471,6 +472,75 @@ impl Client {
     pub async fn fork_thread(&self, params: ForkParams) -> Result<ForkResult, ClientError> {
         let v = serde_json::to_value(&params).map_err(|e| ClientError::Decode(e.to_string()))?;
         let resp = self.call(methods::METHOD_THREAD_FORK, Some(v)).await?;
+        serde_json::from_value(resp).map_err(|e| ClientError::Decode(e.to_string()))
+    }
+
+    /// Lists a thread's revertable workspace checkpoints (oldest first).
+    ///
+    /// Wraps `engine/list_checkpoints`. Powers the rewind picker.
+    ///
+    /// # Errors
+    ///
+    /// * [`ClientError::Disconnected`], [`ClientError::Server`],
+    ///   [`ClientError::Decode`] — see [`Self::call`].
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # async fn example() -> Result<(), zhive_client_native::ClientError> {
+    /// use std::sync::Arc;
+    /// use zhive_proto::domain::ThreadId;
+    /// use zhive_proto::rpc::ListCheckpointsParams;
+    /// use zhive_client_native::Client;
+    ///
+    /// let client = Client::connect_uds("/tmp/zhive.sock").await?;
+    /// let p = ListCheckpointsParams::new(ThreadId(Arc::from("thread:native/x")));
+    /// let result = client.list_checkpoints(p).await?;
+    /// println!("{} checkpoints", result.checkpoints.len());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn list_checkpoints(
+        &self,
+        params: ListCheckpointsParams,
+    ) -> Result<ListCheckpointsResult, ClientError> {
+        let v = serde_json::to_value(&params).map_err(|e| ClientError::Decode(e.to_string()))?;
+        let resp = self.call(methods::METHOD_LIST_CHECKPOINTS, Some(v)).await?;
+        serde_json::from_value(resp).map_err(|e| ClientError::Decode(e.to_string()))
+    }
+
+    /// Reverts workspace files to a checkpoint and rewinds the conversation.
+    ///
+    /// Wraps `engine/restore`. Returns the new branch thread the conversation
+    /// was forked into plus revert counts.
+    ///
+    /// # Errors
+    ///
+    /// * [`ClientError::Disconnected`], [`ClientError::Server`],
+    ///   [`ClientError::Decode`] — see [`Self::call`].
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # async fn example() -> Result<(), zhive_client_native::ClientError> {
+    /// use std::sync::Arc;
+    /// use zhive_proto::domain::{ThreadId, TurnId};
+    /// use zhive_proto::rpc::RestoreParams;
+    /// use zhive_client_native::Client;
+    ///
+    /// let client = Client::connect_uds("/tmp/zhive.sock").await?;
+    /// let p = RestoreParams::new(
+    ///     ThreadId(Arc::from("thread:native/x")),
+    ///     TurnId(Arc::from("turn:thread:native/x/0")),
+    /// );
+    /// let result = client.restore(p).await?;
+    /// println!("reverted {} files into {}", result.reverted, result.new_thread_id.0);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn restore(&self, params: RestoreParams) -> Result<RestoreResult, ClientError> {
+        let v = serde_json::to_value(&params).map_err(|e| ClientError::Decode(e.to_string()))?;
+        let resp = self.call(methods::METHOD_RESTORE, Some(v)).await?;
         serde_json::from_value(resp).map_err(|e| ClientError::Decode(e.to_string()))
     }
 

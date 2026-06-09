@@ -105,6 +105,15 @@ impl Storage {
         })
     }
 
+    /// Returns the base directory holding the databases and `rollouts/`.
+    ///
+    /// The engine derives the per-workspace shadow-snapshot repository root
+    /// (`<base_dir>/shadow`) from this.
+    #[must_use]
+    pub fn base_dir(&self) -> &Path {
+        &self.base_dir
+    }
+
     /// Returns the rollout JSONL path for `thread_id`.
     ///
     /// The id is reduced to an allowlist of `[A-Za-z0-9_-]` characters so a

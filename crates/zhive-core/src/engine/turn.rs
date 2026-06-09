@@ -306,6 +306,7 @@ pub(super) async fn run_turn(
     thread_id: ThreadId,
     turn_id: TurnId,
     cancel: CancellationToken,
+    top_level: bool,
 ) -> Option<TurnError> {
     // Open a `zhive.turn` span for the whole turn's lifetime.
     //
@@ -323,7 +324,7 @@ pub(super) async fn run_turn(
         "session.id"    = %thread_id.0,
         "zhive.turn.id" = %turn_id.0,
     );
-    run_turn_inner(inner, handle, thread_id, turn_id, cancel)
+    run_turn_inner(inner, handle, thread_id, turn_id, cancel, top_level)
         .instrument(span)
         .await
 }
@@ -340,6 +341,7 @@ async fn run_turn_inner(
     thread_id: ThreadId,
     turn_id: TurnId,
     cancel: CancellationToken,
+    top_level: bool,
 ) -> Option<TurnError> {
     // Read the turn scope from the active turn record.
     //
@@ -418,6 +420,12 @@ async fn run_turn_inner(
     // overwrite it on every id-keyed store — the tool record would vanish once
     // the reply arrives.
     let mut item_id_seq: u64 = 0;
+
+    // Once-per-turn guard for the workspace snapshot checkpoint. Captured
+    // lazily just before the first tool dispatch (see PHASE 1 below) so a
+    // pure-conversation or immediately-cancelled turn pays no git cost and a
+    // file-revert point exists exactly when tools are about to mutate the disk.
+    let mut snapshot_captured = false;
 
     'outer: for iteration in 0..max_iterations {
         // ── Steer drain (Pi model §3.1): drain BEFORE each LLM request ────────
@@ -757,6 +765,25 @@ async fn run_turn_inner(
         let reducer = inner.permission_reducer();
         let thread_id_str = thread_id.0.as_ref();
 
+        // ── Workspace snapshot (file-revert checkpoint) ─────────────────────
+        //
+        // Reached only when this iteration produced tool calls, i.e. just
+        // before any tool can write to disk. Capture once per turn and only for
+        // top-level turns: concurrent subagent child turns share the engine and
+        // must not race `git add` against the single shadow index (their
+        // changes are folded into the next top-level checkpoint). Awaited to
+        // completion so the snapshot strictly precedes the first tool write; the
+        // checkpoint is enqueued durably (the writer fsyncs it) so an undo
+        // survives a crash mid-turn.
+        if top_level && !snapshot_captured {
+            snapshot_captured = true;
+            let preview =
+                super::lifecycle::derive_preview_from_items(&handle.active_turn_items().await);
+            inner
+                .capture_turn_snapshot(&thread_id, &turn_id, preview)
+                .await;
+        }
+
         // Tool dispatch runs in three phases so that several tool calls in one
         // model turn execute CONCURRENTLY without firing multiple interactive
         // permission prompts at once:
@@ -916,6 +943,7 @@ async fn run_turn_inner(
                             cancel,
                             stop_loop,
                             spawner,
+                            Some(inner.workspace_root().to_path_buf()),
                         )
                         .await
                     }

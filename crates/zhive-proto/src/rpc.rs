@@ -34,7 +34,7 @@ use serde_json::Value;
 #[cfg(feature = "schema")]
 use schemars::JsonSchema;
 
-use crate::domain::{Item, ItemId, ThinkingEffort, Thread, ThreadId, ToolKind, TurnId};
+use crate::domain::{Checkpoint, Item, ItemId, ThinkingEffort, Thread, ThreadId, ToolKind, TurnId};
 use crate::hook::CompactTrigger;
 use crate::permission::PermissionScope;
 
@@ -532,6 +532,163 @@ impl ForkResult {
             new_thread_id,
             items_replayed,
             summarized,
+        }
+    }
+}
+
+// --- engine/list_checkpoints ---
+
+/// Params of the `engine/list_checkpoints` RPC.
+///
+/// # Examples
+///
+/// ```
+/// use zhive_proto::rpc::ListCheckpointsParams;
+/// let p: ListCheckpointsParams =
+///     serde_json::from_str(r#"{"threadId":"thread:native/01"}"#).unwrap();
+/// assert_eq!(p.thread_id.0.as_ref(), "thread:native/01");
+/// ```
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct ListCheckpointsParams {
+    /// Thread whose checkpoints to list.
+    pub thread_id: ThreadId,
+}
+
+impl ListCheckpointsParams {
+    /// Constructs params for listing a thread's checkpoints.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use zhive_proto::domain::ThreadId;
+    /// use zhive_proto::rpc::ListCheckpointsParams;
+    /// let p = ListCheckpointsParams::new(ThreadId(Arc::from("thread:native/01")));
+    /// assert_eq!(p.thread_id.0.as_ref(), "thread:native/01");
+    /// ```
+    #[must_use]
+    pub fn new(thread_id: ThreadId) -> Self {
+        Self { thread_id }
+    }
+}
+
+/// Result of the `engine/list_checkpoints` RPC.
+///
+/// # Examples
+///
+/// ```
+/// use zhive_proto::rpc::ListCheckpointsResult;
+/// let r = ListCheckpointsResult::new(vec![]);
+/// let v = serde_json::to_value(&r).unwrap();
+/// assert!(v["checkpoints"].as_array().unwrap().is_empty());
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct ListCheckpointsResult {
+    /// Revertable checkpoints, oldest first.
+    pub checkpoints: Vec<Checkpoint>,
+}
+
+impl ListCheckpointsResult {
+    /// Constructs a checkpoint-list result.
+    #[must_use]
+    pub fn new(checkpoints: Vec<Checkpoint>) -> Self {
+        Self { checkpoints }
+    }
+}
+
+// --- engine/restore ---
+
+/// Params of the `engine/restore` RPC.
+///
+/// # Examples
+///
+/// ```
+/// use zhive_proto::rpc::RestoreParams;
+/// let p: RestoreParams = serde_json::from_str(
+///     r#"{"threadId":"thread:native/01","targetTurnId":"turn:thread:native/01/0"}"#,
+/// )
+/// .unwrap();
+/// assert_eq!(p.target_turn_id.0.as_ref(), "turn:thread:native/01/0");
+/// ```
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct RestoreParams {
+    /// Thread that owns the checkpoint.
+    pub thread_id: ThreadId,
+    /// Turn whose start-of-turn checkpoint to revert to.
+    pub target_turn_id: TurnId,
+}
+
+impl RestoreParams {
+    /// Constructs params for reverting a thread to a checkpoint.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use zhive_proto::domain::{ThreadId, TurnId};
+    /// use zhive_proto::rpc::RestoreParams;
+    /// let p = RestoreParams::new(
+    ///     ThreadId(Arc::from("thread:native/01")),
+    ///     TurnId(Arc::from("turn:thread:native/01/0")),
+    /// );
+    /// assert_eq!(p.thread_id.0.as_ref(), "thread:native/01");
+    /// ```
+    #[must_use]
+    pub fn new(thread_id: ThreadId, target_turn_id: TurnId) -> Self {
+        Self {
+            thread_id,
+            target_turn_id,
+        }
+    }
+}
+
+/// Result of the `engine/restore` RPC.
+///
+/// # Examples
+///
+/// ```
+/// use std::sync::Arc;
+/// use zhive_proto::domain::ThreadId;
+/// use zhive_proto::rpc::RestoreResult;
+/// let r = RestoreResult::new(ThreadId(Arc::from("thread:native/fork/0")), 2, 1, 4);
+/// let v = serde_json::to_value(&r).unwrap();
+/// assert_eq!(v["newThreadId"], "thread:native/fork/0");
+/// assert_eq!(v["reverted"], 2u32);
+/// assert_eq!(v["deleted"], 1u32);
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct RestoreResult {
+    /// New branch thread the conversation was forked into.
+    pub new_thread_id: ThreadId,
+    /// Number of files whose content was restored.
+    pub reverted: u32,
+    /// Number of files deleted (created after the checkpoint).
+    pub deleted: u32,
+    /// Number of conversation items replayed into the new branch.
+    pub items_replayed: u32,
+}
+
+impl RestoreResult {
+    /// Constructs a restore result.
+    #[must_use]
+    pub fn new(new_thread_id: ThreadId, reverted: u32, deleted: u32, items_replayed: u32) -> Self {
+        Self {
+            new_thread_id,
+            reverted,
+            deleted,
+            items_replayed,
         }
     }
 }

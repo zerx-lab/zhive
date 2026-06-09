@@ -223,6 +223,24 @@ pub enum StorageWriteOp {
         /// Unix-seconds timestamp of the resolution.
         timestamp: i64,
     },
+
+    /// Records a per-turn workspace file snapshot checkpoint.
+    ///
+    /// Appends a [`RolloutEntry::Snapshot`] to the rollout and projects it into
+    /// the `turn_snapshots` SQL table. Enqueued at top-level turn start so the
+    /// checkpoint is durable before any tool write.
+    Snapshot {
+        /// Thread the snapshot belongs to.
+        thread_id: ThreadId,
+        /// Turn whose start state this snapshot captured.
+        turn_id: TurnId,
+        /// Unix-seconds timestamp at capture time.
+        timestamp: i64,
+        /// 40-hex shadow-git tree id of the captured workspace state.
+        tree: String,
+        /// Short preview of the turn's user message, for the rewind picker.
+        preview: String,
+    },
 }
 
 // ------------------------------------------------------------------
@@ -452,6 +470,15 @@ async fn apply_op(state: &mut WriterState, op: StorageWriteOp) {
             timestamp,
         } => {
             apply_permission_resolved(state, thread_id, request_id, timestamp).await;
+        }
+        StorageWriteOp::Snapshot {
+            thread_id,
+            turn_id,
+            timestamp,
+            tree,
+            preview,
+        } => {
+            apply_snapshot(state, thread_id, turn_id, timestamp, tree, preview).await;
         }
     }
 }
@@ -979,6 +1006,23 @@ pub async fn rebuild_state_from_entries(
                     *seq_base += 1;
                 }
             }
+
+            // Per-turn workspace snapshot: re-project into the turn_snapshots
+            // table so the rewind picker survives a rebuild. Idempotent via the
+            // table's REPLACE semantics.
+            RolloutEntry::Snapshot {
+                thread_id: snap_thread_id,
+                turn_id: snap_turn_id,
+                timestamp,
+                tree,
+                preview,
+            } => {
+                let tid = ThreadId(Arc::from(snap_thread_id.as_str()));
+                let tid_turn = TurnId(Arc::from(snap_turn_id.as_str()));
+                state
+                    .record_snapshot(&tid, &tid_turn, &tree, &preview, timestamp)
+                    .await?;
+            }
         }
     }
 
@@ -1277,6 +1321,61 @@ async fn apply_compaction(
             error = %err,
             turn_id = %turn_id.0,
             "SQL record_turn_end for compaction turn failed; JSONL is authoritative"
+        );
+    }
+}
+
+/// Persists a per-turn workspace snapshot: appends to JSONL (with fsync) then
+/// projects into the `turn_snapshots` SQL table.
+///
+/// The fsync is the durability point that makes the checkpoint survive a crash
+/// mid-turn, which is exactly when an undo is most wanted.
+async fn apply_snapshot(
+    state: &mut WriterState,
+    thread_id: ThreadId,
+    turn_id: TurnId,
+    timestamp: i64,
+    tree: String,
+    preview: String,
+) {
+    if let Some(w) = state.rollout_for(&thread_id).await {
+        let entry = RolloutEntry::Snapshot {
+            thread_id: thread_id.0.to_string(),
+            turn_id: turn_id.0.to_string(),
+            timestamp,
+            tree: tree.clone(),
+            preview: preview.clone(),
+        };
+        if let Err(err) = w.append(&entry).await {
+            tracing::error!(
+                name: "zhive.persistence.writer.snapshot_append_failed",
+                error = %err,
+                thread_id = %thread_id.0,
+                "failed to append Snapshot entry to rollout"
+            );
+            return;
+        }
+        if let Err(err) = w.sync_all().await {
+            tracing::error!(
+                name: "zhive.persistence.writer.snapshot_sync_failed",
+                error = %err,
+                thread_id = %thread_id.0,
+                "fsync after Snapshot checkpoint failed"
+            );
+        }
+    }
+
+    if let Err(err) = state
+        .storage
+        .state
+        .record_snapshot(&thread_id, &turn_id, &tree, &preview, timestamp)
+        .await
+    {
+        tracing::error!(
+            name: "zhive.persistence.writer.snapshot_sql_failed",
+            error = %err,
+            turn_id = %turn_id.0,
+            "SQL record_snapshot failed; JSONL is authoritative"
         );
     }
 }

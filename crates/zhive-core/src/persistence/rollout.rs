@@ -164,6 +164,30 @@ pub enum RolloutEntry {
         /// Unix-seconds timestamp at append time.
         timestamp: i64,
     },
+    /// Per-turn workspace file snapshot backing the revert ("undo") feature.
+    ///
+    /// Records the shadow-git `tree` id captured at the start of a top-level
+    /// user turn, plus a short `preview` of that turn's user message. Enqueued
+    /// before the turn's first tool write so the checkpoint is durable even if
+    /// the turn later crashes mid-flight. Projected into the `turn_snapshots`
+    /// SQL table.
+    ///
+    /// **Single-direction compatibility note**: like [`RolloutEntry::Compaction`],
+    /// a rollout containing this entry cannot be read by a binary that predates
+    /// the variant. Upgrade the reader before writing snapshot rollouts.
+    Snapshot {
+        /// Thread the snapshot belongs to.
+        thread_id: String,
+        /// Turn whose start state this snapshot captured.
+        turn_id: String,
+        /// Unix-seconds timestamp at append time.
+        timestamp: i64,
+        /// 40-hex shadow-git tree id of the captured workspace state.
+        tree: String,
+        /// Short preview of the turn's user message, for the rewind picker.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        preview: String,
+    },
 }
 
 /// Append-only writer for one thread's JSONL rollout.

@@ -174,6 +174,7 @@ mod tests {
             turn_id: TurnId(Arc::from("turn:0")),
             cancel: CancellationToken::new(),
             spawner: Some(Arc::new(MockSpawner { result })),
+            workspace_root: None,
         }
     }
 
@@ -183,6 +184,7 @@ mod tests {
             turn_id: TurnId(Arc::from("turn:0")),
             cancel: CancellationToken::new(),
             spawner: None,
+            workspace_root: None,
         }
     }
 

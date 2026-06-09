@@ -36,6 +36,11 @@ pub(crate) fn render_overlay(frame: &mut Frame, app: &App, overlay: &Overlay, ar
             selected,
             query,
         } => render_model_list(frame, app, area, models, *selected, query),
+        Overlay::CheckpointList {
+            entries,
+            selected,
+            confirm,
+        } => render_checkpoint_list(frame, app, area, entries, *selected, *confirm),
     }
 }
 
@@ -399,6 +404,59 @@ fn render_model_list(
 
     let hint = "↑↓ select · ↵ switch · esc cancel · type to filter";
     render_select_list(frame, p, inner, query, &rows, selected, hint);
+}
+
+/// Renders the rewind checkpoint picker (double-Esc).
+///
+/// Each row shows the user-message preview, the relative age, and the count of
+/// files that would be reverted. The most recent checkpoint is tagged
+/// `(current)`. When `confirm` is set the hint becomes a destructive-revert
+/// confirmation prompt (the revert overwrites disk files).
+fn render_checkpoint_list(
+    frame: &mut Frame,
+    app: &App,
+    area: Rect,
+    entries: &[zhive_proto::domain::Checkpoint],
+    selected: usize,
+    confirm: bool,
+) {
+    let p = &app.palette;
+    let popup = area.centered(Constraint::Percentage(70), Constraint::Percentage(70));
+    let inner = open_popup(frame, popup, "↶ rewind to checkpoint", p);
+
+    let now = now_unix();
+    let last = entries.len().saturating_sub(1);
+    let rows: Vec<SelectRow> = entries
+        .iter()
+        .enumerate()
+        .map(|(i, cp)| {
+            let primary = if cp.preview.is_empty() {
+                format!("turn {}", short_id(cp.turn_id.0.as_ref()))
+            } else {
+                truncate(&cp.preview, 48)
+            };
+            let current = if i == last { " (current)" } else { "" };
+            let files = if cp.files_changed == 0 {
+                String::new()
+            } else {
+                format!(" · +{}F", cp.files_changed)
+            };
+            SelectRow {
+                prefix: "  ".to_owned(),
+                primary,
+                secondary: format!("{}{current}{files}", relative_time(now, cp.created_at)),
+            }
+        })
+        .collect();
+
+    let hint = if confirm {
+        let files = entries.get(selected).map_or(0, |c| c.files_changed);
+        format!("⚠ revert {files} file(s) on disk · ↵ confirm rewind · esc cancel")
+    } else {
+        "↑↓ select · ↵ rewind · esc cancel".to_owned()
+    };
+    // No live filtering for this picker: the query line stays empty.
+    render_select_list(frame, p, inner, "", &rows, selected, &hint);
 }
 
 /// Formats a context window (max input tokens) as a compact `ctx` badge.

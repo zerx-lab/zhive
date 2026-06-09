@@ -252,6 +252,108 @@ impl fmt::Display for ForkError {
 
 impl std::error::Error for ForkError {}
 
+/// Outcome of a successful [`Submission::Restore`] dispatch.
+///
+/// A restore reverts workspace files to a checkpoint and forks the conversation
+/// to just before the target turn, returning the new branch thread (the source
+/// thread is left intact, providing an implicit "redo").
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RestoreReply {
+    /// The workspace and conversation were rewound to the checkpoint.
+    Restored {
+        /// Newly allocated branch thread the conversation was forked into.
+        new_thread_id: ThreadId,
+        /// Number of files whose content was restored from the snapshot.
+        reverted: u32,
+        /// Number of files deleted (created after the snapshot).
+        deleted: u32,
+        /// Number of conversation items replayed into the new branch.
+        items_replayed: u32,
+    },
+}
+
+/// Reasons a [`Submission::Restore`] failed inside the actor.
+///
+/// Hand-written `Display` + `Error` to match the engine submission module's
+/// error style ([`ForkError`] / [`CompactError`]).
+///
+/// # Examples
+///
+/// ```
+/// use zhive_core::engine::submission::RestoreError;
+/// assert_eq!(
+///     RestoreError::CheckpointNotFound.to_string(),
+///     "checkpoint not found for the requested turn",
+/// );
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RestoreError {
+    /// Snapshots are unavailable (no persistent storage, or git could not be
+    /// used). Surfaced honestly to the user as "undo unavailable" rather than
+    /// pretending a revert happened.
+    Unavailable,
+    /// No snapshot checkpoint exists for the requested turn.
+    CheckpointNotFound,
+    /// Engine phase was not `Idle`; restore claims the `Restore` phase and so
+    /// cannot race a live turn, compaction, or fork.
+    EngineBusy {
+        /// Observed phase.
+        current: EnginePhase,
+    },
+    /// Reverting workspace files via the shadow repo failed.
+    SnapshotFailed {
+        /// Human-readable cause.
+        message: String,
+    },
+    /// Forking the conversation to the checkpoint failed.
+    ReplayFailed {
+        /// Human-readable cause.
+        message: String,
+    },
+}
+
+impl fmt::Display for RestoreError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unavailable => f.write_str("file revert is unavailable (no storage or git)"),
+            Self::CheckpointNotFound => f.write_str("checkpoint not found for the requested turn"),
+            Self::EngineBusy { current } => {
+                write!(f, "engine busy (phase {current:?}); restore requires Idle")
+            }
+            Self::SnapshotFailed { message } => write!(f, "file revert failed: {message}"),
+            Self::ReplayFailed { message } => write!(f, "conversation rewind failed: {message}"),
+        }
+    }
+}
+
+impl std::error::Error for RestoreError {}
+
+/// Reasons a [`Submission::ListCheckpoints`] dispatch failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ListCheckpointsError {
+    /// No persistent storage is configured, so no checkpoints exist.
+    StorageUnavailable,
+    /// Reading the checkpoint index failed.
+    ReadFailed {
+        /// Human-readable cause.
+        message: String,
+    },
+}
+
+impl fmt::Display for ListCheckpointsError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::StorageUnavailable => f.write_str("no storage configured; no checkpoints"),
+            Self::ReadFailed { message } => write!(f, "reading checkpoints failed: {message}"),
+        }
+    }
+}
+
+impl std::error::Error for ListCheckpointsError {}
+
 /// Outcome of a [`Submission::ResumeThread`] dispatch.
 ///
 /// Resume reads a persisted thread's full history from its JSONL rollout, makes
@@ -534,6 +636,27 @@ pub enum Submission {
     /// derived from the in-memory registry and is always available regardless
     /// of storage configuration.
     ListTools,
+    /// List the revertable workspace checkpoints for a thread.
+    ///
+    /// Reads the `turn_snapshots` projection and annotates each checkpoint with
+    /// the number of files that differ from the live workspace (computed via the
+    /// shadow repo). Powers the rewind picker.
+    ListCheckpoints {
+        /// Thread whose checkpoints are listed.
+        thread_id: ThreadId,
+    },
+    /// Revert workspace files to a checkpoint and rewind the conversation.
+    ///
+    /// Reverts the files that differ between the live workspace and the
+    /// checkpoint's snapshot tree, then forks the conversation to just before
+    /// `target_turn_id` (leaving the source thread intact for redo). Runs in the
+    /// `Restore` engine phase so it cannot race a live turn.
+    Restore {
+        /// Thread that owns the checkpoint.
+        thread_id: ThreadId,
+        /// Turn whose start-of-turn checkpoint to revert to.
+        target_turn_id: TurnId,
+    },
 }
 
 /// Reasons a [`Submission::SpawnSubagent`] dispatch failed.
@@ -719,6 +842,12 @@ pub enum SubmissionReply {
     ///
     /// `Vec<ToolSpec>` is boxed so the enum stays small.
     ListTools(Box<Vec<zhive_proto::rpc::ToolSpec>>),
+    /// Reply to a [`Submission::ListCheckpoints`].
+    ///
+    /// `Vec<Checkpoint>` is boxed so the enum stays small.
+    ListCheckpoints(Result<Box<Vec<zhive_proto::domain::Checkpoint>>, ListCheckpointsError>),
+    /// Reply to a [`Submission::Restore`].
+    Restore(Result<RestoreReply, RestoreError>),
 }
 
 /// Wraps a [`Submission`] with an optional reply oneshot.

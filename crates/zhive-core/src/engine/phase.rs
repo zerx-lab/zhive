@@ -27,12 +27,12 @@ use zhive_proto::hook::EnginePhase;
 /// ```
 #[must_use]
 pub fn allows_transition(from: EnginePhase, to: EnginePhase) -> bool {
-    use EnginePhase::{BranchSummary, Compaction, Idle, Retry, Turn};
+    use EnginePhase::{BranchSummary, Compaction, Idle, Restore, Retry, Turn};
     matches!(
         (from, to),
-        (Idle, Turn | Compaction | BranchSummary)
+        (Idle, Turn | Compaction | BranchSummary | Restore)
             | (Turn, Compaction | Retry | Idle)
-            | (Compaction | BranchSummary, Idle)
+            | (Compaction | BranchSummary | Restore, Idle)
             | (Retry, Turn | Idle)
     )
 }
@@ -78,6 +78,21 @@ mod tests {
             EnginePhase::BranchSummary,
             EnginePhase::Idle
         ));
+    }
+
+    #[test]
+    fn idle_can_start_restore() {
+        assert!(allows_transition(EnginePhase::Idle, EnginePhase::Restore));
+    }
+
+    #[test]
+    fn restore_returns_to_idle() {
+        assert!(allows_transition(EnginePhase::Restore, EnginePhase::Idle));
+    }
+
+    #[test]
+    fn idle_cannot_jump_into_restore_from_turn() {
+        assert!(!allows_transition(EnginePhase::Turn, EnginePhase::Restore));
     }
 }
 

@@ -86,6 +86,44 @@ pub struct TurnId(pub Arc<str>);
 #[serde(transparent)]
 pub struct ItemId(pub Arc<str>);
 
+/// A revertable workspace checkpoint surfaced by the rewind picker.
+///
+/// Each checkpoint corresponds to a top-level user turn whose start state was
+/// captured as a shadow-git tree (see the engine `snapshot` module). Selecting
+/// one reverts the workspace files to `tree` and rewinds the conversation to
+/// just before `turn_id`.
+///
+/// # Examples
+///
+/// ```
+/// use std::sync::Arc;
+/// use zhive_proto::domain::{Checkpoint, TurnId};
+/// let cp = Checkpoint {
+///     turn_id: TurnId(Arc::from("turn:thread:native/01/0")),
+///     tree: "4b825dc642cb6eb9a060e54bf8d69288fbee4904".to_owned(),
+///     preview: "fix the login handler".to_owned(),
+///     created_at: 1_700_000_000,
+///     files_changed: 3,
+/// };
+/// assert_eq!(cp.files_changed, 3);
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+pub struct Checkpoint {
+    /// Turn whose start the checkpoint captured. Reverting to this checkpoint
+    /// rewinds the conversation to just before this turn.
+    pub turn_id: TurnId,
+    /// Shadow-git tree id holding the workspace state at this turn's start.
+    pub tree: String,
+    /// Short preview of the turn's user message, for labelling the picker row.
+    pub preview: String,
+    /// Unix-seconds timestamp the checkpoint was captured.
+    pub created_at: i64,
+    /// Number of workspace files that would be reverted if this checkpoint is
+    /// selected (files differing between `tree` and the live workspace).
+    pub files_changed: u32,
+}
+
 /// Opaque ACP `SessionId` wire wrapper, retained only by the bridge crate.
 ///
 /// zhive-core does not key its state by this id; instead it joins through

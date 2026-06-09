@@ -38,17 +38,19 @@ use zhive_proto::permission::{PermissionOutcome, ResumePermissionParams};
 use zhive_proto::rpc::{
     CancelTurnParams, CancelTurnResult, CompactParams, CompactResult, CompactStatus,
     DeleteThreadParams, DeleteThreadResult, ForkParams, ForkResult, GetItemsParams, GetItemsResult,
-    InjectionAck, InjectionParams, ListModelsResult, ListThreadsParams, ListThreadsResult,
-    RenameThreadParams, RenameThreadResult, ResumePermissionResult, ResumePermissionStatus,
-    ResumeThreadParams, ResumeThreadResult, SearchThreadsParams, SearchThreadsResult,
-    SessionCancelParams, SetModelParams, StartTurnParams, StartTurnResult, ToolListResult,
+    InjectionAck, InjectionParams, ListCheckpointsParams, ListCheckpointsResult, ListModelsResult,
+    ListThreadsParams, ListThreadsResult, RenameThreadParams, RenameThreadResult, RestoreParams,
+    RestoreResult, ResumePermissionResult, ResumePermissionStatus, ResumeThreadParams,
+    ResumeThreadResult, SearchThreadsParams, SearchThreadsResult, SessionCancelParams,
+    SetModelParams, StartTurnParams, StartTurnResult, ToolListResult,
 };
 
 use crate::engine::{
     Engine, EngineError, PermissionRequestId, Submission,
     submission::{
         CompactError, CompactReply, DeleteError, DeleteReply, ForkError, ForkReply, GetItemsError,
-        RenameError, RenameReply, ResumeError, ResumePermissionReply, ResumeReply,
+        ListCheckpointsError, RenameError, RenameReply, RestoreError, RestoreReply, ResumeError,
+        ResumePermissionReply, ResumeReply,
     },
 };
 use zhive_proto::permission::StreamingBehavior;
@@ -110,6 +112,18 @@ pub fn register_engine_handlers(router: &mut Router, engine: Engine) {
     router.register(
         methods::METHOD_THREAD_FORK,
         Arc::new(ForkHandler {
+            engine: Arc::clone(&engine),
+        }),
+    );
+    router.register(
+        methods::METHOD_LIST_CHECKPOINTS,
+        Arc::new(ListCheckpointsHandler {
+            engine: Arc::clone(&engine),
+        }),
+    );
+    router.register(
+        methods::METHOD_RESTORE,
+        Arc::new(RestoreHandler {
             engine: Arc::clone(&engine),
         }),
     );
@@ -354,6 +368,53 @@ impl Handler for ForkHandler {
                 Ok(serde_json::to_value(result).unwrap_or(Value::Null))
             }
             Ok(Err(domain)) => Err(fork_error(&domain)),
+            Err(err) => Err(engine_error(&err)),
+        }
+    }
+}
+
+struct ListCheckpointsHandler {
+    engine: Arc<Engine>,
+}
+
+#[async_trait]
+impl Handler for ListCheckpointsHandler {
+    async fn handle(&self, params: Option<Value>) -> Result<Value, ErrorObject> {
+        let params: ListCheckpointsParams = decode_params(params)?;
+        match self.engine.list_checkpoints(params.thread_id).await {
+            Ok(Ok(checkpoints)) => {
+                let result = ListCheckpointsResult::new(checkpoints);
+                Ok(serde_json::to_value(result).unwrap_or(Value::Null))
+            }
+            Ok(Err(domain)) => Err(list_checkpoints_error(&domain)),
+            Err(err) => Err(engine_error(&err)),
+        }
+    }
+}
+
+struct RestoreHandler {
+    engine: Arc<Engine>,
+}
+
+#[async_trait]
+impl Handler for RestoreHandler {
+    async fn handle(&self, params: Option<Value>) -> Result<Value, ErrorObject> {
+        let params: RestoreParams = decode_params(params)?;
+        match self
+            .engine
+            .restore(params.thread_id, params.target_turn_id)
+            .await
+        {
+            Ok(Ok(RestoreReply::Restored {
+                new_thread_id,
+                reverted,
+                deleted,
+                items_replayed,
+            })) => {
+                let result = RestoreResult::new(new_thread_id, reverted, deleted, items_replayed);
+                Ok(serde_json::to_value(result).unwrap_or(Value::Null))
+            }
+            Ok(Err(domain)) => Err(restore_error(&domain)),
             Err(err) => Err(engine_error(&err)),
         }
     }
@@ -769,6 +830,53 @@ fn fork_error(err: &ForkError) -> ErrorObject {
         })),
         ForkError::SummarizationFailed { message } => Some(serde_json::json!({
             "kind": "summarization_failed",
+            "reason": message,
+        })),
+    };
+    ErrorObject {
+        code: ENGINE_ERROR_CODE,
+        message,
+        data,
+    }
+}
+
+/// Maps a [`RestoreError`] to a wire error carrying a `kind` discriminator.
+fn restore_error(err: &RestoreError) -> ErrorObject {
+    let message = err.to_string();
+    let data = match err {
+        RestoreError::Unavailable => Some(serde_json::json!({ "kind": "unavailable" })),
+        RestoreError::CheckpointNotFound => {
+            Some(serde_json::json!({ "kind": "checkpoint_not_found" }))
+        }
+        RestoreError::EngineBusy { current } => Some(serde_json::json!({
+            "kind": "engine_busy",
+            "currentPhase": current,
+        })),
+        RestoreError::SnapshotFailed { message } => Some(serde_json::json!({
+            "kind": "snapshot_failed",
+            "reason": message,
+        })),
+        RestoreError::ReplayFailed { message } => Some(serde_json::json!({
+            "kind": "replay_failed",
+            "reason": message,
+        })),
+    };
+    ErrorObject {
+        code: ENGINE_ERROR_CODE,
+        message,
+        data,
+    }
+}
+
+/// Maps a [`ListCheckpointsError`] to a wire error carrying a `kind`.
+fn list_checkpoints_error(err: &ListCheckpointsError) -> ErrorObject {
+    let message = err.to_string();
+    let data = match err {
+        ListCheckpointsError::StorageUnavailable => {
+            Some(serde_json::json!({ "kind": "storage_unavailable" }))
+        }
+        ListCheckpointsError::ReadFailed { message } => Some(serde_json::json!({
+            "kind": "read_failed",
             "reason": message,
         })),
     };

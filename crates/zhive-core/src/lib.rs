@@ -23,6 +23,8 @@ pub mod server;
 /// On-disk Agent-Skills discovery and loading (gated by the `skills` feature).
 #[cfg(feature = "skills")]
 pub mod skills;
+/// Workspace file snapshots via an independent shadow git repository.
+pub(crate) mod snapshot;
 pub mod state;
 pub mod subagent;
 pub mod tools;

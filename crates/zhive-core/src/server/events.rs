@@ -412,12 +412,14 @@ pub fn engine_event_to_notification(event: &EngineEvent) -> Option<Notification>
             ))
             .ok()?,
         ),
-        // Internal engine event suppressed from the wire stream in Phase 1.
+        // Internal engine events suppressed from the wire stream in Phase 1.
         //
         // SavePoint is a persistence marker (deferred session writes flushed);
-        // clients observe durable completion through TurnCompleted. Returning
-        // `None` causes the forwarder to silently skip it.
-        EngineEvent::SavePoint { .. } => return None,
+        // clients observe durable completion through TurnCompleted. Restored is
+        // delivered to the caller through the `engine/restore` RPC reply (which
+        // carries the new branch thread id); a dedicated wire notification for
+        // other observers is deferred. Returning `None` skips them on the wire.
+        EngineEvent::SavePoint { .. } | EngineEvent::Restored { .. } => return None,
     };
     Some(Notification::new(method, Some(params)))
 }

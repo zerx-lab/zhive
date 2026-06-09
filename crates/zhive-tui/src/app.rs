@@ -94,6 +94,15 @@ pub enum Action {
     /// The event loop performs the actual OSC 52 / native clipboard write; the
     /// reducer only decides *what* to copy so it stays free of terminal I/O.
     Copy(String),
+    /// Open the rewind checkpoint picker (populated by `engine/list_checkpoints`).
+    ///
+    /// Triggered by a double-Esc on an idle, empty composer.
+    OpenCheckpointList,
+    /// Revert workspace files and conversation to the chosen checkpoint.
+    Restore {
+        /// Turn whose start-of-turn checkpoint to revert to.
+        target_turn_id: zhive_proto::domain::TurnId,
+    },
 }
 
 /// Which set of persisted sessions the `/session` picker lists.
@@ -421,6 +430,19 @@ pub enum Overlay {
         /// Live fuzzy-filter query typed by the user.
         query: String,
     },
+    /// The rewind checkpoint picker (double-Esc): pick a point to revert to.
+    ///
+    /// Populated by an async `engine/list_checkpoints`. Selecting a row and
+    /// confirming reverts the workspace files and forks the conversation to that
+    /// point. The confirm step exists because the revert overwrites disk files.
+    CheckpointList {
+        /// Checkpoints returned by the engine, oldest first.
+        entries: Vec<zhive_proto::domain::Checkpoint>,
+        /// Index of the highlighted entry (defaults to the most recent).
+        selected: usize,
+        /// `true` while the destructive-revert confirmation panel is shown.
+        confirm: bool,
+    },
 }
 
 /// A slash command shown in the palette and dispatched on submit.
@@ -545,6 +567,12 @@ pub struct App {
     pub overlay: Option<Overlay>,
     /// A transient one-line status message (command feedback, errors).
     pub flash: Option<String>,
+    /// Whether a single Esc has primed the double-Esc rewind gesture.
+    ///
+    /// Set by the first Esc on an idle, empty composer; a second Esc opens the
+    /// rewind checkpoint picker. Cleared by any other key (the gesture must be
+    /// two consecutive Escs).
+    pub(crate) esc_primed: bool,
     /// Spinner animation step.
     pub spinner_tick: usize,
     /// Lines scrolled up from the bottom of the transcript (0 = follow tail).
@@ -773,6 +801,7 @@ impl App {
             input: crate::input::Input::new(),
             overlay: None,
             flash: None,
+            esc_primed: false,
             spinner_tick: 0,
             scrollback: 0,
             viewport_max_scroll: Cell::new(0),
@@ -1566,6 +1595,11 @@ impl App {
                 selected,
                 query,
             }) => self.on_model_list_key(key, models, selected, query),
+            Some(Overlay::CheckpointList {
+                entries,
+                selected,
+                confirm,
+            }) => self.on_checkpoint_list_key(key, entries, selected, confirm),
         }
     }
 
@@ -1668,6 +1702,79 @@ impl App {
             models,
             selected,
             query,
+        });
+        Action::None
+    }
+
+    /// Opens the rewind checkpoint picker with the fetched checkpoints.
+    ///
+    /// Defaults the highlight to the most recent checkpoint (last row). A no-op
+    /// flash is shown when there are none.
+    pub(crate) fn open_checkpoint_list(&mut self, entries: Vec<zhive_proto::domain::Checkpoint>) {
+        if entries.is_empty() {
+            self.flash = Some("no checkpoints to rewind to yet".to_owned());
+            return;
+        }
+        let selected = entries.len().saturating_sub(1);
+        self.overlay = Some(Overlay::CheckpointList {
+            entries,
+            selected,
+            confirm: false,
+        });
+    }
+
+    /// Key handling for the rewind checkpoint picker.
+    ///
+    /// The overlay was `take`n by the caller. Navigation moves the highlight;
+    /// `Enter` opens the destructive-revert confirmation; a second `Enter`
+    /// confirms and reverts; `Esc` backs out of the confirmation or closes the
+    /// picker. The confirm step exists because a revert overwrites disk files.
+    fn on_checkpoint_list_key(
+        &mut self,
+        key: KeyEvent,
+        entries: Vec<zhive_proto::domain::Checkpoint>,
+        selected: usize,
+        confirm: bool,
+    ) -> Action {
+        let max = entries.len().saturating_sub(1);
+        let mut selected = selected.min(max);
+        let mut confirm = confirm;
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                if confirm {
+                    // Back out of the confirmation, keep the picker open.
+                    confirm = false;
+                } else {
+                    return Action::None;
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') if !confirm => {
+                selected = selected.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') if !confirm => {
+                selected = (selected + 1).min(max);
+            }
+            KeyCode::Char('p') if ctrl && !confirm => selected = selected.saturating_sub(1),
+            KeyCode::Char('n') if ctrl && !confirm => selected = (selected + 1).min(max),
+            KeyCode::Enter => {
+                if confirm {
+                    // Confirmed: revert to the highlighted checkpoint.
+                    if let Some(cp) = entries.get(selected) {
+                        return Action::Restore {
+                            target_turn_id: cp.turn_id.clone(),
+                        };
+                    }
+                } else {
+                    confirm = true;
+                }
+            }
+            _ => {}
+        }
+        self.overlay = Some(Overlay::CheckpointList {
+            entries,
+            selected,
+            confirm,
         });
         Action::None
     }
@@ -1796,6 +1903,12 @@ impl App {
         let palette = self.palette_query().is_some();
         let mention = self.mention_query().is_some();
 
+        // Double-Esc gesture: the rewind picker opens only on two *consecutive*
+        // Escs. Capture the primed state and clear it for every key; the Esc
+        // handler below re-arms it on the first press.
+        let esc_was_primed = self.esc_primed;
+        self.esc_primed = false;
+
         // A composer selection is a transient mouse gesture whose row/column
         // indices go stale the moment the buffer changes. Drop it on the next
         // key, except Ctrl+C (which copies it) and Esc (the `has_selection` arm
@@ -1874,7 +1987,16 @@ impl App {
                     ));
                     Action::None
                 } else {
-                    Action::None
+                    // Idle, empty composer, nothing to clear: this is the
+                    // double-Esc rewind gesture. The first Esc primes and hints;
+                    // the second opens the checkpoint picker.
+                    if esc_was_primed {
+                        Action::OpenCheckpointList
+                    } else {
+                        self.esc_primed = true;
+                        self.flash = Some("press Esc again to rewind to a checkpoint".to_owned());
+                        Action::None
+                    }
                 }
             }
             // Palette navigation: arrows or Ctrl+P/Ctrl+N wrap around the list;

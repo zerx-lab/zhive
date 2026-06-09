@@ -37,7 +37,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, RwLock};
 
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{OnceCell, broadcast, mpsc};
 use tokio::task::JoinHandle;
 use zhive_proto::hook::EnginePhase;
 
@@ -48,6 +48,7 @@ use crate::persistence::Storage;
 use crate::persistence::writer::StorageWriteOp;
 use crate::provider::DynLanguageModel;
 use crate::queues::QueueTarget;
+use crate::snapshot::ShadowRepo;
 use crate::state::ThreadStore;
 use crate::tools::ToolRegistry;
 
@@ -208,6 +209,24 @@ pub(crate) struct EngineInner {
     /// bare [`Self::new`] constructor; real paths arrive via
     /// [`super::EngineConfig::cwd`].
     cwd: std::path::PathBuf,
+
+    /// Canonical workspace root used to anchor tool path resolution and the
+    /// shadow snapshot repository's `--work-tree`.
+    ///
+    /// Derived once at construction by canonicalising [`Self::cwd`] (falling
+    /// back to `cwd` verbatim if canonicalisation fails). Pinning a single
+    /// session root here — rather than letting tools resolve against the live
+    /// process `current_dir()` — is what makes file-revert trustworthy: the
+    /// shadow repo and the tools' writes always agree on the same directory.
+    workspace_root: std::path::PathBuf,
+
+    /// Lazily-opened shadow git repository for workspace file snapshots.
+    ///
+    /// `None` once initialised means snapshots are unavailable (no storage, or
+    /// git could not be used); the engine then reports "undo unavailable"
+    /// rather than silently doing nothing. Opened on first
+    /// [`Self::shadow_repo`] call so an in-memory engine pays nothing.
+    shadow: OnceCell<Option<Arc<ShadowRepo>>>,
 }
 
 impl EngineInner {
@@ -273,7 +292,9 @@ impl EngineInner {
             compact_token_threshold,
             last_input_tokens: AtomicU64::new(0),
             storage,
+            workspace_root: std::fs::canonicalize(&cwd).unwrap_or_else(|_| cwd.clone()),
             cwd,
+            shadow: OnceCell::new(),
         }
     }
 
@@ -374,6 +395,37 @@ impl EngineInner {
     /// stable across the upsert `ON CONFLICT` path (see [`super::lifecycle`]).
     pub(in crate::engine) fn cwd(&self) -> &std::path::Path {
         &self.cwd
+    }
+
+    /// Returns the canonical workspace root anchoring tool paths and snapshots.
+    pub(in crate::engine) fn workspace_root(&self) -> &std::path::Path {
+        &self.workspace_root
+    }
+
+    /// Returns the lazily-opened shadow snapshot repository, or `None` when
+    /// snapshots are unavailable (no storage, or git could not be used).
+    ///
+    /// The first call opens (and on first use `git init`s) the per-workspace
+    /// shadow repo under `<storage base>/shadow`; the result is cached so a
+    /// failure is not retried every turn.
+    pub(in crate::engine) async fn shadow_repo(&self) -> Option<Arc<ShadowRepo>> {
+        self.shadow
+            .get_or_init(|| async {
+                let base = self.storage.as_ref()?.base_dir().join("shadow");
+                match ShadowRepo::open(&base, &self.workspace_root).await {
+                    Ok(repo) => Some(Arc::new(repo)),
+                    Err(err) => {
+                        tracing::warn!(
+                            name: "zhive.engine.snapshot.unavailable",
+                            error = %err,
+                            "shadow snapshot repo could not be opened; file revert disabled"
+                        );
+                        None
+                    }
+                }
+            })
+            .await
+            .clone()
     }
 
     /// Returns the effective per-turn iteration cap for [`super::turn`].
@@ -608,7 +660,9 @@ impl EngineInner {
             admin @ (Submission::Delete { .. }
             | Submission::Rename { .. }
             | Submission::Search { .. }
-            | Submission::ListTools) => {
+            | Submission::ListTools
+            | Submission::ListCheckpoints { .. }
+            | Submission::Restore { .. }) => {
                 self.dispatch_thread_admin(admin, reply).await;
             }
             other => {
@@ -660,6 +714,21 @@ impl EngineInner {
                 let specs = self.list_tools();
                 if let Some(tx) = reply {
                     let _ = tx.send(SubmissionReply::ListTools(Box::new(specs)));
+                }
+            }
+            Submission::ListCheckpoints { thread_id } => {
+                let outcome = self.list_checkpoints(&thread_id).await.map(Box::new);
+                if let Some(tx) = reply {
+                    let _ = tx.send(SubmissionReply::ListCheckpoints(outcome));
+                }
+            }
+            Submission::Restore {
+                thread_id,
+                target_turn_id,
+            } => {
+                let outcome = self.restore_to_checkpoint(thread_id, target_turn_id).await;
+                if let Some(tx) = reply {
+                    let _ = tx.send(SubmissionReply::Restore(outcome));
                 }
             }
             _ => drop(reply),

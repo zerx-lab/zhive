@@ -5,7 +5,6 @@ use std::path::Path;
 use async_trait::async_trait;
 use serde_json::Value;
 
-use crate::tools::builtin::resolve_path;
 use crate::tools::{FileDiff, Tool, ToolContext, ToolError, ToolKind, ToolOutput};
 
 /// Per-side byte ceiling above which a captured diff is dropped.
@@ -82,7 +81,7 @@ impl Tool for WriteFileTool {
     ///
     /// Returns [`ToolError::Execution`] if the parent directory cannot be
     /// created, the temp file cannot be written, or the rename fails.
-    async fn execute(&self, args: Value, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+    async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
         let path_str = args["path"]
             .as_str()
             .ok_or_else(|| ToolError::Execution("`path` must be a string".to_owned()))?;
@@ -90,7 +89,7 @@ impl Tool for WriteFileTool {
             .as_str()
             .ok_or_else(|| ToolError::Execution("`content` must be a string".to_owned()))?;
 
-        let dest = resolve_path(path_str);
+        let dest = ctx.resolve(path_str);
 
         // Build the diff before overwriting so the tool call can surface it.
         // Computed up front to distinguish a brand-new file (creation diff) from
@@ -221,7 +220,7 @@ impl Tool for EditFileTool {
     ///
     /// Returns [`ToolError::Execution`] when `old_string == new_string`,
     /// when the unique-match constraint is violated, or when I/O fails.
-    async fn execute(&self, args: Value, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+    async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
         let path_str = args["path"]
             .as_str()
             .ok_or_else(|| ToolError::Execution("`path` must be a string".to_owned()))?;
@@ -239,7 +238,7 @@ impl Tool for EditFileTool {
             ));
         }
 
-        let dest = resolve_path(path_str);
+        let dest = ctx.resolve(path_str);
 
         let raw = tokio::fs::read(&dest)
             .await
@@ -490,6 +489,7 @@ mod tests {
             turn_id: TurnId(Arc::from("turn:0")),
             cancel: CancellationToken::new(),
             spawner: None,
+            workspace_root: None,
         }
     }
 

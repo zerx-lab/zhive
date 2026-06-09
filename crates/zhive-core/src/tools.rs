@@ -287,6 +287,40 @@ pub struct ToolContext {
     /// `None` in tests and other non-engine contexts, in which case a tool
     /// that needs it must return an error rather than spawning.
     pub spawner: Option<Arc<dyn SubagentSpawner>>,
+    /// Canonical session workspace root that relative tool paths resolve
+    /// against.
+    ///
+    /// `Some` during real engine turns (the engine pins one canonical root so
+    /// the shadow snapshot repo and tool writes agree on the same directory,
+    /// regardless of the live process `current_dir()`). `None` in tests and
+    /// non-engine contexts, where [`ToolContext::resolve`] falls back to the
+    /// process working directory.
+    pub workspace_root: Option<std::path::PathBuf>,
+}
+
+impl ToolContext {
+    /// Resolves `path` to an absolute path against the session workspace root.
+    ///
+    /// An absolute input is returned unchanged. A relative input is joined onto
+    /// [`ToolContext::workspace_root`] when set, falling back to the process
+    /// working directory (via [`crate::tools::builtin::resolve_path`]) when not.
+    ///
+    /// Anchoring on the session root — rather than the live process cwd — is
+    /// what keeps file writes and the shadow snapshot repository in agreement,
+    /// so a revert reverts the files that were actually written.
+    #[must_use]
+    pub fn resolve(&self, path: impl AsRef<str>) -> std::path::PathBuf {
+        let p = std::path::PathBuf::from(path.as_ref());
+        if p.is_absolute() {
+            return p;
+        }
+        match &self.workspace_root {
+            Some(root) => root.join(p),
+            None => std::env::current_dir()
+                .unwrap_or_else(|_| std::path::PathBuf::from("/"))
+                .join(p),
+        }
+    }
 }
 
 // ============================================================
@@ -647,6 +681,7 @@ mod tests {
             turn_id: TurnId(Arc::from("turn:thread:native/t/0")),
             cancel: CancellationToken::new(),
             spawner: None,
+            workspace_root: None,
         }
     }
 

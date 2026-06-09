@@ -290,6 +290,22 @@ pub enum EngineEvent {
         /// Human-readable failure reason.
         reason: String,
     },
+
+    /// A workspace file revert ("undo") completed.
+    ///
+    /// The conversation was forked into `new_thread_id` and the workspace files
+    /// were reverted to a checkpoint. The server maps this to a notification so
+    /// UIs can switch to the new branch and flash the revert summary.
+    Restored {
+        /// Thread whose checkpoint was reverted to.
+        source_thread_id: ThreadId,
+        /// New branch thread the conversation was forked into.
+        new_thread_id: ThreadId,
+        /// Number of files whose content was restored.
+        reverted: u32,
+        /// Number of files deleted (created after the checkpoint).
+        deleted: u32,
+    },
 }
 
 // Rust guideline compliant 2026-02-21

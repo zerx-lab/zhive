@@ -210,7 +210,7 @@ impl EngineInner {
             // Top-level turns surface failures via the broadcast `TurnFailed`
             // event already emitted inside `run_turn`; the returned `TurnError`
             // is only needed by the subagent path, so it is dropped here.
-            let _ = super::turn::run_turn(&inner, handle, thread_id, turn_id, cancel).await;
+            let _ = super::turn::run_turn(&inner, handle, thread_id, turn_id, cancel, true).await;
         });
 
         Ok(reply)

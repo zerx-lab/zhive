@@ -97,6 +97,26 @@ pub const METHOD_RESUME_THREAD: &str = "engine/resume_thread";
 /// ```
 pub const METHOD_SHUTDOWN: &str = "engine/shutdown";
 
+/// Client-to-server: revert workspace files and conversation to a checkpoint.
+///
+/// # Examples
+///
+/// ```
+/// use zhive_proto::methods::METHOD_RESTORE;
+/// assert_eq!(METHOD_RESTORE, "engine/restore");
+/// ```
+pub const METHOD_RESTORE: &str = "engine/restore";
+
+/// Client-to-server: list revertable checkpoints for a thread.
+///
+/// # Examples
+///
+/// ```
+/// use zhive_proto::methods::METHOD_LIST_CHECKPOINTS;
+/// assert_eq!(METHOD_LIST_CHECKPOINTS, "engine/list_checkpoints");
+/// ```
+pub const METHOD_LIST_CHECKPOINTS: &str = "engine/list_checkpoints";
+
 // ============================================================
 // thread/* — history surface
 // ============================================================

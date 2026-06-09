@@ -6,8 +6,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use crate::tools::builtin::{
-    DEFAULT_READ_LINE_LIMIT, MAX_LINE_BYTES, MAX_TOOL_OUTPUT_BYTES, clamp_output, resolve_path,
-    truncate_utf8,
+    DEFAULT_READ_LINE_LIMIT, MAX_LINE_BYTES, MAX_TOOL_OUTPUT_BYTES, clamp_output, truncate_utf8,
 };
 use crate::tools::{Tool, ToolContext, ToolError, ToolKind, ToolOutput};
 
@@ -77,7 +76,7 @@ impl Tool for ReadFileTool {
     ///
     /// Returns [`ToolError::Execution`] if the file is missing, unreadable,
     /// or contains binary data.
-    async fn execute(&self, args: Value, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+    async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
         let path_str = args["path"]
             .as_str()
             .ok_or_else(|| ToolError::Execution("`path` must be a string".to_owned()))?;
@@ -90,7 +89,7 @@ impl Tool for ReadFileTool {
             usize::try_from(v).unwrap_or(usize::MAX)
         });
 
-        let abs_path = resolve_path(path_str);
+        let abs_path = ctx.resolve(path_str);
 
         let raw = tokio::fs::read(&abs_path).await.map_err(|e| {
             ToolError::Execution(format!("cannot read `{}`: {e}", abs_path.display()))
@@ -176,6 +175,7 @@ mod tests {
             turn_id: TurnId(Arc::from("turn:0")),
             cancel: CancellationToken::new(),
             spawner: None,
+            workspace_root: None,
         }
     }
 

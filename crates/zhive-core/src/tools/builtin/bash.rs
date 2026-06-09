@@ -173,16 +173,15 @@ impl Tool for BashTool {
                 Duration::from_millis(ms).min(MAX_BASH_TIMEOUT)
             });
 
-        let cwd: Option<std::path::PathBuf> = args["cwd"].as_str().map(|s| {
-            let p = std::path::PathBuf::from(s);
-            if p.is_absolute() {
-                p
-            } else {
-                std::env::current_dir()
-                    .unwrap_or_else(|_| std::path::PathBuf::from("/"))
-                    .join(p)
-            }
-        });
+        // Resolve the working directory: an explicit `cwd` arg (absolute, or
+        // relative to the session root) takes precedence; otherwise default to
+        // the session workspace root so relative writes land where the shadow
+        // snapshot repo tracks them. Falls back to the process cwd only outside
+        // a real engine turn (no workspace root set).
+        let cwd: Option<std::path::PathBuf> = match args["cwd"].as_str() {
+            Some(s) => Some(ctx.resolve(s)),
+            None => ctx.workspace_root.clone(),
+        };
 
         let mut cmd = Command::new("sh");
         cmd.arg("-c").arg(&command);
@@ -356,6 +355,7 @@ mod tests {
             turn_id: TurnId(Arc::from("turn:0")),
             cancel: CancellationToken::new(),
             spawner: None,
+            workspace_root: None,
         }
     }
 
@@ -365,6 +365,7 @@ mod tests {
             turn_id: TurnId(Arc::from("turn:0")),
             cancel,
             spawner: None,
+            workspace_root: None,
         }
     }
 

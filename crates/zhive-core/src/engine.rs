@@ -40,6 +40,7 @@ mod model_catalog;
 pub mod phase;
 mod prompt;
 mod reasoning;
+mod restore;
 mod resume;
 mod subagent_spawn;
 pub mod submission;
@@ -975,6 +976,60 @@ impl Engine {
             .await?;
         match reply {
             submission::SubmissionReply::Fork(r) => Ok(r),
+            _ => Err(EngineError::ReplyDropped),
+        }
+    }
+
+    /// Lists a thread's revertable workspace checkpoints (oldest first).
+    ///
+    /// Each checkpoint is annotated with the number of files that differ from
+    /// the live workspace. Powers the rewind picker.
+    ///
+    /// # Errors
+    ///
+    /// Channel-level [`EngineError`] on actor failure; the listing's own
+    /// failures are folded into the `Ok` value as
+    /// [`submission::ListCheckpointsError`].
+    pub async fn list_checkpoints(
+        &self,
+        thread_id: ThreadId,
+    ) -> Result<
+        Result<Vec<zhive_proto::domain::Checkpoint>, submission::ListCheckpointsError>,
+        EngineError,
+    > {
+        let reply = self
+            .submit_with_reply(Submission::ListCheckpoints { thread_id })
+            .await?;
+        match reply {
+            submission::SubmissionReply::ListCheckpoints(r) => Ok(r.map(|b| *b)),
+            _ => Err(EngineError::ReplyDropped),
+        }
+    }
+
+    /// Reverts workspace files to a checkpoint and rewinds the conversation.
+    ///
+    /// Reverts the files differing from the checkpoint's snapshot tree, then
+    /// forks the conversation to just before `target_turn_id` (the source
+    /// thread is left intact for redo). Runs in the
+    /// [`EnginePhase::Restore`] phase so it cannot race a live turn.
+    ///
+    /// # Errors
+    ///
+    /// Channel-level [`EngineError`] on actor failure; the restore's own
+    /// failures are folded into the `Ok` value as [`submission::RestoreError`].
+    pub async fn restore(
+        &self,
+        thread_id: ThreadId,
+        target_turn_id: TurnId,
+    ) -> Result<Result<submission::RestoreReply, submission::RestoreError>, EngineError> {
+        let reply = self
+            .submit_with_reply(Submission::Restore {
+                thread_id,
+                target_turn_id,
+            })
+            .await?;
+        match reply {
+            submission::SubmissionReply::Restore(r) => Ok(r),
             _ => Err(EngineError::ReplyDropped),
         }
     }

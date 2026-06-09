@@ -141,6 +141,8 @@ pub enum EnginePhase {
     BranchSummary,
     /// Retrying after a provider failure.
     Retry,
+    /// Reverting workspace files (and conversation) to an earlier checkpoint.
+    Restore,
 }
 
 // ============================================================

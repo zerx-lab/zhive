@@ -146,6 +146,24 @@ enum LoopMsg {
         /// Its subagent children, to reattach as nested summaries.
         subagents: Vec<crate::rpc::SubagentRestore>,
     },
+    /// Populate and open the rewind checkpoint picker with fetched checkpoints.
+    ShowCheckpoints {
+        /// The thread's checkpoints, oldest first.
+        entries: Vec<zhive_proto::domain::Checkpoint>,
+    },
+    /// A completed rewind: switch to the new branch thread and flash a summary.
+    Restored {
+        /// The new branch thread the conversation was forked into.
+        thread_id: zhive_proto::domain::ThreadId,
+        /// The new thread's history items, in conversation order.
+        items: Vec<zhive_proto::domain::Item>,
+        /// Historical subagent children to reattach as nested summaries.
+        subagents: Vec<crate::rpc::SubagentRestore>,
+        /// Number of files whose content was restored.
+        reverted: u32,
+        /// Number of files deleted (created after the checkpoint).
+        deleted: u32,
+    },
 }
 
 /// Reports this crate's package version.
@@ -760,6 +778,37 @@ fn perform(
                 }
             });
         }
+        Action::OpenCheckpointList => {
+            spawn_rpc(client, cmd_tx, move |client, _tx| async move {
+                match rpc::list_checkpoints(&client, &thread).await {
+                    Ok(entries) => Some(LoopMsg::ShowCheckpoints { entries }),
+                    Err(e) => Some(LoopMsg::Flash(format!("checkpoints failed: {e}"))),
+                }
+            });
+        }
+        Action::Restore { target_turn_id } => {
+            spawn_rpc(client, cmd_tx, move |client, _tx| async move {
+                let outcome = match rpc::restore(&client, &thread, &target_turn_id).await {
+                    Ok(o) => o,
+                    Err(e) => return Some(LoopMsg::Flash(format!("rewind failed: {e}"))),
+                };
+                // The restore forked a new branch thread; load its history and
+                // any historical subagent children, then switch the view to it.
+                let items = rpc::get_thread_items(&client, &outcome.new_thread_id)
+                    .await
+                    .unwrap_or_default();
+                let subagents = rpc::resume_subagent_children(&client, &outcome.new_thread_id)
+                    .await
+                    .unwrap_or_default();
+                Some(LoopMsg::Restored {
+                    thread_id: outcome.new_thread_id,
+                    items,
+                    subagents,
+                    reverted: outcome.reverted,
+                    deleted: outcome.deleted,
+                })
+            });
+        }
     }
 }
 
@@ -831,6 +880,25 @@ fn apply_loop_msg(app: &mut App, msg: LoopMsg) {
             restore_subagent_views(app, subagents);
             // History was rebuilt, so any selection's line indices are stale.
             app.clear_selection();
+        }
+        LoopMsg::ShowCheckpoints { entries } => {
+            app.open_checkpoint_list(entries);
+        }
+        LoopMsg::Restored {
+            thread_id,
+            items,
+            subagents,
+            reverted,
+            deleted,
+        } => {
+            let count = items.len();
+            app.reset_thread(thread_id);
+            app.conversation.load_history(items);
+            restore_subagent_views(app, subagents);
+            app.scrollback = 0;
+            app.flash = Some(format!(
+                "rewound · {reverted} reverted · {deleted} deleted · {count} items"
+            ));
         }
     }
 }

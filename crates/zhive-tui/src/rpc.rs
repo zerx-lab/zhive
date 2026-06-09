@@ -10,7 +10,7 @@
 use serde::Deserialize;
 use serde_json::json;
 use zhive_client_native::Client;
-use zhive_proto::domain::{Item, ItemContent, ThreadId, TurnId};
+use zhive_proto::domain::{Checkpoint, Item, ItemContent, ThreadId, TurnId};
 use zhive_proto::permission::PermissionOutcome;
 
 use crate::error::Result;
@@ -206,6 +206,55 @@ pub async fn compact(client: &Client, thread: &ThreadId) -> Result<CompactOutcom
     let params = json!({ "threadId": thread });
     let result = client.call("engine/compact", Some(params)).await?;
     Ok(serde_json::from_value(result).unwrap_or_default())
+}
+
+/// Outcome of an `engine/restore` request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestoreOutcome {
+    /// New branch thread the conversation was forked into.
+    pub new_thread_id: ThreadId,
+    /// Number of files whose content was restored.
+    pub reverted: u32,
+    /// Number of files deleted (created after the checkpoint).
+    pub deleted: u32,
+}
+
+/// Lists a thread's revertable checkpoints (oldest first) for the rewind picker.
+///
+/// # Errors
+///
+/// [`crate::error::TuiError::Client`] when the engine call fails.
+pub async fn list_checkpoints(client: &Client, thread: &ThreadId) -> Result<Vec<Checkpoint>> {
+    let params = json!({ "threadId": thread });
+    let result = client
+        .call(zhive_proto::methods::METHOD_LIST_CHECKPOINTS, Some(params))
+        .await?;
+    let reply: zhive_proto::rpc::ListCheckpointsResult = serde_json::from_value(result)
+        .unwrap_or_else(|_| zhive_proto::rpc::ListCheckpointsResult::new(Vec::new()));
+    Ok(reply.checkpoints)
+}
+
+/// Reverts the workspace and conversation to a checkpoint.
+///
+/// # Errors
+///
+/// [`crate::error::TuiError::Client`] when the engine call fails.
+pub async fn restore(
+    client: &Client,
+    thread: &ThreadId,
+    target_turn: &TurnId,
+) -> Result<RestoreOutcome> {
+    let params = json!({ "threadId": thread, "targetTurnId": target_turn });
+    let result = client
+        .call(zhive_proto::methods::METHOD_RESTORE, Some(params))
+        .await?;
+    let reply: zhive_proto::rpc::RestoreResult = serde_json::from_value(result)
+        .map_err(|e| zhive_client_native::ClientError::Decode(e.to_string()))?;
+    Ok(RestoreOutcome {
+        new_thread_id: reply.new_thread_id,
+        reverted: reply.reverted,
+        deleted: reply.deleted,
+    })
 }
 
 /// Asks the engine to shut down (best-effort; ignores the reply).

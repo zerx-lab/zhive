@@ -256,6 +256,7 @@ pub(super) async fn dispatch_tool_call(
                 cancel,
                 stop_loop,
                 spawner,
+                Some(inner.workspace_root().to_path_buf()),
             )
             .await
         }
@@ -903,6 +904,7 @@ pub(super) async fn execute_resolved_tool(
     cancel: &CancellationToken,
     stop_loop: bool,
     spawner: Option<Arc<dyn SubagentSpawner>>,
+    workspace_root: Option<std::path::PathBuf>,
 ) -> DispatchOutcome {
     let span = tracing::info_span!(
         "zhive.tool_call",
@@ -922,6 +924,7 @@ pub(super) async fn execute_resolved_tool(
         cancel,
         stop_loop,
         spawner,
+        workspace_root,
     )
     .instrument(span)
     .await
@@ -962,6 +965,7 @@ async fn execute_resolved_tool_inner(
     cancel: &CancellationToken,
     mut stop_loop: bool,
     spawner: Option<Arc<dyn SubagentSpawner>>,
+    workspace_root: Option<std::path::PathBuf>,
 ) -> DispatchOutcome {
     // Re-derive the engine provenance + cwd locally so this function owns no
     // state from the resolve phase (it must be safe to run concurrently).
@@ -1000,6 +1004,7 @@ async fn execute_resolved_tool_inner(
         turn_id: turn_id.clone(),
         cancel: tool_cancel.clone(),
         spawner,
+        workspace_root,
     };
 
     // Race the tool body against turn cancellation.  Without this, a
@@ -1267,6 +1272,7 @@ mod tests {
             "toolu_test",
             &cancel,
             false,
+            None,
             None,
         )
         .await;

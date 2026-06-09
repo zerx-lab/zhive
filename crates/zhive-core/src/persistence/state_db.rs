@@ -515,6 +515,136 @@ impl StateDb {
         Ok(())
     }
 
+    /// Records (or replaces) a per-turn workspace snapshot checkpoint.
+    ///
+    /// `tree` is the shadow-git tree id captured at the start of a top-level
+    /// user turn; `preview` is a short label for the rewind picker. Replace
+    /// semantics make re-projecting a rollout idempotent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::Sqlx`] on a database failure.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # async fn demo() -> zhive_core::persistence::StorageResult<()> {
+    /// use std::sync::Arc;
+    /// use std::path::Path;
+    /// use zhive_core::persistence::StateDb;
+    /// use zhive_proto::domain::{ThreadId, TurnId};
+    ///
+    /// let db = StateDb::open(Path::new("/tmp/demo/state.db")).await?;
+    /// let tid = ThreadId(Arc::from("thread:native/01"));
+    /// let turn = TurnId(Arc::from("turn:thread:native/01/0"));
+    /// db.record_snapshot(&tid, &turn, "abc123", "fix bug", 1_700_000_000).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn record_snapshot(
+        &self,
+        thread_id: &ThreadId,
+        turn_id: &TurnId,
+        tree: &str,
+        preview: &str,
+        created_at: i64,
+    ) -> StorageResult<()> {
+        sqlx::query(
+            r"
+            INSERT OR REPLACE INTO turn_snapshots
+                (thread_id, turn_id, tree, preview, created_at)
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            ",
+        )
+        .bind(thread_id.0.as_ref())
+        .bind(turn_id.0.as_ref())
+        .bind(tree)
+        .bind(preview)
+        .bind(created_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Lists a thread's checkpoints, oldest first.
+    ///
+    /// `files_changed` is left at `0`; the engine fills it by diffing each
+    /// `tree` against the live workspace via the shadow repo before surfacing
+    /// the list to a client.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::Sqlx`] on a database failure.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # async fn demo() -> zhive_core::persistence::StorageResult<()> {
+    /// use std::sync::Arc;
+    /// use std::path::Path;
+    /// use zhive_core::persistence::StateDb;
+    /// use zhive_proto::domain::ThreadId;
+    ///
+    /// let db = StateDb::open(Path::new("/tmp/demo/state.db")).await?;
+    /// let tid = ThreadId(Arc::from("thread:native/01"));
+    /// let checkpoints = db.list_checkpoints(&tid).await?;
+    /// assert!(checkpoints.is_empty());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn list_checkpoints(
+        &self,
+        thread_id: &ThreadId,
+    ) -> StorageResult<Vec<zhive_proto::domain::Checkpoint>> {
+        let rows = sqlx::query(
+            r"
+            SELECT turn_id, tree, preview, created_at
+            FROM turn_snapshots
+            WHERE thread_id = ?1
+            ORDER BY created_at ASC, turn_id ASC
+            ",
+        )
+        .bind(thread_id.0.as_ref())
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                let turn_id: String = row.get("turn_id");
+                zhive_proto::domain::Checkpoint {
+                    turn_id: TurnId(std::sync::Arc::from(turn_id.as_str())),
+                    tree: row.get("tree"),
+                    preview: row.get("preview"),
+                    created_at: row.get("created_at"),
+                    files_changed: 0,
+                }
+            })
+            .collect())
+    }
+
+    /// Looks up the snapshot tree id for a specific turn, if recorded.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::Sqlx`] on a database failure.
+    pub async fn snapshot_tree_for_turn(
+        &self,
+        thread_id: &ThreadId,
+        turn_id: &TurnId,
+    ) -> StorageResult<Option<String>> {
+        let row = sqlx::query(
+            r"
+            SELECT tree FROM turn_snapshots
+            WHERE thread_id = ?1 AND turn_id = ?2
+            ",
+        )
+        .bind(thread_id.0.as_ref())
+        .bind(turn_id.0.as_ref())
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| r.get("tree")))
+    }
+
     // ------------------------------------------------------------------
     // Read methods
     // ------------------------------------------------------------------
@@ -549,6 +679,12 @@ impl StateDb {
     /// # }
     /// ```
     pub async fn delete_thread(&self, id: &ThreadId) -> StorageResult<bool> {
+        // `turn_snapshots` has no FK to `threads`, so its rows are not removed by
+        // the cascade; delete them explicitly first.
+        sqlx::query("DELETE FROM turn_snapshots WHERE thread_id = ?1")
+            .bind(id.0.as_ref())
+            .execute(&self.pool)
+            .await?;
         let res = sqlx::query("DELETE FROM threads WHERE id = ?1")
             .bind(id.0.as_ref())
             .execute(&self.pool)
@@ -1369,6 +1505,57 @@ mod tests {
             .unwrap()
             .expect("present");
         assert_eq!(fetched2.preview, "edited preview");
+    }
+
+    // ------------------------------------------------------------------
+    // turn_snapshots (rewind checkpoints)
+    // ------------------------------------------------------------------
+
+    /// `record_snapshot` → `list_checkpoints` / `snapshot_tree_for_turn` round
+    /// trips, lists oldest-first, and `delete_thread` removes the rows.
+    #[tokio::test]
+    async fn turn_snapshots_round_trip_and_cascade_delete() {
+        let (_dir, db) = open_temp().await;
+        let tid = ThreadId(Arc::from("thread:native/snap"));
+        db.upsert_thread(&make_thread("thread:native/snap"))
+            .await
+            .unwrap();
+        let t0 = TurnId(Arc::from("turn:thread:native/snap/0"));
+        let t1 = TurnId(Arc::from("turn:thread:native/snap/1"));
+        db.record_snapshot(&tid, &t0, "treeaaa", "first", 100)
+            .await
+            .unwrap();
+        db.record_snapshot(&tid, &t1, "treebbb", "second", 200)
+            .await
+            .unwrap();
+
+        let checkpoints = db.list_checkpoints(&tid).await.unwrap();
+        assert_eq!(checkpoints.len(), 2);
+        assert_eq!(checkpoints[0].turn_id, t0, "oldest first");
+        assert_eq!(checkpoints[0].tree, "treeaaa");
+        assert_eq!(checkpoints[0].preview, "first");
+        assert_eq!(checkpoints[1].turn_id, t1);
+
+        assert_eq!(
+            db.snapshot_tree_for_turn(&tid, &t1).await.unwrap(),
+            Some("treebbb".to_owned())
+        );
+        assert_eq!(
+            db.snapshot_tree_for_turn(&tid, &TurnId(Arc::from("turn:missing")))
+                .await
+                .unwrap(),
+            None
+        );
+
+        // Re-recording the same turn replaces (idempotent re-projection).
+        db.record_snapshot(&tid, &t0, "treeaaa", "first", 100)
+            .await
+            .unwrap();
+        assert_eq!(db.list_checkpoints(&tid).await.unwrap().len(), 2);
+
+        // Deleting the thread also removes its snapshots.
+        db.delete_thread(&tid).await.unwrap();
+        assert!(db.list_checkpoints(&tid).await.unwrap().is_empty());
     }
 }
 
