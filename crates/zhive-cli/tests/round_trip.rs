@@ -86,6 +86,7 @@ async fn user_turn_round_trips_into_conversation() {
         &client,
         &thread,
         "hi",
+        &[],
         zhive_proto::domain::ThinkingEffort::Off,
     )
     .await
