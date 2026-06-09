@@ -4,8 +4,9 @@
 //! carry `syntect` highlighting a full re-render per frame is expensive
 //! (re-parsing + re-highlighting every historical code block).  This cache
 //! keys [`markdown::render`](crate::markdown::render) output by a content hash
-//! so an unchanged message costs a clone instead of a re-highlight; it is
-//! cleared whenever the palette changes.
+//! plus the layout width (tables are laid out to width during render) so an
+//! unchanged message at an unchanged width costs a clone instead of a
+//! re-highlight; it is cleared whenever the palette changes.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -17,27 +18,30 @@ use ratatui::text::Line;
 use crate::markdown;
 use crate::theme::Palette;
 
-/// Memoizes finalized-message markdown rendering, keyed by content hash.
+/// Memoizes finalized-message markdown rendering, keyed by content hash + width.
 ///
 /// Keying on content (not item id) is deliberate: turn-internal item-id reuse
 /// has caused stale-render bugs before, and a content hash is self-correcting.
+/// The render width is part of the key because tables are laid out to the
+/// available width during rendering, so a resize must not reuse a stale layout.
 #[derive(Debug, Default)]
 pub(crate) struct MarkdownCache {
-    map: RefCell<HashMap<u64, Vec<Line<'static>>>>,
+    map: RefCell<HashMap<(u64, u16), Vec<Line<'static>>>>,
 }
 
 impl MarkdownCache {
-    /// Returns the rendered lines for `text`, rendering and caching on a miss.
+    /// Returns the rendered lines for `text` at `width`, rendering and caching
+    /// on a miss.
     ///
     /// The returned `Vec` is owned (cloned from the cache) because the caller
-    /// re-wraps it to the current width every frame; wrapping happens after
-    /// render, so the cache is width-independent.
-    pub(crate) fn render(&self, text: &str, palette: &Palette) -> Vec<Line<'static>> {
-        let key = hash_text(text);
+    /// re-wraps non-table text to the current width every frame; table layout,
+    /// however, depends on `width`, so it is folded into the cache key.
+    pub(crate) fn render(&self, text: &str, palette: &Palette, width: u16) -> Vec<Line<'static>> {
+        let key = (hash_text(text), width);
         if let Some(cached) = self.map.borrow().get(&key) {
             return cached.clone();
         }
-        let lines = markdown::render(text, palette);
+        let lines = markdown::render(text, palette, width);
         self.map.borrow_mut().insert(key, lines.clone());
         lines
     }
@@ -63,8 +67,8 @@ mod tests {
     fn second_render_hits_cache_and_matches() {
         let cache = MarkdownCache::default();
         let p = Palette::default();
-        let first = cache.render("hello **world**", &p);
-        let second = cache.render("hello **world**", &p);
+        let first = cache.render("hello **world**", &p, 80);
+        let second = cache.render("hello **world**", &p, 80);
         assert_eq!(first.len(), second.len());
     }
 
@@ -72,7 +76,7 @@ mod tests {
     fn clear_drops_entries() {
         let cache = MarkdownCache::default();
         let p = Palette::default();
-        let _ = cache.render("x", &p);
+        let _ = cache.render("x", &p, 80);
         cache.clear();
         assert!(cache.map.borrow().is_empty());
     }
@@ -81,9 +85,21 @@ mod tests {
     fn distinct_text_renders_independently() {
         let cache = MarkdownCache::default();
         let p = Palette::default();
-        let a = cache.render("# Heading", &p);
-        let b = cache.render("plain", &p);
+        let a = cache.render("# Heading", &p, 80);
+        let b = cache.render("plain", &p, 80);
         assert!(!a.is_empty() && !b.is_empty());
+        assert_eq!(cache.map.borrow().len(), 2);
+    }
+
+    #[test]
+    fn same_text_at_different_widths_caches_separately() {
+        // Table layout depends on width, so the same source at two widths must
+        // produce two distinct cache entries rather than reusing a stale layout.
+        let cache = MarkdownCache::default();
+        let p = Palette::default();
+        let src = "| a | b |\n|---|---|\n| 1 | 2 |";
+        let _ = cache.render(src, &p, 80);
+        let _ = cache.render(src, &p, 30);
         assert_eq!(cache.map.borrow().len(), 2);
     }
 
@@ -107,18 +123,18 @@ mod tests {
         let cache = MarkdownCache::default();
 
         // Warm up the global highlighter so its one-time asset load is excluded.
-        let _ = markdown::render(&src, &p);
+        let _ = markdown::render(&src, &p, 80);
 
         let t0 = Instant::now();
         for _ in 0..10 {
-            let _ = markdown::render(&src, &p);
+            let _ = markdown::render(&src, &p, 80);
         }
         let cold = t0.elapsed() / 10;
 
-        let _ = cache.render(&src, &p);
+        let _ = cache.render(&src, &p, 80);
         let t1 = Instant::now();
         for _ in 0..10 {
-            let _ = cache.render(&src, &p);
+            let _ = cache.render(&src, &p, 80);
         }
         let warm = t1.elapsed() / 10;
 

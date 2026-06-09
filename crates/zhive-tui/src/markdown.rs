@@ -29,22 +29,25 @@ use two_face::theme::{EmbeddedLazyThemeSet, EmbeddedThemeName};
 
 use crate::theme::Palette;
 
-/// Renders `source` Markdown into owned [`Line`]s styled with `palette`.
+/// Renders `source` Markdown into owned [`Line`]s styled with `palette`,
+/// laying out GFM tables to fit within `width` display cells.
 ///
 /// Parsing is delegated to [`tui_markdown`]; fenced code blocks receive
 /// `syntect` syntax highlighting.  Unrecognized constructs degrade gracefully —
-/// a malformed message renders as readable text rather than erroring.
+/// a malformed message renders as readable text rather than erroring. `width`
+/// bounds table layout (non-table text is wrapped by the caller afterward), so
+/// a narrow terminal wraps wide table cells instead of overflowing the grid.
 ///
 /// # Examples
 ///
 /// ```
 /// use zhive_tui::markdown::render;
 /// use zhive_tui::theme::Palette;
-/// let lines = render("hello `world`", &Palette::default());
+/// let lines = render("hello `world`", &Palette::default(), 80);
 /// assert!(!lines.is_empty());
 /// ```
 #[must_use]
-pub fn render(source: &str, palette: &Palette) -> Vec<Line<'static>> {
+pub fn render(source: &str, palette: &Palette, width: u16) -> Vec<Line<'static>> {
     // Approximate LaTeX math with Unicode before Markdown parsing (tui-markdown
     // does not parse `$…$`; a terminal cannot render real LaTeX anyway).
     let mathed = crate::math::render_math(source);
@@ -55,7 +58,7 @@ pub fn render(source: &str, palette: &Palette) -> Vec<Line<'static>> {
         match segment {
             crate::table::Segment::Markdown(text) => out.extend(render_block(&text, palette)),
             crate::table::Segment::Table(rows) => {
-                out.extend(crate::table::render_table(&rows, palette));
+                out.extend(crate::table::render_table(&rows, palette, width));
             }
         }
     }
@@ -415,25 +418,25 @@ mod tests {
 
     #[test]
     fn plain_text_renders_nonempty() {
-        let lines = render("just text", &palette());
+        let lines = render("just text", &palette(), 80);
         assert!(!lines.is_empty());
     }
 
     #[test]
     fn inline_code_does_not_panic() {
-        let lines = render("a `b` c", &palette());
+        let lines = render("a `b` c", &palette(), 80);
         assert!(!lines.is_empty());
     }
 
     #[test]
     fn bold_and_italic_do_not_panic() {
-        let lines = render("**bold** and _italic_ and ~~strike~~", &palette());
+        let lines = render("**bold** and _italic_ and ~~strike~~", &palette(), 80);
         assert!(!lines.is_empty());
     }
 
     #[test]
     fn heading_strips_literal_hash_marker() {
-        let lines = render("## Title", &palette());
+        let lines = render("## Title", &palette(), 80);
         let joined: String = lines
             .iter()
             .flat_map(|l| l.spans.iter())
@@ -448,7 +451,7 @@ mod tests {
 
     #[test]
     fn fenced_code_block_has_divider_and_body() {
-        let lines = render("```rust\nfn main() {}\n```", &palette());
+        let lines = render("```rust\nfn main() {}\n```", &palette(), 80);
         // open divider + code body + close divider (at least 3 lines).
         assert!(lines.len() >= 3, "got {} lines", lines.len());
         let joined: String = lines
@@ -461,7 +464,7 @@ mod tests {
 
     #[test]
     fn unknown_lang_renders_without_panic() {
-        let lines = render("```cobol\nIDENTIFICATION DIVISION.\n```", &palette());
+        let lines = render("```cobol\nIDENTIFICATION DIVISION.\n```", &palette(), 80);
         assert!(lines.len() >= 3);
     }
 
@@ -471,8 +474,8 @@ mod tests {
         // byte-for-byte identical to the first (cold) render.
         let src = "intro\n\n```rust\nfn main() { let x = 1; }\n```\n\ntail";
         let p = palette();
-        let first = render(src, &p);
-        let second = render(src, &p);
+        let first = render(src, &p, 80);
+        let second = render(src, &p, 80);
         assert_eq!(first, second, "cached closed-block render must match cold");
     }
 
@@ -482,8 +485,8 @@ mod tests {
         // EOF — must still render its body. Two renders match (cache-consistent).
         let src = "```rust\nfn main() {";
         let p = palette();
-        let a = render(src, &p);
-        let b = render(src, &p);
+        let a = render(src, &p, 80);
+        let b = render(src, &p, 80);
         assert_eq!(a, b, "repeated render of an in-flight block must be stable");
         let joined: String = a
             .iter()
@@ -504,8 +507,8 @@ mod tests {
                 .map(|s| s.content.as_ref().to_owned())
                 .collect()
         };
-        let a = render("```rust\nlet a = 1;\n```", &p);
-        let b = render("```rust\nlet b = 2;\n```", &p);
+        let a = render("```rust\nlet a = 1;\n```", &p, 80);
+        let b = render("```rust\nlet b = 2;\n```", &p, 80);
         assert!(body_of(&a).contains("let a = 1;"));
         assert!(body_of(&b).contains("let b = 2;"));
         assert!(!body_of(&b).contains("let a = 1;"));
@@ -536,13 +539,13 @@ mod tests {
         }
         prefix.push_str("```\n\n");
         let p = palette();
-        let _ = render(&prefix, &p); // warm the highlighter + cache the closed block
+        let _ = render(&prefix, &p, 80); // warm the highlighter + cache the closed block
 
         let t0 = Instant::now();
         for frame in 0..30 {
             let mut buf = prefix.clone();
             let _ = write!(buf, "Now streaming an explanation, token {frame} ...");
-            let _ = render(&buf, &p);
+            let _ = render(&buf, &p, 80);
         }
         let per_frame = t0.elapsed() / 30;
         println!("[stream-perf] per-frame with cached closed block = {per_frame:?}");

@@ -497,7 +497,7 @@ fn transcript_lines(app: &App, inner_width: u16) -> Vec<Line<'static>> {
             // eventual style instead of flashing a literal `**` / `` ` `` / `[`.
             let healed = crate::heal::heal_tail(answer);
             let mut lines = Vec::new();
-            for line in markdown::render(&healed, p) {
+            for line in markdown::render(&healed, p, content_width) {
                 lines.extend(wrap::wrap_line(&line, content_width));
             }
             if let Some(last) = lines.last_mut() {
@@ -584,7 +584,7 @@ fn compaction_panel_lines(
             Style::new().fg(p.fg_dim),
         ));
     } else {
-        for line in markdown::render(body, p) {
+        for line in markdown::render(body, p, width) {
             out.extend(wrap::wrap_line(&line, width));
         }
     }
@@ -710,7 +710,7 @@ fn item_body(
             // (the `─── Compaction ───` divider above already labels it).
             if let Some(body) = text.strip_prefix("[context summary]\n") {
                 let mut out = Vec::new();
-                for line in cache.render(body, p) {
+                for line in cache.render(body, p, width) {
                     for wrapped in wrap::wrap_line(&line, width) {
                         out.push(dim_line(wrapped, p));
                     }
@@ -718,7 +718,7 @@ fn item_body(
                 out
             } else {
                 let mut out = Vec::new();
-                for line in cache.render(text, p) {
+                for line in cache.render(text, p, width) {
                     out.extend(wrap::wrap_line(&line, width));
                 }
                 out
