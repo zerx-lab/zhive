@@ -39,6 +39,13 @@ use crate::config::Config;
 /// assert_eq!(s.name, "demo");
 /// ```
 #[derive(Debug, Clone)]
+#[cfg_attr(
+    any(not(any(unix, windows)), not(feature = "tui")),
+    allow(
+        dead_code,
+        reason = "fields are only read by the socket-gated `tui` command; see run.rs"
+    )
+)]
 pub struct RuntimeSkill {
     /// Skill identifier (the frontmatter `name`).
     pub name: String,
@@ -75,12 +82,13 @@ pub struct RuntimeTools {
     /// `skills.enabled` is false.
     ///
     /// Consumed by `run_tui`, which maps these to the TUI's own skill type
-    /// (the TUI must not depend on `zhive_core`). Unused in non-tui builds.
+    /// (the TUI must not depend on `zhive_core`). Unused in non-tui builds and
+    /// on platforms where the socket-gated `tui` command is unavailable.
     #[cfg_attr(
-        not(feature = "tui"),
+        any(not(any(unix, windows)), not(feature = "tui")),
         expect(
             dead_code,
-            reason = "only consumed by run_tui for the TUI skill picker/slash; unused in non-tui builds"
+            reason = "only consumed by run_tui for the TUI skill picker/slash; unused in non-tui/unsupported-platform builds"
         )
     )]
     pub skills: Vec<RuntimeSkill>,
@@ -300,13 +308,8 @@ pub fn data_dir() -> Option<std::path::PathBuf> {
     {
         return Some(PathBuf::from(xdg).join("zhive"));
     }
-    let home = std::env::var_os("HOME")?;
-    Some(
-        PathBuf::from(home)
-            .join(".local")
-            .join("share")
-            .join("zhive"),
-    )
+    let home = std::env::home_dir()?;
+    Some(home.join(".local").join("share").join("zhive"))
 }
 
 /// Maps the `[engine]` config section to engine [`TurnLimits`].

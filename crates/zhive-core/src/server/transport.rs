@@ -5,11 +5,14 @@
 //! [`zhive_proto::Message`] values directly; higher-level RPC semantics
 //! live in [`super::router`].
 
+#[cfg(unix)]
 use std::path::Path;
 
 use async_trait::async_trait;
 use thiserror::Error;
-use tokio::io::{AsyncBufRead, BufReader, BufStream, Stdin, Stdout};
+#[cfg(unix)]
+use tokio::io::BufStream;
+use tokio::io::{AsyncBufRead, BufReader, Stdin, Stdout};
 use zhive_proto::Message;
 use zhive_proto::framing::{self, FramingError};
 
@@ -129,6 +132,43 @@ impl Transport for UdsTransport {
     }
 }
 
+/// Transport that wraps a single Windows named-pipe connection.
+///
+/// The Windows counterpart to [`UdsTransport`]: one is created per accepted
+/// connection in [`super::serve_pipe`] from an already-connected
+/// [`tokio::net::windows::named_pipe::NamedPipeServer`]. The listener loop
+/// (create instance → `connect` → hand off) stays in the caller.
+#[cfg(windows)]
+#[derive(Debug)]
+pub struct NamedPipeTransport {
+    inner: tokio::io::BufStream<tokio::net::windows::named_pipe::NamedPipeServer>,
+}
+
+#[cfg(windows)]
+impl NamedPipeTransport {
+    /// Builds a transport on an already-connected
+    /// [`NamedPipeServer`](tokio::net::windows::named_pipe::NamedPipeServer).
+    #[must_use]
+    pub fn new(pipe: tokio::net::windows::named_pipe::NamedPipeServer) -> Self {
+        Self {
+            inner: tokio::io::BufStream::new(pipe),
+        }
+    }
+}
+
+#[cfg(windows)]
+#[async_trait]
+impl Transport for NamedPipeTransport {
+    async fn next_message(&mut self) -> Result<Option<Message>, TransportError> {
+        read_with_eof(&mut self.inner).await
+    }
+
+    async fn send(&mut self, msg: &Message) -> Result<(), TransportError> {
+        framing::write_message(&mut self.inner, msg).await?;
+        Ok(())
+    }
+}
+
 async fn read_with_eof<R>(reader: &mut R) -> Result<Option<Message>, TransportError>
 where
     R: AsyncBufRead + Unpin + Send,
@@ -145,7 +185,9 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use super::*;
+    #[cfg(unix)]
     use zhive_proto::{Id, Request};
 
     #[cfg(unix)]

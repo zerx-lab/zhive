@@ -1,0 +1,23 @@
+# Normalize line endings so checkouts are identical across platforms.
+#
+# Without this, Windows checkouts with `core.autocrlf=true` rewrite committed
+# LF files to CRLF. That breaks anything embedding text verbatim via
+# `include_str!` (e.g. the prompt templates under crates/zhive-cli/templates),
+# where byte-for-byte output is asserted in tests.
+
+# Default: let git decide what is text and normalize it to LF on commit.
+* text=auto eol=lf
+
+# Prompt templates are embedded verbatim and must always be LF.
+*.j2 text eol=lf
+
+# Source and common text assets: force LF.
+*.rs   text eol=lf
+*.toml text eol=lf
+*.md   text eol=lf
+*.json text eol=lf
+
+# Binary assets must never be touched.
+*.png binary
+*.jpg binary
+*.ico binary

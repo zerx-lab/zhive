@@ -19,8 +19,7 @@ default = []
 
 [dependencies]
 zhive-proto = { workspace = true }
-
-tokio       = { workspace = true, features = ["io-std", "time"] }
+tokio       = { workspace = true, features = ["io-std", "net", "time"] }
 async-trait = { workspace = true }
 futures     = { workspace = true }
 anyhow      = { workspace = true }

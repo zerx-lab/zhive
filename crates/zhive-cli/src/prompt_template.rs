@@ -212,12 +212,30 @@ fn build_environment(use_overrides: bool) -> minijinja::Environment<'static> {
     // compaction prompt ends in `\n` and must keep it byte-for-byte.
     env.set_keep_trailing_newline(true);
     env.set_loader(move |name| {
+        // Normalize CRLF -> LF for every template source so renders are
+        // byte-for-byte identical across platforms. Files committed with LF can
+        // still be checked out as CRLF on Windows (git `core.autocrlf`), and a
+        // user-authored override may use either; prompts are LF-only plain text
+        // fed to the model, so CRLF carries no meaning and only wastes tokens.
         if use_overrides && let Some(content) = load_override(name) {
-            return Ok(Some(content));
+            return Ok(Some(normalize_newlines(content)));
         }
-        Ok(embedded(name).map(str::to_owned))
+        Ok(embedded(name).map(|s| normalize_newlines(s.to_owned())))
     });
     env
+}
+
+/// Rewrites Windows `\r\n` line endings to `\n`, leaving lone `\n` untouched.
+///
+/// Allocation-free on the common case (no `\r\n` present): [`str::replace`]
+/// returns a fresh `String` only when a match is found, and the input is
+/// already owned, so this is a cheap pass-through for LF-only sources.
+fn normalize_newlines(content: String) -> String {
+    if content.contains('\r') {
+        content.replace("\r\n", "\n")
+    } else {
+        content
+    }
 }
 
 /// Resolves the persona partial name for the active provider.
@@ -307,13 +325,8 @@ fn config_templates_dir() -> Option<PathBuf> {
     if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
         return Some(PathBuf::from(xdg).join("zhive").join("templates"));
     }
-    let home = std::env::var_os("HOME")?;
-    Some(
-        PathBuf::from(home)
-            .join(".config")
-            .join("zhive")
-            .join("templates"),
-    )
+    let home = std::env::home_dir()?;
+    Some(home.join(".config").join("zhive").join("templates"))
 }
 
 #[cfg(test)]
@@ -441,6 +454,22 @@ mod tests {
         let rendered = render_compaction(false, &context("/work", "linux", None))
             .expect("embedded compaction render");
         assert_eq!(rendered, ORACLE_SUMMARY_INSTRUCTION);
+    }
+
+    #[test]
+    fn normalize_newlines_rewrites_crlf() {
+        assert_eq!(normalize_newlines("a\r\nb\r\n".to_owned()), "a\nb\n");
+    }
+
+    #[test]
+    fn normalize_newlines_leaves_lf_untouched() {
+        assert_eq!(normalize_newlines("a\nb\n".to_owned()), "a\nb\n");
+    }
+
+    #[test]
+    fn normalize_newlines_handles_mixed_endings() {
+        // A lone `\r` (no following `\n`) is left as-is; only CRLF is rewritten.
+        assert_eq!(normalize_newlines("a\r\nb\nc\rd".to_owned()), "a\nb\nc\rd");
     }
 
     #[test]

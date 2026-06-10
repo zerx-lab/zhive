@@ -534,6 +534,13 @@ impl Config {
     /// assert_eq!(Config::default().active_thinking(), None);
     /// ```
     #[must_use]
+    #[cfg_attr(
+        not(any(unix, windows)),
+        allow(
+            dead_code,
+            reason = "only consumed by the socket-gated `tui` command; see run.rs"
+        )
+    )]
     pub fn active_thinking(&self) -> Option<&str> {
         self.provider
             .providers
@@ -556,6 +563,13 @@ impl Config {
     /// assert_eq!(cfg.active_model(), "claude-opus-4-8");
     /// assert_eq!(cfg.active_thinking(), Some("high"));
     /// ```
+    #[cfg_attr(
+        not(any(unix, windows)),
+        allow(
+            dead_code,
+            reason = "only consumed by the socket-gated `tui` command; see run.rs"
+        )
+    )]
     pub fn set_active_selection(&mut self, model: String, thinking: Option<String>) {
         let name = self.provider.default.clone();
         if let Some(entry) = self.provider.providers.get_mut(&name) {
@@ -577,6 +591,13 @@ impl Config {
 ///
 /// Returns an error if the file cannot be read, parsed as TOML, or written, or
 /// if its parent directory cannot be created.
+#[cfg_attr(
+    not(any(unix, windows)),
+    allow(
+        dead_code,
+        reason = "only consumed by the socket-gated `tui` command; see run.rs"
+    )
+)]
 pub(crate) fn persist_active_selection(path: &Path, config: &Config) -> anyhow::Result<()> {
     use toml_edit::{DocumentMut, Item, Table, value};
 
@@ -640,13 +661,8 @@ pub fn default_config_path() -> Option<PathBuf> {
     {
         return Some(PathBuf::from(xdg).join("zhive").join("config.toml"));
     }
-    let home = std::env::var_os("HOME")?;
-    Some(
-        PathBuf::from(home)
-            .join(".config")
-            .join("zhive")
-            .join("config.toml"),
-    )
+    let home = std::env::home_dir()?;
+    Some(home.join(".config").join("zhive").join("config.toml"))
 }
 
 /// A commented sample config emitted by `zhive config init`.

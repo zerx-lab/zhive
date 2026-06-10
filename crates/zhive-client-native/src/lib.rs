@@ -141,7 +141,7 @@ impl Drop for Inner {
 /// # #[tokio::main]
 /// # async fn main() {
 /// use zhive_client_native::{Client, ClientEvent};
-/// let client = Client::connect_uds("/tmp/zhive.sock").await.unwrap();
+/// let client = Client::connect("/tmp/zhive.sock").await.unwrap();
 /// let mut stream = client.subscribe_events();
 /// while let Some(ev) = stream.next_event().await {
 ///     match ev {
@@ -333,7 +333,7 @@ impl Client {
     /// # async fn run() {
     /// # use zhive_client_native::Client;
     /// # use zhive_proto::initialize::ProtocolVersion;
-    /// let client = Client::connect_uds("/tmp/zhive.sock").await.unwrap();
+    /// let client = Client::connect("/tmp/zhive.sock").await.unwrap();
     /// assert!(client.negotiated_version().0 >= 1);
     /// # }
     /// ```
@@ -349,7 +349,7 @@ impl Client {
     /// ```no_run
     /// # async fn run() {
     /// # use zhive_client_native::Client;
-    /// let client = Client::connect_uds("/tmp/zhive.sock").await.unwrap();
+    /// let client = Client::connect("/tmp/zhive.sock").await.unwrap();
     /// assert!(client.server_capabilities().cancellation);
     /// # }
     /// ```
@@ -365,7 +365,7 @@ impl Client {
     /// ```no_run
     /// # async fn run() {
     /// # use zhive_client_native::Client;
-    /// let client = Client::connect_uds("/tmp/zhive.sock").await.unwrap();
+    /// let client = Client::connect("/tmp/zhive.sock").await.unwrap();
     /// assert!(!client.server_info().name.is_empty());
     /// # }
     /// ```
@@ -396,7 +396,7 @@ impl Client {
     /// use zhive_proto::rpc::StartTurnParams;
     /// use zhive_client_native::Client;
     ///
-    /// let client = Client::connect_uds("/tmp/zhive.sock").await?;
+    /// let client = Client::connect("/tmp/zhive.sock").await?;
     /// let p = StartTurnParams::new(ThreadId(Arc::from("thread:native/x")), vec![], None);
     /// let result = client.start_turn(p).await?;
     /// println!("turn: {}", result.turn_id.0);
@@ -431,7 +431,7 @@ impl Client {
     /// use zhive_proto::rpc::CompactParams;
     /// use zhive_client_native::Client;
     ///
-    /// let client = Client::connect_uds("/tmp/zhive.sock").await?;
+    /// let client = Client::connect("/tmp/zhive.sock").await?;
     /// let p = CompactParams::new(ThreadId(Arc::from("thread:native/x")), CompactTrigger::Manual);
     /// let result = client.compact(p).await?;
     /// println!("compacted {} entries", result.entries_compacted);
@@ -462,7 +462,7 @@ impl Client {
     /// use zhive_proto::rpc::ForkParams;
     /// use zhive_client_native::Client;
     ///
-    /// let client = Client::connect_uds("/tmp/zhive.sock").await?;
+    /// let client = Client::connect("/tmp/zhive.sock").await?;
     /// let p = ForkParams::new(ThreadId(Arc::from("thread:native/src")), None, false);
     /// let result = client.fork_thread(p).await?;
     /// println!("fork: {}", result.new_thread_id.0);
@@ -493,7 +493,7 @@ impl Client {
     /// use zhive_proto::rpc::ListCheckpointsParams;
     /// use zhive_client_native::Client;
     ///
-    /// let client = Client::connect_uds("/tmp/zhive.sock").await?;
+    /// let client = Client::connect("/tmp/zhive.sock").await?;
     /// let p = ListCheckpointsParams::new(ThreadId(Arc::from("thread:native/x")));
     /// let result = client.list_checkpoints(p).await?;
     /// println!("{} checkpoints", result.checkpoints.len());
@@ -528,7 +528,7 @@ impl Client {
     /// use zhive_proto::rpc::RestoreParams;
     /// use zhive_client_native::Client;
     ///
-    /// let client = Client::connect_uds("/tmp/zhive.sock").await?;
+    /// let client = Client::connect("/tmp/zhive.sock").await?;
     /// let p = RestoreParams::new(
     ///     ThreadId(Arc::from("thread:native/x")),
     ///     TurnId(Arc::from("turn:thread:native/x/0")),
@@ -560,7 +560,7 @@ impl Client {
     /// use zhive_proto::rpc::ListThreadsParams;
     /// use zhive_client_native::Client;
     ///
-    /// let client = Client::connect_uds("/tmp/zhive.sock").await?;
+    /// let client = Client::connect("/tmp/zhive.sock").await?;
     /// let result = client.list_threads(ListThreadsParams::new(None)).await?;
     /// println!("{} thread(s)", result.threads.len());
     /// # Ok(())
@@ -593,7 +593,7 @@ impl Client {
     /// use zhive_proto::rpc::ResumeThreadParams;
     /// use zhive_client_native::Client;
     ///
-    /// let client = Client::connect_uds("/tmp/zhive.sock").await?;
+    /// let client = Client::connect("/tmp/zhive.sock").await?;
     /// let p = ResumeThreadParams::new(ThreadId(Arc::from("thread:native/abc")));
     /// let result = client.resume_thread(p).await?;
     /// println!("restored {} items", result.items_restored);
@@ -627,7 +627,7 @@ impl Client {
     /// use zhive_proto::rpc::GetItemsParams;
     /// use zhive_client_native::Client;
     ///
-    /// let client = Client::connect_uds("/tmp/zhive.sock").await?;
+    /// let client = Client::connect("/tmp/zhive.sock").await?;
     /// let p = GetItemsParams::new(ThreadId(Arc::from("thread:native/x")), None, None, None);
     /// let result = client.get_items(p).await?;
     /// println!("{} item(s)", result.items.len());
@@ -658,7 +658,7 @@ impl Client {
     /// use zhive_proto::rpc::InjectionParams;
     /// use zhive_client_native::Client;
     ///
-    /// let client = Client::connect_uds("/tmp/zhive.sock").await?;
+    /// let client = Client::connect("/tmp/zhive.sock").await?;
     /// let p = InjectionParams::new(ThreadId(Arc::from("thread:native/x")), vec![]);
     /// let ack = client.enqueue_steer(p).await?;
     /// assert!(ack.accepted);
@@ -692,7 +692,7 @@ impl Client {
     /// use zhive_proto::rpc::InjectionParams;
     /// use zhive_client_native::Client;
     ///
-    /// let client = Client::connect_uds("/tmp/zhive.sock").await?;
+    /// let client = Client::connect("/tmp/zhive.sock").await?;
     /// let p = InjectionParams::new(ThreadId(Arc::from("thread:native/x")), vec![]);
     /// let ack = client.enqueue_follow_up(p).await?;
     /// assert!(ack.accepted);
@@ -728,7 +728,7 @@ impl Client {
     /// use zhive_proto::rpc::InjectionParams;
     /// use zhive_client_native::Client;
     ///
-    /// let client = Client::connect_uds("/tmp/zhive.sock").await?;
+    /// let client = Client::connect("/tmp/zhive.sock").await?;
     /// let p = InjectionParams::new(ThreadId(Arc::from("thread:native/x")), vec![]);
     /// let ack = client.enqueue_next_turn(p).await?;
     /// assert!(ack.accepted);
@@ -765,7 +765,7 @@ impl Client {
     /// use zhive_proto::rpc::DeleteThreadParams;
     /// use zhive_client_native::Client;
     ///
-    /// let client = Client::connect_uds("/tmp/zhive.sock").await?;
+    /// let client = Client::connect("/tmp/zhive.sock").await?;
     /// let p = DeleteThreadParams::new(ThreadId(Arc::from("thread:native/old")));
     /// let result = client.delete_thread(p).await?;
     /// println!("deleted: {}", result.deleted);
@@ -801,7 +801,7 @@ impl Client {
     /// use zhive_proto::rpc::RenameThreadParams;
     /// use zhive_client_native::Client;
     ///
-    /// let client = Client::connect_uds("/tmp/zhive.sock").await?;
+    /// let client = Client::connect("/tmp/zhive.sock").await?;
     /// let p = RenameThreadParams::new(
     ///     ThreadId(Arc::from("thread:native/x")),
     ///     "my feature branch".into(),
@@ -836,7 +836,7 @@ impl Client {
     /// use zhive_proto::rpc::SearchThreadsParams;
     /// use zhive_client_native::Client;
     ///
-    /// let client = Client::connect_uds("/tmp/zhive.sock").await?;
+    /// let client = Client::connect("/tmp/zhive.sock").await?;
     /// let p = SearchThreadsParams::new("refactor".into(), None);
     /// let result = client.search_threads(p).await?;
     /// println!("{} match(es)", result.threads.len());
@@ -867,7 +867,7 @@ impl Client {
     /// # async fn example() -> Result<(), zhive_client_native::ClientError> {
     /// use zhive_client_native::Client;
     ///
-    /// let client = Client::connect_uds("/tmp/zhive.sock").await?;
+    /// let client = Client::connect("/tmp/zhive.sock").await?;
     /// let result = client.tools_list().await?;
     /// for spec in &result.tools {
     ///     println!("{}: {:?}", spec.name, spec.kind);
@@ -896,7 +896,7 @@ impl Client {
     /// use zhive_proto::permission::{ResumeOutcome, ResumePermissionParams};
     /// use zhive_client_native::Client;
     ///
-    /// let client = Client::connect_uds("/tmp/zhive.sock").await?;
+    /// let client = Client::connect("/tmp/zhive.sock").await?;
     /// let p = ResumePermissionParams::new("perm:1", ResumeOutcome::Cancelled);
     /// let result = client.resume_permission(p).await?;
     /// println!("status: {:?}", result.status);
@@ -1033,7 +1033,7 @@ impl Client {
     /// use std::sync::Arc;
     /// use zhive_client_native::Client;
     ///
-    /// let client = Client::connect_uds("/tmp/zhive.sock").await?;
+    /// let client = Client::connect("/tmp/zhive.sock").await?;
     /// let tid = ThreadId(Arc::from("thread:native/my-thread"));
     /// let cancelled = client.cancel_turn(&tid).await?;
     /// match cancelled {
@@ -1142,7 +1142,7 @@ impl Client {
     /// use zhive_proto::domain::ThreadId;
     /// use zhive_client_native::Client;
     ///
-    /// let client = Client::connect_uds("/tmp/zhive.sock").await?;
+    /// let client = Client::connect("/tmp/zhive.sock").await?;
     /// let tid = ThreadId(Arc::from("thread:native/my-session"));
     /// client.cancel_session(&tid).await?;
     /// # Ok(())

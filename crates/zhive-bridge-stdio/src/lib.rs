@@ -19,9 +19,12 @@
 
 #![forbid(unsafe_code)]
 
+#[cfg(any(unix, windows))]
 use std::path::Path;
 
+#[cfg(any(unix, windows))]
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, copy};
+#[cfg(unix)]
 use tokio::net::UnixStream;
 
 /// Errors produced by [`run`].
@@ -66,6 +69,7 @@ pub enum BridgeError {
 /// std::process::exit(if exit.is_ok() { 0 } else { 1 });
 /// # });
 /// ```
+#[cfg(unix)]
 pub async fn run<R, W>(
     socket_path: impl AsRef<Path>,
     mut stdin: R,
@@ -99,13 +103,100 @@ where
     Ok(())
 }
 
+/// Connects to the engine named pipe derived from `socket_path` and bridges
+/// `stdin` / `stdout` (Windows counterpart of the unix [`run`]).
+///
+/// The pipe address is derived from `socket_path` the same way the engine
+/// server derives it (`zhive_core::server::pipe_name_for`): the file stem is
+/// lifted into `\\.\pipe\<stem>`. The connect is retried while the pipe is
+/// missing or busy, up to a two-second deadline.
+///
+/// # Errors
+/// Returns [`BridgeError::Connect`] if the pipe cannot be reached before the
+/// deadline and [`BridgeError::Forward`] if either copy half fails mid-stream.
+///
+/// # Examples
+/// ```no_run
+/// # let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+/// # rt.block_on(async {
+/// # #[cfg(windows)]
+/// let exit = zhive_bridge_stdio::run(
+///     r"C:\Temp\zhive.sock",
+///     tokio::io::stdin(),
+///     tokio::io::stdout(),
+/// )
+/// .await;
+/// # });
+/// ```
+#[cfg(windows)]
+pub async fn run<R, W>(
+    socket_path: impl AsRef<Path>,
+    mut stdin: R,
+    mut stdout: W,
+) -> Result<(), BridgeError>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    use std::time::Duration;
+
+    use tokio::net::windows::named_pipe::ClientOptions;
+
+    let path = socket_path.as_ref().to_path_buf();
+    let name = pipe_name_for(&path);
+
+    // NotFound (server not up yet) and ERROR_PIPE_BUSY (231) are transient;
+    // retry until the deadline before giving up.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let pipe = loop {
+        match ClientOptions::new().open(&name) {
+            Ok(pipe) => break pipe,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound || e.raw_os_error() == Some(231) => {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(BridgeError::Connect { path, source: e });
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Err(source) => return Err(BridgeError::Connect { path, source }),
+        }
+    };
+
+    let (mut sock_read, mut sock_write) = tokio::io::split(pipe);
+
+    let upstream = async {
+        copy(&mut stdin, &mut sock_write).await?;
+        sock_write.shutdown().await
+    };
+    let downstream = async {
+        copy(&mut sock_read, &mut stdout).await?;
+        stdout.shutdown().await
+    };
+
+    tokio::try_join!(upstream, downstream)?;
+    Ok(())
+}
+
+/// Derives a Windows named-pipe address from a UDS-style [`Path`].
+///
+/// MUST stay in sync with `zhive_core::server::pipe_name_for` so the bridge
+/// and the engine server agree on the pipe address.
+#[cfg(windows)]
+fn pipe_name_for(path: &Path) -> String {
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("zhive");
+    format!(r"\\.\pipe\{stem}")
+}
+
 /// Reports this crate's package version.
 #[must_use]
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use tokio::net::UnixListener;

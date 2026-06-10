@@ -7,7 +7,10 @@
 //! transport. The socket lives in `$XDG_RUNTIME_DIR` (or the temp dir) under a
 //! per-pid name and is removed on shutdown.
 
-use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::path::Path;
+use std::path::PathBuf;
+#[cfg(unix)]
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
@@ -19,7 +22,7 @@ use zhive_core::engine::{Engine, EngineConfig, ModelCatalog};
 use zhive_core::hooks::HookHost;
 use zhive_core::provider::DynLanguageModel;
 use zhive_core::server::{
-    DEFAULT_MAX_CONNECTIONS, Router, register_engine_handlers, serve_uds_with_events,
+    DEFAULT_MAX_CONNECTIONS, Router, register_engine_handlers, serve_with_events,
 };
 
 use crate::boot::RuntimeTools;
@@ -101,7 +104,7 @@ impl Host {
         let serve_engine = engine.clone();
         let serve_shutdown = shutdown.clone();
         tokio::spawn(async move {
-            if let Err(err) = serve_uds_with_events(
+            if let Err(err) = serve_with_events(
                 &serve_socket,
                 router,
                 serve_engine,
@@ -110,10 +113,15 @@ impl Host {
             )
             .await
             {
-                tracing::error!(error = %err, "engine UDS server exited with error");
+                tracing::error!(error = %err, "engine server exited with error");
             }
         });
 
+        // On unix the server publishes a socket file we can poll for; on
+        // windows the named pipe has no filesystem presence, so the client's
+        // own connect retry (see `Client::connect_pipe`) handles the startup
+        // race instead.
+        #[cfg(unix)]
         if let Err(err) = wait_for_socket(&socket).await {
             // `Host` is not constructed here; tear the half-started engine and
             // capability handles down so MCP connections do not leak.
@@ -123,7 +131,8 @@ impl Host {
             let _ = std::fs::remove_file(&socket);
             return Err(err);
         }
-        let client = match Client::connect_uds(&socket).await {
+        let connect_result = Client::connect(&socket).await;
+        let client = match connect_result {
             Ok(client) => client,
             Err(err) => {
                 // `Host` is never constructed on this path, so its `Drop` will
@@ -186,6 +195,7 @@ pub fn tui_socket_path() -> PathBuf {
 }
 
 /// Polls until `socket` exists, up to a two-second deadline.
+#[cfg(unix)]
 async fn wait_for_socket(socket: &Path) -> anyhow::Result<()> {
     // Two seconds is generous for a local bind; if it is not up by then the
     // serve task almost certainly failed and the connect would hang.

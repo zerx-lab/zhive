@@ -36,7 +36,7 @@ tools   = ["dep:ignore", "dep:regex", "dep:glob", "dep:grep-searcher", "dep:grep
 
 [dependencies]
 zhive-proto = { workspace = true }
-tokio = { workspace = true, features = ["io-std", "process"] }
+tokio = { workspace = true, features = ["io-std", "net", "process"] }
 tokio-util  = { workspace = true }
 async-trait = { workspace = true }
 futures     = { workspace = true }
@@ -74,6 +74,7 @@ regex  = { workspace = true, optional = true }
 glob   = { workspace = true, optional = true }
 grep-searcher = { version = "0.1.16", optional = true }
 grep-regex = { version = "0.1.14", optional = true }
+dunce = "1.0.5"
 
 # Safe syscall wrappers; only the UDS fallback path uses
 # `rustix::process::getuid` to compose `/tmp/zhive-<uid>.sock` without

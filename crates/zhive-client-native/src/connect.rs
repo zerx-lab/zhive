@@ -6,6 +6,7 @@
 //! [`Client::from_split`] (defined in `lib.rs`) when they need to
 //! manage the handshake themselves (e.g. unit tests).
 
+#[cfg(any(unix, windows))]
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -36,6 +37,22 @@ pub struct HandshakeMeta {
     pub server_capabilities: Capabilities,
     /// Identity card the server included in the `initialize` response.
     pub server_info: Implementation,
+}
+
+/// Derives a Windows named-pipe address from a UDS-style [`Path`].
+///
+/// MUST stay byte-for-byte in sync with `zhive_core::server::pipe_name_for`
+/// so the client and server agree on the address. The two crates are
+/// deliberately not linked (D-002 layering), so the mapping is duplicated
+/// rather than shared.
+#[cfg(windows)]
+fn pipe_name_for(path: &Path) -> String {
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("zhive");
+    format!(r"\\.\pipe\{stem}")
 }
 
 /// Builds the placeholder [`HandshakeMeta`] used by clients created
@@ -213,6 +230,40 @@ impl Client {
         }
     }
 
+    /// Connects to the engine's local IPC endpoint at `path` and performs the
+    /// full initialize / initialized handshake (D-007) before returning.
+    ///
+    /// Platform-neutral entry point: on unix this dials the Unix-domain socket
+    /// at `path` (see [`Self::connect_uds`]); on windows it dials the named
+    /// pipe derived from `path` (see [`Self::connect_pipe`]). Callers that do
+    /// not care about the transport should prefer this over the
+    /// platform-specific methods.
+    ///
+    /// # Errors
+    ///
+    /// * [`ClientError::Io`] — connect failed.
+    /// * [`ClientError::ProtocolVersionUnsupported`] — server rejected
+    ///   the requested protocol version (-32001).
+    /// * [`ClientError::InitializeFailed`] — server returned any other
+    ///   error or the response could not be decoded.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), zhive_client_native::ClientError> {
+    /// use zhive_client_native::Client;
+    ///
+    /// let client = Client::connect("/run/user/1000/zhive.sock").await?;
+    /// # let _ = client;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[cfg(any(unix, windows))]
+    pub async fn connect(path: impl AsRef<Path>) -> Result<Self, ClientError> {
+        ClientBuilder::default().connect(path).await
+    }
+
     /// Connects to a Unix-domain socket at `path` and performs the
     /// full initialize / initialized handshake (D-007) before
     /// returning.
@@ -230,6 +281,24 @@ impl Client {
     #[cfg(unix)]
     pub async fn connect_uds(path: impl AsRef<Path>) -> Result<Self, ClientError> {
         ClientBuilder::default().connect_uds(path).await
+    }
+
+    /// Connects to a Windows named pipe derived from `path` and performs
+    /// the full initialize / initialized handshake (D-007).
+    ///
+    /// The Windows counterpart to [`Self::connect_uds`]. The pipe address is
+    /// derived from `path` the same way the server derives it (see
+    /// `zhive_core::server::pipe_name_for`), so the cross-platform CLI can
+    /// keep passing a single [`Path`].
+    ///
+    /// Delegates to [`ClientBuilder::default().connect_pipe(path)`][ClientBuilder::connect_pipe].
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::connect_uds`].
+    #[cfg(windows)]
+    pub async fn connect_pipe(path: impl AsRef<Path>) -> Result<Self, ClientError> {
+        ClientBuilder::default().connect_pipe(path).await
     }
 
     /// Wraps the process's inherited stdio in a client and performs
@@ -270,7 +339,7 @@ impl Client {
 /// ).unwrap();
 /// let client = ClientBuilder::new()
 ///     .client_info(info)
-///     .connect_uds("/tmp/zhive.sock")
+///     .connect("/tmp/zhive.sock")
 ///     .await?;
 /// # Ok(())
 /// # }
@@ -443,6 +512,107 @@ impl ClientBuilder {
     pub async fn connect_uds(self, path: impl AsRef<Path>) -> Result<Client, ClientError> {
         let stream = tokio::net::UnixStream::connect(path.as_ref()).await?;
         let (read, write) = stream.into_split();
+        let client = Client::from_split(read, write);
+        let meta = perform_handshake_with_params(&client, &self).await?;
+        Ok(client.replace_meta(meta))
+    }
+
+    /// Connects to the engine's local IPC endpoint at `path` and performs the
+    /// full `initialize` / `initialized` handshake (D-007).
+    ///
+    /// Platform-neutral: dials a Unix-domain socket on unix
+    /// ([`Self::connect_uds`]) and a named pipe on windows
+    /// ([`Self::connect_pipe`]). The handshake uses the builder's settings.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::connect_uds`] / [`Self::connect_pipe`].
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), zhive_client_native::ClientError> {
+    /// use zhive_client_native::ClientBuilder;
+    ///
+    /// let client = ClientBuilder::new()
+    ///     .connect("/run/user/1000/zhive.sock")
+    ///     .await?;
+    /// # let _ = client;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[cfg(any(unix, windows))]
+    pub async fn connect(self, path: impl AsRef<Path>) -> Result<Client, ClientError> {
+        #[cfg(unix)]
+        {
+            self.connect_uds(path).await
+        }
+        #[cfg(windows)]
+        {
+            self.connect_pipe(path).await
+        }
+    }
+
+    /// Connects to a Windows named pipe derived from `path` and performs
+    /// the full `initialize` / `initialized` handshake (D-007).
+    ///
+    /// The Windows counterpart to [`Self::connect_uds`]. The pipe address is
+    /// derived from `path` exactly as the server derives it, so the
+    /// cross-platform CLI can keep passing a single [`Path`]. The connect is
+    /// retried while the pipe is missing or all instances are busy, up to a
+    /// two-second deadline, so a client started just after the server can wait
+    /// for the first instance to become available.
+    ///
+    /// # Errors
+    ///
+    /// * [`ClientError::Io`] — the pipe never became available before the
+    ///   deadline, or another OS error occurred.
+    /// * [`ClientError::ProtocolVersionUnsupported`] — server rejected the
+    ///   requested protocol version (-32001).
+    /// * [`ClientError::InitializeFailed`] — server error or decode failure.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), zhive_client_native::ClientError> {
+    /// use zhive_client_native::ClientBuilder;
+    ///
+    /// let client = ClientBuilder::new()
+    ///     .connect_pipe(r"C:\Temp\zhive.sock")
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[cfg(windows)]
+    pub async fn connect_pipe(self, path: impl AsRef<Path>) -> Result<Client, ClientError> {
+        use tokio::net::windows::named_pipe::ClientOptions;
+
+        let name = pipe_name_for(path.as_ref());
+
+        // The server may not have created its first instance yet (NotFound),
+        // or every instance may be momentarily busy (ERROR_PIPE_BUSY = 231).
+        // Both are transient; retry until the two-second deadline, matching
+        // the UDS `wait_for_socket` budget used by the CLI host.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let pipe = loop {
+            match ClientOptions::new().open(&name) {
+                Ok(pipe) => break pipe,
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::NotFound
+                        || e.raw_os_error() == Some(231) =>
+                {
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(ClientError::Io(e));
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Err(e) => return Err(ClientError::Io(e)),
+            }
+        };
+
+        let (read, write) = tokio::io::split(pipe);
         let client = Client::from_split(read, write);
         let meta = perform_handshake_with_params(&client, &self).await?;
         Ok(client.replace_meta(meta))

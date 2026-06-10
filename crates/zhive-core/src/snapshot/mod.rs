@@ -113,8 +113,14 @@ impl ShadowRepo {
         workspace_root: impl AsRef<Path>,
     ) -> Result<Self, SnapshotError> {
         ensure_git_available().await?;
-        let work_tree = workspace_root.as_ref().to_path_buf();
-        let git_dir = base_dir.as_ref().join(shadow_key(&work_tree));
+        // Strip any Windows `\\?\` verbatim prefix before handing paths to git.
+        // `tempfile` and `std::fs::canonicalize` yield verbatim paths on
+        // Windows, but git-for-Windows rejects them as `--work-tree` /
+        // `GIT_WORK_TREE` ("not a git repository"). `dunce::simplified` removes
+        // the prefix when it is safe to do so and is a no-op elsewhere, so the
+        // shadow key stays stable across platforms.
+        let work_tree = dunce::simplified(workspace_root.as_ref()).to_path_buf();
+        let git_dir = dunce::simplified(base_dir.as_ref()).join(shadow_key(&work_tree));
         let repo = Self {
             git_dir,
             work_tree,

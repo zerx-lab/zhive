@@ -77,9 +77,9 @@ impl ExtensionDiscoveryConfig {
     }
 }
 
-/// Returns the user's home directory from `$HOME`, or `None` when unset.
+/// Returns the user's home directory, or `None` when it cannot be determined.
 fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
+    std::env::home_dir()
 }
 
 /// Builds the ordered `(source, setting-root)` list, low priority first.

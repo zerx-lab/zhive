@@ -34,7 +34,7 @@
 //! }
 //!
 //! # async fn run() {
-//! let client = Client::connect_uds("/tmp/zhive.sock").await.unwrap();
+//! let client = Client::connect("/tmp/zhive.sock").await.unwrap();
 //! client.set_permission_handler(Arc::new(AlwaysAllow));
 //! # }
 //! ```
@@ -136,7 +136,7 @@ pub trait PermissionHandler: Send + Sync {
 /// }
 ///
 /// # async fn run() {
-/// let client = Client::connect_uds("/tmp/zhive.sock").await.unwrap();
+/// let client = Client::connect("/tmp/zhive.sock").await.unwrap();
 /// let adapter = Arc::new(PermissionReverseAdapter::new(Arc::new(AutoAllow)));
 /// client.set_reverse_handler(Some(adapter));
 /// # }

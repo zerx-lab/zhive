@@ -82,8 +82,8 @@ fn user_skill_root() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| {
-            // $HOME is the POSIX fallback when XDG is not set.
-            std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config"))
+            // The home directory is the POSIX fallback when XDG is not set.
+            std::env::home_dir().map(|h| h.join(".config"))
         })?;
     Some(base.join("zhive").join("skills"))
 }
@@ -93,9 +93,9 @@ fn project_skill_root() -> PathBuf {
     PathBuf::from(".zhive").join("skills")
 }
 
-/// Returns the user's home directory from `$HOME`, or `None` when unset.
+/// Returns the user's home directory, or `None` when it cannot be determined.
 fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
+    std::env::home_dir()
 }
 
 /// Returns the nearest ancestor of `start` that contains a `.git` entry.

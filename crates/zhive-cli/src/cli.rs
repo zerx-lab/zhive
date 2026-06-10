@@ -40,7 +40,8 @@ pub enum Command {
     /// ```
     #[cfg(feature = "engine")]
     Exec(ExecArgs),
-    /// Run the engine as a daemon serving JSON-RPC over a Unix socket.
+    /// Run the engine as a daemon serving JSON-RPC over a local socket
+    /// (Unix-domain socket on unix, named pipe on windows).
     Serve(ServeArgs),
     /// Pipe stdio to a running engine socket (editor / ACP / MCP hosts).
     Bridge(BridgeArgs),

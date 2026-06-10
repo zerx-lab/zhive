@@ -75,12 +75,12 @@ impl TuiConfig {
     #[must_use]
     pub fn cwd_display(&self) -> String {
         let full = self.cwd.to_string_lossy().into_owned();
-        let Some(home) = std::env::var_os("HOME") else {
+        let Some(home) = std::env::home_dir() else {
             return full;
         };
-        let home = home.to_string_lossy();
+        let home = home.to_string_lossy().into_owned();
         if !home.is_empty()
-            && let Some(rest) = full.strip_prefix(home.as_ref())
+            && let Some(rest) = full.strip_prefix(home.as_str())
         {
             return format!("~{rest}");
         }

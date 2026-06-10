@@ -29,7 +29,7 @@
 - 新增 crate 或调整 workspace 结构
 - 写文档注释（doc comment）
 
-若**命中任一项**，必须先读 `ms-rust` skills。
+若**命中任一项**,必须先读 `rust-router` skill
 若仅是改变量名、调格式、加日志等局部改动，可跳过。
 
 ## 参考项目

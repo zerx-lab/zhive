@@ -77,12 +77,19 @@ pub use transport::{StdioTransport, Transport, TransportError};
 #[doc(inline)]
 pub use transport::UdsTransport;
 
+#[cfg(windows)]
+#[doc(inline)]
+pub use transport::NamedPipeTransport;
+
+#[cfg(any(unix, windows))]
 use std::path::Path;
 use std::sync::Arc;
 
 use thiserror::Error;
+#[cfg(any(unix, windows))]
 use tokio::sync::{Semaphore, mpsc};
 use tokio_util::sync::CancellationToken;
+#[cfg(any(unix, windows))]
 use zhive_proto::Message;
 
 /// Default capacity for the per-connection outbound queue used by
@@ -216,23 +223,234 @@ pub async fn serve_uds_with_events(
     serve_uds_inner(socket_path, router, max_connections, Some(engine), shutdown).await
 }
 
+/// Maps a UDS-style socket path to a Windows named-pipe address.
+///
+/// The cross-platform CLI keeps passing a [`Path`] (e.g.
+/// `C:\Users\me\AppData\Local\Temp\zhive-tui-1234.sock`); on Windows that
+/// path has no kernel meaning, so the file *stem* is lifted into the pipe
+/// namespace as `\\.\pipe\<stem>`. Both the server
+/// ([`serve_pipe`]) and the client must derive the address the same way.
+///
+/// Falls back to the fixed name `\\.\pipe\zhive` when the path has no
+/// usable file stem.
+#[cfg(windows)]
+#[must_use]
+pub fn pipe_name_for(path: &Path) -> String {
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("zhive");
+    format!(r"\\.\pipe\{stem}")
+}
+
+/// Windows counterpart to [`serve_uds`]: listens on a named pipe.
+///
+/// The pipe address is derived from `socket_path` via [`pipe_name_for`], so
+/// callers can keep using the same [`Path`]-based API on every platform. The
+/// first instance is created with `first_pipe_instance(true)`, which fails
+/// with [`ServerError::UdsAlreadyRunning`] if another zhive server already
+/// owns the name — the named-pipe equivalent of the UDS live-server probe.
+///
+/// # Errors
+///
+/// * [`ServerError::InvalidMaxConnections`] when `max_connections` is `0`.
+/// * [`ServerError::UdsAlreadyRunning`] when the pipe name is already owned
+///   by a live server.
+/// * [`ServerError::Io`] when a `create` / `connect` call fails.
+#[cfg(windows)]
+pub async fn serve_pipe(
+    socket_path: &Path,
+    router: Arc<Router>,
+    max_connections: usize,
+    shutdown: CancellationToken,
+) -> Result<(), ServerError> {
+    serve_pipe_inner(socket_path, router, max_connections, None, shutdown).await
+}
+
+/// Windows counterpart to [`serve_uds_with_events`]: serves a named pipe and
+/// forwards [`crate::engine::EngineEvent`]s to every connected client.
+///
+/// # Errors
+///
+/// Same as [`serve_pipe`].
+#[cfg(windows)]
+pub async fn serve_pipe_with_events(
+    socket_path: &Path,
+    router: Arc<Router>,
+    engine: crate::engine::Engine,
+    max_connections: usize,
+    shutdown: CancellationToken,
+) -> Result<(), ServerError> {
+    serve_pipe_inner(socket_path, router, max_connections, Some(engine), shutdown).await
+}
+
+/// Platform-neutral engine listener: serves the local IPC endpoint at
+/// `socket_path`.
+///
+/// Dispatches to [`serve_uds`] on unix and [`serve_pipe`] on windows, so the
+/// cross-platform CLI can serve with a single call. See those for the exact
+/// transport semantics.
+///
+/// # Errors
+///
+/// Same as [`serve_uds`] / [`serve_pipe`].
+#[cfg(any(unix, windows))]
+pub async fn serve(
+    socket_path: &Path,
+    router: Arc<Router>,
+    max_connections: usize,
+    shutdown: CancellationToken,
+) -> Result<(), ServerError> {
+    #[cfg(unix)]
+    {
+        serve_uds(socket_path, router, max_connections, shutdown).await
+    }
+    #[cfg(windows)]
+    {
+        serve_pipe(socket_path, router, max_connections, shutdown).await
+    }
+}
+
+/// Platform-neutral counterpart to [`serve`] that also forwards engine events.
+///
+/// Dispatches to [`serve_uds_with_events`] on unix and
+/// [`serve_pipe_with_events`] on windows.
+///
+/// # Errors
+///
+/// Same as [`serve`].
+#[cfg(any(unix, windows))]
+pub async fn serve_with_events(
+    socket_path: &Path,
+    router: Arc<Router>,
+    engine: crate::engine::Engine,
+    max_connections: usize,
+    shutdown: CancellationToken,
+) -> Result<(), ServerError> {
+    #[cfg(unix)]
+    {
+        serve_uds_with_events(socket_path, router, engine, max_connections, shutdown).await
+    }
+    #[cfg(windows)]
+    {
+        serve_pipe_with_events(socket_path, router, engine, max_connections, shutdown).await
+    }
+}
+
+#[cfg(windows)]
+async fn serve_pipe_inner(
+    socket_path: &Path,
+    router: Arc<Router>,
+    max_connections: usize,
+    engine_for_events: Option<crate::engine::Engine>,
+    shutdown: CancellationToken,
+) -> Result<(), ServerError> {
+    use tokio::net::windows::named_pipe::ServerOptions;
+
+    if max_connections == 0 {
+        return Err(ServerError::InvalidMaxConnections);
+    }
+
+    let name = pipe_name_for(socket_path);
+
+    // The first instance both reserves the name and acts as the
+    // "already running" probe: `first_pipe_instance(true)` fails when another
+    // process already owns this pipe, mirroring the UDS `AddrInUse` check.
+    let mut server = ServerOptions::new()
+        .first_pipe_instance(true)
+        .create(&name)
+        .map_err(|e| {
+            // ERROR_ACCESS_DENIED (5) / ERROR_PIPE_BUSY (231) here mean the
+            // name is already taken by a live server.
+            if matches!(e.raw_os_error(), Some(5 | 231)) {
+                ServerError::UdsAlreadyRunning { path: name.clone() }
+            } else {
+                ServerError::Io(e)
+            }
+        })?;
+
+    let limiter = Arc::new(Semaphore::new(max_connections));
+    let mut tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+
+    let outcome = loop {
+        let permit = {
+            let limiter = Arc::clone(&limiter);
+            tokio::select! {
+                biased;
+                () = shutdown.cancelled() => break Ok(()),
+                acquire = limiter.acquire_owned() => match acquire {
+                    Ok(p) => p,
+                    Err(_closed) => break Ok(()),
+                },
+            }
+        };
+
+        // Wait for a client to connect to the current instance.
+        let connect_res = tokio::select! {
+            biased;
+            () = shutdown.cancelled() => break Ok(()),
+            res = server.connect() => res,
+        };
+        if let Err(e) = connect_res {
+            break Err(ServerError::Io(e));
+        }
+
+        // The connected instance is handed to the connection task; a fresh
+        // instance must be created *before* moving the old one so a racing
+        // client never sees `NotFound` (the idiomatic tokio listen loop).
+        let connected = std::mem::replace(
+            &mut server,
+            match ServerOptions::new().create(&name) {
+                Ok(next) => next,
+                Err(e) => break Err(ServerError::Io(e)),
+            },
+        );
+
+        spawn_connection(
+            &mut tasks,
+            transport::NamedPipeTransport::new(connected),
+            permit,
+            Arc::clone(&router),
+            shutdown.clone(),
+            engine_for_events.clone(),
+        );
+    };
+
+    // Drain in-flight connection tasks for a clean shutdown.
+    while let Some(join_res) = tasks.join_next().await {
+        if let Err(e) = join_res {
+            let message = e.to_string();
+            tracing::warn!(
+                name: "zhive.server.pipe.task_join_error",
+                error_message = %message,
+                "connection task did not join cleanly"
+            );
+        }
+    }
+    outcome
+}
+
 /// Spawns one connection-handling task into `tasks`.
 ///
 /// Pulled out of [`serve_uds_inner`] so the body of that loop stays
-/// short enough to satisfy `clippy::too_many_lines`.
-#[cfg(unix)]
-fn spawn_connection(
+/// short enough to satisfy `clippy::too_many_lines`. Generic over the
+/// [`Transport`] so the UDS (unix) and named-pipe (windows) accept loops
+/// share the same per-connection driver.
+#[cfg(any(unix, windows))]
+fn spawn_connection<T>(
     tasks: &mut tokio::task::JoinSet<()>,
-    stream: tokio::net::UnixStream,
+    mut transport: T,
     permit: tokio::sync::OwnedSemaphorePermit,
     router: Arc<Router>,
     shutdown: CancellationToken,
     engine_for_events: Option<crate::engine::Engine>,
-) {
+) where
+    T: Transport + Send + 'static,
+{
     use std::sync::Mutex;
     tasks.spawn(async move {
         let _permit = permit; // released when task exits
-        let mut transport = UdsTransport::new(stream);
         // When events forwarding is enabled, create a per-connection
         // outbound channel and spawn a forwarder that pumps engine
         // events into it.  A shared EventFilter is also created so the
@@ -493,7 +711,7 @@ async fn serve_uds_inner(
             Ok((stream, _peer)) => {
                 spawn_connection(
                     &mut tasks,
-                    stream,
+                    UdsTransport::new(stream),
                     permit,
                     Arc::clone(&router),
                     shutdown.clone(),
@@ -737,6 +955,121 @@ mod tests {
             .expect("server must shut down")
             .expect("server join");
         server_res.expect("serve_uds clean exit");
+
+        match reply {
+            Message::Response(resp) => match resp.outcome {
+                zhive_proto::ResponseOutcome::Result(v) => {
+                    assert_eq!(v, serde_json::json!("pong"));
+                }
+                zhive_proto::ResponseOutcome::Error(e) => {
+                    panic!("expected ok result, got error {e:?}")
+                }
+            },
+            other => panic!("expected response, got {other:?}"),
+        }
+    }
+
+    // ── named-pipe (windows) tests ────────────────────────────────
+
+    /// `pipe_name_for` lifts the file stem into the pipe namespace and falls
+    /// back to a fixed name when there is no usable stem.
+    #[cfg(windows)]
+    #[test]
+    fn pipe_name_for_maps_stem() {
+        assert_eq!(
+            pipe_name_for(std::path::Path::new(r"C:\tmp\zhive-tui-42.sock")),
+            r"\\.\pipe\zhive-tui-42"
+        );
+        assert_eq!(
+            pipe_name_for(std::path::Path::new("zhive.sock")),
+            r"\\.\pipe\zhive"
+        );
+    }
+
+    /// End-to-end named-pipe round-trip: `serve_pipe` accepts a client,
+    /// completes the initialize handshake, answers a `ping`, then shuts down
+    /// cleanly on cancel. Exercises the same accept-loop + transport the
+    /// `tui` / `serve` commands use on windows.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn serve_pipe_round_trip_then_shutdown() {
+        use std::time::Duration;
+
+        use tokio::net::windows::named_pipe::ClientOptions;
+        use zhive_proto::framing;
+        use zhive_proto::{Id, Request};
+
+        // A unique socket-style path so the derived pipe name is unique per run.
+        let socket = std::path::PathBuf::from(format!(
+            r"C:\zhive-test\pipe-rt-{}.sock",
+            std::process::id()
+        ));
+        let expected_name = pipe_name_for(&socket);
+
+        let mut router = Router::new();
+        router.register("ping", Arc::new(Pong));
+        let router = Arc::new(router);
+        let token = CancellationToken::new();
+
+        let socket_for_task = socket.clone();
+        let token_for_task = token.clone();
+        let server = tokio::spawn(async move {
+            serve_pipe(
+                &socket_for_task,
+                router,
+                DEFAULT_MAX_CONNECTIONS,
+                token_for_task,
+            )
+            .await
+        });
+
+        // Connect to the derived pipe name, retrying while the first instance
+        // is still being created (NotFound) or busy (231).
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let pipe = loop {
+            match ClientOptions::new().open(&expected_name) {
+                Ok(p) => break p,
+                Err(e)
+                    if (e.kind() == std::io::ErrorKind::NotFound
+                        || e.raw_os_error() == Some(231))
+                        && std::time::Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Err(e) => panic!("pipe connect failed: {e:?}"),
+            }
+        };
+
+        // Drive the client side with the wire framing directly. `BufStream`
+        // gives the `AsyncBufRead` half `read_message` needs while keeping the
+        // `AsyncWrite` half for `write_message`.
+        let mut pipe = tokio::io::BufStream::new(pipe);
+        let init = Request::new(
+            Id::Number(0),
+            "initialize",
+            Some(serde_json::json!({
+                "protocolVersion": 1,
+                "clientInfo": { "name": "test-client", "version": "0.0.0" },
+            })),
+        );
+        framing::write_message(&mut pipe, &Message::Request(init))
+            .await
+            .unwrap();
+        let _init_reply = framing::read_message(&mut pipe).await.unwrap();
+
+        let req = Request::new(Id::Number(7), "ping", None);
+        framing::write_message(&mut pipe, &Message::Request(req))
+            .await
+            .unwrap();
+        let reply = framing::read_message(&mut pipe).await.unwrap();
+        drop(pipe);
+        token.cancel();
+
+        let server_res = tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("server must shut down")
+            .expect("server join");
+        server_res.expect("serve_pipe clean exit");
 
         match reply {
             Message::Response(resp) => match resp.outcome {

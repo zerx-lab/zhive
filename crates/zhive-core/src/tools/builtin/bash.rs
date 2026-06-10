@@ -216,7 +216,10 @@ impl Tool for BashTool {
             .map_err(|e| ToolError::Execution(format!("failed to spawn command: {e}")))?;
 
         // Capture the child's pid *before* `wait_with_output` moves it.  Used
-        // in the timeout/cancel arms to kill the whole process group.
+        // in the timeout/cancel arms to kill the whole process group. Only the
+        // unix arms consume it, so the binding is gated to avoid an unused
+        // warning on platforms without `kill_process_group`.
+        #[cfg(unix)]
         let child_pid = child.id();
 
         let cancel = ctx.cancel.clone();
@@ -461,14 +464,29 @@ mod tests {
 
     #[tokio::test]
     async fn bash_cwd_respected() {
+        // Verify the `cwd` arg actually changes the child's working directory,
+        // without depending on how the shell prints paths: `pwd` emits a
+        // POSIX path on unix but an MSYS-style `/c/...` path under git-bash on
+        // Windows, and `TempDir` yields a `\\?\C:\...` verbatim path there, so
+        // a substring match on `pwd` output is not portable. Instead, drop a
+        // uniquely-named marker file into the target dir and have the command
+        // list the directory: the filename appears in the output only if the
+        // child ran in that directory.
         let dir = tempfile::TempDir::new().unwrap();
+        let marker = "zhive_cwd_marker.txt";
+        std::fs::write(dir.path().join(marker), b"x").unwrap();
+
         let tool = BashTool::new();
         let args = serde_json::json!({
-            "command": "pwd",
+            "command": "ls",
             "cwd": dir.path().to_str().unwrap()
         });
         let out = tool.execute(args, &ctx()).await.unwrap();
-        assert!(out.text.contains(dir.path().to_str().unwrap()));
+        assert!(
+            out.text.contains(marker),
+            "expected `ls` in the cwd to list {marker}, got: {}",
+            out.text
+        );
     }
 
     #[tokio::test]

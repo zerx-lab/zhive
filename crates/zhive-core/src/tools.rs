@@ -623,6 +623,7 @@ impl ToolRegistry {
 ///     turn_id:   TurnId(Arc::from("turn:thread:native/test/0")),
 ///     cancel:    CancellationToken::new(),
 ///     spawner:   None,
+///     workspace_root: None,
 /// };
 /// let out = EchoTool.execute(serde_json::json!({"msg": "hello"}), &ctx).await.unwrap();
 /// assert!(out.text.contains("hello"));

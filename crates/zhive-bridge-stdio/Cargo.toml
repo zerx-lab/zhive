@@ -19,8 +19,9 @@ default = []
 zhive-proto = { workspace = true }
 
 # `io-std` enables tokio::io::stdin/stdout async wrappers used by the
-# bridge's runtime; the rest are inherited from the workspace defaults.
-tokio      = { workspace = true, features = ["io-std"] }
+# bridge's runtime; `net` provides the Windows named-pipe client used by the
+# windows `run` path. The rest are inherited from the workspace defaults.
+tokio      = { workspace = true, features = ["io-std", "net"] }
 tokio-util = { workspace = true }
 anyhow     = { workspace = true }
 thiserror  = { workspace = true }

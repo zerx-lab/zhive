@@ -16,7 +16,7 @@ mod run;
 // in (via `tui` / `serve` / `mcp` / `acp` / `skills`).
 #[cfg(feature = "engine")]
 mod boot;
-#[cfg(feature = "engine")]
+#[cfg(all(any(unix, windows), feature = "engine"))]
 mod engine_host;
 #[cfg(feature = "engine")]
 mod models;

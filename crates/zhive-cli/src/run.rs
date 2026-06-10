@@ -35,7 +35,7 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
 // tui
 // ============================================================
 
-#[cfg(feature = "tui")]
+#[cfg(all(any(unix, windows), feature = "tui"))]
 async fn run_tui(config_path: Option<std::path::PathBuf>, args: crate::cli::TuiArgs) -> Result<()> {
     // TUI owns the full terminal, so nothing may go to stderr or stdout.
     // Spin up a file-backed subscriber instead (best-effort; silently degraded
@@ -111,7 +111,7 @@ async fn run_tui(config_path: Option<std::path::PathBuf>, args: crate::cli::TuiA
 ///
 /// Failure (missing home directory, permission denied, etc.) is silently
 /// ignored so it never prevents the TUI from launching.
-#[cfg(feature = "tui")]
+#[cfg(all(any(unix, windows), feature = "tui"))]
 fn init_tui_file_logging() {
     use std::sync::Arc;
 
@@ -154,13 +154,22 @@ fn init_tui_file_logging() {
 /// Resolves the TUI log-file path: `<data_dir>/zhive-tui.log`.
 ///
 /// Returns `None` when the data directory cannot be determined.
-#[cfg(feature = "tui")]
+#[cfg(all(any(unix, windows), feature = "tui"))]
 fn tui_log_path() -> Option<std::path::PathBuf> {
     crate::boot::data_dir().map(|d| d.join("zhive-tui.log"))
 }
 
-#[cfg(not(feature = "tui"))]
+#[cfg(any(not(any(unix, windows)), not(feature = "tui")))]
+#[expect(
+    clippy::unused_async,
+    reason = "stub must match the async fn signature of the platform-gated real impl"
+)]
 async fn run_tui(_config: Option<std::path::PathBuf>, _args: crate::cli::TuiArgs) -> Result<()> {
+    #[cfg(not(any(unix, windows)))]
+    anyhow::bail!(
+        "`zhive tui` hosts the engine over a local socket, which is not supported on this platform"
+    );
+    #[cfg(any(unix, windows))]
     anyhow::bail!("this build was compiled without the `tui` feature")
 }
 
@@ -170,7 +179,7 @@ async fn run_tui(_config: Option<std::path::PathBuf>, _args: crate::cli::TuiArgs
 /// exist in the providers map a warning is emitted and the current default is
 /// kept. `--model <id>` overrides the model of the (possibly just-changed)
 /// active entry.
-#[cfg(feature = "tui")]
+#[cfg(all(any(unix, windows), feature = "tui"))]
 fn apply_tui_overrides(cfg: &mut crate::config::Config, args: &crate::cli::TuiArgs) {
     if let Some(provider_name) = &args.provider {
         if cfg.provider.providers.contains_key(provider_name.as_str()) {
@@ -197,7 +206,7 @@ fn apply_tui_overrides(cfg: &mut crate::config::Config, args: &crate::cli::TuiAr
 }
 
 /// Distills the config into the UI-facing `TuiConfig` (D-002).
-#[cfg(feature = "tui")]
+#[cfg(all(any(unix, windows), feature = "tui"))]
 fn build_tui_config(cfg: &crate::config::Config) -> zhive_tui::TuiConfig {
     zhive_tui::TuiConfig {
         theme: parse_theme(&cfg.ui.theme),
@@ -219,7 +228,7 @@ fn build_tui_config(cfg: &crate::config::Config) -> zhive_tui::TuiConfig {
     }
 }
 
-#[cfg(feature = "tui")]
+#[cfg(all(any(unix, windows), feature = "tui"))]
 fn parse_theme(s: &str) -> zhive_tui::Theme {
     match s {
         "light" => zhive_tui::Theme::Light,
@@ -228,7 +237,7 @@ fn parse_theme(s: &str) -> zhive_tui::Theme {
     }
 }
 
-#[cfg(feature = "tui")]
+#[cfg(all(any(unix, windows), feature = "tui"))]
 fn parse_accent(s: &str) -> zhive_tui::Accent {
     match s {
         "amber" => zhive_tui::Accent::Amber,
@@ -238,7 +247,7 @@ fn parse_accent(s: &str) -> zhive_tui::Accent {
     }
 }
 
-#[cfg(feature = "tui")]
+#[cfg(all(any(unix, windows), feature = "tui"))]
 fn parse_density(s: &str) -> zhive_tui::Density {
     match s {
         "lean" => zhive_tui::Density::Lean,
@@ -248,7 +257,7 @@ fn parse_density(s: &str) -> zhive_tui::Density {
 }
 
 /// Best-effort current git branch from `.git/HEAD`.
-#[cfg(feature = "tui")]
+#[cfg(all(any(unix, windows), feature = "tui"))]
 fn detect_branch() -> Option<String> {
     let head = std::fs::read_to_string(".git/HEAD").ok()?;
     let branch = head.trim().strip_prefix("ref: refs/heads/")?;
@@ -274,7 +283,7 @@ fn detect_branch() -> Option<String> {
 ///
 /// Returns an error if config loading, provider build, engine startup, or the
 /// `start_turn` RPC fails.
-#[cfg(feature = "engine")]
+#[cfg(all(any(unix, windows), feature = "engine"))]
 #[expect(
     clippy::too_many_lines,
     reason = "run_exec is one cohesive headless driver: config/override → engine start → \
@@ -426,11 +435,25 @@ async fn run_exec(
     Ok(())
 }
 
+#[cfg(all(not(any(unix, windows)), feature = "engine"))]
+#[expect(
+    clippy::unused_async,
+    reason = "stub must match the async fn signature of the platform-gated real impl"
+)]
+async fn run_exec(
+    _config_path: Option<std::path::PathBuf>,
+    _args: crate::cli::ExecArgs,
+) -> Result<()> {
+    anyhow::bail!(
+        "`zhive exec` hosts the engine over a local socket, which is not supported on this platform"
+    )
+}
+
 // ============================================================
 // serve
 // ============================================================
 
-#[cfg(feature = "serve")]
+#[cfg(all(any(unix, windows), feature = "serve"))]
 async fn run_serve(
     config_path: Option<std::path::PathBuf>,
     args: crate::cli::ServeArgs,
@@ -441,7 +464,7 @@ async fn run_serve(
     use zhive_core::engine::{Engine, EngineConfig};
     use zhive_core::hooks::HookHost;
     use zhive_core::server::{
-        DEFAULT_MAX_CONNECTIONS, Router, register_engine_handlers, serve_uds_with_events,
+        DEFAULT_MAX_CONNECTIONS, Router, register_engine_handlers, serve_with_events,
     };
 
     init_stderr_logging();
@@ -484,7 +507,7 @@ async fn run_serve(
     let serve_engine = engine.clone();
     let serve_token = token.clone();
     let mut handle = tokio::spawn(async move {
-        serve_uds_with_events(
+        serve_with_events(
             &serve_socket,
             router,
             serve_engine,
@@ -530,7 +553,7 @@ async fn run_serve(
     }
 }
 
-#[cfg(not(feature = "serve"))]
+#[cfg(any(not(any(unix, windows)), not(feature = "serve")))]
 #[expect(
     clippy::unused_async,
     reason = "stub must match the async fn signature of the feature-gated real impl"
@@ -539,6 +562,11 @@ async fn run_serve(
     _config: Option<std::path::PathBuf>,
     _args: crate::cli::ServeArgs,
 ) -> Result<()> {
+    #[cfg(not(any(unix, windows)))]
+    anyhow::bail!(
+        "`zhive serve` requires a local socket transport, which is not supported on this platform"
+    );
+    #[cfg(any(unix, windows))]
     anyhow::bail!("this build was compiled without the `serve` feature")
 }
 
@@ -562,19 +590,24 @@ fn init_stderr_logging() {
 // bridge
 // ============================================================
 
-#[cfg(feature = "bridge-stdio")]
+#[cfg(all(any(unix, windows), feature = "bridge-stdio"))]
 async fn run_bridge(args: crate::cli::BridgeArgs) -> Result<()> {
     let socket = args.socket.unwrap_or_else(default_socket);
     zhive_bridge_stdio::run(&socket, tokio::io::stdin(), tokio::io::stdout()).await?;
     Ok(())
 }
 
-#[cfg(not(feature = "bridge-stdio"))]
+#[cfg(any(not(any(unix, windows)), not(feature = "bridge-stdio")))]
 #[expect(
     clippy::unused_async,
     reason = "stub must match the async fn signature of the feature-gated real impl"
 )]
 async fn run_bridge(_args: crate::cli::BridgeArgs) -> Result<()> {
+    #[cfg(not(any(unix, windows)))]
+    anyhow::bail!(
+        "`zhive bridge` forwards stdio to a local socket, which is not supported on this platform"
+    );
+    #[cfg(any(unix, windows))]
     anyhow::bail!("this build was compiled without the `bridge-stdio` feature")
 }
 
@@ -748,6 +781,7 @@ async fn run_doctor(config_path: Option<std::path::PathBuf>) -> Result<()> {
 
 /// Default engine socket: `$XDG_RUNTIME_DIR/zhive.sock` or the temp dir.
 #[cfg(any(feature = "serve", feature = "bridge-stdio"))]
+#[cfg(any(unix, windows))]
 fn default_socket() -> std::path::PathBuf {
     std::env::var_os("XDG_RUNTIME_DIR")
         .filter(|v| !v.is_empty())
@@ -873,7 +907,7 @@ mod tests {
     #[cfg(feature = "tui")]
     #[test]
     fn tui_log_path_ends_with_log_filename() {
-        if std::env::var_os("HOME").is_none()
+        if std::env::home_dir().is_none()
             && std::env::var_os("XDG_DATA_HOME").is_none()
             && std::env::var_os("ZHIVE_DATA_DIR").is_none()
         {

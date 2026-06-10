@@ -7,6 +7,11 @@
 //! `Content-Length:` framed JSON-RPC frames. They are the canonical
 //! smoke check that the three crates compose without surprises.
 
+// This suite is Unix-domain-socket specific. The windows named-pipe path has
+// equivalent end-to-end coverage in the `zhive-core` library tests
+// (`server::tests::serve_pipe_round_trip_then_shutdown`).
+#![cfg(unix)]
+
 use std::sync::Arc;
 use std::time::Duration;
 

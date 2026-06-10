@@ -6,7 +6,7 @@
 //! through `zhive_tui::protocol::decode` and `zhive_tui::conversation` — the same
 //! decode + reduce the running UI performs. No API key or network is needed.
 
-#![cfg(all(feature = "tui", feature = "serve"))]
+#![cfg(all(unix, feature = "tui", feature = "serve"))]
 
 use std::sync::Arc;
 use std::time::Duration;

@@ -379,6 +379,13 @@ pub(crate) struct ActiveModelInfo {
     ///
     /// `None` when no catalogue exists, the fetch failed, or the active model is
     /// absent from the listing — the TUI then falls back to its static table.
+    #[cfg_attr(
+        any(not(any(unix, windows)), not(feature = "tui")),
+        allow(
+            dead_code,
+            reason = "only read by the socket-gated `tui` command; see run.rs"
+        )
+    )]
     pub supported_efforts: Option<Vec<ThinkingEffort>>,
 }
 

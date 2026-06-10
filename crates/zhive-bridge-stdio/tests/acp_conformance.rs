@@ -15,6 +15,11 @@
 //! verifies that bytes in == bytes out, in order, with `Content-Length`
 //! boundaries preserved across both directions.
 
+// The harness drives the bridge over a Unix-domain socket. The windows
+// named-pipe `run` path is covered by the end-to-end pipe round-trip test in
+// `zhive-core` (`serve_pipe_round_trip_then_shutdown`).
+#![cfg(unix)]
+
 use std::io::Cursor;
 
 use serde_json::json;
